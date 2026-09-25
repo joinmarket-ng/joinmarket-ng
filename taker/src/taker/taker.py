@@ -19,7 +19,7 @@ import inspect
 import math
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from jmcore.bitcoin import calculate_tx_vsize, get_address_type
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
@@ -61,6 +61,9 @@ from taker.orderbook import (
     maker_selection_keys,
 )
 from taker.podle_manager import PoDLEManager
+
+if TYPE_CHECKING:
+    from taker.buyout import ChannelBuyout
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
 __all__ = [
@@ -513,11 +516,26 @@ class Taker(TakerMonitoringMixin):
         """Resolved minimum miner fee rate for the current round."""
         return self._session._minimum_fee_rate_sat_vb
 
+    def _wallet_funding_required(
+        self,
+        total_required: int,
+        buyout: ChannelBuyout | None = None,
+    ) -> int:
+        """Wallet-only funding requirement, for a prepared or attached buyout.
+
+        Preflight runs before a round exists, so the caller may pass the adapter
+        it is about to use; otherwise the current round's adapter (or none) decides.
+        """
+        if buyout is None:
+            return self._session.wallet_funding_required(total_required)
+        return buyout.wallet_funding_required(total_required)
+
     async def _resolve_explicit_input_utxos(
         self,
         input_utxos: list[str],
         mixdepth: int,
         amount: int,
+        buyout: ChannelBuyout | None = None,
     ) -> list[UTXOInfo]:
         """Resolve and validate a strict set of taker CoinJoin inputs."""
         selected, _locktime_cutoff = await resolve_input_utxos(
@@ -544,12 +562,15 @@ class Taker(TakerMonitoringMixin):
 
         if amount > 0:
             total = sum(utxo.value for utxo in selected)
-            if total < amount:
+            required = self._wallet_funding_required(amount, buyout)
+            if total < required:
                 msg = (
                     f"Insufficient funds in explicit input UTXOs: have {total:,} sats, "
-                    f"need at least {amount:,} sats before fees"
+                    f"need at least {required:,} sats before fees"
                 )
                 raise ValueError(msg)
+            # The PoDLE commitment covers the CoinJoin amount itself, so channel
+            # value never lowers the wallet UTXO size this requires.
             if not podle_threshold_met(
                 selected,
                 amount,
@@ -571,6 +592,7 @@ class Taker(TakerMonitoringMixin):
         amount: int,
         mixdepth: int | None,
         input_utxos: list[str] | None = None,
+        buyout: ChannelBuyout | None = None,
     ) -> str | None:
         """Validate that ``mixdepth`` can fund a CoinJoin of ``amount``.
 
@@ -588,6 +610,10 @@ class Taker(TakerMonitoringMixin):
                 otherwise it falls back to mixdepth 0.
             input_utxos: Optional exact ``txid:vout`` set to validate instead
                 of automatic or interactive selection.
+            buyout: Prepared channel buyout this round will use, when it was
+                not attached to a session yet. Channel value lowers the
+                *funding* the wallet must supply; it never lowers the PoDLE
+                commitment requirement, which follows the CoinJoin amount.
 
         Returns:
             ``None`` when a CoinJoin can proceed, otherwise a human-readable
@@ -604,6 +630,7 @@ class Taker(TakerMonitoringMixin):
                     input_utxos,
                     resolved_mixdepth,
                     amount,
+                    buyout,
                 )
             except ValueError as exc:
                 return str(exc)
@@ -665,7 +692,7 @@ class Taker(TakerMonitoringMixin):
         try:
             self.wallet.select_utxos(
                 mixdepth,
-                amount,
+                self._wallet_funding_required(amount, buyout),
                 min_conf,
                 exclude=reserved,
             )
@@ -999,6 +1026,7 @@ class Taker(TakerMonitoringMixin):
         exclude_nicks: set[str] | None = None,
         input_utxos: list[str] | None = None,
         penalized_maker_keys: set[str] | None = None,
+        buyout: ChannelBuyout | None = None,
     ) -> str | None:
         """Run one CoinJoin with fresh, non-reusable per-round state."""
         if self._round_lock.locked():
@@ -1008,6 +1036,19 @@ class Taker(TakerMonitoringMixin):
         async with self._round_lock:
             session = CoinJoinSession()
             session.attach(self)
+            if buyout is not None:
+                if (
+                    amount <= 0
+                    or offer_output_script_type(self.config.preferred_offer_type) != "p2tr"
+                ):
+                    raise ValueError("A channel buyout requires a non-sweep Taproot CoinJoin")
+                if (
+                    buyout.terms.proposal.network
+                    != (self.config.bitcoin_network or self.config.network).value
+                ):
+                    raise ValueError("Buyout and CoinJoin Bitcoin networks differ")
+                buyout.begin_round()
+                session.buyout = buyout
             self._session = session
             self.state = TakerState.IDLE
             return await self._do_coinjoin(
@@ -1362,11 +1403,13 @@ class Taker(TakerMonitoringMixin):
                     # Estimate required amount (conservative estimate for UTXO pre-selection)
                     # We'll refine this in _phase_build_tx once we have exact maker UTXOs
                     estimated_inputs = 2 + len(selected_offers) * 2  # Rough estimate
+                    estimated_inputs += self._session.buyout_input_count
                     estimated_outputs = 2 + len(selected_offers) * 2
                     estimated_tx_fee = self._session._estimate_tx_fee(
                         estimated_inputs, estimated_outputs
                     )
                     estimated_required = self._session.cj_amount + total_fee + estimated_tx_fee
+                    estimated_required = self._session.wallet_funding_required(estimated_required)
 
                     # Pre-select UTXOs for the CoinJoin, skipping any inputs
                     # locked by another in-flight round (this or another process
@@ -1697,7 +1740,7 @@ class Taker(TakerMonitoringMixin):
             )
 
             # Validate selected UTXOs have sufficient funds (for non-sweep)
-            if amount > 0 and total_selected < amount:
+            if amount > 0 and total_selected < self._session.wallet_funding_required(amount):
                 logger.error("Selected UTXOs have insufficient funds")
                 logger.bind(sensitive=True).error(
                     "Selected UTXO funding detail: have {:,} sats, need at least {:,} sats",
@@ -2160,7 +2203,7 @@ class Taker(TakerMonitoringMixin):
 
     async def _finalize_and_broadcast(self, destination: str) -> str | None:
         # Final confirmation before broadcast
-        num_taker_inputs = len(self._session.selected_utxos)
+        num_taker_inputs = len(self._session.selected_utxos) + self._session.buyout_input_count
         num_maker_inputs = sum(len(s.utxos) for s in self._session.maker_sessions.values())
         total_inputs = num_taker_inputs + num_maker_inputs
 
@@ -2169,6 +2212,8 @@ class Taker(TakerMonitoringMixin):
         total_output_value = sum(out.value for out in tx.outputs)
 
         taker_input_value = sum(utxo.value for utxo in self._session.selected_utxos)
+        if self._session.buyout is not None:
+            taker_input_value += self._session.buyout.total_value
         maker_input_value = sum(
             utxo["value"]
             for session in self._session.maker_sessions.values()
@@ -2298,7 +2343,7 @@ class Taker(TakerMonitoringMixin):
         try:
             updated = update_taker_awaiting_transaction_broadcast(
                 destination_address=self._session.cj_destination,
-                change_address=self._session.taker_change_address,  # Empty string if no change
+                change_address=self._session.wallet_change_address,
                 txid=self._session.txid,
                 mining_fee=actual_mining_fee,
                 broadcast_method=self._session.broadcast_method,

@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from jmwallet.wallet.models import UTXOInfo
     from jmwallet.wallet.service import WalletService
 
+    from taker.buyout import ChannelBuyout
     from taker.config import TakerConfig
     from taker.multi_directory import MultiDirectoryClient
     from taker.taker import Taker
@@ -185,6 +186,7 @@ class CoinJoinSession:
         # Addresses recorded for broadcast verification and history reconciliation.
         self.cj_destination: str = ""
         self.taker_change_address: str = ""
+        self.buyout: ChannelBuyout | None = None
 
         # Sweep-only: the tx-fee budget reserved at order-selection time. At
         # build time we re-use this exact number to keep the actual fee in line
@@ -220,6 +222,21 @@ class CoinJoinSession:
             equalize_cj_fees=self.config.equalize_cj_fees,
         )
 
+    def wallet_funding_required(self, total_required: int) -> int:
+        """Keep the mandatory escrow reserve outside spendable wallet funding."""
+        if self.buyout is None:
+            return total_required
+        return max(1, total_required + self.buyout.minimum_change - self.buyout.total_value)
+
+    @property
+    def wallet_change_address(self) -> str:
+        """Escrow change belongs in the buyout journal, not wallet address history."""
+        return self.taker_change_address if self.buyout is None else ""
+
+    @property
+    def buyout_input_count(self) -> int:
+        return len(self.buyout.inputs) if self.buyout is not None else 0
+
     def reset(self) -> None:
         """Reset transient session state to a fresh state."""
         if self.reserved_inputs:
@@ -249,6 +266,7 @@ class CoinJoinSession:
         self.declined_signer_nicks = set()
         self.cj_destination = ""
         self.taker_change_address = ""
+        self.buyout = None
         self._sweep_tx_fee_budget = 0
         self.crypto_session = None
         self._fee_rate = None
@@ -1173,7 +1191,7 @@ class CoinJoinSession:
                     )
 
             # Estimate tx fee with actual input counts
-            num_taker_inputs = len(self.preselected_utxos)
+            num_taker_inputs = len(self.preselected_utxos) + self.buyout_input_count
             num_maker_inputs = sum(len(s.utxos) for s in self.maker_sessions.values())
             num_inputs = num_taker_inputs + num_maker_inputs
 
@@ -1351,7 +1369,7 @@ class CoinJoinSession:
                 # NORMAL MODE: Use pre-selected UTXOs, add more if needed
                 # For normal mode, we use the actual tx_fee estimate
                 tx_fee = actual_tx_fee
-                required = self.cj_amount + total_maker_fee + tx_fee
+                required = self.wallet_funding_required(self.cj_amount + total_maker_fee + tx_fee)
 
                 # Use pre-selected UTXOs (which include the PoDLE UTXO)
                 # These were selected during PoDLE generation to ensure the commitment
@@ -1419,6 +1437,15 @@ class CoinJoinSession:
             self.selected_utxos = selected_utxos
 
             taker_total = sum(u.value for u in selected_utxos)
+            if self.buyout is not None:
+                if self.is_sweep or not all(u.is_p2tr for u in selected_utxos):
+                    raise ValueError(
+                        "Buyout requires ordinary Taproot wallet inputs and escrow change"
+                    )
+                channel_points = {(u["txid"], u["vout"]) for u in self.buyout.inputs}
+                if channel_points.intersection((u.txid, u.vout) for u in selected_utxos):
+                    raise ValueError("Channel funding inputs cannot be wallet-owned inputs")
+                taker_total += self.buyout.total_value
 
             # Calculate expected change to determine if we need a change address
             # Change = total_input - cj_amount - maker_fees - tx_fee
@@ -1426,7 +1453,12 @@ class CoinJoinSession:
 
             # Only generate change address if we'll actually have a change output
             # This avoids recording unused addresses in history
-            if expected_change > BITCOIN_DUST_THRESHOLD:
+            if self.buyout is not None:
+                if expected_change < self.buyout.minimum_change:
+                    raise ValueError("Buyout escrow reserve is insufficient")
+                taker_change_address = self.buyout.change_address
+                self.taker_change_address = taker_change_address
+            elif expected_change > BITCOIN_DUST_THRESHOLD:
                 taker_change_address = self.wallet.get_new_internal_address(mixdepth)
                 self.taker_change_address = taker_change_address
                 logger.bind(sensitive=True).debug(
@@ -1474,7 +1506,8 @@ class CoinJoinSession:
                         "scriptpubkey": u.scriptpubkey,
                     }
                     for u in selected_utxos
-                ],
+                ]
+                + (self.buyout.inputs if self.buyout is not None else []),
                 taker_cj_address=destination,
                 taker_change_address=taker_change_address,
                 taker_total_input=taker_total,
@@ -1484,6 +1517,8 @@ class CoinJoinSession:
                 network=network,
                 locktime=locktime,
             )
+            if self.buyout is not None:
+                self.buyout.validate(self.unsigned_tx, self._build_prevout_map(), current_height)
 
             logger.bind(sensitive=True).debug("Built unsigned tx: {} bytes", len(self.unsigned_tx))
             logger.bind(sensitive=True).debug(
@@ -1591,6 +1626,7 @@ class CoinJoinSession:
             self._classify_scriptpubkey(getattr(utxo, "scriptpubkey", "") or "", cj_type)
             for utxo in selected_utxos
         ]
+        input_types.extend(["p2tr"] * self.buyout_input_count)
         for session in self.maker_sessions.values():
             input_types.extend(
                 self._classify_scriptpubkey(utxo.get("scriptpubkey", "") or "", cj_type)
@@ -1780,6 +1816,8 @@ class CoinJoinSession:
         total_input = sum(utxo.value for utxo in self.selected_utxos) + sum(
             utxo["value"] for session in self.maker_sessions.values() for utxo in session.utxos
         )
+        if self.buyout is not None:
+            total_input += self.buyout.total_value
         fee = total_input - sum(output.value for output in tx.outputs)
         input_types, output_types = self._build_script_type_lists(
             self.selected_utxos, len(tx.outputs)
@@ -2033,7 +2071,7 @@ class CoinJoinSession:
                 total_maker_fees=total_maker_fees,
                 mining_fee=0,  # Will be updated after signing
                 destination=self.cj_destination,
-                change_address=self.taker_change_address,  # Empty string if no change needed
+                change_address=self.wallet_change_address,
                 source_mixdepth=self.tx_metadata.get("source_mixdepth", 0),
                 selected_utxos=[(utxo.txid, utxo.vout) for utxo in self.selected_utxos],
                 txid="",  # Will be updated after broadcast
@@ -2284,6 +2322,12 @@ class CoinJoinSession:
     def _build_prevout_map(self) -> dict[tuple[str, int], tuple[int, bytes]]:
         """Map every CoinJoin input to the data committed by BIP341."""
         prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
+        if self.buyout is not None:
+            for item in self.buyout.inputs:
+                prevouts[(item["txid"], item["vout"])] = (
+                    item["value"],
+                    bytes.fromhex(item["scriptpubkey"]),
+                )
         for utxo in self.selected_utxos:
             prevouts[(utxo.txid, utxo.vout)] = (
                 utxo.value,
@@ -2361,6 +2405,14 @@ class CoinJoinSession:
             if need_prevouts:
                 prevout_values, prevout_scripts = self._assemble_prevouts(
                     tx, self._build_prevout_map()
+                )
+
+            if self.buyout is not None:
+                if not all(utxo.is_p2tr for utxo in self.selected_utxos):
+                    raise TransactionSigningError("Buyout requires ordinary Taproot wallet inputs")
+                self.signing_boundary_crossed = True
+                signatures_info.extend(
+                    await self.buyout.sign(self.unsigned_tx, self._build_prevout_map())
                 )
 
             # Sign each of our UTXOs
@@ -2445,7 +2497,7 @@ class CoinJoinSession:
                 total_maker_fees=total_maker_fees,
                 mining_fee=mining_fee,
                 destination=destination,
-                change_address=self.taker_change_address,  # May be empty string if no change
+                change_address=self.wallet_change_address,
                 source_mixdepth=self.tx_metadata.get("source_mixdepth", 0),
                 selected_utxos=[(utxo.txid, utxo.vout) for utxo in self.selected_utxos],
                 txid=txid,

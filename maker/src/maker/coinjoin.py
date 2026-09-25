@@ -17,7 +17,7 @@ import secrets
 import time
 from collections.abc import Callable
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jmcore.bitcoin import parse_transaction
 from jmcore.encryption import CryptoSession
@@ -45,8 +45,37 @@ from maker.mixdepth_selection import MixdepthSelectionPolicy, mixdepth_attempt_o
 from maker.offer_math import required_maker_input
 from maker.tx_verification import find_output_index, verify_unsigned_transaction
 
+if TYPE_CHECKING:
+    # A maker without prepared channel buyouts never imports jmswap at runtime.
+    from jmswap.coinjoin_funding import ChannelBuyout
+
 MINER_FEE_PREVOUT_LOOKUP_TIMEOUT_SEC = 10.0
 MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE = 10
+
+
+def bound_buyout_mixdepth(
+    buyout: ChannelBuyout,
+    wallet: WalletService,
+    backend: BlockchainBackend,
+    pit_script_type: str,
+) -> int:
+    """Validate the wallet binding before advertising or accepting buyout rounds."""
+    if pit_script_type != "p2tr" or getattr(wallet, "address_type", None) != "p2tr":
+        raise ValueError("A channel buyout requires a Taproot wallet and a Taproot pit")
+    if not backend.can_lookup_arbitrary_utxos():
+        raise ValueError("A channel buyout requires a backend that can look up arbitrary UTXOs")
+    binding = dict(getattr(buyout.buyer, "runtime_binding", None) or {})
+    if buyout.terms.proposal.network != wallet.network or binding.get("network") != wallet.network:
+        raise ValueError("Buyout and wallet Bitcoin networks differ")
+    fingerprint = binding.get("wallet_fingerprint")
+    if not isinstance(fingerprint, str) or fingerprint != wallet.wallet_fingerprint:
+        raise ValueError("Buyout is not bound to this wallet")
+    mixdepth = binding.get("mixdepth")
+    if type(mixdepth) is not int:
+        raise ValueError("Buyout is not bound to a wallet mixdepth")
+    if not 0 <= mixdepth < wallet.mixdepth_count:
+        raise ValueError(f"Buyout mixdepth {mixdepth} is outside this wallet")
+    return mixdepth
 
 
 class CoinJoinState(StrEnum):
@@ -86,6 +115,7 @@ class CoinJoinSession:
         restrict_md0: bool = True,
         minimum_fee_rate_sat_vb: float | None = None,
         mixdepth_selection_policy: MixdepthSelectionPolicy = MixdepthSelectionPolicy.BALANCED,
+        buyout: ChannelBuyout | None = None,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -119,6 +149,18 @@ class CoinJoinSession:
                 f"the wallet is {wallet_type!r}; a rigid JMP-0010 pit requires them to "
                 f"match (advertise a {wallet_type!r} offer family)."
             )
+        # Optional prepared channel buyout. Channel funding outputs fund this
+        # round without ever becoming wallet UTXOs, so they are tracked apart
+        # from ``our_utxos`` and are never signed by the wallet.
+        self.buyout = buyout
+        self.buyout_mixdepth = (
+            -1
+            if buyout is None
+            else bound_buyout_mixdepth(buyout, wallet, backend, self.pit_script_type)
+        )
+        self.channel_prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
+        self.channel_heights: dict[tuple[str, int], int | None] = {}
+        self._parent_prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
         self.commitment = b""
         self.commitment_authenticated = False
         self.taker_nacl_pk = ""  # Taker's NaCl pubkey (hex) for btc_sig
@@ -141,6 +183,11 @@ class CoinJoinSession:
 
         # E2E encryption session with taker
         self.crypto = CryptoSession()
+
+    @property
+    def wallet_change_address(self) -> str:
+        """Escrow change belongs in the buyout journal, not wallet address history."""
+        return "" if self.buyout is not None else self.change_address
 
     def is_timed_out(self) -> bool:
         """Check if the session has exceeded the timeout."""
@@ -530,6 +577,15 @@ class CoinJoinSession:
                     "error_code": "authorization UTXO already active",
                 }
 
+            if self.buyout is not None:
+                channel_error = await self._verify_channel_inputs(active_check)
+                if channel_error is not None:
+                    logger.warning("Rejecting CoinJoin: channel input verification failed")
+                    logger.bind(sensitive=True).warning(
+                        f"Channel input verification failed for {self.taker_nick}: {channel_error}"
+                    )
+                    return False, {"error": channel_error}
+
             utxos_dict, cj_addr, change_addr, mixdepth = await self._select_our_utxos(
                 exclude_utxos=exclude_utxos,
                 active_check=active_check,
@@ -560,6 +616,20 @@ class CoinJoinSession:
                 )
                 for (txid, vout), utxo_info in utxos_dict.items()
             ]
+
+            # Channel funding outputs are disclosed after the wallet inputs.
+            # Their metadata is chain-derived (see _verify_channel_inputs), not
+            # taken from the buyout terms.
+            if self.buyout is not None:
+                utxo_metadata_list.extend(
+                    UTXOMetadata(
+                        txid=item["txid"],
+                        vout=item["vout"],
+                        scriptpubkey=self.channel_prevouts[(item["txid"], item["vout"])][1].hex(),
+                        blockheight=self.channel_heights[(item["txid"], item["vout"])],
+                    )
+                    for item in self.buyout.inputs
+                )
 
             # Use extended format if peer supports neutrino_compat
             utxo_list_str = format_utxo_list(utxo_metadata_list, extended=self.peer_neutrino_compat)
@@ -659,6 +729,7 @@ class CoinJoinSession:
                 offer_type=self.offer.ordertype,
                 network=network,
                 current_block_height=current_block_height,
+                external_prevouts=self.channel_prevouts or None,
             )
 
             if not is_valid:
@@ -679,6 +750,18 @@ class CoinJoinSession:
                     )
                     self.state = CoinJoinState.FAILED
                     return False, {"error": fee_policy_error}
+
+            if self.buyout is not None:
+                buyout_error = await self._validate_buyout_parent(
+                    tx_hex, current_block_height, active_check
+                )
+                if buyout_error is not None:
+                    logger.warning("Rejecting CoinJoin: buyout parent validation failed")
+                    logger.bind(sensitive=True).warning(
+                        f"Buyout parent validation failed for {self.taker_nick}: {buyout_error}"
+                    )
+                    self.state = CoinJoinState.FAILED
+                    return False, {"error": buyout_error}
 
             logger.debug("Transaction verification PASSED ✓")
             self.state = CoinJoinState.TX_RECEIVED
@@ -739,6 +822,68 @@ class CoinJoinSession:
             if self.state != CoinJoinState.SIG_SENT:
                 self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
+
+    async def _resolve_parent_prevouts(
+        self, tx_hex: str, active_check: Callable[[], bool] | None
+    ) -> tuple[dict[tuple[str, int], tuple[int, bytes]] | None, str | None]:
+        """Resolve a verified value and script for every input of the parent.
+
+        A buyout binds the whole transaction, so unknown inputs are looked up
+        against our own backend (a buyout always requires a backend that can);
+        an input we cannot verify fails the round instead of being assumed.
+        """
+        prevouts: dict[tuple[str, int], tuple[int, bytes]] = {
+            outpoint: (utxo.value, bytes.fromhex(utxo.scriptpubkey))
+            for outpoint, utxo in self.our_utxos.items()
+        }
+        prevouts.update(self.channel_prevouts)
+        parsed = parse_transaction(tx_hex)
+        unknown = list(
+            dict.fromkeys(
+                (tx_input.txid, tx_input.vout)
+                for tx_input in parsed.inputs
+                if (tx_input.txid, tx_input.vout) not in prevouts
+            )
+        )
+        try:
+            async with asyncio.timeout(MINER_FEE_PREVOUT_LOOKUP_TIMEOUT_SEC):
+                for offset in range(0, len(unknown), MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE):
+                    batch = unknown[offset : offset + MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE]
+                    found = await asyncio.gather(
+                        *(self.backend.get_utxo(txid, vout) for txid, vout in batch)
+                    )
+                    for outpoint, utxo in zip(batch, found, strict=True):
+                        if utxo is None or not utxo.scriptpubkey:
+                            return None, "Could not verify every prevout of the buyout parent"
+                        prevouts[outpoint] = (utxo.value, bytes.fromhex(utxo.scriptpubkey))
+        except Exception as exc:  # noqa: BLE001 - a lookup failure fails the round
+            logger.bind(sensitive=True).warning(f"Buyout parent prevout lookup failed: {exc}")
+            return None, "Could not verify every prevout of the buyout parent"
+        if self.is_timed_out() or (active_check is not None and not active_check()):
+            return None, "Session expired during buyout parent verification"
+        return prevouts, None
+
+    async def _validate_buyout_parent(
+        self,
+        tx_hex: str,
+        current_block_height: int | None,
+        active_check: Callable[[], bool] | None,
+    ) -> str | None:
+        """Bind the complete CoinJoin to the buyout terms before any signing."""
+        if self.buyout is None:
+            return None
+        if current_block_height is None:
+            return "Chain tip is unknown; refusing to validate the buyout parent"
+        prevouts, error = await self._resolve_parent_prevouts(tx_hex, active_check)
+        if prevouts is None:
+            return error
+        try:
+            self.buyout.validate(bytes.fromhex(tx_hex), prevouts, current_block_height)
+        except Exception as exc:  # noqa: BLE001 - any rejection fails the round
+            logger.bind(sensitive=True).warning(f"Buyout rejected the parent: {exc}")
+            return f"Buyout parent validation failed: {exc}"
+        self._parent_prevouts = prevouts
+        return None
 
     async def _verify_minimum_miner_fee(
         self, tx_hex: str, active_check: Callable[[], bool] | None
@@ -831,6 +976,50 @@ class CoinJoinSession:
             return format_low_fee_error(actual_rate, minimum_fee_rate)
         return None
 
+    async def _verify_channel_inputs(
+        self, active_check: Callable[[], bool] | None = None
+    ) -> str | None:
+        """Confirm each channel funding output on chain before disclosing it.
+
+        Channel funding is not wallet state, so the value, script, confirmation
+        depth and block height we advertise must come from our own backend and
+        agree with the buyout terms. A height is never invented: without one we
+        cannot serve a peer that expects extended (neutrino) metadata.
+
+        Returns:
+            An error message, or ``None`` when every channel input is verified.
+        """
+        if self.buyout is None:
+            return None
+        prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
+        heights: dict[tuple[str, int], int | None] = {}
+        for item in self.buyout.inputs:
+            outpoint = (item["txid"], item["vout"])
+            if outpoint in prevouts:
+                return "Buyout repeats a channel input"
+            utxo = await self.backend.get_utxo(*outpoint)
+            if active_check is not None and not active_check():
+                return "Session expired during channel input verification"
+            if utxo is None or not utxo.scriptpubkey:
+                return "Channel funding output not found on the blockchain"
+            if (
+                utxo.value != item["value"]
+                or utxo.scriptpubkey.lower() != str(item["scriptpubkey"]).lower()
+            ):
+                return "Channel funding output does not match the buyout terms"
+            if utxo.confirmations < self.min_confirmations:
+                return (
+                    f"Channel funding output too young: "
+                    f"{utxo.confirmations} < {self.min_confirmations}"
+                )
+            if self.peer_neutrino_compat and utxo.height is None:
+                return "Channel funding output has no confirmed block height"
+            prevouts[outpoint] = (utxo.value, bytes.fromhex(utxo.scriptpubkey))
+            heights[outpoint] = utxo.height
+        self.channel_prevouts = prevouts
+        self.channel_heights = heights
+        return None
+
     async def _select_our_utxos(
         self,
         exclude_utxos: set[tuple[str, int]] | None = None,
@@ -858,12 +1047,18 @@ class CoinJoinSession:
         reserved_outpoints: set[tuple[str, int]] = set()
         try:
             required_amount = required_maker_input(self.offer, self.amount)
+            if self.buyout is not None:
+                # Channel value funds most of the round, but the escrow change
+                # must keep its reserve, and an ordinary wallet input is still
+                # required for the !ioauth ownership proof.
+                required_amount = self.buyout.wallet_funding_required(required_amount)
 
             # Inputs disclosed to another in-flight session are not available
             # liquidity. Apply the same exclusion to both the balance gate and
             # the selector so the chosen mixdepth is actually fillable.
             exclude = set(exclude_utxos or set())
             exclude |= self.wallet.get_locked_input_outpoints()
+            exclude |= set(self.channel_prevouts)
             md0_mergeable_outpoints = (
                 await self.wallet.get_maker_rotation_lineage_outpoints()
                 if self.restrict_md0
@@ -885,6 +1080,12 @@ class CoinJoinSession:
                 balances[md] = balance
 
             eligible_mixdepths = {md: bal for md, bal in balances.items() if bal >= required_amount}
+            if self.buyout is not None:
+                # The buyout is bound to one mixdepth; spending another wallet
+                # mixdepth would link funds the binding never authorized.
+                eligible_mixdepths = {
+                    md: bal for md, bal in eligible_mixdepths.items() if md == self.buyout_mixdepth
+                }
 
             if not eligible_mixdepths:
                 logger.error("No mixdepth with sufficient balance")
@@ -956,9 +1157,19 @@ class CoinJoinSession:
                 )
                 return {}, "", "", -1
 
+            if self.buyout is not None:
+                # Consume the single-use durable reservation now: the wallet
+                # inputs are committed and nothing has been disclosed yet. A
+                # later failure never gives this reservation back.
+                self.buyout.begin_round()
+
             cj_output_mixdepth = (max_mixdepth + 1) % self.wallet.mixdepth_count
             cj_address = self.wallet.get_new_internal_address(cj_output_mixdepth)
-            change_address = self.wallet.get_new_internal_address(max_mixdepth)
+            change_address = (
+                self.buyout.change_address
+                if self.buyout is not None
+                else self.wallet.get_new_internal_address(max_mixdepth)
+            )
 
             logger.info("Selected maker inputs for CoinJoin")
             logger.bind(sensitive=True).info(
@@ -993,6 +1204,12 @@ class CoinJoinSession:
                 scripts.append(bytes.fromhex(utxo.scriptpubkey))
                 continue
 
+            verified = self._parent_prevouts.get(key)
+            if verified is not None:
+                values.append(verified[0])
+                scripts.append(verified[1])
+                continue
+
             utxo = await self.backend.get_utxo(txid_hex, tx_input.vout)
             if utxo is None or not utxo.scriptpubkey:
                 raise TransactionSigningError(
@@ -1003,6 +1220,44 @@ class CoinJoinSession:
             scripts.append(bytes.fromhex(utxo.scriptpubkey))
         return values, scripts
 
+    async def _sign_channel_inputs(
+        self, tx_hex: str, active_check: Callable[[], bool] | None
+    ) -> list[str]:
+        """Collect channel signatures from the buyout runtime, never the wallet.
+
+        The wire envelope is the ordinary one: a 64-byte BIP340 signature and
+        the 32-byte x-only output key of the funding output being spent.
+        """
+        import base64
+
+        if self.buyout is None:
+            return []
+        if not self._parent_prevouts:
+            raise TransactionSigningError("Buyout parent was not verified before signing")
+        if self.is_timed_out() or (active_check is not None and not active_check()):
+            raise TransactionSigningError("Session expired before channel signing")
+        signed = await self.buyout.sign(bytes.fromhex(tx_hex), self._parent_prevouts)
+        if self.is_timed_out() or (active_check is not None and not active_check()):
+            raise TransactionSigningError("Session expired during channel signing")
+
+        produced = {(item["txid"], item["vout"]) for item in signed}
+        if produced != set(self.channel_prevouts):
+            raise TransactionSigningError("Buyout signed an unexpected set of inputs")
+
+        encoded: list[str] = []
+        for item in signed:
+            outpoint = (item["txid"], item["vout"])
+            if outpoint in self.our_utxos:
+                raise TransactionSigningError("A channel input is also a wallet UTXO")
+            signature = bytes.fromhex(item["signature"])
+            script = self.channel_prevouts[outpoint][1]
+            if len(signature) != 64 or len(script) != 34 or script[:2] != b"\x51\x20":
+                raise TransactionSigningError("Channel input is not a Taproot key-spend signature")
+            output_key = script[2:]
+            sigmsg = bytes([len(signature)]) + signature + bytes([len(output_key)]) + output_key
+            encoded.append(base64.b64encode(sigmsg).decode("ascii"))
+        return encoded
+
     async def _sign_transaction(
         self, tx_hex: str, active_check: Callable[[], bool] | None = None
     ) -> list[str]:
@@ -1011,10 +1266,14 @@ class CoinJoinSession:
         Returns list of base64-encoded signatures in JM format.
         Each signature is ``base64(sig_len || sig || pub_len || pub)``. Taproot
         signatures use a 64-byte BIP340 signature and 32-byte x-only output key.
+        Channel inputs of a prepared buyout are signed first and by their own
+        runtime; if they fail, no wallet input is signed and nothing usable is
+        returned.
         """
         import base64
 
         try:
+            channel_signatures = await self._sign_channel_inputs(tx_hex, active_check)
             tx_bytes = bytes.fromhex(tx_hex)
             tx = deserialize_transaction(tx_bytes)
 
@@ -1086,7 +1345,9 @@ class CoinJoinSession:
                     f"Signed input {input_index} for UTXO {txid}:{vout}"
                 )
 
-            return signatures
+            # Channel signatures follow the wallet ones, matching the order the
+            # inputs were disclosed in !ioauth.
+            return signatures + channel_signatures
 
         except TransactionSigningError as e:
             logger.error("Signing error")

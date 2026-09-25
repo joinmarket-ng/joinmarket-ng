@@ -11,13 +11,14 @@ Configuration is loaded with the following priority (highest to lowest):
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Self
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.cli_help import SortedTyper
-from jmcore.models import NetworkType
+from jmcore.models import NetworkType, offer_output_script_type
 from jmcore.notifications import get_notifier
 from jmcore.paths import get_nick_state_component, remove_nick_state, write_nick_state
 from jmcore.settings import JoinMarketSettings, ensure_config_file
@@ -27,7 +28,16 @@ from loguru import logger
 from taker.config import TakerConfig
 from taker.config_builder import build_taker_config
 
+if TYPE_CHECKING:
+    from jmswap.buyout_config import BuyoutSettings
+    from jmswap.buyout_runtime import BuyoutRuntime
+
+    from taker.buyout import ChannelBuyout
+
 __all__ = ["app", "build_taker_config", "create_backend"]
+
+BUYOUT_SETTLED_STATE = "COMPLETED"
+"""The settled outcome the CLI waits for after a successful broadcast."""
 
 app = SortedTyper(
     name="jm-taker",
@@ -80,6 +90,116 @@ def create_backend(config: TakerConfig) -> Any:
         backend.set_wallet_creation_height(config.creation_height)
 
     return backend
+
+
+def _validated_buyout_mixdepth(
+    settings: BuyoutSettings,
+    *,
+    config: TakerConfig,
+    amount: int,
+    mixdepth: int | None,
+    wallet_fingerprint: str,
+) -> int:
+    """Check one explicit buyout file against this CoinJoin, and pin its mixdepth.
+
+    Every rule here is decided before a journal, a node connection or a channel
+    signature exists, so a file that does not describe *this* wallet, network or
+    round cannot reach a durable resource. An omitted ``--mixdepth`` is pinned to
+    the configured one rather than left to default or to an interactive choice:
+    the runtime binds its sessions to that mixdepth, and a round sourced from
+    another one could never be settled by them.
+    """
+    if not settings.enabled:
+        raise ValueError("The buyout service is disabled in the given configuration file")
+    if (
+        amount <= 0
+        or offer_output_script_type(config.preferred_offer_type) != "p2tr"
+        or config.address_type != "p2tr"
+    ):
+        # The escrow spends and the wallet input share one Taproot round: a
+        # segwit v0 pit or a segwit v0 wallet could not produce it.
+        raise ValueError("A channel buyout requires a non-sweep Taproot CoinJoin")
+    if settings.network != (config.bitcoin_network or config.network).value:
+        raise ValueError("Buyout and CoinJoin Bitcoin networks differ")
+    if settings.wallet_fingerprint is None:
+        raise ValueError("A buyer session requires a configured wallet_fingerprint")
+    if settings.wallet_fingerprint != wallet_fingerprint:
+        raise ValueError("The buyout configuration is bound to a different wallet fingerprint")
+    if settings.mixdepth is None:
+        raise ValueError("An enabled buyout service requires mixdepth")
+    if settings.mixdepth >= config.mixdepth_count:
+        raise ValueError(
+            f"The configured buyout mixdepth {settings.mixdepth} is outside this "
+            f"wallet's {config.mixdepth_count} mixdepths"
+        )
+    if mixdepth is not None and mixdepth != settings.mixdepth:
+        raise ValueError(f"--mixdepth must be the configured buyout mixdepth {settings.mixdepth}")
+    return settings.mixdepth
+
+
+class PreparedBuyoutSession:
+    """The buyer runtime, adapter and settlement monitor of one opt-in CoinJoin.
+
+    Opening it connects the runtime, refuses a session this runtime is not bound
+    to, and starts polling settlement. The monitor runs for the whole lifetime,
+    inside a task group, so a monitor that dies takes the round down with it
+    instead of leaving the taker signing behind an endpoint that answers nobody.
+
+    Closing stops the monitor and releases the runtime, on success, failure and
+    cancellation alike. Nothing here cancels, force-closes or otherwise resolves
+    a session: the journal owns that decision, and an interrupted round leaves it
+    exactly as it was.
+    """
+
+    def __init__(self, settings: BuyoutSettings, session_id: str) -> None:
+        self.session_id = session_id
+        self._settings = settings
+        self._stop = asyncio.Event()
+        self._stack = AsyncExitStack()
+        self._adapter: ChannelBuyout | None = None
+        self._runtime: BuyoutRuntime | None = None
+
+    @property
+    def adapter(self) -> ChannelBuyout:
+        if self._adapter is None:
+            raise RuntimeError("the prepared buyout session is not open")
+        return self._adapter
+
+    async def __aenter__(self) -> Self:
+        from jmswap.buyout_runtime import BuyoutRuntime
+
+        from taker.buyout import ChannelBuyout
+
+        try:
+            runtime = await self._stack.enter_async_context(BuyoutRuntime(self._settings))
+            runtime.require_buyer_session(self.session_id)
+            adapter = ChannelBuyout(runtime.buyer, self.session_id)
+            group = await self._stack.enter_async_context(asyncio.TaskGroup())
+            # Registered last, so unwinding stops the monitor before the group
+            # waits for it and before the runtime releases the journal.
+            self._stack.callback(self._stop.set)
+            group.create_task(runtime.run(self._stop))
+            self._runtime, self._adapter = runtime, adapter
+        except BaseException:
+            await self._stack.aclose()
+            raise
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        self._adapter = None
+        await self._stack.aclose()
+
+    async def wait_for_settlement(self) -> str:
+        """Block until the monitor resolves this session, and report its state."""
+        from jmswap.buyout_store import RESOLVED_STATES
+
+        if self._runtime is None:
+            raise RuntimeError("the prepared buyout session is not open")
+        while True:
+            state = self._runtime.store.get(self.session_id).state
+            if state in RESOLVED_STATES:
+                return str(state)
+            await asyncio.sleep(self._settings.poll_interval_seconds)
 
 
 @app.command()
@@ -253,6 +373,22 @@ def coinjoin(
             "--select-utxos.",
         ),
     ] = None,
+    buyout_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--buyout-config",
+            help="Explicit buyout TOML file (no location is ever guessed). Requires "
+            "--buyout-session; without both, this CoinJoin uses wallet inputs only.",
+        ),
+    ] = None,
+    buyout_session: Annotated[
+        str | None,
+        typer.Option(
+            "--buyout-session",
+            help="Session id of an accepted, unused buyout to fund this CoinJoin with. "
+            "Requires --buyout-config.",
+        ),
+    ] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
     data_dir: Annotated[
         Path | None,
@@ -283,6 +419,10 @@ def coinjoin(
     """
     if select_utxos and input_utxo:
         logger.error("Cannot specify both --select-utxos and --input-utxo")
+        raise typer.Exit(1)
+
+    if (buyout_config is None) != (buyout_session is None):
+        logger.error("--buyout-config and --buyout-session must be given together")
         raise typer.Exit(1)
 
     if amount is None:
@@ -367,6 +507,8 @@ def coinjoin(
                 counterparties=config.counterparty_count,
                 skip_confirmation=yes,
                 input_utxos=input_utxo,
+                buyout_config=buyout_config,
+                buyout_session=buyout_session,
             )
         )
     except RuntimeError as e:
@@ -392,6 +534,8 @@ async def _run_coinjoin(
     counterparties: int | None,
     skip_confirmation: bool,
     input_utxos: list[str] | None = None,
+    buyout_config: Path | None = None,
+    buyout_session: str | None = None,
 ) -> None:
     """Run CoinJoin transaction."""
     from taker.taker import Taker
@@ -484,7 +628,38 @@ async def _run_coinjoin(
     # One taker per CoinJoin pit: the nick state filename is fixed per address type.
     nick_component = get_nick_state_component("taker", config.address_type)
 
+    # Opt-in channel buyout: only an explicit file plus session id enables it.
+    buyout: ChannelBuyout | None = None
+    prepared: PreparedBuyoutSession | None = None
+    buyout_stack = AsyncExitStack()
+
     try:
+        if buyout_config is not None and buyout_session is not None:
+            # Loading and validation happen inside this protected lifetime, so a
+            # rejected file still unwinds the taker, and before the runtime
+            # entry below, so a rejected file opens no journal and no socket.
+            try:
+                from jmswap.buyout_config import BuyoutConfigError, load_buyout_settings
+            except ImportError:
+                logger.error("Channel buyout support requires the jmswap package")
+                raise typer.Exit(1)
+            try:
+                buyout_settings = load_buyout_settings(buyout_config)
+                mixdepth = _validated_buyout_mixdepth(
+                    buyout_settings,
+                    config=config,
+                    amount=amount,
+                    mixdepth=mixdepth,
+                    wallet_fingerprint=wallet.wallet_fingerprint,
+                )
+            except (BuyoutConfigError, ValueError) as exc:
+                logger.error(str(exc))
+                raise typer.Exit(1)
+            prepared = await buyout_stack.enter_async_context(
+                PreparedBuyoutSession(buyout_settings, buyout_session)
+            )
+            buyout = prepared.adapter
+            logger.info(f"Funding this CoinJoin from buyout session {buyout_session}")
         # Write nick state file for external tracking and cross-component protection
         nick = taker.nick
         data_dir = config.data_dir
@@ -514,6 +689,7 @@ async def _run_coinjoin(
             amount,
             mixdepth,
             input_utxos=input_utxos,
+            buyout=buyout,
         )
         if eligibility_reason is not None:
             logger.error(eligibility_reason)
@@ -530,6 +706,7 @@ async def _run_coinjoin(
             mixdepth=mixdepth,
             counterparty_count=counterparties,
             input_utxos=input_utxos,
+            buyout=buyout,
         )
 
         if txid:
@@ -543,17 +720,52 @@ async def _run_coinjoin(
                     taker.last_broadcast_policy,
                     taker.last_broadcast_fallback_reason,
                 )
+            if prepared is not None:
+                await _await_buyout_settlement(prepared, buyout_config)
         else:
             logger.error("CoinJoin failed")
             # Free our reserved inputs immediately so a retry can reuse them
             # (otherwise they stay locked until the TTL expires).
             taker.release_input_locks()
+            if prepared is not None:
+                # The journal owns irreversible state: a failed round never
+                # cancels or force-closes the session behind the operator.
+                logger.info(
+                    f"Buyout session {prepared.session_id} is untouched; "
+                    "cancel it explicitly if you no longer want it"
+                )
             raise typer.Exit(1)
 
     finally:
-        # Clean up nick state file on shutdown
-        remove_nick_state(config.data_dir, nick_component)
-        await taker.stop()
+        try:
+            # Clean up nick state file on shutdown
+            try:
+                remove_nick_state(config.data_dir, nick_component)
+            finally:
+                await taker.stop()
+        finally:
+            # Stops the settlement monitor and releases the journal and the
+            # nodes, whatever the round did and however taker shutdown went.
+            await buyout_stack.aclose()
+
+
+async def _await_buyout_settlement(
+    prepared: PreparedBuyoutSession, buyout_config: Path | None
+) -> None:
+    """Keep watching the broadcast round's session until the journal resolves it."""
+    typer.echo(f"Buyout session: {prepared.session_id}")
+    typer.echo("Watching buyout settlement; this continues until the session resolves.")
+    try:
+        state = await prepared.wait_for_settlement()
+    except asyncio.CancelledError:
+        typer.echo(
+            "Interrupted: the buyout session is intact. Resume monitoring with "
+            f"'jm-buyout --config {buyout_config} serve'."
+        )
+        raise
+    typer.echo(f"Buyout session {prepared.session_id} resolved: {state}")
+    if state != BUYOUT_SETTLED_STATE:
+        logger.warning(f"Buyout session {prepared.session_id} did not complete: {state}")
 
 
 @app.command()

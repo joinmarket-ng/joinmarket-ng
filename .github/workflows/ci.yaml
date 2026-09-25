@@ -166,7 +166,10 @@ jobs:
 
   test-unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Includes the live LND buyout regtest suite, which now also covers the
+    # three settlement routing scenarios (second private channel, announced
+    # public channels, failed payment followed by the split broadcast).
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
@@ -184,16 +187,30 @@ jobs:
       - uses: ./.github/actions/setup-python-deps
         with:
           python-version: ${{ matrix.python-version }}
-          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler,jmswap
           install-dev: 'true'
 
       - name: Run unit tests
         run: |
-          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler \
+          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler jmswap \
             --junitxml=junit/unit-tests.xml \
-            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler \
+            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler --cov=jmswap \
             --cov-report=term-missing --cov-report=xml --cov-report=html \
             -v --fail-on-skip
+
+      - name: Check escrow transactions against Bitcoin Core
+        if: matrix.python-version == '3.14'
+        run: |
+          pytest -c pytest.ini jmswap/tests/test_bitcoin_escrow_regtest.py \
+            -m docker --no-cov --fail-on-skip -v
+
+      - name: Check private buyout signing and settlement against LND
+        # The pinned image runs focused backend tests at build time.
+        if: matrix.python-version == '3.14'
+        run: |
+          docker build -t jm-buyout-lnd:v0.21.3-beta lnd
+          pytest -c pytest.ini jmswap/tests/test_lnd_buyout_regtest.py \
+            -m docker --no-cov --fail-on-skip -v
 
       - name: Run repo-root tests
         # Tests under the top-level tests/ directory (TUI, release scripts,
