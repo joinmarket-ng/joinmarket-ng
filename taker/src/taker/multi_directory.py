@@ -10,6 +10,7 @@ it as disconnected.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -605,11 +606,10 @@ class MultiDirectoryClient(DirectoryClientPool):
         log_routing: bool = False,
         force_channel: str | None = None,
     ) -> str:
-        """Send a private message, respecting channel consistency for CoinJoin sessions.
+        """Send a private message over the chosen onion-network route.
 
-        CRITICAL: Within a single CoinJoin session, all messages to a maker MUST use the
-        same communication channel (either direct or a specific directory). Mixing channels
-        causes the maker to reject messages as they appear to be from different sessions.
+        Direct peers and directory relays share the onion-network signing host ID.
+        A session can switch between those routes without changing its identity.
 
         Message routing priority (when force_channel is None):
         1. Direct peer connection (if connected and prefer_direct_connections=True)
@@ -623,6 +623,7 @@ class MultiDirectoryClient(DirectoryClientPool):
             force_channel: If set, only use this channel:
                 - "direct" = peer-to-peer onion connection
                 - "directory:<host>:<port>" = relay through specific directory
+                - "directory" = directory relay only, preferring one listing the peer
 
         Returns:
             Channel used: "direct" or "directory:<host>:<port>"
@@ -630,8 +631,8 @@ class MultiDirectoryClient(DirectoryClientPool):
         # Get maker's direct onion location if available
         maker_location = self._get_peer_location(recipient)
 
-        # If force_channel is set, use only that channel
-        if force_channel:
+        # If force_channel names one channel, use only that channel
+        if force_channel and force_channel != "directory":
             if force_channel == "direct":
                 peer = self._get_connected_peer(recipient)
                 if not peer:
@@ -665,7 +666,7 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         # No forced channel - choose best available
         # Try direct connection first if available
-        if self.prefer_direct_connections:
+        if self.prefer_direct_connections and force_channel != "directory":
             peer = self._get_connected_peer(recipient)
             if peer:
                 try:
@@ -682,7 +683,7 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         # Fall back to directory relay
         # Opportunistically start direct connection for future messages
-        if self.prefer_direct_connections and maker_location:
+        if self.prefer_direct_connections and maker_location and force_channel != "directory":
             self._try_direct_connect(recipient)
 
         # Identify valid directories for this recipient
@@ -732,14 +733,48 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         raise RuntimeError(f"Failed to send !{command} to {recipient} via any directory")
 
+    async def _listen_for_response_batch(
+        self,
+        server: str,
+        client: DirectoryClient,
+        duration: float,
+        errors_reported: set[str],
+    ) -> list[dict[str, Any]]:
+        """Read one directory batch, evicting only the failed client instance."""
+        try:
+            return await client.listen_for_messages(duration=duration)
+        except DirectoryClientError as e:
+            logger.warning(f"Error listening to {server}: {e}")
+            # A reconnect may replace this client while its listener is still
+            # unwinding. Only tear down the object that failed.
+            if self.clients.get(server) is client:
+                self.clients.pop(server)
+            try:
+                await client.close()
+            except Exception as close_error:
+                logger.debug(f"Error closing failed directory {server}: {close_error}")
+        except Exception as e:
+            if server not in errors_reported:
+                errors_reported.add(server)
+                logger.warning(f"Error listening to {server}: {e}")
+            else:
+                logger.debug(f"Error listening to {server}: {e}")
+        return []
+
     async def wait_for_responses(
         self,
         expected_nicks: list[str],
         expected_command: str,
         timeout: float = 60.0,
         expected_counts: dict[str, int] | None = None,
+        on_stalled: tuple[float, Callable[[set[str]], Awaitable[None]]] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Wait for responses from multiple makers at once.
+
+        ``on_stalled=(delay, callback)`` calls ``callback`` once, after ``delay``
+        seconds, with the nicks that have not answered at all yet. It runs alongside
+        response collection and is canceled and joined when this phase ends. The
+        wait keeps its original deadline and everything already received.
 
         Listens for responses from BOTH:
         - Directory server message streams (via client.listen_for_messages())
@@ -792,21 +827,15 @@ class MultiDirectoryClient(DirectoryClientPool):
             """Check if we have all expected responses."""
             if remaining_nicks:
                 return False
-            if accumulate_responses and expected_counts:
-                # Check that every peer supplied its exact expected message count.
-                for nick, expected in expected_counts.items():
-                    if nick not in responses:
-                        return False
-                    response = responses[nick]
-                    if response.get("error"):
-                        continue
-                    data = response.get("data", [])
-                    if not isinstance(data, list):
-                        return False
-                    received = len(data)
-                    if received < expected:
-                        return False
-            return True
+            if not accumulate_responses or not expected_counts:
+                return True
+            # process_message owns this dict: accumulated data is always a list,
+            # except for terminal errors, which satisfy the wait immediately.
+            return all(
+                nick in responses
+                and (responses[nick].get("error") or len(responses[nick]["data"]) >= expected)
+                for nick, expected in expected_counts.items()
+            )
 
         def process_message(msg: dict[str, Any], source: str) -> None:
             """Process a single message from any source (directory or direct)."""
@@ -882,81 +911,73 @@ class MultiDirectoryClient(DirectoryClientPool):
                     f"from {from_nick} via {source}"
                 )
 
-        while not is_complete():
-            elapsed = loop.time() - start_time
-            if elapsed >= timeout:
-                if not accumulate_responses:
-                    logger.warning(
-                        f"Timeout waiting for {expected_command} from: {remaining_nicks}"
-                    )
-                elif expected_counts:
-                    # Log which makers haven't sent all signatures
-                    for nick, expected in expected_counts.items():
-                        received = len(responses.get(nick, {}).get("data", []))
-                        if received < expected:
-                            logger.warning(f"Timeout: {nick} sent {received}/{expected} signatures")
-                break
-
-            remaining_time = min(5.0, timeout - elapsed)  # Listen in 5s chunks
-
-            # First, drain any pending direct peer messages (non-blocking)
-            while True:
-                try:
-                    msg = self._direct_message_queue.get_nowait()
-                    process_message(msg, "direct")
-                except asyncio.QueueEmpty:
+        retry_task: asyncio.Future[None] | None = None
+        try:
+            while not is_complete():
+                elapsed = loop.time() - start_time
+                if retry_task is not None and retry_task.done():
+                    retry_task.result()
+                if elapsed >= timeout:
+                    if not accumulate_responses:
+                        logger.warning(
+                            f"Timeout waiting for {expected_command} from: {remaining_nicks}"
+                        )
+                    elif expected_counts:
+                        # Log which makers haven't sent all signatures
+                        for nick, expected in expected_counts.items():
+                            received = len(responses.get(nick, {}).get("data", []))
+                            if received < expected:
+                                logger.warning(
+                                    f"Timeout: {nick} sent {received}/{expected} signatures"
+                                )
                     break
 
-            # Check if we have everything after processing direct messages
-            if is_complete():
-                break
-
-            # Listen to all directory clients concurrently for shorter duration
-            # Use 1s chunks to allow more frequent checking of direct message queue
-            listen_duration = min(1.0, remaining_time)
-
-            async def listen_to_client(
-                server: str, client: DirectoryClient
-            ) -> list[tuple[str, dict[str, Any]]]:
-                try:
-                    messages = await client.listen_for_messages(duration=listen_duration)
-                    return [(server, msg) for msg in messages]
-                except DirectoryClientError as e:
-                    logger.warning(f"Error listening to {server}: {e}")
-                    # A reconnect may replace this client while its listener is
-                    # still unwinding. Only tear down the object that failed.
-                    if self.clients.get(server) is client:
-                        self.clients.pop(server)
+                # First, drain any pending direct peer messages (non-blocking).
+                # A queued response must not trigger an unnecessary retry.
+                while True:
                     try:
-                        await client.close()
-                    except Exception as close_error:
-                        logger.debug(f"Error closing failed directory {server}: {close_error}")
-                    return []
-                except Exception as e:
-                    if server not in listen_errors_reported:
-                        listen_errors_reported.add(server)
-                        logger.warning(f"Error listening to {server}: {e}")
-                    else:
-                        logger.debug(f"Error listening to {server}: {e}")
-                    return []
+                        msg = self._direct_message_queue.get_nowait()
+                        process_message(msg, "direct")
+                    except asyncio.QueueEmpty:
+                        break
 
-            # Gather messages from all directories concurrently
-            listen_started = loop.time()
-            results = await asyncio.gather(
-                *[listen_to_client(s, c) for s, c in self.clients.items()]
-            )
-            for result_list in results:
-                for server, msg in result_list:
-                    process_message(msg, f"directory:{server}")
+                if is_complete():
+                    break
 
-            # Pace the loop: when every directory listen fails immediately
-            # (e.g. all connections closed) or there are no directory clients
-            # at all, the gather above returns in microseconds. Without a
-            # sleep this degenerates into a busy loop that spins thousands of
-            # iterations per second until the timeout, flooding the log.
-            listen_elapsed = loop.time() - listen_started
-            if listen_elapsed < listen_duration and not is_complete():
-                await asyncio.sleep(listen_duration - listen_elapsed)
+                if on_stalled is not None and elapsed >= on_stalled[0]:
+                    stalled_callback, on_stalled = on_stalled[1], None
+                    retry_task = asyncio.ensure_future(stalled_callback(set(remaining_nicks)))
+
+                # Keep polling while a fallback write is blocked. Wake for the
+                # fallback timer too, even when it is shorter than one second.
+                listen_duration = min(1.0, timeout - elapsed)
+                if on_stalled is not None:
+                    listen_duration = min(listen_duration, on_stalled[0] - elapsed)
+
+                listen_started = loop.time()
+                clients = list(self.clients.items())
+                results = await asyncio.gather(
+                    *[
+                        self._listen_for_response_batch(
+                            s, c, listen_duration, listen_errors_reported
+                        )
+                        for s, c in clients
+                    ]
+                )
+                for (server, _), messages in zip(clients, results, strict=True):
+                    for msg in messages:
+                        process_message(msg, f"directory:{server}")
+
+                # Pace empty or immediately failing listeners to avoid a busy loop.
+                listen_elapsed = loop.time() - listen_started
+                if listen_elapsed < listen_duration and not is_complete():
+                    await asyncio.sleep(listen_duration - listen_elapsed)
+        finally:
+            if retry_task is not None:
+                retry_task.cancel()
+                await asyncio.gather(retry_task, return_exceptions=True)
+        if retry_task is not None and not retry_task.cancelled():
+            retry_task.result()
 
         # Log deduplication stats if there were duplicates
         stats = deduplicator.stats

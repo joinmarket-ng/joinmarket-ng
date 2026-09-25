@@ -883,6 +883,89 @@ class TestPhaseCollectSignaturesCompleteness:
         assert taker._session.reserved_inputs == set()
 
     @pytest.mark.asyncio
+    async def test_stalled_direct_maker_gets_tx_resent_via_directory(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        """A direct Tor stream can stall after !auth; !tx is resent once via a directory."""
+        from jmcore.models import Offer, OfferType
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            nick: self._make_maker_session(nick, offer, [{"txid": c * 64, "vout": 0}])
+            for nick, c in (("maker1", "b"), ("maker2", "c"))
+        }
+        direct_session = maker_sessions["maker1"]
+        direct_session.comm_channel = "direct"
+        maker_sessions["maker2"].comm_channel = "directory:dir1"
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        taker.directory_client.upgrade_channel_prefer_direct = MagicMock(
+            side_effect=lambda nick, channel: channel
+        )
+        taker.directory_client.send_privmsg = AsyncMock(return_value="directory:dir2")
+        delays: list[float] = []
+
+        async def wait_for_responses(**kwargs: Any) -> dict[str, Any]:
+            delay, callback = kwargs["on_stalled"]
+            delays.append(delay)
+            await callback({"maker1", "maker2"})
+            return {}
+
+        taker.directory_client.wait_for_responses = wait_for_responses
+
+        assert await taker._session._phase_collect_signatures() is False
+        assert delays == [2.5]  # half of maker_timeout_sec=5, capped at 30s
+        calls = taker.directory_client.send_privmsg.await_args_list
+        assert [(c.args[0], c.kwargs["force_channel"]) for c in calls] == [
+            ("maker1", "direct"),
+            ("maker2", "directory:dir1"),
+            ("maker1", "directory"),
+        ]
+        assert calls[2].args[1:3] == ("tx", "encrypted")
+        assert direct_session.comm_channel == "directory:dir2"
+
+    @pytest.mark.asyncio
+    async def test_stalled_resend_rechecks_input_ownership(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        from jmcore.models import Offer, OfferType
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        session = self._make_maker_session("maker1", offer, [{"txid": "b" * 64, "vout": 0}])
+        session.comm_channel = "direct"
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions={"maker1": session})
+        taker.directory_client.upgrade_channel_prefer_direct = MagicMock(
+            side_effect=lambda nick, channel: channel
+        )
+
+        async def wait_for_responses(**kwargs: Any) -> dict[str, Any]:
+            taker.wallet.renew_coinjoin_inputs.return_value = False
+            await kwargs["on_stalled"][1]({"maker1"})
+            return {"maker1": {"data": ["sig"]}}
+
+        taker.directory_client.wait_for_responses = wait_for_responses
+
+        assert await taker._session._phase_collect_signatures() is False
+        assert taker.directory_client.send_privmsg.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_owner_loss_before_tx_prevents_signature_requests(
         self, two_maker_tx_data: CoinJoinTxData
     ) -> None:
