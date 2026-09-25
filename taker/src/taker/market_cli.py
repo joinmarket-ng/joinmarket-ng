@@ -1455,7 +1455,7 @@ fault evidence to the network. When the owner of a bond you rented also runs
 it as an ordinary maker, proof observe turns that into the same evidence.
 
 Run any command with --help for its options and examples. For background,
-trust assumptions, and risks, read docs/credential-market-overview.md.
+trust assumptions, and risks, read docs/experimental-ring-market.md.
 """
 
 _KEY_FORMAT_EPILOG = """\

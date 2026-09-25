@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig
 from jmcore.models import OfferType
 from maker.config import MakerConfig, OfferConfig
 
@@ -42,6 +43,38 @@ def test_policy_disables_fidelity_bond() -> None:
     config = _baseline_config(no_fidelity_bond=False)
     apply_tumbler_maker_policy(config)
     assert config.no_fidelity_bond is True
+
+
+def test_policy_disables_new_rings_but_preserves_recovery_bindings(tmp_path) -> None:
+    ring = ChannelRingConfig(
+        enabled=True,
+        nodes={
+            "maker": ChannelRingNodeConfig(
+                lnd_grpc_url="https://127.0.0.1:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint="a" * 56 + ".onion:9735",
+            )
+        },
+        mixdepth_nodes={0: "maker"},
+        node_binding_directory=tmp_path / "bindings",
+        persistence_directory=tmp_path / "rings",
+    )
+    config = _baseline_config(
+        address_type="p2tr", offer_type=OfferType.TR0_ABSOLUTE, channel_ring=ring
+    )
+
+    apply_tumbler_maker_policy(config)
+    assert config.channel_ring.enabled is False
+    assert config.channel_ring.nodes == ring.nodes
+    assert config.channel_ring.mixdepth_nodes == ring.mixdepth_nodes
+    assert config.channel_ring.node_binding_directory == ring.node_binding_directory
+    assert config.channel_ring.persistence_directory == ring.persistence_directory
+    assert config.get_effective_offer_configs()[0].offer_type == OfferType.TR0_ABSOLUTE
+
+    apply_tumbler_maker_policy(config)
+    assert config.channel_ring.enabled is False
+    assert config.channel_ring.nodes == ring.nodes
 
 
 def test_policy_preserves_taproot_pit() -> None:

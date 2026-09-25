@@ -65,7 +65,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from jmcore.channel_ring import ChannelRingSettings
+from jmcore.channel_ring import ChannelRingSettings, TakerChannelRingSettings
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.fee_policy import validate_min_fee_block_target
 from jmcore.models import (
@@ -1060,7 +1060,17 @@ class MakerSettings(BaseModel):
 class TakerSettings(BaseModel):
     """Taker-specific settings."""
 
-    channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
+    channel_ring: TakerChannelRingSettings = Field(default_factory=TakerChannelRingSettings)
+
+    @field_validator("channel_ring", mode="before")
+    @classmethod
+    def accept_common_channel_ring_settings(cls, value: Any) -> Any:
+        if isinstance(value, ChannelRingSettings) and not isinstance(
+            value, TakerChannelRingSettings
+        ):
+            return value.model_dump()
+        return value
+
     counterparty_count: int | None = Field(
         default=None,
         ge=1,

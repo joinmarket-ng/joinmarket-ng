@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from jmcore.channel_ring import RingNodeBinding
 from jmcore.channel_ring_store import (
     Outpoint,
     RingAntiGriefError,
@@ -36,6 +37,14 @@ def record(
     outpoint: Outpoint = OUTPOINT,
 ) -> RingParticipantRecord:
     values: dict[str, object] = {
+        "journal_kind": "private_channel_ring",
+        "node_binding": RingNodeBinding(
+            network="regtest",
+            wallet_identity="a" * 64,
+            source_mixdepth=0,
+            node_name="md0",
+            local_node_id="02" + PUBLIC,
+        ),
         "round_nonce": "33" * 32,
         "revision": revision,
         "ring_secret": SECRET.hex(),
@@ -70,7 +79,7 @@ def record(
             confirmed_conflict_txid="44" * 32,
             conflict_confirmations=1,
         )
-    return RingParticipantRecord(**values)
+    return RingParticipantRecord.model_validate(values)
 
 
 ALLOWED = {
@@ -85,13 +94,20 @@ ALLOWED = {
         RingLifecycleState.RECOVERY_REQUIRED,
     },
     RingLifecycleState.ACCEPTOR_ARMED: {
-        RingLifecycleState.PREPARED,
+        RingLifecycleState.PREPARED_NOT_VERIFIED,
         RingLifecycleState.RETIRING,
         RingLifecycleState.RECOVERY_REQUIRED,
     },
     RingLifecycleState.PREPARED: {
-        RingLifecycleState.PSBT_VERIFIED,
+        RingLifecycleState.RECOVERY_REQUIRED,
+    },
+    RingLifecycleState.PREPARED_NOT_VERIFIED: {
+        RingLifecycleState.VERIFYING,
         RingLifecycleState.RETIRING,
+        RingLifecycleState.RECOVERY_REQUIRED,
+    },
+    RingLifecycleState.VERIFYING: {
+        RingLifecycleState.PSBT_VERIFIED,
         RingLifecycleState.RECOVERY_REQUIRED,
     },
     RingLifecycleState.PSBT_VERIFIED: {
@@ -134,16 +150,64 @@ ALLOWED = {
 }
 
 
+def test_node_binding_cannot_change_through_transition_or_save(tmp_path: Path) -> None:
+    original = record()
+    replacement = original.node_binding.model_copy(update={"source_mixdepth": 1})
+    store = RingParticipantStore(tmp_path, max_active_sessions=4, max_verified_sessions=2)
+    store.save(original)
+    before = (tmp_path / original.key.filename).read_bytes()
+    with pytest.raises(RingTransitionError, match="identity fields"):
+        store.transition(original.key, original.state, updates={"node_binding": replacement})
+    with pytest.raises(RingStoreError, match="ownership"):
+        store.save(original.model_copy(update={"node_binding": replacement}))
+    assert (tmp_path / original.key.filename).read_bytes() == before
+
+
 @pytest.mark.parametrize("source", list(RingLifecycleState))
 @pytest.mark.parametrize("target", list(RingLifecycleState))
 def test_complete_transition_matrix(source: RingLifecycleState, target: RingLifecycleState) -> None:
-    assert record(state=source).can_transition_to(target) is (
+    # Verification intent has mandatory transaction evidence; this test only
+    # exercises the transition graph, not record validation.
+    source_record = (
+        record(state=RingLifecycleState.PREPARED).model_copy(update={"state": source})
+        if source is RingLifecycleState.VERIFYING
+        else record(state=source)
+    )
+    assert source_record.can_transition_to(target) is (
         target == source or target in ALLOWED[source]
     )
 
 
+def test_interrupted_verification_cannot_cancel_a_consumed_shim() -> None:
+    prepared = record(state=RingLifecycleState.PREPARED_NOT_VERIFIED)
+    assert prepared.can_transition_to(RingLifecycleState.VERIFYING)
+    assert not prepared.can_transition_to(RingLifecycleState.PSBT_VERIFIED)
+    intent = prepared.model_copy(update={"state": RingLifecycleState.VERIFYING})
+    assert intent.verified_unresolved
+    assert intent.retirement_action() is RingRetirementAction.BLOCKED
+    assert not intent.can_transition_to(RingLifecycleState.RETIRING)
+    with pytest.raises(ValueError, match="exact unsigned funding evidence"):
+        RingParticipantRecord.model_validate(intent.model_dump())
+
+    legacy = record(state=RingLifecycleState.PREPARED)
+    assert legacy.verified_unresolved
+    assert legacy.retirement_action() is RingRetirementAction.BLOCKED
+    assert not legacy.can_transition_to(RingLifecycleState.RETIRING)
+
+
+def test_retained_legacy_prepared_record_loads_but_cannot_shim_cancel(tmp_path: Path) -> None:
+    store = RingParticipantStore(tmp_path, max_active_sessions=4, max_verified_sessions=2)
+    legacy = record(state=RingLifecycleState.PREPARED)
+    store.save(legacy)
+    original = (tmp_path / legacy.key.filename).read_bytes()
+    assert store.load(legacy.key) == legacy
+    with pytest.raises(RingTransitionError, match="not allowed"):
+        store.transition(legacy.key, RingLifecycleState.RETIRING)
+    assert (tmp_path / legacy.key.filename).read_bytes() == original
+
+
 def test_preverified_retirement_and_verified_abandon_authorization() -> None:
-    prepared = record(state=RingLifecycleState.PREPARED)
+    prepared = record(state=RingLifecycleState.PREPARED_NOT_VERIFIED)
     assert prepared.retirement_action() is RingRetirementAction.SHIM_CANCEL
     assert (
         prepared.transition(RingLifecycleState.RETIRING, now=2.0).state
@@ -210,9 +274,13 @@ def test_signed_state_cannot_retire_until_confirmed_conflict() -> None:
 
 
 def test_recovery_retirement_requires_point_of_no_return_evidence() -> None:
-    preverified = record(state=RingLifecycleState.RECOVERY_REQUIRED)
-    assert preverified.retirement_action() is RingRetirementAction.SHIM_CANCEL
-    assert preverified.transition(RingLifecycleState.RETIRING).state is RingLifecycleState.RETIRING
+    unknown = record(state=RingLifecycleState.RECOVERY_REQUIRED)
+    # An older PREPARED record may enter recovery with no persisted unsigned
+    # transaction even after LND consumed its shim. Missing evidence is not
+    # evidence that a cancellation is safe.
+    assert unknown.retirement_action() is RingRetirementAction.BLOCKED
+    with pytest.raises(RingTransitionError, match="safe retirement evidence"):
+        unknown.transition(RingLifecycleState.RETIRING)
 
     signed_values = record(state=RingLifecycleState.RECOVERY_REQUIRED).model_dump()
     signed_values.update(
@@ -286,6 +354,43 @@ def test_corruption_is_reported_not_deleted_and_blocks_updates(tmp_path: Path) -
     assert bad.exists()
     with pytest.raises(RingStoreError, match="corrupt records"):
         store.save(record())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_kind",
+        "wrong_kind",
+        "unknown_key",
+    ],
+)
+def test_wrong_journal_envelope_is_preserved_and_blocks_writes(
+    tmp_path: Path, mutation: str
+) -> None:
+    store = RingParticipantStore(tmp_path / "rings", max_active_sessions=4, max_verified_sessions=2)
+    durable = record()
+    path = store.directory / durable.key.filename
+    payload = durable.model_dump(mode="json")
+    if mutation == "missing_kind":
+        del payload["journal_kind"]
+    elif mutation == "wrong_kind":
+        payload["journal_kind"] = "old_channel_ring"
+    elif mutation == "unknown_key":
+        payload["unexpected"] = True
+    else:  # pragma: no cover
+        raise AssertionError(mutation)
+    source = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    path.write_text(source, encoding="ascii")
+    path.chmod(0o600)
+
+    report = store.load_all()
+
+    assert report.records == ()
+    assert len(report.corruptions) == 1
+    assert path.read_text(encoding="ascii") == source
+    with pytest.raises(RingStoreError, match="corrupt records"):
+        store.save(record(revision=1))
+    assert path.read_text(encoding="ascii") == source
 
 
 def test_unsafe_file_mode_and_symlink_are_rejected(tmp_path: Path) -> None:

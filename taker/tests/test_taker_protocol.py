@@ -2611,6 +2611,9 @@ class TestPhaseAuthMakerAuthentication:
         cj_amount: int = 0,
         utxo_value: int = 1_500_000,
         utxo_list_override: str | None = None,
+        hold_seconds: str | None = "0",
+        extra_ioauth_field: str | None = None,
+        ring_enabled: bool = True,
     ):
         from bitcointx.core.key import CKey
         from jmcore.bitcoin import pubkey_to_p2wpkh_script
@@ -2659,7 +2662,12 @@ class TestPhaseAuthMakerAuthentication:
             utxo_list = f"{txid}:{vout}" + (f",{extra}" if extra else "")
         cj_addr = "bcrt1ql3e9pgs3mmwuwrh95fecme0s0qtn2880hlwwpw"
         change_addr = "bcrt1q2vfxp232rx0z9rzn0hay9jptagk8c86ddphpjv"
-        ioauth = f"{utxo_list} {auth_pub.hex()} {cj_addr} {change_addr} {btc_sig}"
+        ioauth_fields = [utxo_list, auth_pub.hex(), cj_addr, change_addr, btc_sig]
+        if hold_seconds is not None:
+            ioauth_fields.append(hold_seconds)
+        if extra_ioauth_field is not None:
+            ioauth_fields.append(extra_ioauth_field)
+        ioauth = " ".join(ioauth_fields)
         encrypted = maker_crypto.encrypt(ioauth)
 
         nick = "J5maker"
@@ -2726,6 +2734,7 @@ class TestPhaseAuthMakerAuthentication:
                     )
                 )
             taker.config = MagicMock()
+            taker.config.channel_ring.enabled = ring_enabled
             taker.config.minimum_makers = 1
             taker.config.maker_timeout_sec = 5
             taker.config.max_maker_utxos = max_maker_utxos
@@ -2766,7 +2775,117 @@ class TestPhaseAuthMakerAuthentication:
         )
         assert result.success is True
         assert nick in session_state.maker_sessions
-        assert session_state.maker_sessions[nick].responded_auth is True
+        maker_session = session_state.maker_sessions[nick]
+        assert maker_session.responded_auth is True
+        assert maker_session.auth_pubkey
+        assert maker_session.cj_address
+        assert maker_session.change_address
+        assert maker_session.utxos
+        assert maker_session.hold_seconds == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("auth_owns_utxo", "valid_btc_sig", "accepted"),
+        [(True, True, True), (True, False, False), (False, True, False)],
+    )
+    async def test_legacy_ioauth_without_hold_only_for_ordinary_coinjoin(
+        self, auth_owns_utxo, valid_btc_sig, accepted
+    ) -> None:
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=auth_owns_utxo,
+            valid_btc_sig=valid_btc_sig,
+            hold_seconds=None,
+            ring_enabled=False,
+        )
+
+        assert result.success is accepted
+        if accepted:
+            maker = session_state.maker_sessions[nick]
+            assert maker.responded_auth
+            assert maker.hold_seconds == 0
+            assert maker.hold_deadline is not None
+        else:
+            assert nick not in session_state.maker_sessions
+            assert result.failed_makers == [nick]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("hold_seconds", "expected_deadline"), [("0", 123.5), ("5", 128.5)])
+    async def test_records_authenticated_hold_with_local_monotonic_deadline(
+        self, hold_seconds, expected_deadline
+    ) -> None:
+        with patch("taker.coinjoin_session.time.monotonic", return_value=123.5):
+            result, session_state, nick = await self._drive_phase_auth(
+                auth_owns_utxo=True,
+                valid_btc_sig=True,
+                hold_seconds=hold_seconds,
+            )
+
+        maker_session = session_state.maker_sessions[nick]
+        assert result.success is True
+        assert maker_session.hold_seconds == int(hold_seconds)
+        assert maker_session.hold_deadline == expected_deadline
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("hold_seconds", "extra_ioauth_field"),
+        [
+            (None, None),
+            ("1 0", None),
+            ("01", None),
+            ("+1", None),
+            ("-1", None),
+            ("1.0", None),
+            ("1e0", None),
+            ("1", "0"),
+            ("1\u00a0", None),
+            ("3601", None),
+        ],
+        ids=[
+            "missing",
+            "extra",
+            "leading-zero",
+            "plus",
+            "minus",
+            "decimal",
+            "exponent",
+            "space-separated",
+            "non-ascii",
+            "above-channel-ring-hold-maximum",
+        ],
+    )
+    async def test_rejects_noncanonical_or_out_of_range_hold(
+        self, hold_seconds, extra_ioauth_field
+    ) -> None:
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True,
+            valid_btc_sig=True,
+            hold_seconds=hold_seconds,
+            extra_ioauth_field=extra_ioauth_field,
+        )
+
+        assert result.success is False
+        assert nick not in session_state.maker_sessions
+        assert result.failed_makers == [nick]
+
+    @pytest.mark.asyncio
+    async def test_accepts_hold_above_maker_response_timeout_within_ring_limit(self) -> None:
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True,
+            valid_btc_sig=True,
+            hold_seconds="630",
+        )
+
+        assert result.success is True
+        assert session_state.maker_sessions[nick].hold_seconds == 630
+
+    def test_replayed_hold_cannot_extend_first_authenticated_deadline(self) -> None:
+        maker_session = MakerSession(nick="J5maker", offer=_simple_offer("J5maker"))
+
+        maker_session.record_hold(hold_seconds=5, received_at=100.0)
+        maker_session.record_hold(hold_seconds=60, received_at=200.0)
+
+        assert maker_session.hold_seconds == 5
+        assert maker_session.hold_deadline == 105.0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

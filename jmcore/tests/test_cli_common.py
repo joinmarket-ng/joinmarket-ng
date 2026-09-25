@@ -303,6 +303,29 @@ class TestSetupCli:
 
         assert exc_info.value.code == 1
 
+    def test_setup_cli_unknown_strict_key_names_it_and_suggests_template(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A key left over from another build is named, not reported as raw pydantic."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[taker.channel_ring]\nstale_key = true\n")
+        monkeypatch.delenv("JOINMARKET_CONFIG_FILE", raising=False)
+        # setup_cli replaces all log handlers; keep the capturing sink alive.
+        monkeypatch.setattr("jmcore.cli_common.setup_logging", lambda *a, **k: None)
+        messages: list[str] = []
+        sink = logger.add(lambda message: messages.append(str(message)), level="ERROR")
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                setup_cli(config_file=config_file)
+        finally:
+            logger.remove(sink)
+
+        assert exc_info.value.code == 1
+        output = "".join(messages)
+        assert "taker.channel_ring.stale_key: unknown setting in this version" in output
+        assert "config.toml.template" in output
+        assert "Extra inputs are not permitted" not in output
+
     def test_setup_cli_scalar_notification_url(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

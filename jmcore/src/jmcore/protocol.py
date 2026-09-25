@@ -15,7 +15,7 @@ Available Features:
   light client verification. Required for Neutrino backend takers.
 - push_encrypted: Encrypted !push command with session binding. Prevents
   abuse of makers as unauthenticated broadcast bots.
-- cofunded_channel_ring_v1: Backend-validated support for private co-funded
+- private_channel_ring: Backend-validated support for private
   Taproot channel rings. This has no legacy fallback.
 
 Feature Dependencies:
@@ -84,7 +84,7 @@ _FEATURE_IDENTIFIER_DELIMITERS = _PEERLIST_FIELD_DELIMITERS | {"+"}
 # Feature flag constants
 FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
 FEATURE_PUSH_ENCRYPTED = "push_encrypted"
-FEATURE_COFUNDED_CHANNEL_RING_V1 = "cofunded_channel_ring_v1"
+FEATURE_PRIVATE_CHANNEL_RING = "private_channel_ring"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
 FEATURE_DIRECT_PING_V1 = "direct_ping_v1"  # Verified direct sockets echo a 16-byte hex nonce
@@ -94,7 +94,7 @@ FEATURE_NICK_AUTH = "nick_auth"
 FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_NEUTRINO_COMPAT: [],
     FEATURE_PUSH_ENCRYPTED: [],  # Requires NaCl session, but that's implicit
-    FEATURE_COFUNDED_CHANNEL_RING_V1: [],
+    FEATURE_PRIVATE_CHANNEL_RING: [],
     FEATURE_PEERLIST_FEATURES: [],  # No dependencies
     FEATURE_PING: [],  # No dependencies
     FEATURE_DIRECT_PING_V1: [],
@@ -105,7 +105,7 @@ FEATURE_DEPENDENCIES: dict[str, list[str]] = {
 ALL_FEATURES = {
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_PUSH_ENCRYPTED,
-    FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_PRIVATE_CHANNEL_RING,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
     FEATURE_DIRECT_PING_V1,

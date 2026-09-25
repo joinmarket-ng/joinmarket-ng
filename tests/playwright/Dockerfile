@@ -7,6 +7,7 @@ LABEL server-version="${JM_NG_REVISION}"
 # build context so CI and local runs exercise the exact working tree.
 COPY jmcore /build/jmcore
 COPY jmwallet /build/jmwallet
+COPY jmswap /build/jmswap
 COPY maker /build/maker
 COPY taker /build/taker
 COPY orderbook_watcher /build/orderbook_watcher
@@ -16,9 +17,12 @@ COPY tumbler /build/tumbler
 # New checkout dependencies may not exist in the pinned remote base.
 RUN /opt/venv/bin/pip install --no-cache-dir \
         --require-hashes -r /build/taker/requirements.txt \
+    && /opt/venv/bin/pip install --no-cache-dir \
+        --require-hashes -r /build/jmswap/requirements.txt \
     && /opt/venv/bin/pip install --no-cache-dir --no-deps --force-reinstall \
         /build/jmcore \
         /build/jmwallet \
+        /build/jmswap \
         /build/maker \
         /build/taker \
         /build/orderbook_watcher \
