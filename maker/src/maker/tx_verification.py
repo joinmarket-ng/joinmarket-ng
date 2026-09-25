@@ -70,6 +70,7 @@ def verify_unsigned_transaction(
     offer_type: OfferType,
     network: NetworkType = NetworkType.MAINNET,
     current_block_height: int | None = None,
+    external_prevouts: dict[tuple[str, int], tuple[int, bytes]] | None = None,
 ) -> tuple[bool, str]:
     """
     Verify unsigned CoinJoin transaction proposed by taker.
@@ -90,6 +91,12 @@ def verify_unsigned_transaction(
             validate a height-based nLockTime (reference/JAM sw0 takers set
             this for anti-fee-sniping). ``None`` rejects any height-based
             locktime outright (fail closed when the tip is unknown).
+        external_prevouts: ``(txid, vout) -> (value, scriptPubKey)`` for inputs
+            we contribute without owning them in the wallet (channel funding
+            outputs of a prepared buyout). Their value must be present in the
+            transaction and is expected back in our change output, so the
+            values must already have been verified against the chain. They can
+            never also be wallet UTXOs.
 
     Returns:
         (is_valid, error_message)
@@ -109,14 +116,22 @@ def verify_unsigned_transaction(
         if not locktime_ok:
             return False, locktime_error
 
+        external = external_prevouts or {}
         our_utxo_set = set(our_utxos.keys())
+        overlapping = our_utxo_set & set(external)
+        if overlapping:
+            return False, f"External inputs overlap our wallet UTXOs: {overlapping}"
+
+        required_input_set = our_utxo_set | set(external)
         tx_utxo_set = {(inp["txid"], inp["vout"]) for inp in tx_inputs}
 
-        if not tx_utxo_set.issuperset(our_utxo_set):
-            missing = our_utxo_set - tx_utxo_set
+        if not tx_utxo_set.issuperset(required_input_set):
+            missing = required_input_set - tx_utxo_set
             return False, f"Our UTXOs not included in transaction: {missing}"
 
-        my_total_in = sum(utxo.value for utxo in our_utxos.values())
+        my_total_in = sum(utxo.value for utxo in our_utxos.values()) + sum(
+            value for value, _ in external.values()
+        )
 
         real_cjfee = calculate_cj_fee(offer_type, cjfee, amount)
 
