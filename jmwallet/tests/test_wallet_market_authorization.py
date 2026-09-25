@@ -130,6 +130,34 @@ async def test_missing_cache_does_not_trigger_sync(
         await wallet.close()
 
 
+@pytest.mark.parametrize("purpose", [84, 86])
+async def test_authorization_accepts_verified_bond_with_sync_path_suffix(
+    seller_wallet: tuple[WalletService, AsyncMock, ExternalPoDLEOutpoint], purpose: int
+) -> None:
+    wallet, _, outpoint = seller_wallet
+    path = f"m/{purpose}'/1'/0'/2/{timestamp_to_timenumber(LOCKTIME)}"
+    key = wallet.master_key.derive(path)
+    pubkey = key.get_public_key_bytes(compressed=True)
+    address = derive_bond_address(pubkey, LOCKTIME, "regtest")
+    utxo = wallet.utxo_cache[0][0]
+    utxo.path = f"{path}:{LOCKTIME}"
+    utxo.address = address.address
+    utxo.scriptpubkey = address.scriptpubkey.hex()
+    try:
+        if purpose == 86:
+            # Bonds are P2WSH under BIP84 in both pits; a BIP86 key is never a bond.
+            with pytest.raises(MarketKeyError):
+                await wallet.create_market_authorization(outpoint)
+            return
+        _, document = await wallet.create_market_authorization(outpoint)
+        assert verify_authorization(document).bond.pubkey == pubkey.hex()
+        utxo.path = f"{path}:{LOCKTIME + 1}"
+        with pytest.raises(MarketKeyError):
+            await wallet.create_market_authorization(outpoint)
+    finally:
+        await wallet.close()
+
+
 @pytest.mark.parametrize("failure", ["genesis", "height", "clock", "spent", "outpoint", "value"])
 async def test_chain_verification_failure_never_authorizes(
     seller_wallet: tuple[WalletService, AsyncMock, ExternalPoDLEOutpoint], failure: str

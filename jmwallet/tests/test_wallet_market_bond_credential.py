@@ -104,6 +104,30 @@ async def test_wallet_issues_verifiable_bond_credential_without_sync_or_key_expo
         await wallet.close()
 
 
+async def test_wallet_issues_credential_for_exact_verified_bond_path(
+    seller_wallet: tuple[WalletService, AsyncMock, ExternalPoDLEOutpoint],
+) -> None:
+    wallet, backend, outpoint = seller_wallet
+    path = f"m/84'/1'/0'/2/{timestamp_to_timenumber(LOCKTIME)}"
+    pubkey = wallet.master_key.derive(path).get_public_key_bytes(compressed=True)
+    address = derive_bond_address(pubkey, LOCKTIME, "regtest")
+    cached = wallet.utxo_cache[0][0]
+    cached.path = f"{path}:{LOCKTIME}"
+    cached.address = address.address
+    cached.scriptpubkey = address.scriptpubkey.hex()
+    try:
+        _, authorization = await wallet.create_market_authorization(outpoint)
+        credential = await wallet.create_market_bond_credential(
+            authorization, _certificate_pubkey()
+        )
+        assert credential.bond.pubkey == pubkey.hex()
+        credential.verify()
+        assert backend.verify_bonds.await_count == 2
+        wallet.sync_all.assert_not_awaited()
+    finally:
+        await wallet.close()
+
+
 async def test_wallet_rejects_foreign_or_tampered_authorization(
     seller_wallet: tuple[WalletService, AsyncMock, ExternalPoDLEOutpoint], tmp_path: Path
 ) -> None:
