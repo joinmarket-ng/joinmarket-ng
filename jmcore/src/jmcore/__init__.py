@@ -31,6 +31,7 @@ from jmcore.bitcoin import (
     sha256,
 )
 from jmcore.btc_script import BondAddressInfo, derive_bond_address
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingSettings
 from jmcore.commitment_blacklist import (
     COMMITMENT_HEX_LENGTH,
     CommitmentBlacklist,
@@ -110,6 +111,7 @@ from jmcore.podle import (
     verify_podle,
 )
 from jmcore.protocol import (
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_PUSH_ENCRYPTED,
     JM_VERSION,
@@ -272,6 +274,7 @@ __all__ = [
     "serialize_revelation",
     "verify_podle",
     # Protocol
+    "FEATURE_COFUNDED_CHANNEL_RING_V1",
     "FEATURE_NEUTRINO_COMPAT",
     "FEATURE_PUSH_ENCRYPTED",
     "FeatureSet",
@@ -285,6 +288,9 @@ __all__ = [
     "get_nick_version",
     "parse_utxo_list",
     "peer_supports_neutrino_compat",
+    # Channel ring
+    "ChannelRingConfig",
+    "ChannelRingSettings",
     # Rate limiting
     "RateLimiter",
     "TokenBucket",

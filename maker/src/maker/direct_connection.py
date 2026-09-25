@@ -20,6 +20,7 @@ from jmcore.network import ConnectionError as NetworkConnectionError
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     COMMAND_PREFIX,
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
@@ -216,6 +217,10 @@ async def _process_direct_message(
         await bot._handle_tx(
             sender_nick, full_message, source="direct", generation_id=generation_id
         )
+    elif command == "ring":
+        await bot._handle_ring(
+            sender_nick, full_message, source="direct", generation_id=generation_id
+        )
     elif command == "push":
         await bot._handle_push(
             sender_nick, full_message, source="direct", generation_id=generation_id
@@ -243,6 +248,7 @@ class DirectConnectionMixin:
     direct_connections: dict[str, TCPConnection]
     _direct_connection_states: dict[TCPConnection, DirectConnectionState]
     _direct_connection_rate_limiter: DirectConnectionRateLimiter
+    channel_ring_capability_validated: bool
 
     def _remove_direct_connection(
         self: MakerBotProtocol, connection: TCPConnection, generation_id: int | None = None
@@ -339,6 +345,10 @@ class DirectConnectionMixin:
                 logger.warning(f"Dropping unauthenticated direct message from {sender_nick}")
                 return None
 
+            # Ring dispatch verifies the signed envelope again before decoding
+            # its private payload. Other commands retain their stripped API.
+            if command == "ring":
+                msg_data = rest.split(" ", 1)[1]
             return (sender_nick, command, msg_data)
 
         return None
@@ -446,6 +456,8 @@ class DirectConnectionMixin:
             features.features.add(FEATURE_NEUTRINO_COMPAT)
         if self.config.nick_auth_mode is not NickAuthMode.DISABLED:
             features.features.add(FEATURE_NICK_AUTH)
+        if self.channel_ring_capability_validated:
+            features.features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
 
         # Determine our location string (onion address or NOT-SERVING-ONION)
         onion_host = generation.onion_host
@@ -485,7 +497,7 @@ class DirectConnectionMixin:
     ) -> None:
         """Handle incoming direct connection from a taker via hidden service.
 
-        Direct connections support three message formats:
+        Direct connections support two message formats:
 
         1. Handshake request (health check / feature discovery):
            {"type": 793, "line": "<json handshake data>"}
@@ -494,9 +506,6 @@ class DirectConnectionMixin:
         2. Reference implementation format (OnionCustomMessage):
            {"type": 685, "line": "from_nick!to_nick!command data"}
            Where type 685 = PRIVMSG.
-
-        3. Our simplified format:
-           {"nick": "sender", "cmd": "command", "data": "..."}
 
         This bypasses the directory server for lower latency once the taker
         knows the maker's onion address (from the peerlist).

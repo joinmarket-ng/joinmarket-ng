@@ -16,6 +16,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from jmcore.channel_ring import ChannelRingConfig
+from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
@@ -24,7 +26,7 @@ from jmcore.fee_policy import resolve_min_fee_rate
 from jmcore.models import Offer
 from jmcore.network import HiddenServiceListener, TCPConnection
 from jmcore.notifications import get_notifier
-from jmcore.paths import get_nick_state_component, read_nick_state
+from jmcore.paths import get_default_data_dir, get_nick_state_component, read_nick_state
 from jmcore.protocol import (
     JM_VERSION,
 )
@@ -77,7 +79,9 @@ from maker.rate_limiting import (
 )
 
 if TYPE_CHECKING:
-    # A maker without a prepared channel buyout never imports jmswap at runtime.
+    # A maker without a prepared channel buyout or ring never imports jmswap at
+    # runtime.
+    from jmswap.channel_ring import InitializedChannelRingBackend
     from jmswap.coinjoin_funding import ChannelBuyout
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
@@ -150,6 +154,18 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 "backend cannot, so it could never sign a tr0 CoinJoin. Use a Core backend "
                 "or configure a p2wpkh (sw0) wallet instead."
             )
+        # A round funds its non-CoinJoin output from either a prepared buyout
+        # escrow or a co-funded ring, never both: each one owns the change
+        # output of the round it funds. Reject the combination before the
+        # buyout is bound, so this configuration error is reported instead of
+        # a confusing binding failure, and long before any offer is advertised
+        # or any input is reserved.
+        if buyout is not None and config.channel_ring.enabled:
+            raise ValueError(
+                "A prepared channel buyout and an enabled co-funded channel ring cannot "
+                "be used by the same maker: both claim the round's non-CoinJoin change "
+                "output. Disable channel_ring or drop --buyout-config/--buyout-session."
+            )
         # One prepared channel buyout, shared by every offer manager and every
         # CoinJoin session this bot creates, including those of rotated
         # identities: the durable record behind it is single-use, so there is
@@ -172,6 +188,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             nick_identity=self.nick_identity,
             neutrino_compat=backend.can_provide_neutrino_metadata(),
         )
+        self.channel_ring_capability_validated = False
+        self._channel_ring_backend: InitializedChannelRingBackend | None = None
+        self._channel_ring_store: RingParticipantStore | None = None
+        self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
+        if isinstance(config.channel_ring, ChannelRingConfig) and config.channel_ring.enabled:
+            data_directory = config.data_dir or get_default_data_dir()
+            self._channel_ring_store = RingParticipantStore(
+                config.channel_ring.persistence_path(data_directory),
+                max_active_sessions=config.channel_ring.max_active_sessions,
+                max_verified_sessions=config.channel_ring.max_verified_sessions,
+            )
         self._directory_pool.clients = self.directory_clients
         self.offer_manager = OfferManager(
             self.wallet,
@@ -1357,6 +1384,45 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # Determine the onion address to advertise
             onion_host = self.config.onion_host
 
+            if self.config.channel_ring.enabled:
+                from jmswap.channel_ring import initialize_channel_ring_backend
+
+                offer_type = self.config.get_effective_offer_configs()[0].offer_type.value
+                self._channel_ring_backend = await initialize_channel_ring_backend(
+                    self.config.channel_ring,
+                    network=self.config.network.value,
+                    offer_type=offer_type,
+                )
+                assert self._channel_ring_store is not None
+                from maker.channel_ring import reconcile_ring_records
+
+                await reconcile_ring_records(
+                    self._channel_ring_store,
+                    self._channel_ring_backend,
+                    self.backend,
+                    self._channel_ring_recovery_tasks,
+                    acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                )
+                report = self._channel_ring_store.load_all()
+                if not self._renew_channel_ring_input_locks():
+                    raise RuntimeError("could not restore an active channel-ring input reservation")
+                active = sum(record.active for record in report.records)
+                verified = sum(record.verified_unresolved for record in report.records)
+                capacity_available = (
+                    not report.corruptions
+                    and active < self.config.channel_ring.max_active_sessions
+                    and verified < self.config.channel_ring.max_verified_sessions
+                )
+                if capacity_available:
+                    self.channel_ring_capability_validated = True
+                    self._directory_pool.enable_cofunded_channel_ring_v1()
+                    logger.info("Validated co-funded channel-ring LND backend")
+                else:
+                    logger.warning(
+                        "Co-funded channel ring is not advertised: durable participant "
+                        "capacity is exhausted or records are corrupt"
+                    )
+
             logger.info("Connecting to directory servers...")
             await self._connect_to_directories_with_retry()
 
@@ -1427,6 +1493,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 )
                 self.listen_tasks.append(self._tor_onion_monitor_task)
 
+            if self._channel_ring_backend is not None and self._channel_ring_store is not None:
+                ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
+                self.listen_tasks.append(ring_task)
+
             # Start periodic summary notification task (if enabled)
             notifier = get_notifier()
             if notifier.config.notify_summary:
@@ -1495,6 +1565,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # their directory dispatchers.
         for listener_task in self.listen_tasks:
             listener_task.cancel()
+        for recovery_task in self._channel_ring_recovery_tasks.values():
+            recovery_task.cancel()
+        for session in self.active_sessions.values():
+            if session.ring_participant is not None:
+                session.ring_participant.cancel_acceptor_task()
 
         if self.listen_tasks:
             _, pending_listeners = await asyncio.wait(set(self.listen_tasks), timeout=2.0)
@@ -1502,6 +1577,16 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 listener_task.cancel()
         self.listen_tasks.clear()
         self._session_cleanup_task = None
+        if self._channel_ring_recovery_tasks:
+            await asyncio.gather(
+                *self._channel_ring_recovery_tasks.values(), return_exceptions=True
+            )
+            self._channel_ring_recovery_tasks.clear()
+
+        if self._channel_ring_backend is not None:
+            await self._channel_ring_backend.backend.close()
+            self._channel_ring_backend = None
+            self.channel_ring_capability_validated = False
 
         # Close every generation. The compatibility aliases point at the
         # current record, so generation-owned cleanup also handles replacement
@@ -1534,6 +1619,64 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         for listener_task in self.listen_tasks:
             if listener_task is not current_task:
                 listener_task.cancel()
+
+    async def _periodic_channel_ring_reconciliation(self) -> None:
+        from maker.channel_ring import reconcile_ring_records
+
+        while self.running:
+            assert self._channel_ring_store is not None
+            assert self._channel_ring_backend is not None
+            active_identities = frozenset(
+                f"{session.taker_nick}:{session.commitment.hex()}"
+                for session in self.active_sessions.values()
+            )
+            await reconcile_ring_records(
+                self._channel_ring_store,
+                self._channel_ring_backend,
+                self.backend,
+                self._channel_ring_recovery_tasks,
+                acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                active_session_identities=active_identities,
+            )
+            if not self._renew_channel_ring_input_locks():
+                self.channel_ring_capability_validated = False
+                logger.error(
+                    "Disabled channel-ring participation: input reservation renewal failed"
+                )
+                return
+            await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
+
+    def _renew_channel_ring_input_locks(self) -> bool:
+        """Keep the wallet leases of active durable ring records alive.
+
+        Renewal comes first so an existing lease this owner already holds is
+        extended instead of colliding with itself. Acquisition is only a
+        fallback for leases that are missing or expired (typically after a
+        restart), and it still fails closed when a live lock belongs to another
+        owner. Records without a persisted owner are never restored, because an
+        absent owner proves nothing about who holds the coins.
+        """
+        if self._channel_ring_store is None:
+            return True
+        report = self._channel_ring_store.load_all()
+        if report.corruptions:
+            return False
+        ttl = max(
+            self.config.pending_tx_timeout_min * 60,
+            self.config.pending_tx_abandon_hours * 3600,
+        )
+        for record in report.records:
+            if not record.active or not record.local_input_outpoints:
+                continue
+            owner = record.input_lock_owner
+            if owner is None:
+                return False
+            outpoints = {(item.txid, item.vout) for item in record.local_input_outpoints}
+            if self.wallet.renew_coinjoin_inputs(outpoints, ttl=ttl, owner=owner):
+                continue
+            if not self.wallet.reserve_coinjoin_inputs(outpoints, ttl=ttl, owner=owner):
+                return False
+        return True
 
     def _log_rate_limited(
         self,

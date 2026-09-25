@@ -513,6 +513,35 @@
 # Both offers stay in the pit selected by wallet.address_type (sw0 or tr0).
 # dual_offers = false
 
+# Experimental co-funded private Taproot channel ring. Disabled means no LND
+# connection and no capability advertisement. Enabling requires a p2tr wallet,
+# only tr0 offers, local TLS-authenticated LND, and a v3 onion Lightning URI.
+[maker.channel_ring]
+# enabled = false
+# lnd_grpc_url = "https://127.0.0.1:10009"
+# lnd_tls_cert_path = "/home/user/.lnd/tls.cert"
+# lnd_macaroon_path = "/home/user/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+# onion_endpoint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion:9735"
+# minimum_makers = 3
+# min_channel_capacity = 1000000
+# max_channel_capacity = 20000000
+# max_push = 500000
+# opener_reserve = 10000
+# fundee_reserve = 10000
+# maximum_commitment_fee = 100000
+# taproot_commitment_overhead = 660  # Fixed, must not be changed
+# spendable_margin = 100000
+# confirmation_depth = 3
+# minimum_csv_delay = 72
+# maximum_csv_delay = 432
+# allowed_csv_delays = [72, 144, 288, 432]
+# phase_timeout_seconds = 120.0
+# open_timeout_seconds = 60.0
+# readiness_timeout_seconds = 120.0
+# max_active_sessions = 4
+# max_verified_sessions = 2
+# persistence_directory = "/home/user/.joinmarket-ng/channel-ring-maker"
+
 # ============================================================================
 # Taker Settings (CoinJoin Client)
 # ============================================================================
@@ -603,6 +632,35 @@
 # Maximum attempts to replace failed makers and restore counterparty_count.
 # Set to 0 to disable replacement. Default: 3 (range: 0-10).
 # max_maker_replacement_attempts = 3
+
+# Taker-side policy uses the same strict model and safety bounds as the maker.
+# It only recognizes validated maker capability for now; normal CoinJoin maker
+# selection is unchanged while this feature is disabled or not orchestrated.
+[taker.channel_ring]
+# enabled = false
+# lnd_grpc_url = "https://127.0.0.1:10009"
+# lnd_tls_cert_path = "/home/user/.lnd/tls.cert"
+# lnd_macaroon_path = "/home/user/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+# onion_endpoint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.onion:9735"
+# minimum_makers = 3
+# min_channel_capacity = 1000000
+# max_channel_capacity = 20000000
+# max_push = 500000
+# opener_reserve = 10000
+# fundee_reserve = 10000
+# maximum_commitment_fee = 100000
+# taproot_commitment_overhead = 660
+# spendable_margin = 100000
+# confirmation_depth = 3
+# minimum_csv_delay = 72
+# maximum_csv_delay = 432
+# allowed_csv_delays = [72, 144, 288, 432]
+# phase_timeout_seconds = 120.0
+# open_timeout_seconds = 60.0
+# readiness_timeout_seconds = 120.0
+# max_active_sessions = 4
+# max_verified_sessions = 2
+# persistence_directory = "/home/user/.joinmarket-ng/channel-ring-taker"
 
 # ============================================================================
 # Tumbler Settings

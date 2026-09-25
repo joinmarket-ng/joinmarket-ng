@@ -46,8 +46,8 @@ and explicit force-close recovery after signing and an LND restart.
 
 This remains experimental. Automatic fee escalation of the presigned timeout
 split is not implemented, and broader reorg coverage remains incomplete.
-This branch does not include cofunded ring channel creation or the credential
-market. Its buyout regtests do not establish the combined lifecycle of ring
+This branch includes cofunded ring channel creation and the credential
+market, but its separate regtests do not establish the combined lifecycle of ring
 change, a later channel-funded CoinJoin, Lightning settlement, and rented PoDLE
 or fidelity-bond credentials on signet.
 Do not use the runtime with funded operator channels. Existing wallets

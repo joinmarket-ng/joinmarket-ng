@@ -10,7 +10,7 @@ from __future__ import annotations
 from hashlib import sha256
 
 import pytest
-from jmcore.bitcoin import TxInput, TxOutput
+from jmcore.bitcoin import TxInput, TxOutput, create_p2tr_scriptpubkey
 from jmcore.btc_script import mk_freeze_script
 from jmcore.timenumber import timestamp_to_timenumber
 
@@ -20,6 +20,7 @@ from jmwallet.wallet.signing import (
     ParsedTransaction,
     TransactionSigningError,
     create_p2wpkh_script_code,
+    verify_p2tr_signature,
     verify_p2wpkh_signature,
 )
 
@@ -133,6 +134,45 @@ class TestSignInputP2WPKH:
 
         with pytest.raises(TransactionSigningError, match="does not match transaction input"):
             wallet_service.sign_input(_single_input_tx(), 0, utxo)
+
+
+class TestSignInputP2TR:
+    def test_returns_verifiable_keypath_signature(self, wallet_service):
+        key = wallet_service.master_key.derive(f"{wallet_service.root_path}/0'/0/0")
+        address = key.get_p2tr_address(wallet_service.network)
+        wallet_service.address_cache[address] = (0, 0, 0)
+        scriptpubkey = create_p2tr_scriptpubkey(key.get_p2tr_output_xonly())
+        utxo = UTXOInfo(
+            txid="00" * 32,
+            vout=0,
+            value=100_000,
+            address=address,
+            confirmations=10,
+            scriptpubkey=scriptpubkey.hex(),
+            path=f"{wallet_service.root_path}/0'/0/0",
+            mixdepth=0,
+        )
+        tx = _single_input_tx()
+
+        signed = wallet_service.sign_input(
+            tx,
+            0,
+            utxo,
+            prevout_values=[utxo.value],
+            prevout_scripts=[scriptpubkey],
+        )
+
+        assert len(signed.signature) == 64
+        assert signed.witness == [signed.signature]
+        assert signed.pubkey == key.get_p2tr_output_xonly()
+        assert verify_p2tr_signature(
+            tx,
+            0,
+            [utxo.value],
+            [scriptpubkey],
+            signed.signature,
+            signed.pubkey,
+        )
 
 
 class TestSignInputFidelityBond:

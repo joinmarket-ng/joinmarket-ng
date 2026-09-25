@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from jmcore.channel_ring import ChannelRingConfig
 from jmcore.models import NetworkType
 from jmcore.settings import DEFAULT_DIRECTORY_SERVERS, JoinMarketSettings
 
@@ -299,6 +300,7 @@ def build_taker_config_kwargs(
         "taker_utxo_retries": settings.taker.taker_utxo_retries,
         "taker_utxo_amtpercent": settings.taker.taker_utxo_amtpercent,
         "max_maker_utxos": settings.taker.max_maker_utxos,
+        "channel_ring": ChannelRingConfig.from_settings(settings.taker.channel_ring),
     }
 
 
