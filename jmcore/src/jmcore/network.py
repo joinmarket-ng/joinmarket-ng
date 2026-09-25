@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import json
+import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
@@ -20,6 +22,14 @@ if TYPE_CHECKING:
 # Used for message signing to prevent replay attacks
 # Reference: jmdaemon/onionmc.py self.hostid = "onion-network"
 ONION_HOSTID = "onion-network"
+
+# Probes remain below the maker's 60-second idle limit. Its sequential command
+# handler can occupy the reader for a full ring operation, so response grace is
+# longer. Neither traffic nor wrong PONGs extend that absolute deadline.
+_DIRECT_PING_INTERVAL_SEC = 20.0
+_DIRECT_PING_TIMEOUT_SEC = 660.0
+_DIRECT_PING_WRITE_TIMEOUT_SEC = 30.0
+_DIRECT_CLOSE_TIMEOUT_SEC = 5.0
 
 
 class ConnectionError(Exception):
@@ -357,6 +367,59 @@ class HiddenServiceListener:
         return wait_until_stopped()
 
 
+class _DirectHeartbeat:
+    """One bounded challenge at a time, owned by one physical connection.
+
+    No identities, timestamps, wallet data, or cross-connection state go on the
+    wire. Closing an old heartbeat cannot close a replacement connection.
+    """
+
+    def __init__(self, connection: TCPConnection) -> None:
+        self.connection = connection
+        self.enabled = False
+        self._nonce: str | None = None
+        self._pong = asyncio.Event()
+
+    def receive_pong(self, nonce: object) -> None:
+        if self._nonce is not None and isinstance(nonce, str) and nonce == self._nonce:
+            self._pong.set()
+
+    @staticmethod
+    def _interval() -> float:
+        return _DIRECT_PING_INTERVAL_SEC * (0.75 + secrets.randbelow(501) / 1000)
+
+    async def run(self) -> None:
+        from jmcore.protocol import MessageType
+
+        try:
+            while self.connection.is_connected():
+                await asyncio.sleep(self._interval())
+                if not self.enabled:
+                    continue
+                self._pong.clear()
+                self._nonce = secrets.token_hex(16)
+                message = json.dumps({"type": MessageType.PING.value, "line": self._nonce})
+                # Retrying the same challenge keeps the socket alive while a
+                # sequential maker handler is busy. Do not enqueue distinct
+                # challenges or renew grace on unrelated traffic.
+                async with asyncio.timeout(_DIRECT_PING_TIMEOUT_SEC):
+                    while True:
+                        await asyncio.wait_for(
+                            self.connection.send(message.encode()),
+                            timeout=_DIRECT_PING_WRITE_TIMEOUT_SEC,
+                        )
+                        try:
+                            await asyncio.wait_for(self._pong.wait(), self._interval())
+                            break
+                        except TimeoutError:
+                            pass
+                self._nonce = None
+        except (TimeoutError, ConnectionError):
+            logger.debug("Direct peer heartbeat failed")
+            # Graceful close can hang behind a peer that stopped reading.
+            self.connection.abort()
+
+
 class PeerStatus:
     """Connection status for OnionPeer."""
 
@@ -472,6 +535,8 @@ class OnionPeer:
         # include a features field (e.g., older peers) -- callers should treat
         # this as "unknown" rather than "not supported".
         self.peer_features: dict[str, Any] = {}
+        self._peer_handshake_received = False
+        self._network: str | None = None
 
     def _parse_location(self) -> None:
         """Parse location string into hostname and port."""
@@ -560,6 +625,9 @@ class OnionPeer:
                 return False
 
             self._status = PeerStatus.CONNECTING
+            self.peer_features = {}
+            self._peer_handshake_received = False
+            self._network = network
             self._connect_attempts += 1
             self._last_connect_attempt = asyncio.get_event_loop().time()
 
@@ -661,6 +729,11 @@ class OnionPeer:
             self.peer_features = {}
             return
         response = json.loads(response_data.decode("utf-8"))
+        self._accept_peer_handshake(response, network)
+
+    def _accept_peer_handshake(self, response: dict[str, Any], network: str) -> None:
+        """Validate reciprocal handshakes, including replies arriving after 2s."""
+        from jmcore.protocol import MessageType
 
         if response.get("type") != MessageType.HANDSHAKE.value:
             raise OnionPeerConnectionError(f"Expected HANDSHAKE, got type {response.get('type')}")
@@ -701,6 +774,7 @@ class OnionPeer:
             self.peer_features = dict(raw_features)
         else:
             self.peer_features = {}
+        self._peer_handshake_received = True
 
         logger.bind(sensitive=True).debug(f"Handshake with peer {self.nick} successful")
 
@@ -711,12 +785,23 @@ class OnionPeer:
 
         import json
 
-        from jmcore.protocol import MessageType
+        from jmcore.protocol import FEATURE_DIRECT_PING_V1, MessageType
+
+        connection = self._connection
+        heartbeat = _DirectHeartbeat(connection)
+        heartbeat.enabled = self.peer_features.get(FEATURE_DIRECT_PING_V1) is True
+        heartbeat_task = asyncio.create_task(heartbeat.run())
 
         try:
-            while self._status == PeerStatus.HANDSHAKED and self._connection.is_connected():
+            while (
+                self._status == PeerStatus.HANDSHAKED
+                and self._connection is connection
+                and connection.is_connected()
+            ):
                 try:
-                    data = await self._connection.receive()
+                    data = await connection.receive()
+                    if self._connection is not connection:
+                        break
                     try:
                         message = json.loads(data.decode("utf-8"))
                     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -725,9 +810,15 @@ class OnionPeer:
                         isinstance(message, dict)
                         and message.get("type") == MessageType.HANDSHAKE.value
                     ):
-                        logger.bind(sensitive=True).debug(
-                            f"Ignoring late handshake from peer {self.nick}"
-                        )
+                        if not self._peer_handshake_received and self._network is not None:
+                            self._accept_peer_handshake(message, self._network)
+                            heartbeat.enabled = (
+                                self.peer_features.get(FEATURE_DIRECT_PING_V1) is True
+                            )
+                        continue
+                    if isinstance(message, dict) and message.get("type") == MessageType.PONG.value:
+                        if set(message) == {"type", "line"}:
+                            heartbeat.receive_pong(message.get("line"))
                         continue
                     if self.on_message:
                         await self.on_message(self.nick, data)
@@ -740,7 +831,13 @@ class OnionPeer:
                     )
                     break
         finally:
-            await self._handle_disconnect()
+            heartbeat_task.cancel()
+            try:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            finally:
+                if self._connection is connection:
+                    await self._handle_disconnect()
 
     async def _handle_disconnect(self) -> None:
         """Handle peer disconnection."""
@@ -748,12 +845,20 @@ class OnionPeer:
             if self._status == PeerStatus.DISCONNECTED:
                 return
             self._status = PeerStatus.DISCONNECTED
+            connection = self._connection
+            self._connection = None
 
         logger.bind(sensitive=True).debug(f"Peer {self.nick} disconnected")
 
-        if self._connection:
-            await self._connection.close()
-            self._connection = None
+        if connection:
+            try:
+                await asyncio.wait_for(connection.close(), _DIRECT_CLOSE_TIMEOUT_SEC)
+            except asyncio.CancelledError:
+                connection.abort()
+                raise
+            except Exception:
+                connection.abort()
+                logger.debug("Direct peer transport failed during disconnect")
 
         if self.on_disconnect:
             await self.on_disconnect(self.nick)

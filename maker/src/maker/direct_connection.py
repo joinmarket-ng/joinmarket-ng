@@ -21,6 +21,7 @@ from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     COMMAND_PREFIX,
     FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_DIRECT_PING_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
@@ -148,6 +149,29 @@ async def _process_direct_message(
         logger.warning("Dropping message before direct handshake")
         logger.bind(sensitive=True).warning(
             f"Dropping message before direct handshake from {peer_str}"
+        )
+        return True
+
+    # Heartbeats are transport liveness only, never identity authentication.
+    # Keep the absolute unauthenticated deadline and message rate limiter above.
+    try:
+        heartbeat = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        heartbeat = None
+    if isinstance(heartbeat, dict) and heartbeat.get("type") == MessageType.PING.value:
+        if not state.verified:
+            return True
+        nonce = heartbeat.get("line")
+        if (
+            set(heartbeat) != {"type", "line"}
+            or not isinstance(nonce, str)
+            or len(nonce) != 32
+            or any(character not in "0123456789abcdef" for character in nonce)
+        ):
+            return False
+        await asyncio.wait_for(
+            connection.send(json.dumps({"type": MessageType.PONG.value, "line": nonce}).encode()),
+            timeout=_DIRECT_CONNECTION_IDLE_TIMEOUT_SEC,
         )
         return True
 
@@ -451,7 +475,9 @@ class DirectConnectionMixin:
         state.nick = peer_nick
 
         # Build our feature set for the handshake
-        features = FeatureSet(features={FEATURE_PEERLIST_FEATURES, FEATURE_PING})
+        features = FeatureSet(
+            features={FEATURE_PEERLIST_FEATURES, FEATURE_PING, FEATURE_DIRECT_PING_V1}
+        )
         if self.backend.can_provide_neutrino_metadata():
             features.features.add(FEATURE_NEUTRINO_COMPAT)
         if self.config.nick_auth_mode is not NickAuthMode.DISABLED:

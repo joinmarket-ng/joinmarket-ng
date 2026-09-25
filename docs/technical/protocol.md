@@ -314,6 +314,7 @@ This implementation uses feature flags instead of protocol version bumps to enab
 |---------|-------------|
 | `peerlist_features` | Supports extended peerlist format with feature flags in `F:` field |
 | `ping` | Supports application-level PING/PONG heartbeat liveness checks |
+| `direct_ping_v1` | Direct maker handshake capability for nonce-based PING/PONG on verified sockets |
 | `neutrino_compat` | Can provide extended UTXO format with scriptPubKey and blockheight for own UTXOs |
 
 **Extended Peerlist Format:**
@@ -362,5 +363,31 @@ Defaults match joinmarket-rs behavior for interoperability:
 - Idle probe threshold: 600s (10 min)
 - Hard eviction: 1500s (25 min)
 - PONG wait: 30s
+
+Direct maker connections use a separate `direct_ping_v1` capability. Older makers
+advertise `ping` without implementing direct PONG responses, so that flag alone
+does not enable direct probes. A validated reciprocal handshake must explicitly
+advertise `direct_ping_v1: true`; a late reciprocal handshake can also enable it.
+
+A direct PING has exactly `type` and `line` fields. Its `line` is a fresh random
+16-byte nonce encoded as 32 lowercase hexadecimal characters. The maker echoes
+that nonce in a PONG only after a signed private message verifies the socket's
+sender. The existing message rate limit, 256-socket process cap, and absolute
+60-second unauthenticated deadline still apply. Malformed authenticated PINGs
+close the connection without a reply.
+
+Probes use independent 15-to-25-second intervals. There is only one outstanding
+nonce per socket, retried while the maker's sequential command handler is busy.
+The response deadline is a fixed 660 seconds, allowing a 600-second ring operation
+plus scheduling margin; writes have a separate 30-second deadline. Missing or
+incorrect PONGs cannot renew that deadline. Failure aborts that socket, and never
+switches a pinned session to a directory relay.
+
+These messages carry no identities, timestamps, channel topology, or wallet data.
+They do not enter CoinJoin handlers, renew session deadlines or input leases, or
+prove protocol progress. Each connection owns its heartbeat and nonce; teardown
+of an old connection cannot close its replacement. Upgrades require no persisted
+state changes, and connections to peers lacking the new capability retain their
+previous behavior.
 
 ---
