@@ -735,7 +735,11 @@ class TestPreferredOfferTypeRoundTrip:
 def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
     tmp_path, sample_mnemonic: str
 ) -> None:
-    from jmcore.channel_ring import ChannelRingSettings
+    from jmcore.channel_ring import (
+        ChannelRingNodeSettings,
+        ChannelRingSettings,
+        TakerChannelRingSettings,
+    )
     from jmcore.models import OfferType
     from jmcore.settings import JoinMarketSettings, TakerSettings, WalletSettings
 
@@ -743,10 +747,16 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
 
     ring = ChannelRingSettings(
         enabled=True,
-        lnd_grpc_url="https://localhost:10009",
-        lnd_tls_cert_path=tmp_path / "tls.cert",
-        lnd_macaroon_path=tmp_path / "admin.macaroon",
-        onion_endpoint="b" * 56 + ".onion:9735",
+        nodes={
+            "local": ChannelRingNodeSettings(
+                lnd_grpc_url="https://localhost:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint="b" * 56 + ".onion:9735",
+            )
+        },
+        mixdepth_nodes={0: "local"},
+        node_binding_directory=tmp_path / "node-bindings",
         confirmation_depth=6,
     )
     settings = JoinMarketSettings(
@@ -759,7 +769,44 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
     config = build_taker_config(settings, mnemonic=sample_mnemonic, passphrase="")
     assert config.channel_ring.enabled
     assert config.channel_ring.confirmation_depth == 6
-    assert config.channel_ring.onion_endpoint == "b" * 56 + ".onion:9735"
+    assert config.channel_ring.nodes["local"].onion_endpoint == "b" * 56 + ".onion:9735"
+    assert config.channel_ring.mixdepth_nodes == {0: "local"}
+    assert config.channel_ring.node_binding_directory == tmp_path / "node-bindings"
+    assert config.channel_ring.taker_joins
+
+    opted_out = build_taker_config(
+        settings.model_copy(
+            update={
+                "taker": settings.taker.model_copy(
+                    update={
+                        "channel_ring": TakerChannelRingSettings(
+                            **ring.model_dump(), taker_participates=False
+                        )
+                    }
+                )
+            }
+        ),
+        mnemonic=sample_mnemonic,
+        passphrase="",
+    )
+    assert opted_out.channel_ring.enabled
+    assert not opted_out.channel_ring.taker_joins
+    assert opted_out.channel_ring.mixdepth_nodes == {0: "local"}
+
+    no_lnd = build_taker_config(
+        JoinMarketSettings(
+            wallet=WalletSettings(address_type="p2tr"),
+            taker=TakerSettings(
+                preferred_offer_type=OfferType.TR0_RELATIVE,
+                channel_ring=ChannelRingSettings(enabled=True),
+            ),
+        ),
+        mnemonic=sample_mnemonic,
+        passphrase="",
+    )
+    assert no_lnd.channel_ring.enabled
+    assert no_lnd.channel_ring.nodes == {}
+    assert not no_lnd.channel_ring.taker_joins
 
     incompatible = JoinMarketSettings(
         wallet=WalletSettings(address_type="p2wpkh"),
@@ -789,4 +836,5 @@ def test_disabled_channel_ring_round_trip_preserves_default_behavior(sample_mnem
 
     config = build_taker_config(JoinMarketSettings(), mnemonic=sample_mnemonic, passphrase="")
     assert config.channel_ring.enabled is False
-    assert config.channel_ring.onion_endpoint == ""
+    assert config.channel_ring.nodes == {}
+    assert config.channel_ring.mixdepth_nodes == {}

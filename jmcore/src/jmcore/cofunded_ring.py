@@ -1,4 +1,4 @@
-"""Core models and authentication for the JMP-0010 co-funded channel ring."""
+"""Core models and authentication for private channel rings."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, ClassVar, Literal, TypeAlias, cast
+from typing import Any, ClassVar, Final, Literal, TypeAlias, cast
 
 from bitcointx.core.key import CKey, CPubKey, XOnlyPubKey
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,9 +19,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from jmcore.bitcoin import hash256, parse_transaction_bytes, serialize_transaction
 from jmcore.constants import MAX_MONEY
 
-RING_DESIGN = "cofunded_channel_ring_v1"
-RING_VERSION = 1
-MIN_RING_PARTICIPANTS = 4
+RING_PAYLOAD_FORMAT: Final = "canonical_json"
+MIN_RING_PARTICIPANTS = 3
 MAX_RING_PARTICIPANTS = 32
 MAX_RING_PAYLOAD_BYTES = 65_536
 MAX_RING_JSON_DEPTH = 10
@@ -256,7 +255,7 @@ class ManifestOutput(RingModel):
     """One output in transaction order."""
 
     index: int = Field(ge=0, le=65_535)
-    amount: int = Field(ge=0, le=MAX_MONEY)
+    amount: int = Field(ge=1, le=MAX_MONEY)
     script_pubkey: ScriptHex
 
     @model_validator(mode="after")
@@ -268,7 +267,7 @@ class ManifestOutput(RingModel):
 class RingManifest(RingModel):
     """Public transaction and cycle commitment. Private node data is intentionally absent."""
 
-    v: Literal[1] = 1
+    payload_format: Literal["canonical_json"] = RING_PAYLOAD_FORMAT
     network: RingNetwork
     round_nonce: Hex32
     revision: int = Field(ge=0, le=MAX_REVISION)
@@ -280,23 +279,22 @@ class RingManifest(RingModel):
     edges: list[RingEdge] = Field(
         min_length=MIN_RING_PARTICIPANTS, max_length=MAX_RING_PARTICIPANTS
     )
-    equal_output_indices: list[int] = Field(
-        min_length=MIN_RING_PARTICIPANTS, max_length=MAX_RING_PARTICIPANTS
-    )
-    outputs: list[ManifestOutput] = Field(min_length=8, max_length=64)
+    equal_output_indices: list[int] = Field(min_length=MIN_RING_PARTICIPANTS, max_length=64)
+    outputs: list[ManifestOutput] = Field(min_length=2 * MIN_RING_PARTICIPANTS, max_length=128)
 
     @model_validator(mode="after")
     def validate_manifest(self) -> RingManifest:
         _validate_hex(self.round_nonce, 32, "round_nonce")
         _validate_hex(self.unsigned_tx_hash, 32, "unsigned_tx_hash")
         _validate_hex(self.unsigned_txid, 32, "unsigned_txid")
-        count = len(self.participant_keys)
-        if len(self.edges) != count or len(self.equal_output_indices) != count:
-            raise ValueError("manifest participant, edge, and equal-output counts differ")
-        if len(self.outputs) != 2 * count:
-            raise ValueError(
-                "manifest must contain exactly one equal and one channel output per participant"
-            )
+        ring_count = len(self.participant_keys)
+        equal_count = len(self.equal_output_indices)
+        if len(self.edges) != ring_count:
+            raise ValueError("manifest participant and edge counts differ")
+        if not ring_count <= equal_count <= 64:
+            raise ValueError("equal output count must be between the ring size and 64")
+        if len(self.outputs) != 2 * equal_count:
+            raise ValueError("manifest must contain exactly twice as many outputs as equal outputs")
 
         keys = self.participant_keys
         for key in keys:
@@ -308,7 +306,10 @@ class RingManifest(RingModel):
         _all_unique(self.equal_output_indices, "equal output_index")
 
         for index, edge in enumerate(self.edges):
-            if edge.opener_key != keys[index] or edge.acceptor_key != keys[(index + 1) % count]:
+            if (
+                edge.opener_key != keys[index]
+                or edge.acceptor_key != keys[(index + 1) % ring_count]
+            ):
                 raise ValueError("edges do not form the declared directed cycle")
 
         output_indices = [output.index for output in self.outputs]
@@ -319,22 +320,24 @@ class RingManifest(RingModel):
         if sorted(output_indices) != list(range(len(self.outputs))):
             raise ValueError("manifest outputs must cover every transaction output in order")
         output_by_index = {output.index: output for output in self.outputs}
-        if set(self.equal_output_indices) & {edge.output_index for edge in self.edges}:
+        equal_indices = set(self.equal_output_indices)
+        channel_indices = {edge.output_index for edge in self.edges}
+        if equal_indices & channel_indices:
             raise ValueError("equal and channel output indices overlap")
-        declared_indices = set(self.equal_output_indices) | {
-            edge.output_index for edge in self.edges
-        }
-        if declared_indices != set(output_indices):
-            raise ValueError("manifest output classifications do not cover every output")
+        if not equal_indices.issubset(output_by_index) or not channel_indices.issubset(
+            output_by_index
+        ):
+            raise ValueError("manifest output classification index is absent from outputs")
+        ordinary_indices = set(output_indices) - equal_indices - channel_indices
+        if len(ordinary_indices) != equal_count - ring_count:
+            raise ValueError("manifest ordinary output count does not match the mixed round shape")
         for index in self.equal_output_indices:
-            if index not in output_by_index:
-                raise ValueError("equal output index is absent from outputs")
-            if output_by_index[index].amount < 1:
-                raise ValueError("equal output amount must be positive")
-            _validate_p2tr_script(
-                output_by_index[index].script_pubkey,
-                "tr0 equal output",
-            )
+            _validate_p2tr_script(output_by_index[index].script_pubkey, "tr0 equal output")
+        equal_amounts = {output_by_index[index].amount for index in equal_indices}
+        if len(equal_amounts) != 1:
+            raise ValueError("equal output amounts must be identical")
+        for index in ordinary_indices:
+            _validate_p2tr_script(output_by_index[index].script_pubkey, "tr0 ordinary output")
         for edge in self.edges:
             output = output_by_index.get(edge.output_index)
             if (
@@ -458,7 +461,7 @@ class RingPayload(RingModel):
     """Fields shared by every canonical ring message payload."""
 
     message_type: ClassVar[str]
-    v: Literal[1] = 1
+    payload_format: Literal["canonical_json"] = RING_PAYLOAD_FORMAT
     type: str
     round_nonce: Hex32
     revision: int = Field(ge=0, le=MAX_REVISION)
@@ -536,8 +539,8 @@ class RingPlanPayload(RingPayload):
         for key in self.cycle_keys:
             _validate_xonly_key(key, "cycle key")
         _all_unique(self.cycle_keys, "cycle key")
-        if self.signer_key not in self.cycle_keys:
-            raise ValueError("plan signer must be the taker's cycle key")
+        # The coordinator authenticates the round, but need not fund a channel.
+        # In particular, this must not identify whether the taker is in the cycle.
         if self.position >= len(self.cycle_keys):
             raise ValueError("local plan position is outside the cycle")
         local_key = self.cycle_keys[self.position]
@@ -812,7 +815,9 @@ class RingReadySetPayload(RingPayload):
     message_type: ClassVar[str] = "ring_ready_set"
     type: Literal["ring_ready_set"] = "ring_ready_set"
     manifest: RingManifest
-    attestations: list[SignedReadinessAttestation] = Field(min_length=8, max_length=64)
+    attestations: list[SignedReadinessAttestation] = Field(
+        min_length=2 * MIN_RING_PARTICIPANTS, max_length=64
+    )
 
     @model_validator(mode="after")
     def validate_complete_set(self) -> RingReadySetPayload:
@@ -1000,10 +1005,10 @@ def canonical_json(value: Any, *, exclude_signature: bool = False) -> bytes:
 
 
 def ring_hash(object_type: str, value: Any) -> bytes:
-    """Compute the exact JMP-0010 domain-separated object hash."""
+    """Compute the exact JMP-0014 domain-separated object hash."""
 
     try:
-        domain = f"JMP0010/{object_type}/v1\0".encode("ascii")
+        domain = f"JMP0014/{object_type}/v1\0".encode("ascii")
     except UnicodeEncodeError as exc:
         raise RingValidationError("ring hash type must be ASCII") from exc
     return hashlib.sha256(domain + canonical_json(value)).digest()
@@ -1014,7 +1019,7 @@ def manifest_hash(manifest: RingManifest) -> bytes:
 
 
 def payload_hash(payload: RingPayload) -> bytes:
-    domain = f"JMP0010/{payload.type}/v1\0".encode("ascii")
+    domain = f"JMP0014/{payload.type}/{RING_PAYLOAD_FORMAT}\0".encode("ascii")
     return hashlib.sha256(domain + canonical_json(payload, exclude_signature=True)).digest()
 
 
@@ -1176,7 +1181,7 @@ def encode_ring_message(payload: RingPayload) -> str:
 
 
 def decode_ring_message(message: str) -> RingPayloadType:
-    """Parse one canonical envelope with size, depth, duplicate, type, and version checks."""
+    """Parse one canonical envelope with size, depth, duplicate, type, and format checks."""
 
     try:
         message_bytes = message.encode("ascii")
@@ -1219,8 +1224,8 @@ def decode_ring_message(message: str) -> RingPayloadType:
         raise RingValidationError("ring payload is not valid UTF-8 JSON") from exc
     if not isinstance(decoded, dict):
         raise RingValidationError("ring payload must be a JSON object")
-    if decoded.get("v") != RING_VERSION:
-        raise RingValidationError("unknown ring payload version")
+    if decoded.get("payload_format") != RING_PAYLOAD_FORMAT:
+        raise RingValidationError("unknown ring payload format")
     if decoded.get("type") != envelope_type:
         raise RingValidationError("envelope and payload message types differ")
     try:

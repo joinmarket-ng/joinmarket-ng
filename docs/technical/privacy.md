@@ -244,6 +244,39 @@ redemption, migration, and the public hardware-wallet test vector are
 operational procedures. See [Fidelity Bond Operations](../fidelity-bond-operations.md)
 for the maintained workflow.
 
+## Private Channel Ring Limits
+
+Randomly splitting change across cofunded private Taproot channels obscures
+individual ownership amounts from a passive on-chain observer. It is not a
+proof that subset-sum or transaction-graph analysis is impossible. Ordinary
+makers still receive exact single-owner change, and timing, repeated peers,
+amount bounds, later spends, and implementation fingerprints remain evidence.
+
+The taker coordinates the ring and learns participant inputs, contributions,
+and Lightning identities. Each ring maker learns its two neighbors and its own
+channel balances. Unannounced channels and SCID aliases do not hide this
+information from the endpoints. Colluding neighbors or a malicious coordinator
+have a stronger view than an on-chain observer. Reusing a fidelity bond across
+pits also lets takers who receive its proofs correlate those maker identities.
+
+Private channel buyout messages stay between the channel owners, not the
+CoinJoin taker. A cooperative key-path spend avoids explicitly identifying the
+input as a channel, but an observer with prior knowledge of that funding output
+can still follow it. An immediate escrow sweep adds a recognizable graph edge;
+it is not equivalent to reusing the escrow directly in another CoinJoin.
+Timeout splits and force closes can expose balances, and script-path claims
+reveal the escrow's hashlock construction. Routing or rebalancing may change
+balances, but must not be assumed to have erased the original allocation.
+
+Lightning settlement has its own threat model: routing peers see adjacent
+nodes and local amounts, invoices can disclose route hints, and failed payment
+attempts can leak information. A mixdepth-specific node limits cross-mixdepth
+identity reuse, not all payment correlation. See the
+[transaction-graph analysis](https://gist.github.com/nothingmuch/d84ba390d89b5b08897af2d95009c2a1)
+and [Lightning privacy study](https://arxiv.org/abs/2003.12470v1). The
+[multiparty-channel liquidity analysis](https://arxiv.org/abs/2601.04835)
+does not establish anonymity or buyout security.
+
 ## Cryptographic Parameters
 
 JoinMarket uses secp256k1, the same curve used by Bitcoin:

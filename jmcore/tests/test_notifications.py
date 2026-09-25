@@ -33,6 +33,12 @@ from jmcore.notifications import (
 from jmcore.tor_isolation import IsolationCategory
 
 
+@pytest.fixture(autouse=True)
+def isolate_notification_config_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty-env cases must not discover the operator's real config through Path.home()."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+
 class RecordingNotificationWorker:
     """Deterministic worker seam for notifier tests."""
 

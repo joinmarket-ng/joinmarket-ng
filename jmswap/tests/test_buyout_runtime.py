@@ -103,7 +103,7 @@ def _settings(tmp_path: Path, **overrides: object) -> BuyoutSettings:
         "bitcoin_rpc_user": "buyout",
         "bitcoin_rpc_password": "regtest-placeholder",
         "allowed_peers": (PEER,),
-        "payout_address": PAYOUT_ADDRESS,
+        "payout_addresses": [PAYOUT_ADDRESS],
         "mixdepth": 0,
         "wallet_fingerprint": FINGERPRINT,
         "poll_interval_seconds": 0.01,

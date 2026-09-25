@@ -296,15 +296,26 @@ def _exit_on_invalid_config(exc: ValidationError) -> NoReturn:
     ``section.key: message`` line pointing at the offending value.
     """
     logger.error(f"Invalid configuration in {get_config_path()}:")
+    unknown_keys = False
     for err in exc.errors():
         location = ".".join(str(part) for part in err.get("loc", ())) or "<root>"
         message = err.get("msg", "invalid value")
+        if err.get("type") == "extra_forbidden":
+            # Strict sections (such as channel_ring) reject keys this version
+            # does not know, typically left over from another build.
+            unknown_keys = True
+            message = "unknown setting in this version"
         logger.error(f"  {location}: {message}")
         if location.endswith("urls"):
             logger.error(
                 "    Tip: notification urls must be a TOML array, e.g. "
                 'urls = ["tgram://bottoken/ChatID"]'
             )
+    if unknown_keys:
+        logger.error(
+            "    Tip: unknown keys usually come from another JoinMarket NG version. "
+            "Remove or rename them using config.toml.template for this version."
+        )
     logger.error("Please fix these values in your config file and try again.")
     sys.exit(1)
 

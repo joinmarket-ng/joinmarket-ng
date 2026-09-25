@@ -175,7 +175,7 @@ def atomic_write_sensitive_file(path: Path, data: bytes) -> None:
 
 
 @contextmanager
-def exclusive_file_lock(path: Path) -> Iterator[None]:
+def exclusive_file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Lock a stable sidecar inode across processes without replacing or deleting it."""
     _reject_parent_traversal(path)
     if path.is_symlink():
@@ -193,7 +193,8 @@ def exclusive_file_lock(path: Path) -> Iterator[None]:
                 handle.write(b"\0")
                 handle.flush()
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+            msvcrt.locking(handle.fileno(), mode, 1)
             try:
                 yield
             finally:
@@ -203,7 +204,8 @@ def exclusive_file_lock(path: Path) -> Iterator[None]:
             import fcntl
 
             os.fchmod(handle.fileno(), 0o600)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), flags)
             try:
                 yield
             finally:

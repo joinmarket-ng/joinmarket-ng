@@ -1,16 +1,22 @@
-"""Durable taker coordinator for JMP-0010 co-funded channel rings."""
+"""Durable taker coordinator for JMP-0014 co-funded channel rings."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import hashlib
+import hmac
 import secrets
 import time
-from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from jmcore.bitcoin import get_txid, parse_transaction, scriptpubkey_to_address
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    get_txid,
+    parse_transaction,
+    scriptpubkey_to_address,
+)
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.channel_ring_store import (
     FundingEdgeRecord,
@@ -28,6 +34,7 @@ from jmcore.channel_ring_store import (
 )
 from jmcore.cofunded_ring import (
     MAX_RING_CIPHERTEXT_BYTES,
+    BackendLimits,
     ChannelPolicy,
     EndpointRole,
     LocalContribution,
@@ -43,6 +50,7 @@ from jmcore.cofunded_ring import (
     RingEdge,
     RingHelloPayload,
     RingInvitePayload,
+    RingKeyPair,
     RingManifest,
     RingOpenPayload,
     RingPayloadType,
@@ -66,8 +74,9 @@ from jmcore.cofunded_ring import (
     verify_payload,
     verify_ready_payload,
 )
+from jmcore.constants import DUST_THRESHOLD, GENESIS_BLOCK_HASHES
 from jmcore.models import is_taproot_offer_type
-from jmswap.channel_ring import InitializedChannelRingBackend
+from jmswap.channel_ring_nodes import BoundChannelRingNode, ChannelRingNodePool
 from jmswap.lnd import (
     AcceptorBounds,
     AcceptorObservation,
@@ -89,7 +98,7 @@ from jmswap.lnd import (
 )
 from loguru import logger
 
-from taker.orderbook import calculate_cj_fee, offer_supports_cofunded_channel_ring_v1
+from taker.orderbook import offer_supports_private_channel_ring
 from taker.ring_planner import (
     ParticipantChannelLimits,
     RingParty,
@@ -97,6 +106,7 @@ from taker.ring_planner import (
 )
 from taker.tx_builder import (
     ChannelEndpointContribution,
+    FinalizedOrdinaryMakerChange,
     FinalizedRingChannelOutput,
     FinalizedRingTransactionPlan,
     build_coinjoin_tx,
@@ -112,17 +122,9 @@ class TakerRingError(Exception):
     """A strict all-party ring round cannot safely advance."""
 
 
-_CHAIN_HASHES = {
-    "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-    "testnet": "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
-    "signet": "00000008819873e925422c1ff0f99f7c3bdb3adc1d93b6f4e2af5f996e3157b",
-    "regtest": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
-}
-
-
 def _chain_hash(network: str) -> bytes:
     try:
-        return bytes.fromhex(_CHAIN_HASHES[network])[::-1]
+        return bytes.fromhex(GENESIS_BLOCK_HASHES[network])[::-1]
     except KeyError as exc:
         raise TakerRingError(f"unsupported channel-ring network {network!r}") from exc
 
@@ -137,6 +139,8 @@ _UNRESUMABLE_NEGOTIATION_STATES = frozenset(
     {
         RingLifecycleState.ACCEPTOR_ARMED,
         RingLifecycleState.PREPARED,
+        RingLifecycleState.PREPARED_NOT_VERIFIED,
+        RingLifecycleState.VERIFYING,
         RingLifecycleState.PSBT_VERIFIED,
         RingLifecycleState.READY,
         RingLifecycleState.SIGNING,
@@ -185,7 +189,7 @@ class TakerRingCoordinator:
         *,
         config: ChannelRingConfig,
         store: RingParticipantStore,
-        initialized_backend: InitializedChannelRingBackend,
+        initialized_backend: BoundChannelRingNode,
         chain_backend: BlockchainBackend,
         session_identity: str,
     ) -> None:
@@ -205,6 +209,12 @@ class TakerRingCoordinator:
         self._prepared_by_key: dict[str, RingPreparedPayload] = {}
         self._negotiation: FundingNegotiation | None = None
         self._residuals: dict[str, int] = {}
+        self._setup_deadline: float | None = None
+
+    @property
+    def has_durable_record(self) -> bool:
+        """A journal key exists before any invitation can leave this process."""
+        return self.record_key is not None
 
     def _record(self) -> RingParticipantRecord:
         if self.record_key is None:
@@ -222,13 +232,61 @@ class TakerRingCoordinator:
     def local_secret(self) -> str:
         return self._record().ring_secret
 
+    @property
+    def coordinator_keypair(self) -> RingKeyPair:
+        """A separate, durable signing identity in both taker participation modes.
+
+        Derive it from the already-persisted per-round secret rather than
+        writing a second secret into older strict participant journals. No
+        coordinator message exposes a public link to the channel key.
+        """
+        secret = bytes.fromhex(self.local_secret)
+        counter = 0
+        while True:
+            derived = hmac.digest(
+                secret,
+                b"joinmarket-ng/channel-ring/coordinator/v1" + counter.to_bytes(4, "big"),
+                "sha256",
+            )
+            try:
+                keypair = RingKeyPair.from_secret(derived)
+            except ValueError:
+                counter += 1
+                continue
+            if keypair.public_key != self.local_key:
+                return keypair
+            counter += 1
+
+    @property
+    def coordinator_key(self) -> str:
+        return self.coordinator_keypair.public_key
+
     def _sign(self, payload: RingPayloadType) -> RingPayloadType:
-        return _signed(payload, self.local_secret)
+        return _signed(payload, self.coordinator_keypair.secret_key.hex())
 
     def _set_phase(self, phase: str) -> None:
         from taker.models import TakerState
 
         self.session._taker.state = TakerState(phase)
+
+    def _start_setup_deadline(self) -> None:
+        self._setup_deadline = time.monotonic() + self.config.setup_timeout_seconds
+
+    def _bounded_setup_timeout(self, timeout: float) -> float:
+        """Return one action's timeout without exceeding ring setup's deadline."""
+        if self._setup_deadline is None:
+            raise TakerRingError("channel-ring setup deadline has not started")
+        remaining = self._setup_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TakerRingError("channel-ring setup deadline expired")
+        return min(timeout, remaining)
+
+    async def _await_setup_action(
+        self, action: Callable[[], Awaitable[Any]], timeout: float
+    ) -> Any:
+        """Run one external setup action only while the overall budget remains."""
+        action_timeout = self._bounded_setup_timeout(timeout)
+        return await asyncio.wait_for(action(), timeout=action_timeout)
 
     def _preconditions(self) -> None:
         makers = self.session.maker_sessions
@@ -245,25 +303,66 @@ class TakerRingCoordinator:
             self.chain_backend.can_get_confirmations_by_txid()
         ):
             raise TakerRingError("ring cancellation requires a full absence-proving backend")
-        if any(
-            not offer_supports_cofunded_channel_ring_v1(maker.offer) for maker in makers.values()
-        ):
-            raise TakerRingError("every selected maker must advertise cofunded_channel_ring_v1")
-        offer_types = {maker.offer.ordertype for maker in makers.values()}
+        self._freeze_authenticated_roles()
+        offer_types = {maker.offer.ordertype for maker in self._ring_sessions().values()}
         if offer_types != {self.session.config.preferred_offer_type}:
             raise TakerRingError("ring makers must use the exact preferred tr0 offer type")
+        self.session.freeze_maker_fee_plan()
+
+    def _ring_sessions(self) -> dict[str, Any]:
+        if not self.session.ring_maker_sessions:
+            raise TakerRingError("authenticated ring maker subset has not been frozen")
+        return self.session.ring_maker_sessions
+
+    def _freeze_authenticated_roles(self) -> None:
+        """Freeze exact authenticated roles before private coordination starts."""
+        if self.session.ring_maker_sessions or self.session.ordinary_maker_sessions:
+            return
+        candidates = self.session.ring_candidate_nicks
+        if not candidates:
+            # Coordinator-only callers are all-ring by construction.
+            candidates = {
+                nick
+                for nick, maker in self.session.maker_sessions.items()
+                if offer_supports_private_channel_ring(maker.offer)
+            }
+        ring = {
+            nick: self.session.maker_sessions[nick]
+            for nick in sorted(candidates)
+            if nick in self.session.maker_sessions
+            and self.session.maker_sessions[nick].responded_auth
+            and offer_supports_private_channel_ring(self.session.maker_sessions[nick].offer)
+        }
+        ordinary = {
+            nick: maker
+            for nick, maker in sorted(self.session.maker_sessions.items())
+            if nick not in candidates and maker.responded_auth
+        }
+        if len(ring) != len(candidates):
+            raise TakerRingError(
+                "authenticated ring candidate no longer advertises private_channel_ring"
+            )
+        if len(ring) < self.config.minimum_makers:
+            raise TakerRingError("fewer than the required ring-capable makers authenticated")
+        if len(ring) + len(ordinary) != len(self.session.maker_sessions):
+            raise TakerRingError("selected maker roles are not fully authenticated")
+        self.session.ring_maker_sessions = ring
+        self.session.ordinary_maker_sessions = ordinary
 
     async def _send(self, nick: str, payload: RingPayloadType) -> None:
-        maker = self.session.maker_sessions[nick]
+        maker = self._ring_sessions()[nick]
         if maker.crypto is None:
             raise TakerRingError("ring peer has no authenticated encryption session")
         encrypted = maker.crypto.encrypt(encode_ring_message(payload))
-        await self.session.directory_client.send_privmsg(
-            nick,
-            "ring",
-            encrypted,
-            log_routing=True,
-            force_channel=maker.comm_channel,
+        await self._await_setup_action(
+            lambda: self.session.directory_client.send_privmsg(
+                nick,
+                "ring",
+                encrypted,
+                log_routing=True,
+                force_channel=maker.comm_channel,
+            ),
+            self.config.phase_timeout_seconds,
         )
 
     async def _receive(
@@ -273,13 +372,18 @@ class TakerRingCoordinator:
         expected_counts: int = 1,
         timeout: float | None = None,
     ) -> dict[str, list[RingPayloadType]]:
-        nicks = list(self.session.maker_sessions)
+        nicks = list(self._ring_sessions())
         counts = {nick: expected_counts for nick in nicks} if expected_counts > 1 else None
-        responses = await self.session.directory_client.wait_for_responses(
-            expected_nicks=nicks,
-            expected_command="!ring",
-            timeout=self.config.phase_timeout_seconds if timeout is None else timeout,
-            expected_counts=counts,
+        responses = await self._await_setup_action(
+            lambda: self.session.directory_client.wait_for_responses(
+                expected_nicks=nicks,
+                expected_command="!ring",
+                timeout=self._bounded_setup_timeout(
+                    self.config.phase_timeout_seconds if timeout is None else timeout
+                ),
+                expected_counts=counts,
+            ),
+            self.config.phase_timeout_seconds if timeout is None else timeout,
         )
         result: dict[str, list[RingPayloadType]] = {}
         for nick in nicks:
@@ -293,7 +397,7 @@ class TakerRingCoordinator:
                     f"ring peer returned {len(encoded_values)} responses, "
                     f"expected {expected_counts}"
                 )
-            maker = self.session.maker_sessions[nick]
+            maker = self._ring_sessions()[nick]
             assert maker.crypto is not None
             decoded: list[RingPayloadType] = []
             for encoded in encoded_values:
@@ -323,12 +427,13 @@ class TakerRingCoordinator:
         expected_counts: int = 1,
         timeout: float | None = None,
     ) -> dict[str, list[RingPayloadType]]:
-        if set(payloads) != set(self.session.maker_sessions):
-            raise TakerRingError("ring phase payloads do not cover exactly the selected makers")
+        if set(payloads) != set(self._ring_sessions()):
+            raise TakerRingError("ring phase payloads do not cover exactly the frozen ring makers")
         await asyncio.gather(*(self._send(nick, payload) for nick, payload in payloads.items()))
         return await self._receive(expected_type, expected_counts=expected_counts, timeout=timeout)
 
     def _finalize_fees_and_inputs(self, mixdepth: int) -> tuple[int, dict[str, int]]:
+        maker_fee_plan = self.session.maker_fee_plan()
         maker_count = len(self.session.maker_sessions)
         participant_count = maker_count + 1
         input_count = len(self.session.preselected_utxos) + sum(
@@ -343,13 +448,12 @@ class TakerRingCoordinator:
             input_types=input_types,
             output_types=["p2tr"] * (2 * participant_count),
         )
-        total_maker_fee = sum(
-            calculate_cj_fee(maker.offer, self.session.cj_amount)
-            for maker in self.session.maker_sessions.values()
-        )
+        total_maker_fee = sum(maker_fee_plan.values())
         required = self.session.cj_amount + total_maker_fee + tx_fee
         selected = self.session.preselected_utxos
         if sum(utxo.value for utxo in selected) < required:
+            if self.session.strict_input_selection:
+                raise TakerRingError("Explicit input UTXOs are insufficient after negotiated fees")
             selected = self.session.wallet.select_utxos(
                 mixdepth,
                 required,
@@ -387,15 +491,29 @@ class TakerRingCoordinator:
             residuals[nick] = (
                 sum(int(utxo["value"]) for utxo in maker.utxos)
                 - self.session.cj_amount
-                + calculate_cj_fee(maker.offer, self.session.cj_amount)
+                + maker_fee_plan[nick]
                 - maker.offer.txfee
             )
         if any(value <= 0 for value in residuals.values()):
             raise TakerRingError("ring participant has no positive finalized residual")
+        for nick in self.session.ordinary_maker_sessions:
+            if residuals[nick] < DUST_THRESHOLD:
+                raise TakerRingError(
+                    f"final maker fee plan leaves ordinary maker {nick} with "
+                    f"{residuals[nick]} sats of change, below the maker change threshold "
+                    f"({DUST_THRESHOLD})"
+                )
+        local_limits = self._limits(self.initialized_backend.backend_limits)
+        local_floor = local_limits.minimum_outgoing + local_limits.minimum_incoming
+        if residuals["taker"] < local_floor:
+            raise TakerRingError(
+                "final maker fee plan leaves the taker with "
+                f"{residuals['taker']} sats, below the local channel contribution floor "
+                f"({local_floor})"
+            )
         return tx_fee, residuals
 
-    def _limits(self, participant: PrivateParticipant) -> ParticipantChannelLimits:
-        backend = participant.backend_limits
+    def _limits(self, backend: BackendLimits) -> ParticipantChannelLimits:
         return ParticipantChannelLimits(
             min_channel_capacity=backend.min_channel_capacity,
             max_channel_capacity=backend.max_channel_capacity,
@@ -419,9 +537,17 @@ class TakerRingCoordinator:
         )
 
     async def _invite(self, tx_fee: int, residuals: dict[str, int]) -> None:
+        if any(
+            utxo.mixdepth != self.initialized_backend.binding.source_mixdepth
+            for utxo in self.session.selected_utxos
+        ):
+            raise TakerRingError("ring inputs must all belong to the bound source mixdepth")
+        self._start_setup_deadline()
+        self._require_hold_budget()
         self._set_phase("ring_inviting")
         logger.info("Channel-ring phase: authenticated invitation")
         record = RingParticipantRecord.fresh(
+            node_binding=self.initialized_backend.binding,
             round_nonce=secrets.token_hex(32),
             revision=0,
             taker_session_identity=self.session_identity,
@@ -440,10 +566,12 @@ class TakerRingCoordinator:
                 RingInvitePayload(
                     round_nonce=record.round_nonce,
                     revision=record.revision,
-                    signer_key=record.ring_public_key,
+                    signer_key=self.coordinator_key,
                     network=cast(Any, self.session.config.network.value),
                     offer_type=cast(Any, self.session.config.preferred_offer_type.value),
-                    expiry=int(time.time() + self.config.phase_timeout_seconds),
+                    expiry=int(
+                        time.time() + self._bounded_setup_timeout(self.config.phase_timeout_seconds)
+                    ),
                     policy_bounds=PolicyBounds(
                         min_csv_delay=self.config.minimum_csv_delay,
                         max_csv_delay=self.config.maximum_csv_delay,
@@ -456,7 +584,7 @@ class TakerRingCoordinator:
             ),
         )
         responses = await self._exchange(
-            {nick: invite for nick in self.session.maker_sessions}, RingHelloPayload
+            {nick: invite for nick in self._ring_sessions()}, RingHelloPayload
         )
         participants = [self.initialized_backend.private_participant(record.ring_public_key)]
         for nick, items in responses.items():
@@ -478,6 +606,20 @@ class TakerRingCoordinator:
         )
         self._residuals = residuals
 
+    def _require_hold_budget(self) -> None:
+        """Reject before durable invitation when a pre-sign maker hold is too short.
+
+        Holds end when makers receive normal !tx, so normal signature collection
+        is deliberately outside this pre-invitation budget.
+        """
+        required_seconds = (
+            self.config.setup_timeout_seconds + self.config.hold_safety_margin_seconds
+        )
+        required_until = time.monotonic() + required_seconds
+        for maker in self.session.maker_sessions.values():
+            if maker.hold_deadline is None or maker.hold_deadline <= required_until:
+                raise TakerRingError("authenticated maker hold does not cover channel-ring setup")
+
     def _build_plans(self) -> tuple[dict[str, RingPlanPayload], RingPlanPayload]:
         local = self._record()
         party_id_by_key = {local.ring_public_key: "taker"}
@@ -486,7 +628,7 @@ class TakerRingCoordinator:
             RingParty(
                 party_id=party_id_by_key[participant.participant_key],
                 residual=self._residuals[party_id_by_key[participant.participant_key]],
-                limits=self._limits(participant),
+                limits=self._limits(participant.backend_limits),
             )
             for participant in self._participant_by_key.values()
         ]
@@ -518,7 +660,7 @@ class TakerRingCoordinator:
                     RingPlanPayload(
                         round_nonce=local.round_nonce,
                         revision=local.revision,
-                        signer_key=local.ring_public_key,
+                        signer_key=self.coordinator_key,
                         network=cast(Any, self.session.config.network.value),
                         offer_type=cast(Any, self.session.config.preferred_offer_type.value),
                         cycle_keys=cycle_keys,
@@ -545,6 +687,7 @@ class TakerRingCoordinator:
     def _acceptor_expectation(self, plan: RingPlanPayload) -> InboundChannelExpectation:
         edge = plan.incoming_edge
         return InboundChannelExpectation(
+            scid_alias=True,
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             opener_node_id=plan.predecessor.node_id,
             chain_hash=_chain_hash(plan.network),
@@ -603,11 +746,11 @@ class TakerRingCoordinator:
                     min_csv_delay=self.config.minimum_csv_delay,
                     max_csv_delay=self.config.maximum_csv_delay,
                 ),
-                timeout_seconds=self.config.phase_timeout_seconds,
+                timeout_seconds=self._bounded_setup_timeout(self.config.phase_timeout_seconds),
                 ready=ready,
             )
         )
-        await asyncio.wait_for(ready.wait(), self.config.open_timeout_seconds)
+        await self._await_setup_action(ready.wait, self.config.open_timeout_seconds)
         self.store.transition(record.key, RingLifecycleState.ACCEPTOR_ARMED)
         return local_plan
 
@@ -616,8 +759,11 @@ class TakerRingCoordinator:
     ) -> tuple[FundingNegotiation, AcceptorObservation]:
         if self.acceptor_task is None:
             raise TakerRingError("local incoming channel acceptor is not armed")
+        acceptor_task = self.acceptor_task
         edge = plan.outgoing_edge
+        open_timeout = self._bounded_setup_timeout(self.config.open_timeout_seconds)
         request = ExternalChannelRequest(
+            scid_alias=True,
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             peer_node_id=plan.successor.node_id,
             peer_host=plan.successor.onion_endpoint,
@@ -628,7 +774,7 @@ class TakerRingCoordinator:
             opener_csv_delay=edge.policy.opener_csv_delay,
             fundee_csv_delay=edge.policy.fundee_csv_delay,
             min_depth=edge.policy.min_depth,
-            timeout_seconds=self.config.open_timeout_seconds,
+            timeout_seconds=open_timeout,
         )
         record = self._record()
         self.store.transition(
@@ -636,8 +782,14 @@ class TakerRingCoordinator:
             RingLifecycleState.ACCEPTOR_ARMED,
             updates={"outgoing_open_started": True},
         )
-        outgoing, incoming = await asyncio.gather(
-            self.lnd.start_external_channel(request), self.acceptor_task
+        outgoing, incoming = await self._await_setup_action(
+            lambda: asyncio.gather(
+                _log_preparation_leg(
+                    "outgoing channel negotiation", self.lnd.start_external_channel(request)
+                ),
+                _log_preparation_leg("incoming channel acceptance", acceptor_task),
+            ),
+            self.config.open_timeout_seconds,
         )
         return outgoing, incoming
 
@@ -653,7 +805,7 @@ class TakerRingCoordinator:
                     RingOpenPayload(
                         round_nonce=record.round_nonce,
                         revision=record.revision,
-                        signer_key=record.ring_public_key,
+                        signer_key=self.coordinator_key,
                         plan_hash=ring_hash("plan", plans[key]).hex(),
                     )
                 ),
@@ -698,7 +850,7 @@ class TakerRingCoordinator:
         self._prepared_by_key = prepared
         self.store.transition(
             record.key,
-            RingLifecycleState.PREPARED,
+            RingLifecycleState.PREPARED_NOT_VERIFIED,
             updates={
                 "prepared_outgoing": local_prepared.outgoing,
                 "prepared_incoming": local_prepared.incoming,
@@ -742,17 +894,22 @@ class TakerRingCoordinator:
     def _transaction_plan(self) -> FinalizedRingTransactionPlan:
         record = self._record()
         assert record.plan is not None
-        participant_ids = [
+        ring_participant_ids = [
             "taker" if key == record.ring_public_key else self._peer_by_key[key]
             for key in record.plan.cycle_keys
+        ]
+        participant_ids = [
+            "taker",
+            *sorted(self._ring_sessions()),
+            *sorted(self.session.ordinary_maker_sessions),
         ]
         outputs: list[FinalizedRingChannelOutput] = []
         for index, opener_key in enumerate(record.plan.cycle_keys):
             fundee_key = record.plan.cycle_keys[(index + 1) % len(record.plan.cycle_keys)]
             edge = record.coordinator_plans[opener_key].outgoing_edge
             prepared = self._prepared_by_key[opener_key].outgoing
-            opener_id = participant_ids[index]
-            fundee_id = participant_ids[(index + 1) % len(participant_ids)]
+            opener_id = ring_participant_ids[index]
+            fundee_id = ring_participant_ids[(index + 1) % len(ring_participant_ids)]
             outputs.append(
                 FinalizedRingChannelOutput(
                     edge_id=edge.edge_id,
@@ -778,18 +935,28 @@ class TakerRingCoordinator:
                 participant_id: self._residuals[participant_id]
                 for participant_id in participant_ids
             },
+            ring_participant_ids=ring_participant_ids,
             channel_outputs=outputs,
+            ordinary_maker_changes={
+                nick: FinalizedOrdinaryMakerChange(
+                    address=maker.change_address,
+                    script_pubkey=address_to_scriptpubkey(maker.change_address).hex(),
+                    amount=self._residuals[nick],
+                )
+                for nick, maker in self.session.ordinary_maker_sessions.items()
+            },
         )
 
     def _build_unsigned(
         self, destination: str, tx_fee: int
     ) -> tuple[RingUnsignedPayload, list[WitnessUtxo]]:
+        maker_fee_plan = self.session.maker_fee_plan()
         maker_data = {
             nick: {
                 "utxos": maker.utxos,
                 "cj_addr": maker.cj_address,
                 "change_addr": maker.change_address,
-                "cjfee": calculate_cj_fee(maker.offer, self.session.cj_amount),
+                "cjfee": maker_fee_plan[nick],
                 "txfee": maker.offer.txfee,
             }
             for nick, maker in self.session.maker_sessions.items()
@@ -897,7 +1064,7 @@ class TakerRingCoordinator:
                 RingUnsignedPayload(
                     round_nonce=record.round_nonce,
                     revision=record.revision,
-                    signer_key=record.ring_public_key,
+                    signer_key=self.coordinator_key,
                     unsigned_tx=unsigned.hex(),
                     psbt=base64.b64encode(psbt).decode("ascii"),
                     manifest=manifest,
@@ -1014,17 +1181,39 @@ class TakerRingCoordinator:
     async def _verify_local(
         self, unsigned: RingUnsignedPayload, witnesses: list[WitnessUtxo]
     ) -> tuple[ReadinessState, ReadinessState]:
-        if self._negotiation is None:
+        negotiation = self._negotiation
+        if negotiation is None:
             raise TakerRingError("local outgoing funding negotiation is missing")
         outgoing_expected, incoming_expected = self._pending_expectations(unsigned.manifest)
-        verified = await self.lnd.verify_external_funding(
-            self._negotiation,
-            unsigned.unsigned_tx,
-            unsigned.manifest.unsigned_txid,
-            int(outgoing_expected.channel_point.rpartition(":")[2]),
-            witnesses,
-            timeout_seconds=self.config.readiness_timeout_seconds,
+        expected_psbt, expected_txid = build_unsigned_psbt(unsigned.unsigned_tx, witnesses)
+        if expected_txid != unsigned.manifest.unsigned_txid:
+            raise TakerRingError("ring unsigned transaction differs from funding manifest")
+        record = self._record()
+        # Persist the exact candidate before LND can consume the funding shim.
+        # An interrupted verification is unresolved, never safe to shim-cancel.
+        self.store.transition(
+            record.key,
+            RingLifecycleState.VERIFYING,
+            updates={
+                "unsigned_psbt": expected_psbt.hex(),
+                "unsigned_tx": unsigned.unsigned_tx,
+                "manifest": unsigned.manifest,
+                "chain_status": RingChainStatus(exact_txid=unsigned.manifest.unsigned_txid),
+            },
         )
+        verified = await self._await_setup_action(
+            lambda: self.lnd.verify_external_funding(
+                negotiation,
+                unsigned.unsigned_tx,
+                unsigned.manifest.unsigned_txid,
+                int(outgoing_expected.channel_point.rpartition(":")[2]),
+                witnesses,
+                timeout_seconds=self._bounded_setup_timeout(self.config.readiness_timeout_seconds),
+            ),
+            self.config.readiness_timeout_seconds,
+        )
+        if verified.unsigned_psbt != expected_psbt:
+            raise TakerRingError("LND returned a different unsigned funding PSBT")
         # Persist the PsbtVerify boundary before either endpoint observation.
         # From this point onward cancellation requires exact chain absence and
         # verified-channel abandonment for both local endpoint records.
@@ -1057,17 +1246,21 @@ class TakerRingCoordinator:
                 "chain_status": RingChainStatus(exact_txid=unsigned.manifest.unsigned_txid),
             },
         )
-        outgoing_observation, incoming_observation = await asyncio.gather(
-            self.lnd.pending_channel_observation(
-                outgoing_expected,
-                LndEndpointRole.OPENER,
-                timeout_seconds=self.config.readiness_timeout_seconds,
+        readiness_timeout = self._bounded_setup_timeout(self.config.readiness_timeout_seconds)
+        outgoing_observation, incoming_observation = await self._await_setup_action(
+            lambda: asyncio.gather(
+                self.lnd.pending_channel_observation(
+                    outgoing_expected,
+                    LndEndpointRole.OPENER,
+                    timeout_seconds=readiness_timeout,
+                ),
+                self.lnd.pending_channel_observation(
+                    incoming_expected,
+                    LndEndpointRole.FUNDEE,
+                    timeout_seconds=readiness_timeout,
+                ),
             ),
-            self.lnd.pending_channel_observation(
-                incoming_expected,
-                LndEndpointRole.FUNDEE,
-                timeout_seconds=self.config.readiness_timeout_seconds,
-            ),
+            self.config.readiness_timeout_seconds,
         )
         for observation, expected in (
             (outgoing_observation, outgoing_expected),
@@ -1160,7 +1353,7 @@ class TakerRingCoordinator:
         self._set_phase("ring_verifying")
         logger.info("Channel-ring phase: exact funding verification")
         record = self._record()
-        payloads = {nick: unsigned for nick in self.session.maker_sessions}
+        payloads = {nick: unsigned for nick in self._ring_sessions()}
         local_task = asyncio.create_task(self._verify_local(unsigned, witnesses))
         remote_task = asyncio.create_task(
             self._exchange(
@@ -1206,14 +1399,14 @@ class TakerRingCoordinator:
                 RingReadySetPayload(
                     round_nonce=record.round_nonce,
                     revision=record.revision,
-                    signer_key=record.ring_public_key,
+                    signer_key=self.coordinator_key,
                     manifest=unsigned.manifest,
                     attestations=list(readiness),
                 )
             ),
         )
         ready_acks = await self._exchange(
-            {nick: ready_set for nick in self.session.maker_sessions}, RingReadySetAckPayload
+            {nick: ready_set for nick in self._ring_sessions()}, RingReadySetAckPayload
         )
         acknowledged: list[str] = []
         for items in ready_acks.values():
@@ -1233,7 +1426,7 @@ class TakerRingCoordinator:
                 RingSignPayload(
                     round_nonce=record.round_nonce,
                     revision=record.revision,
-                    signer_key=record.ring_public_key,
+                    signer_key=self.coordinator_key,
                     manifest_hash=manifest_hash(unsigned.manifest).hex(),
                     unsigned_tx_hash=unsigned.manifest.unsigned_tx_hash,
                 )
@@ -1248,7 +1441,7 @@ class TakerRingCoordinator:
         logger.info("Channel-ring phase: durable signing authorization")
         self.sign_authorized = True
         sign_acks = await self._exchange(
-            {nick: sign for nick in self.session.maker_sessions}, RingSignAckPayload
+            {nick: sign for nick in self._ring_sessions()}, RingSignAckPayload
         )
         signed_keys: list[str] = []
         for items in sign_acks.values():
@@ -1348,6 +1541,9 @@ class TakerRingCoordinator:
     async def cancel(self, reason_code: str) -> None:
         """Best-effort signed peer cancellation plus mandatory safe local retirement."""
 
+        # Cleanup must remain possible after the preparation window expires.
+        self._setup_deadline = float("inf")
+
         record = self._record()
         if (
             record.state
@@ -1369,7 +1565,7 @@ class TakerRingCoordinator:
                 RingCancelPayload(
                     round_nonce=record.round_nonce,
                     revision=record.revision,
-                    signer_key=record.ring_public_key,
+                    signer_key=self.coordinator_key,
                     reason_code=reason_code,
                     canceled_pending_ids=sorted(
                         {
@@ -1382,7 +1578,7 @@ class TakerRingCoordinator:
         )
         # Every selected maker was reached by the invitation send, even when a
         # missing hello prevented its fresh participant key from being learned.
-        reached = {nick: cancel for nick in self.session.maker_sessions}
+        reached = {nick: cancel for nick in self._ring_sessions()}
         if reached:
             try:
                 responses = await self._exchange(reached, RingCancelPayload)
@@ -1445,9 +1641,29 @@ class TakerRingCoordinator:
         )
 
 
+_T = TypeVar("_T")
+
+
+async def _log_preparation_leg(label: str, leg: Awaitable[_T]) -> _T:
+    """Log which private-channel preparation leg finished or stalled, and when."""
+    started = time.monotonic()
+    try:
+        result = await leg
+    except BaseException as exc:
+        logger.warning(
+            "Channel-ring {} failed after {:.0f}s: {}",
+            label,
+            time.monotonic() - started,
+            type(exc).__name__,
+        )
+        raise
+    logger.info("Channel-ring {} ready after {:.0f}s", label, time.monotonic() - started)
+    return result
+
+
 async def reconcile_taker_ring_records(
     store: RingParticipantStore,
-    initialized_backend: InitializedChannelRingBackend,
+    nodes: ChannelRingNodePool,
     chain_backend: BlockchainBackend,
     acceptor_tasks: dict[str, asyncio.Task[object]] | None = None,
     *,
@@ -1468,6 +1684,7 @@ async def reconcile_taker_ring_records(
     for record in report.records:
         if not record.active:
             continue
+        initialized_backend = nodes.for_binding(record.node_binding)
         stranded = (
             record.taker_session_identity not in active_session_identities
             and record.state in _UNRESUMABLE_NEGOTIATION_STATES
@@ -1486,6 +1703,7 @@ async def reconcile_taker_ring_records(
                     task = asyncio.create_task(
                         initialized_backend.backend.run_channel_acceptor(
                             InboundChannelExpectation(
+                                scid_alias=True,
                                 pending_channel_id=bytes.fromhex(
                                     plan.incoming_edge.pending_channel_id
                                 ),
@@ -1506,7 +1724,7 @@ async def reconcile_taker_ring_records(
                     if acceptor_tasks is not None:
                         acceptor_tasks[task_key] = task
             if record.plan is not None and record.state in {
-                RingLifecycleState.PREPARED,
+                RingLifecycleState.PREPARED_NOT_VERIFIED,
                 RingLifecycleState.PSBT_VERIFIED,
                 RingLifecycleState.READY,
                 RingLifecycleState.SIGNING,
@@ -1514,6 +1732,7 @@ async def reconcile_taker_ring_records(
                 plan = record.plan
                 initialized_backend.backend.resume_inbound_channel(
                     InboundChannelExpectation(
+                        scid_alias=True,
                         pending_channel_id=bytes.fromhex(plan.incoming_edge.pending_channel_id),
                         opener_node_id=plan.predecessor.node_id,
                         chain_hash=_chain_hash(plan.network),

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from jmcore.channel_ring import ChannelRingConfig
-from jmcore.channel_ring_store import RingParticipantStore
+from jmcore.channel_ring_store import RingParticipantRecord, RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
@@ -81,7 +81,7 @@ from maker.rate_limiting import (
 if TYPE_CHECKING:
     # A maker without a prepared channel buyout or ring never imports jmswap at
     # runtime.
-    from jmswap.channel_ring import InitializedChannelRingBackend
+    from jmswap.channel_ring_nodes import ChannelRingNodePool
     from jmswap.coinjoin_funding import ChannelBuyout
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
@@ -189,7 +189,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             neutrino_compat=backend.can_provide_neutrino_metadata(),
         )
         self.channel_ring_capability_validated = False
-        self._channel_ring_backend: InitializedChannelRingBackend | None = None
+        self._channel_ring_nodes: ChannelRingNodePool | None = None
         self._channel_ring_store: RingParticipantStore | None = None
         self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
         if isinstance(config.channel_ring, ChannelRingConfig) and config.channel_ring.enabled:
@@ -215,6 +215,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.current_block_height: int = 0  # Cached block height for bond proof generation
 
         self.running = False
+        self._stopping = False
+        self._session_handler_tasks: set[asyncio.Task[None]] = set()
         self.listen_tasks: list[asyncio.Task[None]] = []
         self._session_cleanup_task: asyncio.Task[None] | None = None
         self._session_handler_task_count = 0
@@ -1384,21 +1386,29 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # Determine the onion address to advertise
             onion_host = self.config.onion_host
 
-            if self.config.channel_ring.enabled:
-                from jmswap.channel_ring import initialize_channel_ring_backend
+            if self.config.channel_ring.enabled or self.config.channel_ring.nodes:
+                from jmswap.channel_ring_nodes import (
+                    channel_ring_wallet_identity,
+                    initialize_channel_ring_nodes,
+                )
 
                 offer_type = self.config.get_effective_offer_configs()[0].offer_type.value
-                self._channel_ring_backend = await initialize_channel_ring_backend(
+                self._channel_ring_nodes = await initialize_channel_ring_nodes(
                     self.config.channel_ring,
                     network=self.config.network.value,
                     offer_type=offer_type,
+                    wallet_identity=channel_ring_wallet_identity(
+                        self.wallet.master_key.get_public_key_bytes()
+                    ),
+                    mixdepth_count=self.wallet.mixdepth_count,
+                    data_directory=self.config.data_dir or get_default_data_dir(),
                 )
-                assert self._channel_ring_store is not None
+                self._channel_ring_store = self._channel_ring_nodes.store
                 from maker.channel_ring import reconcile_ring_records
 
-                await reconcile_ring_records(
+                expired_invites = await reconcile_ring_records(
                     self._channel_ring_store,
-                    self._channel_ring_backend,
+                    self._channel_ring_nodes,
                     self.backend,
                     self._channel_ring_recovery_tasks,
                     acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
@@ -1406,6 +1416,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 report = self._channel_ring_store.load_all()
                 if not self._renew_channel_ring_input_locks():
                     raise RuntimeError("could not restore an active channel-ring input reservation")
+                self._release_expired_invite_inputs(expired_invites)
+                if self.config.channel_ring.enabled:
+                    await self._channel_ring_nodes.enable_funding()
                 active = sum(record.active for record in report.records)
                 verified = sum(record.verified_unresolved for record in report.records)
                 capacity_available = (
@@ -1413,13 +1426,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     and active < self.config.channel_ring.max_active_sessions
                     and verified < self.config.channel_ring.max_verified_sessions
                 )
-                if capacity_available:
+                if capacity_available and self.config.channel_ring.enabled:
                     self.channel_ring_capability_validated = True
-                    self._directory_pool.enable_cofunded_channel_ring_v1()
-                    logger.info("Validated co-funded channel-ring LND backend")
+                    self._directory_pool.enable_private_channel_ring()
+                    logger.info("Validated private channel-ring LND backend")
                 else:
                     logger.warning(
-                        "Co-funded channel ring is not advertised: durable participant "
+                        "Private channel ring is not advertised: durable participant "
                         "capacity is exhausted or records are corrupt"
                     )
 
@@ -1493,7 +1506,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 )
                 self.listen_tasks.append(self._tor_onion_monitor_task)
 
-            if self._channel_ring_backend is not None and self._channel_ring_store is not None:
+            if self._channel_ring_nodes is not None and self._channel_ring_store is not None:
                 ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
                 self.listen_tasks.append(ring_task)
 
@@ -1520,7 +1533,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
     async def stop(self) -> None:
         """Stop the maker bot"""
         logger.info("Stopping maker bot...")
+        self._stopping = True
         self.running = False
+        ring_sessions = list(self.active_sessions.values())
         # Either task may be mid-rotation; cancel both so rollback runs first.
         for rotation_task in (self._identity_renewal_task, self._tor_onion_monitor_task):
             if rotation_task is not None:
@@ -1575,6 +1590,33 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             _, pending_listeners = await asyncio.wait(set(self.listen_tasks), timeout=2.0)
             for listener_task in pending_listeners:
                 listener_task.cancel()
+        if self._channel_ring_nodes is not None:
+            # A bounded shutdown must not hand the journal lease to another
+            # process while cancellation-suppressing writers are still alive.
+            producers = set(self.listen_tasks) | set(expiration_tasks)
+            if cleanup_task is not None:
+                producers.add(cleanup_task)
+            if producers:
+                await asyncio.gather(*producers, return_exceptions=True)
+            # Dispatcher cancellation can register detached handlers during
+            # that await. Direct-connection handlers are tracked too, even
+            # before their dispatcher detaches them.
+            ring_writers = self._session_handler_tasks | self._detached_handler_tasks
+            for writer in ring_writers:
+                if not writer.done():
+                    writer.cancel()
+            if ring_writers:
+                await asyncio.gather(*ring_writers, return_exceptions=True)
+            ring_acceptors = [
+                session.ring_participant.acceptor_task
+                for session in ring_sessions
+                if session.ring_participant is not None
+                and session.ring_participant.acceptor_task is not None
+            ]
+            for acceptor in ring_acceptors:
+                acceptor.cancel()
+            if ring_acceptors:
+                await asyncio.gather(*ring_acceptors, return_exceptions=True)
         self.listen_tasks.clear()
         self._session_cleanup_task = None
         if self._channel_ring_recovery_tasks:
@@ -1583,9 +1625,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             )
             self._channel_ring_recovery_tasks.clear()
 
-        if self._channel_ring_backend is not None:
-            await self._channel_ring_backend.backend.close()
-            self._channel_ring_backend = None
+        if self._channel_ring_nodes is not None:
+            await self._channel_ring_nodes.close()
+            self._channel_ring_nodes = None
             self.channel_ring_capability_validated = False
 
         # Close every generation. The compatibility aliases point at the
@@ -1613,6 +1655,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """Stop listener tasks so ``start`` can propagate a fatal background error."""
         if self._fatal_error is None:
             self._fatal_error = error
+        # Merely clearing ``running`` does not prevent an already-connected
+        # taker from entering a fill handler before the listeners unwind.
+        self._stopping = True
         self.running = False
 
         current_task = asyncio.current_task()
@@ -1624,27 +1669,51 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         from maker.channel_ring import reconcile_ring_records
 
         while self.running:
-            assert self._channel_ring_store is not None
-            assert self._channel_ring_backend is not None
-            active_identities = frozenset(
-                f"{session.taker_nick}:{session.commitment.hex()}"
-                for session in self.active_sessions.values()
-            )
-            await reconcile_ring_records(
-                self._channel_ring_store,
-                self._channel_ring_backend,
-                self.backend,
-                self._channel_ring_recovery_tasks,
-                acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
-                active_session_identities=active_identities,
-            )
-            if not self._renew_channel_ring_input_locks():
+            try:
+                assert self._channel_ring_store is not None
+                assert self._channel_ring_nodes is not None
+                active_identities = frozenset(
+                    f"{session.taker_nick}:{session.commitment.hex()}"
+                    for session in self.active_sessions.values()
+                )
+                expired_invites = await reconcile_ring_records(
+                    self._channel_ring_store,
+                    self._channel_ring_nodes,
+                    self.backend,
+                    self._channel_ring_recovery_tasks,
+                    acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                    active_session_identities=active_identities,
+                )
+                if not self._renew_channel_ring_input_locks():
+                    raise RuntimeError("channel-ring input reservation renewal failed")
+                self._release_expired_invite_inputs(expired_invites)
+            except Exception as exc:
                 self.channel_ring_capability_validated = False
-                logger.error(
-                    "Disabled channel-ring participation: input reservation renewal failed"
+                logger.error("Stopping maker: channel-ring input safety check failed")
+                logger.bind(sensitive=True).error("Channel-ring recovery failure: {}", exc)
+                self._abort_for_fatal_error(
+                    RuntimeError(
+                        "channel-ring input safety check failed; operator recovery required"
+                    )
                 )
                 return
             await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
+
+    def _release_expired_invite_inputs(
+        self, expired_invites: tuple[RingParticipantRecord, ...]
+    ) -> None:
+        """Release owner-qualified leases of invitations retired before planning.
+
+        The ring store refuses two active records sharing an input, and an
+        owner-qualified release never touches a lease another session holds.
+        """
+        for record in expired_invites:
+            if record.input_lock_owner is None or not record.local_input_outpoints:
+                continue
+            self.wallet.release_coinjoin_inputs(
+                {(item.txid, item.vout) for item in record.local_input_outpoints},
+                owner=record.input_lock_owner,
+            )
 
     def _renew_channel_ring_input_locks(self) -> bool:
         """Keep the wallet leases of active durable ring records alive.

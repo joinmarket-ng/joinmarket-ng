@@ -19,6 +19,10 @@ the user has configured the standalone ``maker`` bot:
    bond itself is the strongest cross-phase fingerprint and must be
    suppressed explicitly.
 
+3. **No new channel rings.** Reusing an LND identity across transient maker
+   phases would correlate their wallet inputs. Keep the node mappings and
+   journal paths for recovery of any already-open rounds.
+
 Multi-offer (``offer_configs``) is also cleared so the absolute-fee policy
 is not silently overridden by ``MakerConfig.get_effective_offers``.
 """
@@ -48,6 +52,10 @@ def apply_tumbler_maker_policy(config: MakerConfig) -> MakerConfig:
     # a tumbler-controlled session and then mentioning that value in docs.
     config.cj_fee_relative = "0.001"
     config.no_fidelity_bond = True
+    # Disabling only new funding preserves configured nodes and paths: maker
+    # startup still quarantines unresolved ring journals and renews their input
+    # locks. Clearing the topology would skip that recovery entirely.
+    config.channel_ring = config.channel_ring.model_copy(update={"enabled": False})
     # Multi-offer takes precedence over the single-offer fields when
     # non-empty (see ``MakerConfig.get_effective_offers``); a non-empty
     # list would silently re-introduce the user's relative-fee or

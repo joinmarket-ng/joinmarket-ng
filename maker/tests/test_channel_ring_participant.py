@@ -19,13 +19,14 @@ from jmcore.bitcoin import (
     scriptpubkey_to_address,
     serialize_transaction,
 )
-from jmcore.channel_ring import ChannelRingConfig
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig, RingNodeBinding
 from jmcore.channel_ring_store import (
     Outpoint,
     RingLifecycleState,
     RingParticipantRecord,
     RingParticipantRole,
     RingParticipantStore,
+    RingRetirementAction,
 )
 from jmcore.cofunded_ring import (
     BackendLimits,
@@ -59,7 +60,7 @@ from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.models import Offer, OfferType
 from jmcore.network import ONION_HOSTID
 from jmcore.protocol import parse_jm_message
-from jmswap.channel_ring import InitializedChannelRingBackend
+from jmswap.channel_ring_nodes import BoundChannelRingNode
 from jmswap.lnd import (
     AcceptorObservation,
     FundingNegotiation,
@@ -150,13 +151,20 @@ def _participant(key: str, node: str) -> PrivateParticipant:
     )
 
 
-def _config(tmp_path: Path) -> ChannelRingConfig:
+def _config(tmp_path: Path, *, minimum_makers: int = 3) -> ChannelRingConfig:
     return ChannelRingConfig(
         enabled=True,
-        lnd_grpc_url="https://127.0.0.1:10009",
-        lnd_tls_cert_path=tmp_path / "tls.cert",
-        lnd_macaroon_path=tmp_path / "admin.macaroon",
-        onion_endpoint=ONION,
+        nodes={
+            "local": ChannelRingNodeConfig(
+                lnd_grpc_url="https://127.0.0.1:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint=ONION,
+            )
+        },
+        mixdepth_nodes={0: "local"},
+        node_binding_directory=tmp_path / "node-bindings",
+        minimum_makers=minimum_makers,
         min_channel_capacity=500_000,
         max_channel_capacity=2_000_000,
         max_push=499_999,
@@ -172,6 +180,25 @@ def _config(tmp_path: Path) -> ChannelRingConfig:
         readiness_timeout_seconds=10.0,
         persistence_directory=tmp_path / "rings",
     )
+
+
+def _binding() -> RingNodeBinding:
+    return RingNodeBinding(
+        network="regtest",
+        wallet_identity="00" * 32,
+        source_mixdepth=0,
+        node_name="local",
+        local_node_id=LOCAL_NODE,
+    )
+
+
+class FakeNodePool:
+    def __init__(self, node: BoundChannelRingNode) -> None:
+        self.node = node
+
+    def for_binding(self, binding: RingNodeBinding) -> BoundChannelRingNode:
+        assert binding == self.node.binding
+        return self.node
 
 
 class FakeLnd:
@@ -337,8 +364,8 @@ class FakeChain:
 
 
 class Harness:
-    def __init__(self, tmp_path: Path) -> None:
-        self.config = _config(tmp_path)
+    def __init__(self, tmp_path: Path, *, minimum_makers: int = 3) -> None:
+        self.config = _config(tmp_path, minimum_makers=minimum_makers)
         self.lnd = FakeLnd()
         self.chain = FakeChain()
         self.store = RingParticipantStore(
@@ -382,7 +409,8 @@ class Harness:
             confirmations=local_utxo.confirmations,
             scriptpubkey=local_utxo.scriptpubkey,
         )
-        self.initialized = InitializedChannelRingBackend(
+        self.initialized = BoundChannelRingNode(
+            binding=_binding(),
             backend=self.lnd,  # type: ignore[arg-type]
             node_info=LndNodeInfo(
                 identity_pubkey=LOCAL_NODE,
@@ -403,6 +431,7 @@ class Harness:
             initialized_backend=self.initialized,
             chain_backend=self.chain,  # type: ignore[arg-type]
         )
+        self.nodes = FakeNodePool(self.initialized)
         self.taker_secret = _secret(10)
         self.taker_key = _key(10)
         self.other_secrets = {_key(index): _secret(index) for index in (10, 12, 13)}
@@ -433,9 +462,11 @@ class Harness:
     def record(self) -> Any:
         return self.machine._record()
 
-    def plan(self, *, residual: int = 1_000_000) -> RingPlanPayload:
+    def plan(self, *, residual: int = 1_000_000, three_members: bool = False) -> RingPlanPayload:
         local = self.record().ring_public_key
-        cycle = [self.taker_key, local, _key(12), _key(13)]
+        cycle = [self.taker_key, local, _key(12)]
+        if not three_members:
+            cycle.append(_key(13))
         return self.signed(
             RingPlanPayload(
                 round_nonce="aa" * 32,
@@ -609,6 +640,40 @@ class Harness:
 @pytest.fixture
 def harness(tmp_path: Path) -> Harness:
     return Harness(tmp_path)
+
+
+async def test_explicit_four_member_policy_rejects_three_member_plan(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, minimum_makers=4)
+    await harness.machine.handle(harness.invite())
+    with pytest.raises(MakerRingError, match="too few channel participants"):
+        await harness.machine.handle(harness.plan(three_members=True))
+    assert harness.record().state is RingLifecycleState.INVITED
+
+
+async def test_default_maker_accepts_three_member_cycle(harness: Harness) -> None:
+    await harness.machine.handle(harness.invite())
+    acknowledgments = await harness.machine.handle(harness.plan(three_members=True))
+    assert acknowledgments[0].plan_hash
+    assert harness.record().state is RingLifecycleState.ACCEPTOR_ARMED
+
+
+async def test_maker_accepts_distinct_coordinator_and_endpoint_keys(harness: Harness) -> None:
+    coordinator_secret = _secret(14)
+    coordinator_key = _key(14)
+    invite = RingInvitePayload.model_validate(
+        {**harness.invite().model_dump(), "signer_key": coordinator_key}
+    )
+    await harness.machine.handle(sign_payload(invite, coordinator_secret))
+
+    old_plan = harness.plan()
+    with pytest.raises(MakerRingError, match="bound taker key"):
+        await harness.machine.handle(old_plan)
+
+    plan = RingPlanPayload.model_validate({**old_plan.model_dump(), "signer_key": coordinator_key})
+    acknowledgments = await harness.machine.handle(sign_payload(plan, coordinator_secret))
+    assert acknowledgments[0].plan_hash
+    assert coordinator_key not in plan.cycle_keys
+    assert harness.record().state is RingLifecycleState.ACCEPTOR_ARMED
 
 
 async def test_complete_participant_flow_and_signature_persistence(harness: Harness) -> None:
@@ -898,13 +963,33 @@ async def test_partial_psbt_verification_requires_verified_retirement(harness: H
     assert len(harness.lnd.retired) == 2
 
 
+async def test_interrupted_psbt_verification_retains_uncertain_intent(harness: Harness) -> None:
+    await harness.through_open()
+    unsigned = await harness.unsigned()
+
+    async def fail_verify(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError("connection lost during PsbtVerify")
+
+    harness.lnd.verify_external_funding = fail_verify  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="connection lost during PsbtVerify"):
+        await harness.machine.handle(unsigned)
+
+    intent = harness.record()
+    assert intent.state is RingLifecycleState.VERIFYING
+    assert intent.manifest == unsigned.manifest
+    assert intent.unsigned_psbt is not None
+    assert intent.retirement_action() is RingRetirementAction.BLOCKED
+    assert harness.lnd.canceled == []
+
+
 async def test_restart_rehydrates_prepared_and_rebroadcasts_exact_final_tx(
     harness: Harness,
 ) -> None:
     await harness.through_open()
     await reconcile_ring_records(
         harness.store,
-        harness.initialized,
+        harness.nodes,
         harness.chain,  # type: ignore[arg-type]
         {},
     )
@@ -930,7 +1015,7 @@ async def test_restart_rehydrates_prepared_and_rebroadcasts_exact_final_tx(
     await harness.machine.observe_final_transaction(unsigned.unsigned_tx)
     await reconcile_ring_records(
         harness.store,
-        harness.initialized,
+        harness.nodes,
         harness.chain,  # type: ignore[arg-type]
         {},
     )
@@ -944,7 +1029,7 @@ async def test_restart_rehydrates_prepared_and_rebroadcasts_exact_final_tx(
     )
     await reconcile_ring_records(
         harness.store,
-        harness.initialized,
+        harness.nodes,
         harness.chain,  # type: ignore[arg-type]
         {},
     )
@@ -975,7 +1060,7 @@ async def test_reconcile_escalation_skips_live_sessions(harness: Harness) -> Non
     # A record belonging to a live in-process session is resumed but not escalated.
     await reconcile_ring_records(
         harness.store,
-        harness.initialized,
+        harness.nodes,
         harness.chain,  # type: ignore[arg-type]
         {},
         active_session_identities=frozenset({live.taker_session_identity}),
@@ -985,7 +1070,7 @@ async def test_reconcile_escalation_skips_live_sessions(harness: Harness) -> Non
     # The same record with no live session is restart wreckage and escalates.
     await reconcile_ring_records(
         harness.store,
-        harness.initialized,
+        harness.nodes,
         harness.chain,  # type: ignore[arg-type]
         {},
     )
@@ -1005,7 +1090,7 @@ async def test_reconcile_rearms_acceptor_with_configured_timeout(harness: Harnes
     tasks: dict[str, asyncio.Task[object]] = {}
     await reconcile_ring_records(
         harness.store,
-        harness.initialized,
+        harness.nodes,
         harness.chain,  # type: ignore[arg-type]
         tasks,
         acceptor_timeout_seconds=123.0,
@@ -1039,7 +1124,7 @@ async def test_encrypted_ring_dispatch_requires_ioauth_and_enabled_validated_fea
     bot = SimpleNamespace(
         config=SimpleNamespace(channel_ring=SimpleNamespace(enabled=enabled)),
         channel_ring_capability_validated=validated,
-        _channel_ring_backend=None,
+        _channel_ring_nodes=None,
         _channel_ring_store=None,
     )
     await session.on_ring(bot, "ring ciphertext", "dir:test")  # type: ignore[arg-type]
@@ -1104,7 +1189,7 @@ async def test_signed_ring_dispatch_replies_only_on_source_channel(
     bot = SimpleNamespace(
         config=SimpleNamespace(channel_ring=SimpleNamespace(enabled=True)),
         channel_ring_capability_validated=True,
-        _channel_ring_backend=object(),
+        _channel_ring_nodes=object(),
         _channel_ring_store=object(),
         directory_clients={"selected": selected, "other": other},
         direct_connections={taker_identity.nick: direct},
@@ -1187,7 +1272,7 @@ async def test_ring_cancel_releases_coinjoin_input_locks(harness: Harness, activ
     bot = SimpleNamespace(
         config=SimpleNamespace(channel_ring=SimpleNamespace(enabled=True)),
         channel_ring_capability_validated=True,
-        _channel_ring_backend=object(),
+        _channel_ring_nodes=object(),
         _channel_ring_store=object(),
         directory_clients={"selected": selected},
         direct_connections={},
@@ -1309,6 +1394,7 @@ def _ring_record(
     nonce_byte: str = "11",
 ) -> RingParticipantRecord:
     return RingParticipantRecord.fresh(
+        node_binding=_binding(),
         round_nonce=nonce_byte * 32,
         revision=0,
         taker_session_identity="taker:ring-session",
@@ -1327,6 +1413,111 @@ def _lock_state(bot: MakerBot, outpoint: Outpoint) -> tuple[str | None, float | 
     if record is None:
         return (None, None)
     return (record.lock_owner, record.lock_until)
+
+
+async def test_preparation_leg_log_preserves_result_and_error() -> None:
+    from maker.channel_ring import _log_preparation_leg
+
+    async def ready() -> str:
+        return "negotiated"
+
+    async def stalled() -> str:
+        raise TimeoutError
+
+    assert await _log_preparation_leg("outgoing channel negotiation", ready()) == "negotiated"
+    with pytest.raises(TimeoutError):
+        await _log_preparation_leg("incoming channel acceptance", stalled())
+
+
+def _invite_record(
+    outpoint: Outpoint, owner: str, nonce_byte: str, age: float
+) -> RingParticipantRecord:
+    return RingParticipantRecord.fresh(
+        node_binding=_binding(),
+        round_nonce=nonce_byte * 32,
+        revision=0,
+        taker_session_identity="taker:ring-session",
+        local_role=RingParticipantRole.MAKER,
+        local_position=1,
+        local_input_outpoints=(outpoint,),
+        input_lock_owner=owner,
+        now=time.time() - age,
+    )
+
+
+async def _expire_invites(
+    bot: MakerBot, active: frozenset[str] = frozenset()
+) -> tuple[RingParticipantRecord, ...]:
+    assert bot._channel_ring_store is not None
+    nodes = SimpleNamespace(for_binding=lambda _binding: SimpleNamespace(backend=None))
+    expired = await reconcile_ring_records(
+        bot._channel_ring_store,
+        nodes,  # type: ignore[arg-type]
+        SimpleNamespace(),  # type: ignore[arg-type]
+        {},
+        acceptor_timeout_seconds=60,
+        active_session_identities=active,
+    )
+    assert bot._renew_channel_ring_input_locks()
+    bot._release_expired_invite_inputs(expired)
+    return expired
+
+
+@pytest.mark.parametrize(
+    ("age", "active", "expires"),
+    [
+        (120.0, frozenset(), True),
+        (10.0, frozenset(), False),
+        (120.0, frozenset({"taker:ring-session"}), False),
+    ],
+)
+async def test_abandoned_invite_expires_and_releases_owned_inputs(
+    tmp_path: Path, age: float, active: frozenset[str], expires: bool
+) -> None:
+    outpoint = Outpoint(txid="0b" * 32, vout=0)
+    owner = "maker:abandoned-invite"
+    record = _invite_record(outpoint, owner, "21", age)
+    bot = _ring_lock_bot(tmp_path, (record,))
+    assert bot.wallet.reserve_coinjoin_inputs({(outpoint.txid, outpoint.vout)}, 60, owner)
+
+    expired = await _expire_invites(bot, active)
+
+    assert bot._channel_ring_store is not None
+    stored = bot._channel_ring_store.load(record.key)
+    assert stored is not None
+    if expires:
+        assert [item.key for item in expired] == [record.key]
+        assert stored.state is RingLifecycleState.RETIRED
+        assert _lock_state(bot, outpoint)[0] is None
+        # Retirement is terminal; a later pass neither re-expires nor re-locks.
+        assert await _expire_invites(bot) == ()
+        assert _lock_state(bot, outpoint)[0] is None
+    else:
+        assert expired == ()
+        assert stored.state is RingLifecycleState.INVITED
+        assert _lock_state(bot, outpoint)[0] == owner
+
+
+async def test_expired_invite_never_releases_another_owners_lease(tmp_path: Path) -> None:
+    outpoint = Outpoint(txid="0d" * 32, vout=0)
+    record = _invite_record(outpoint, "maker:abandoned", "24", 120.0)
+    bot = _ring_lock_bot(tmp_path, (record,))
+    # The input was reserved again by an unrelated ordinary session.
+    assert bot.wallet.reserve_coinjoin_inputs({(outpoint.txid, outpoint.vout)}, 60, "maker:other")
+    assert bot._channel_ring_store is not None
+    nodes = SimpleNamespace(for_binding=lambda _binding: SimpleNamespace(backend=None))
+    expired = await reconcile_ring_records(
+        bot._channel_ring_store,
+        nodes,  # type: ignore[arg-type]
+        SimpleNamespace(),  # type: ignore[arg-type]
+        {},
+        acceptor_timeout_seconds=60,
+    )
+
+    bot._release_expired_invite_inputs(expired)
+
+    assert len(expired) == 1
+    assert _lock_state(bot, outpoint)[0] == "maker:other"
 
 
 def test_renew_extends_lease_already_held_by_same_owner(tmp_path: Path) -> None:
@@ -1412,6 +1603,58 @@ def test_renew_refuses_corrupt_store(tmp_path: Path) -> None:
 
     assert not bot._renew_channel_ring_input_locks()
     assert _lock_state(bot, outpoint) == (None, None)
+
+
+@pytest.mark.parametrize("reconcile_raises", [False, True])
+async def test_periodic_ring_safety_failure_stops_ordinary_fills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reconcile_raises: bool
+) -> None:
+    outpoint = Outpoint(txid="0a" * 32, vout=0)
+    owner = "maker:pending-ring"
+    bot = _ring_lock_bot(tmp_path, (_ring_record(outpoint=outpoint, owner=owner),))
+    assert bot.wallet.reserve_coinjoin_inputs({(outpoint.txid, outpoint.vout)}, 60, owner)
+    bot.config.channel_ring = SimpleNamespace(phase_timeout_seconds=1.0)
+    bot._channel_ring_nodes = SimpleNamespace()
+    bot._channel_ring_recovery_tasks = {}
+    bot.backend = SimpleNamespace()
+    bot.active_sessions = {}
+    bot.listen_tasks = []
+    bot._fatal_error = None
+    bot._stopping = False
+    bot.running = True
+    bot.channel_ring_capability_validated = True
+
+    if reconcile_raises:
+        monkeypatch.setattr(
+            "maker.channel_ring.reconcile_ring_records",
+            AsyncMock(side_effect=RuntimeError("recovery unavailable")),
+        )
+    else:
+        corrupt = tmp_path / "ring-store" / "corrupt.json"
+        corrupt.write_text("{not json", encoding="ascii")
+        corrupt.chmod(0o600)
+
+    await bot._periodic_channel_ring_reconciliation()
+
+    assert bot._stopping
+    assert not bot.running
+    assert not bot.channel_ring_capability_validated
+    assert isinstance(bot._fatal_error, RuntimeError)
+    assert "operator recovery required" in str(bot._fatal_error)
+    lock_owner, lock_until = _lock_state(bot, outpoint)
+    assert lock_owner == owner
+    assert lock_until is not None and lock_until > time.time()
+    # An already-connected taker must not enter a new ordinary fill handler.
+    await bot._handle_fill("peer", "malformed fill")
+
+    # A handler detached before the shutdown must not proceed to signing or
+    # reveal signatures merely because its session object remains registered.
+    session = MakerSession.__new__(MakerSession)
+    session.expired = False
+    session.generation_id = 0
+    session.inner = SimpleNamespace(taker_nick="peer")
+    bot.active_sessions[(0, "peer")] = session
+    assert not session.is_active(bot)
 
 
 def test_renew_refuses_partial_lease_without_mutating_owned_input(tmp_path: Path) -> None:

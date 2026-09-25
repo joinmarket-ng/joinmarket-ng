@@ -1034,6 +1034,138 @@ def start(
 
 
 @app.command()
+def enroll_ring_nodes(
+    component: Annotated[str, typer.Option(help="Ring settings to enroll: maker or taker")],
+    expected_node: Annotated[
+        list[str], typer.Option(help="Repeat NAME=PUBKEY for every mapped LND identity")
+    ],
+    acknowledge_prior_use: Annotated[
+        bool,
+        typer.Option(help="Acknowledge that enrollment cannot prove historical node isolation"),
+    ] = False,
+    config_file: Annotated[Path | None, typer.Option(help="Configuration file")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="JoinMarket data directory")] = None,
+    mnemonic_file: Annotated[Path | None, typer.Option(help="Wallet mnemonic file")] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool, typer.Option(help="Prompt for the wallet's BIP39 passphrase")
+    ] = False,
+) -> None:
+    """Explicitly bind LN identities to this wallet's source mixdepths.
+
+    Does not sync the wallet, open channels, recover journals, or start a maker.
+    Every cooperating maker/taker profile must share the binding directory.
+    """
+    from jmcore.channel_ring import ChannelRingConfig
+    from jmcore.process_hardening import harden_current_process
+    from jmswap.channel_ring_nodes import (
+        ChannelRingNodeError,
+        channel_ring_wallet_identity,
+        enroll_configured_ring_nodes,
+    )
+    from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
+
+    if component not in {"maker", "taker"} or not acknowledge_prior_use:
+        raise typer.BadParameter("choose maker or taker and explicitly acknowledge prior node use")
+    identities: dict[str, str] = {}
+    for item in expected_node:
+        name, separator, node_id = item.partition("=")
+        if not separator or not name or name in identities:
+            raise typer.BadParameter("expected nodes must be unique NAME=PUBKEY pairs")
+        identities[name] = node_id
+    harden_current_process()
+    settings = setup_cli(None, data_dir=data_dir, config_file=config_file)
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+        if resolved is None:
+            raise ValueError("node enrollment requires the wallet mnemonic")
+        if settings.wallet.address_type != "p2tr":
+            raise ValueError("channel-ring enrollment requires a p2tr wallet")
+        ring_settings = (
+            settings.maker.channel_ring if component == "maker" else settings.taker.channel_ring
+        )
+        offer_type = (
+            settings.maker.offer_type
+            if component == "maker"
+            else settings.taker.preferred_offer_type.value
+        )
+        master = HDKey.from_seed(mnemonic_to_seed(resolved.mnemonic, resolved.bip39_passphrase))
+        bindings = run_async(
+            enroll_configured_ring_nodes(
+                ChannelRingConfig.from_settings(ring_settings),
+                network=settings.network_config.network.value,
+                offer_type=offer_type,
+                wallet_identity=channel_ring_wallet_identity(master.get_public_key_bytes()),
+                mixdepth_count=settings.wallet.mixdepth_count,
+                expected_node_ids=identities,
+                acknowledge_prior_use=acknowledge_prior_use,
+            )
+        )
+    except (ValueError, OSError, ChannelRingNodeError) as exc:
+        logger.error("Node enrollment failed: {}", exc)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Enrolled {len(bindings)} node identity binding(s); no channels were changed.")
+
+
+@app.command()
+def ring_records(
+    component: Annotated[
+        str, typer.Option(help="Ring settings to inspect: maker or taker")
+    ] = "maker",
+    config_file: Annotated[Path | None, typer.Option(help="Configuration file")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="JoinMarket data directory")] = None,
+) -> None:
+    """List retained channel-ring records as JSON for operator recovery.
+
+    Read-only: does not create the journal, contact LND or the chain, change
+    wallet leases, or print ring secrets. Active records keep their inputs
+    locked; ``retirement_action`` is ``blocked`` when no local evidence proves
+    that retiring the record is safe.
+    """
+    import json
+
+    from jmcore.channel_ring import ChannelRingConfig
+    from jmcore.channel_ring_store import RingParticipantStore, RingStoreError
+
+    if component not in {"maker", "taker"}:
+        raise typer.BadParameter("choose maker or taker")
+    settings = setup_cli(None, data_dir=data_dir, config_file=config_file)
+    ring_settings = (
+        settings.maker.channel_ring if component == "maker" else settings.taker.channel_ring
+    )
+    try:
+        config = ChannelRingConfig.from_settings(ring_settings)
+        effective_data_dir = data_dir if data_dir is not None else settings.get_data_dir()
+        directory = config.persistence_path(effective_data_dir)
+        if not directory.is_dir():
+            typer.echo(json.dumps({"directory": str(directory), "records": [], "corrupt": []}))
+            return
+        report = RingParticipantStore(
+            directory,
+            max_active_sessions=config.max_active_sessions,
+            max_verified_sessions=config.max_verified_sessions,
+        ).load_all()
+    except (ValueError, OSError, RingStoreError) as exc:
+        logger.error("Could not read channel-ring records: {}", exc)
+        raise typer.Exit(1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "directory": str(directory),
+                "records": [record.operator_summary() for record in report.records],
+                "corrupt": [
+                    {"file": item.path.name, "error": item.error} for item in report.corruptions
+                ],
+            },
+            indent=2,
+        )
+    )
+
+
+@app.command()
 def generate_address(
     mnemonic_file: Annotated[
         Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")

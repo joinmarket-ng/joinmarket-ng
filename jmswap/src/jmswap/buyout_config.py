@@ -128,7 +128,7 @@ _REQUIRED_WHEN_ENABLED = (
     "bitcoin_rpc_url",
     "bitcoin_rpc_user",
     "bitcoin_rpc_password",
-    "payout_address",
+    "payout_addresses",
     "mixdepth",
 )
 
@@ -276,7 +276,7 @@ class BuyoutSettings(_ConfigModel):
     required once ``enabled`` is true, which is what lets a disabled
     configuration be a single key. When ``enabled`` is true, all of ``network``,
     ``journal``, the five LND and Bitcoin Core connection fields, the two RPC
-    credentials, ``payout_address``, ``mixdepth`` and a non-empty
+    credentials, ``payout_addresses``, ``mixdepth`` and a non-empty
     ``allowed_peers`` are present and mutually consistent.
 
     ``wallet_fingerprint`` is optional here on purpose: a counterparty-only
@@ -321,7 +321,7 @@ class BuyoutSettings(_ConfigModel):
     It is excluded from the model repr: a hint names channels of this operator's
     node and is not something a log of the settings should carry.
     """
-    payout_address: str | None = None
+    payout_addresses: list[str] | None = None
     mixdepth: Annotated[int, Field(ge=0)] | None = None
     wallet_fingerprint: WalletFingerprint | None = None
     poll_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 5.0
@@ -419,29 +419,36 @@ class BuyoutSettings(_ConfigModel):
 
     def _check_payout_address(self) -> None:
         try:
-            self.payout_script()
+            self.payout_scripts()
         except BuyoutConfigError as exc:
-            raise _invalid("payout_address_invalid", str(exc)) from None
+            raise _invalid("payout_addresses_invalid", str(exc)) from None
 
-    def payout_script(self) -> str:
-        """The scriptPubKey of ``payout_address`` as lowercase hex.
+    def payout_scripts(self) -> tuple[str, ...]:
+        """The scriptPubKeys of ``payout_addresses`` as lowercase hex, in order.
 
         This is the form the signing protocol puts on the wire
         (``split_script_B`` / ``split_script_C``), and deriving it here is what
-        binds the address to the configured network: an address for another
+        binds each address to the configured network: an address for another
         network, or one that is not a P2TR output, cannot produce a script.
+        Each session takes the first address no earlier session in the journal
+        used, so one address never receives two buyout payouts.
         """
-        if self.payout_address is None or self.network is None:
-            raise BuyoutConfigError("payout_address and network are not configured")
-        try:
-            script = address_to_scriptpubkey_for_network(self.payout_address, self.network)
-        except ValueError:
-            raise BuyoutConfigError(
-                f"payout_address is not a valid {self.network} address"
-            ) from None
-        if len(script) != _P2TR_SCRIPT_LENGTH or script[:2] != b"\x51\x20":
-            raise BuyoutConfigError("payout_address must be a P2TR (witness v1) address")
-        return script.hex()
+        if not self.payout_addresses or self.network is None:
+            raise BuyoutConfigError("payout_addresses and network are not configured")
+        scripts: list[str] = []
+        for address in self.payout_addresses:
+            try:
+                script = address_to_scriptpubkey_for_network(address, self.network)
+            except ValueError:
+                raise BuyoutConfigError(
+                    f"payout_addresses has an invalid {self.network} address"
+                ) from None
+            if len(script) != _P2TR_SCRIPT_LENGTH or script[:2] != b"\x51\x20":
+                raise BuyoutConfigError("payout_addresses must be P2TR (witness v1) addresses")
+            scripts.append(script.hex())
+        if len(set(scripts)) != len(scripts):
+            raise BuyoutConfigError("payout_addresses contains a duplicate address")
+        return tuple(scripts)
 
     def build_signing_policy(self) -> BuyoutPolicy:
         """The :class:`~jmswap.buyout_signing.BuyoutPolicy` this file describes.

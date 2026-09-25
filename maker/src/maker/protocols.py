@@ -37,7 +37,7 @@ from maker.rate_limiting import (
 )
 
 if TYPE_CHECKING:
-    from jmswap.channel_ring import InitializedChannelRingBackend
+    from jmswap.channel_ring_nodes import ChannelRingNodePool
     from jmwallet.history import TransactionHistoryEntry
 
     from maker.direct_connection import DirectConnectionState
@@ -94,7 +94,9 @@ class MakerBotProtocol(Protocol):
     _pending_signed_rounds_lock: asyncio.Lock
     minimum_fee_rate_sat_vb: float
     channel_ring_capability_validated: bool
-    _channel_ring_backend: InitializedChannelRingBackend | None
+    _channel_ring_nodes: ChannelRingNodePool | None
+    _stopping: bool
+    _session_handler_tasks: set[asyncio.Task[None]]
     _channel_ring_store: RingParticipantStore | None
 
     # -- Cross-mixin methods --

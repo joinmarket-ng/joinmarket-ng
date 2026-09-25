@@ -1,8 +1,8 @@
 # Experimental Credential Market
 
-**Buyers should start with the [signet quickstart](credential-market-overview.md)**,
-which is the whole purchase in six commands. This page is the operator and
-protocol reference: seller setup, offline owner material, wallet-native seller
+Start with the [experimental guide](experimental-ring-market.md) for the
+warning, setup, and the end-to-end signet or mainnet workflow. This page is the
+operator reference: seller setup, offline owner material, wallet-native seller
 operations, recovery, and fault evidence.
 
 `jm-market` is an opt-in native directory market with a scriptable JSON CLI for
@@ -19,11 +19,8 @@ store. Explicit wallet-ledger activation blocks those unbound seller writes and
 below. Inspection and export remain available through the CLI. Activation does
 not enable automatic trading.
 
-The companion `jmp` repository contains the protocol drafts `jmp-0012.md`
-(Credential Market) and `jmp-0013.md` (Signed Market Fault Evidence) on branch
-`jmp-credential-market`. They are experimental, not stable interface references.
-Implementation discussions are [NG #597](https://github.com/joinmarket-ng/joinmarket-ng/issues/597)
-and [NG #598](https://github.com/joinmarket-ng/joinmarket-ng/issues/598).
+The protocol drafts are JMP-0012 (Credential Market) and JMP-0013 (Signed
+Market Fault Evidence).
 
 ## Before You Trade
 
@@ -273,9 +270,8 @@ Without a separately configured onion service, omit `--direct-location`,
 `--listen-host`, and `--listen-port`; directory relay remains available. The
 default quote lifetime is 300 seconds and every issued quote is clamped to 900
 seconds, so a longer `--quote-ttl` has no effect. Each unpaid quote still
-reserves inventory and can be used for griefing. Published listings expire 60
-seconds after they are signed, so a buyer must request promptly after
-discovery. The store permits at most 64 live quotes and the service admits at
+reserves inventory and can be used for griefing. Published listings are valid
+for one hour and the seller re-announces them every 30 minutes. The store permits at most 64 live quotes and the service admits at
 most one new quote per second globally. These are resource bounds, not DoS or
 Sybil protection.
 
@@ -535,9 +531,9 @@ Rebinding does not clear a recovery requirement or detect a complete offline rol
 
 ## Buyer Workflow
 
-The [signet quickstart](credential-market-overview.md) is the recommended path:
-no hand-edited JSON and no key files to create. This section records what those
-commands do, the options they do not show, and how to recover a failed step.
+The [experimental guide](experimental-ring-market.md) shows the recommended
+path. This section records what those commands do, the options they do not
+show, and how to recover a failed step.
 
 ```bash
 export BUYER_DATA="$HOME/.joinmarket-ng-market-buyer"
@@ -565,8 +561,7 @@ request) and `buy.json.quote` (the signed quote). It prints the quote id and the
 `lightning:` URI to pay externally. `--request-file` is durable private state:
 rerunning the command retries that same purchase instead of creating a second
 one, and a persisted request whose `.keys` file is missing fails rather than
-silently rotating to a key the seller never quoted. Listings expire 60 seconds after signing, so request promptly after
-discovery.
+silently rotating to a key the seller never quoted.
 
 After the seller has locally finalized the trade, poll. `--request-file` resolves
 the quote to `buy.json.quote`. The transport carries the package sealed to the
@@ -686,7 +681,7 @@ an older version, has an unknown seller and receives no exclusion.
   Confirm Tor is reachable and that `network` matches the network your seller
   uses. Never move to mainnet to find inventory.
 - **`listing document is invalid` from `request`.** The listing expired (they
-  live 60 seconds). Output files are never overwritten with different content, so
+  live one hour). Output files are never overwritten with different content, so
   discover again into a **new** path and rerun `request` with the same
   `--request-file`, which keeps the buyer key and request id of that purchase:
 
@@ -708,7 +703,7 @@ jm-market request --data-dir "$BUYER_DATA" --listing seller-2.json \
   delivers, that is the exposure this market does not remove; it is not a
   provable fault.
 
-## Fault Evidence And Testing
+## Fault Evidence
 
 Keep the raw signed packages. For a statically invalid seller delivery, use the
 raw delivery saved by `poll`; for double allocation, retain two finalized
@@ -733,23 +728,3 @@ jm-market proof broadcast \
 Publishing is best-effort gossip, not consensus or a global blacklist. It does
 not extend the fixed current-plus-next-period exclusion interval. Invalid
 delivery evidence can reveal a PoDLE opening, so treat that opening as exposed.
-
-Focused implementation checks are:
-
-```bash
-PYTHONPATH="jmcore/src:taker/src:jmwallet/src" \
-  pytest jmcore/tests/test_credential_market.py jmcore/tests/test_external_podle.py \
-  jmcore/tests/test_market_faults.py taker/tests/test_market_cli.py \
-  taker/tests/test_market_store.py taker/tests/test_external_podle_pool.py \
-  taker/tests/test_market_transport.py taker/tests/test_market_quickstart.py \
-  taker/tests/test_market_buyer_keys.py taker/tests/test_market_lightning_only.py \
-  taker/tests/test_external_podle_seller_separation.py \
-  jmcore/tests/test_bond_lease_conflict.py taker/tests/test_market_lease_reporting.py
-
-PYTHONPATH="jmcore/src:taker/src:jmwallet/src" \
-  pytest -m e2e --fail-on-skip tests/e2e/test_credential_market_e2e.py
-```
-
-The direct transport e2e path uses a local TCP stand-in for Tor hidden-service
-mapping. It tests direct-versus-relay behavior but does not demonstrate live
-Tor onion reachability.

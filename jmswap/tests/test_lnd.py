@@ -16,8 +16,8 @@ from jmcore.bitcoin import (
 )
 
 from jmswap.lnd import (
-    COFUNDED_CHANNEL_RING_V1_CAPABLE,
     FINAL_TAPROOT_COMMITMENT,
+    PRIVATE_CHANNEL_RING_CAPABLE,
     AcceptorBounds,
     EndpointRole,
     ExternalChannelRequest,
@@ -40,7 +40,7 @@ from jmswap.lnd import (
     VerifiedFunding,
     WitnessUtxo,
     build_unsigned_psbt,
-    can_advertise_cofunded_channel_ring_v1,
+    can_advertise_private_channel_ring,
     evaluate_channel_accept_request,
     validate_contribution_accounting,
     validate_endpoint_readiness,
@@ -264,6 +264,17 @@ def valid_accept_request() -> Any:
     )
 
 
+def test_ring_acceptor_requires_alias_without_relaxing_ordinary_policy() -> None:
+    ring = inbound_expectation().model_copy(update={"scid_alias": True})
+    request = valid_accept_request()
+    assert not evaluate_channel_accept_request(request, ring, AcceptorBounds()).accept
+    request.wants_scid_alias = True
+    assert evaluate_channel_accept_request(request, ring, AcceptorBounds()).accept
+    assert not evaluate_channel_accept_request(
+        request, inbound_expectation(), AcceptorBounds()
+    ).accept
+
+
 def funding_tx(
     script: bytes = FUNDING_SCRIPT, value: int = CAPACITY
 ) -> tuple[str, list[WitnessUtxo]]:
@@ -296,13 +307,26 @@ async def test_node_info_checks_identity_version_network_sync_and_capability() -
     assert info.advertised_uris == (f"{OPENER_ID}@{'a' * 56}.onion:9735",)
 
 
+async def test_confirmed_onchain_balance_reads_lnd_wallet_balance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = FakeStub()
+
+    async def wallet_balance(request: Any) -> Any:
+        assert isinstance(request, ln.WalletBalanceRequest)
+        return ln.WalletBalanceResponse(confirmed_balance=75_000)
+
+    monkeypatch.setattr(stub, "WalletBalance", wallet_balance, raising=False)
+    assert await backend(stub).confirmed_onchain_balance() == 75_000
+
+
 async def test_production_capability_binds_onion_endpoint_to_getinfo_identity() -> None:
     target = backend()
     endpoint = "a" * 56 + ".onion:9735"
-    info = await target.check_production_cofunded_channel_ring_v1(endpoint)
+    info = await target.check_production_private_channel_ring(endpoint)
     assert info.identity_pubkey == OPENER_ID
     with pytest.raises(LndCapabilityError, match="not advertised"):
-        await target.check_production_cofunded_channel_ring_v1("b" * 56 + ".onion:9735")
+        await target.check_production_private_channel_ring("b" * 56 + ".onion:9735")
 
 
 def test_lnd_credentials_are_redacted_from_repr() -> None:
@@ -401,6 +425,12 @@ async def test_open_uses_caller_id_exact_push_private_final_taproot_and_no_publi
         await target.start_external_channel(external_request())
 
 
+async def test_explicit_ring_open_requests_alias_without_changing_default() -> None:
+    target = backend()
+    await target.start_external_channel(external_request(scid_alias=True))
+    assert target._stub.open_requests[0].scid_alias is True
+
+
 async def test_open_allows_tor_peer_connection_to_use_full_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,6 +454,22 @@ async def test_open_retries_transient_onion_peer_connection(
     await target.start_external_channel(external_request(peer_host=f"{'a' * 56}.onion:9735"))
 
     assert connect_peer.await_count == 2
+
+
+async def test_open_names_tor_peer_connection_failure_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = backend()
+    connect_peer = AsyncMock(side_effect=RuntimeError("TTL expired"))
+    monkeypatch.setattr(target, "connect_peer", connect_peer)
+
+    with pytest.raises(LndTimeoutError, match=r"over Tor after \d+ attempt") as raised:
+        await target.start_external_channel(
+            external_request(peer_host=f"{'a' * 56}.onion:9735", timeout_seconds=0.3)
+        )
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert connect_peer.await_count >= 1
 
 
 async def test_open_does_not_retry_non_onion_peer_connection(
@@ -947,17 +993,17 @@ async def test_retirement_fails_if_pending_point_remains_after_abandon() -> None
 
 
 def test_ring_capability_requires_a_complete_lifecycle_strategy() -> None:
-    assert not can_advertise_cofunded_channel_ring_v1(
+    assert not can_advertise_private_channel_ring(
         safe_verified_retirement_live_validated=False,
         retained_state_reconciliation=True,
         strict_anti_grief_limits=False,
     )
-    assert can_advertise_cofunded_channel_ring_v1(
+    assert can_advertise_private_channel_ring(
         safe_verified_retirement_live_validated=False,
         retained_state_reconciliation=True,
         strict_anti_grief_limits=True,
     )
-    assert COFUNDED_CHANNEL_RING_V1_CAPABLE is True
+    assert PRIVATE_CHANNEL_RING_CAPABLE is True
 
 
 @pytest.mark.parametrize(

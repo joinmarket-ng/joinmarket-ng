@@ -184,7 +184,7 @@ class BuyoutRuntime:
         if not self._allowed_peers:
             raise BuyoutRuntimeError("an enabled buyout service requires at least one allowed peer")
         try:
-            self._payout_script = settings.payout_script()
+            self._payout_scripts = settings.payout_scripts()
             self._policy = settings.build_signing_policy()
             self._settlement_policy = settings.build_settlement_policy()
         except (BuyoutConfigError, ValueError) as exc:
@@ -316,7 +316,7 @@ class BuyoutRuntime:
                 peer,
                 chain.height,
                 self._policy,
-                self._payout_script,
+                self._payout_scripts,
                 runtime_binding=self._binding,
                 recovery_authorized=True,
                 force_close_authorized=self.settings.automatic_force_close,
@@ -392,7 +392,7 @@ class BuyoutRuntime:
             raise BuyoutRuntimeError("peer is not in the operator allowlist")
         if self.settings.wallet_fingerprint is None:
             raise BuyoutRuntimeError("a buyer session requires a configured wallet_fingerprint")
-        return await buyer.prepare(peer, points, self._payout_script)
+        return await buyer.prepare(peer, points, self._payout_scripts)
 
     def require_buyer_session(self, session_id: str) -> StoredSession:
         """Validate ownership before an operator resumes a buyer operation."""

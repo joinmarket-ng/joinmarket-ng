@@ -244,6 +244,33 @@ jobs:
         if: always()
 
   # ==========================================================================
+  # Private ring integration needs its own Tor/LND stack, not the legacy e2e profile.
+  test-private-ring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          python-version: '3.14'
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmswap
+          install-dev: 'true'
+      - name: Build the pinned escrow backend
+        run: docker build -t jm-buyout-lnd:v0.21.3-beta lnd
+      - name: Exercise external funding and mixed ring lifecycle
+        run: scripts/run-ring-e2e.sh all
+        # Do not upload the retained wallet, LND, or buyout journals as artifacts.
+      - name: Exercise maker-only ring without taker LND
+        run: RING_E2E_NO_BUILD=1 scripts/run-ring-e2e.sh ring-no-taker
+
+  # ==========================================================================
   # Stage 2b: install.sh smoke tests across operating systems
   # Linux (container): real Docker install in vanilla debian:stable-slim +
   # ubuntu:24.04, verifies the script bootstraps curl/gnupg/sudo and that
@@ -2242,6 +2269,7 @@ jobs:
       - complexipy
       # Unit tests (combined in single job)
       - test-unit
+      - test-private-ring
       # Component integration tests (run docker-marked tests only)
       - test-jmwallet
       # Integration tests (depend on build-images)

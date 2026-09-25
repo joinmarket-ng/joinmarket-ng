@@ -233,21 +233,22 @@ def test_canonical_bip340_vector() -> None:
     invite = _invite()
     expected_json = (
         b'{"expiry":1,"network":"regtest","offer_type":"tr0absoffer",'
+        b'"payload_format":"canonical_json",'
         b'"policy_bounds":{"max_csv_delay":2,"max_depth":2,"max_reserve":1,'
         b'"min_csv_delay":1,"min_depth":1,"min_reserve":0},"revision":0,'
         b'"round_nonce":"' + b"0" * 64 + b'","signer_key":'
         b'"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",'
-        b'"type":"ring_invite","v":1}'
+        b'"type":"ring_invite"}'
     )
     assert canonical_json(invite, exclude_signature=True) == expected_json
     assert payload_hash(invite).hex() == (
-        "8952fea4ff5244ae7de0c8f6f9933bb7fb88fb8d6ab6e4cbafc3dd2811b39e37"
+        "4ec443825107498bb0e6b481b9abd4ed000cff5251b8cb6119eff63fe6887e46"
     )
 
     signed = sign_payload(invite, _secret(1), aux_randomness=b"\x00" * 32)
     assert signed.sig == (
-        "6ae1af64178a2573ca81e8df3f459732fdaa827f0ad40c8ff6bcb5c701c976b1"
-        "bdf4983e8645f6ffeea818e9db3f343af674e4e2e44ba66ebec5aae3139ee998"
+        "abe6c389678a4ed05e746ddba8ddfe7fdb7e3d0454ff0f5733ab8e0fae52fd32"
+        "f14de43a7ef5f13e01603556e069bb1aecf36d1d77fd4d2e37e775510d33b072"
     )
     assert verify_payload(signed)
     assert decode_ring_message(encode_ring_message(signed)) == signed
@@ -277,22 +278,22 @@ def test_envelope_rejects_unknown_or_malformed_data(message: str, match: str) ->
         decode_ring_message(message)
 
 
-def test_envelope_rejects_duplicate_keys_unknown_version_type_and_extra_fields() -> None:
+def test_envelope_rejects_duplicate_keys_wrong_format_type_and_extra_fields() -> None:
     signed = sign_payload(_invite(), _secret(1), aux_randomness=b"\x00" * 32)
     body = canonical_json(signed).decode()
 
-    duplicate = body[:-1] + ',"v":1}'
+    duplicate = body[:-1] + ',"payload_format":"canonical_json"}'
     encoded = base64.urlsafe_b64encode(duplicate.encode()).rstrip(b"=").decode()
     with pytest.raises(RingValidationError, match="duplicate JSON key"):
         decode_ring_message(f"!ring ring_invite {encoded}")
 
     for replacement, match in (
-        ('"v":2', "unknown ring payload version"),
+        ('"payload_format":"wrong"', "unknown ring payload format"),
         ('"type":"ring_hello"', "message types differ"),
     ):
         changed = (
-            body.replace('"v":1', replacement, 1)
-            if "v" in replacement
+            body.replace('"payload_format":"canonical_json"', replacement, 1)
+            if "payload_format" in replacement
             else body.replace('"type":"ring_invite"', replacement, 1)
         )
         encoded = base64.urlsafe_b64encode(changed.encode()).rstrip(b"=").decode()

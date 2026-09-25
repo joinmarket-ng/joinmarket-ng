@@ -176,6 +176,9 @@ class BuyoutSettlement:
                     return _status(record, terms, parent)
             else:
                 _save(self.store, record.session_id, "INVOICE_CREATING", invoice_started=True)
+                # LND hints only active private channels whose peer is in the
+                # public graph, so peers with only private channels stay hidden.
+                # A direct peer of the buyer needs no hint.
                 invoice = await self.peer.create_invoice(
                     bytes.fromhex(cast(str, record.data["preimage"])),
                     terms.claim_sat,

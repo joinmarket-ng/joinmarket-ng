@@ -32,9 +32,19 @@ What the journal guarantees
   that is a written statement that nothing was ever signed for those channels, so
   a later attempt may take them over. A missing or unrecognized record is never
   such evidence.
+* **One funding transaction per buyer.** A buyer session may not reserve a
+  channel whose funding transaction already funds a different channel reserved
+  by another buyer session. A node's two ring edges share one funding
+  transaction, so this keeps the node from buying out both edges, which would
+  tie them to one owner on chain. Released (canceled, never-signed) reservations
+  do not count.
 * **Bounded occupancy.** At most :data:`MAX_UNRESOLVED_SESSIONS` sessions may be
   unresolved at once (``CANCELED``, ``COMPLETED`` and ``CONFLICTED`` are the
   resolved states), which keeps a stuck peer from filling the journal.
+  Resolved sessions are never pruned: they back session-id replay rejection and
+  the ``CANCELED`` channel takeover above. A configured peer that repeatedly
+  proposes and cancels therefore grows the journal slowly; the peer allowlist,
+  not the store, is the control for that.
 
 Upgrade and file handling
 -------------------------
@@ -103,6 +113,9 @@ RESOLVED_STATES = frozenset({"CANCELED", "COMPLETED", "CONFLICTED"})
 DIRECTORY_MODE = 0o700
 FILE_MODE = 0o600
 BUSY_TIMEOUT_MS = 5000
+
+#: Session data key naming the session's own payout script (hex scriptPubKey).
+PAYOUT_SCRIPT_KEY = "payout_script"
 
 Role = Literal["buyer", "counterparty"]
 _ROLES: frozenset[str] = frozenset({"buyer", "counterparty"})
@@ -296,6 +309,11 @@ class BuyoutStore:
             ).fetchone()[0]
             if unresolved >= MAX_UNRESOLVED_SESSIONS:
                 raise ConflictError("the journal already holds the maximum of unresolved sessions")
+            if record.role == "buyer":
+                _reject_sibling_buyout(cursor, record.channel_points)
+            payout = record.data.get(PAYOUT_SCRIPT_KEY)
+            if payout is not None and payout in _used_payout_scripts(cursor):
+                raise ConflictError("the payout address was already used by another session")
             for point in record.channel_points:
                 _reserve_channel_point(cursor, point)
             cursor.execute(
@@ -321,6 +339,24 @@ class BuyoutStore:
                 ],
             )
         return record
+
+    def next_payout_script(self, candidates: Sequence[str]) -> str:
+        """Return the first candidate no recorded session has used as its payout.
+
+        Every session records its own payout script under
+        :data:`PAYOUT_SCRIPT_KEY`, and :meth:`create` refuses a script that is
+        already recorded, so a concurrent pick cannot reuse an address. Scripts
+        are never released, not even by a canceled session.
+        """
+        with self._read() as cursor:
+            used = _used_payout_scripts(cursor)
+        for script in candidates:
+            if script not in used:
+                return script
+        raise ConflictError(
+            "every configured payout address was already used; reserve fresh ones with"
+            " `jm-wallet address new` and add them to payout_addresses"
+        )
 
     def get(self, session_id: str) -> StoredSession:
         """Return the stored session, or raise :class:`UnknownSessionError`."""
@@ -363,6 +399,10 @@ class BuyoutStore:
                 or stored.channel_points != record.channel_points
             ):
                 raise InvalidRecordError("the record does not match the stored session binding")
+            # Fixed at create: it can be neither changed, removed, nor added later
+            # (a late addition would bypass the uniqueness check in create).
+            if stored.data.get(PAYOUT_SCRIPT_KEY) != data.get(PAYOUT_SCRIPT_KEY):
+                raise InvalidRecordError("a session's payout script cannot change")
             if stored.revision != record.revision:
                 raise ConflictError("the session was modified by another writer")
             marker = (
@@ -443,6 +483,43 @@ def _check_marker(
         if released is not None:
             raise InvalidRecordError(
                 "parent signing cannot start after the channel points were taken over"
+            )
+
+
+def _used_payout_scripts(cursor: sqlite3.Cursor) -> set[str]:
+    """Collect every payout script a stored session used or may have signed for."""
+    used: set[str] = set()
+    for (encoded,) in cursor.execute("SELECT data FROM sessions"):
+        data = _decoded_data(encoded)
+        script = data.get(PAYOUT_SCRIPT_KEY)
+        if isinstance(script, str):
+            used.add(script)
+        # Sessions recorded before PAYOUT_SCRIPT_KEY existed still name their
+        # split scripts in the agreed terms.
+        for message, key in (("proposal", "split_script_B"), ("acceptance", "split_script_C")):
+            body = data.get(message)
+            if isinstance(body, dict) and isinstance(body.get(key), str):
+                used.add(body[key])
+    return used
+
+
+def _reject_sibling_buyout(cursor: sqlite3.Cursor, points: Sequence[str]) -> None:
+    """Refuse a buyer session sharing a funding transaction with an earlier one."""
+    wanted = set(points)
+    for txid in {point.rpartition(":")[0] for point in points}:
+        rows = cursor.execute(
+            "SELECT session_channels.channel_point FROM session_channels"
+            " JOIN sessions USING (session_id)"
+            " WHERE sessions.role = 'buyer' AND session_channels.reserved = 1"
+            " AND NOT (sessions.state = ? AND sessions.parent_signing_started = 0)"
+            " AND substr(session_channels.channel_point, 1, ?) = ?",
+            (STATE_CANCELED, len(txid) + 1, f"{txid}:"),
+        ).fetchall()
+        # The exact same point is left to _reserve_channel_point, which applies
+        # the canceled-and-never-signed takeover rule.
+        if any(row[0] not in wanted for row in rows):
+            raise ConflictError(
+                "a buyout of another channel from the same funding transaction exists"
             )
 
 
