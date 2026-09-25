@@ -115,6 +115,7 @@ class CoinJoinSession:
         restrict_md0: bool = True,
         minimum_fee_rate_sat_vb: float | None = None,
         mixdepth_selection_policy: MixdepthSelectionPolicy = MixdepthSelectionPolicy.BALANCED,
+        allowed_mixdepths: frozenset[int] | None = None,
         buyout: ChannelBuyout | None = None,
     ):
         self.taker_nick = taker_nick
@@ -129,6 +130,7 @@ class CoinJoinSession:
         self.restrict_md0 = restrict_md0  # Mixdepth 0 UTXO merge restriction
         self.minimum_fee_rate_sat_vb = minimum_fee_rate_sat_vb
         self.mixdepth_selection_policy = mixdepth_selection_policy
+        self.allowed_mixdepths = allowed_mixdepths
 
         self.state = CoinJoinState.IDLE
         self.amount = 0
@@ -1067,6 +1069,8 @@ class CoinJoinSession:
 
             balances = {}
             for md in range(self.wallet.mixdepth_count):
+                if self.allowed_mixdepths is not None and md not in self.allowed_mixdepths:
+                    continue
                 # Use balance for offers (excludes fidelity bonds)
                 balance = await self.wallet.get_balance_for_offers(
                     md,

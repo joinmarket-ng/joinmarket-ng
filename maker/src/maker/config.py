@@ -553,6 +553,10 @@ class MakerConfig(WalletConfig):
         # the generic pit check: an operator who enabled the ring needs to know
         # which feature constrains the wallet and offer family.
         if self.channel_ring.enabled:
+            if not self.channel_ring.mixdepth_nodes:
+                raise ValueError("enabled maker channel ring requires local mixdepth_nodes")
+            if self.channel_ring.taker_participates is not None:
+                raise ValueError("taker_participates is a taker-only channel-ring setting")
             if self.address_type != "p2tr":
                 raise ValueError("enabled channel ring requires a p2tr wallet")
             if any(

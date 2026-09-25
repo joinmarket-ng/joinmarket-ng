@@ -99,14 +99,32 @@ def test_randomized_uneven_residuals_form_complete_cycles(seed: int) -> None:
     _assert_complete(plan, parties)
 
 
-def test_minimum_four_parties_includes_taker() -> None:
+def test_three_party_ring_can_include_taker_and_two_makers() -> None:
     parties = _parties([200_000, 240_000, 280_000, 320_000])
-    plan = plan_cofunded_ring(parties, rng=random.Random(7))
-    _assert_complete(plan, parties)
+    plan = plan_cofunded_ring(parties[:3], rng=random.Random(7))
+    _assert_complete(plan, parties[:3])
     assert "taker" in plan.cycle
 
-    with pytest.raises(RingPlanningError, match="requires 4"):
-        plan_cofunded_ring(parties[:3], rng=random.Random(7))
+    with pytest.raises(RingPlanningError, match="requires 3"):
+        plan_cofunded_ring(parties[:2], rng=random.Random(7))
+
+
+def test_three_maker_ring_allows_ordinary_taker_to_coordinate() -> None:
+    parties = _parties([200_000, 240_000, 280_000, 320_000])
+    makers = parties[1:]
+    with pytest.raises(RingPlanningError, match="requires 3"):
+        plan_cofunded_ring(makers[:2], taker_participates=False, rng=random.Random(7))
+    three_maker_plan = plan_cofunded_ring(makers, taker_participates=False, rng=random.Random(7))
+    _assert_complete(three_maker_plan, makers)
+    assert "taker" not in three_maker_plan.cycle
+    makers.append(type(parties[0])(party_id="maker-4", residual=360_000, limits=parties[0].limits))
+    with pytest.raises(RingPlanningError, match="reserved taker ID"):
+        plan_cofunded_ring(makers, rng=random.Random(7))
+    planned = plan_cofunded_ring(makers, taker_participates=False, rng=random.Random(7))
+    _assert_complete(planned, makers)
+    assert "taker" not in planned.cycle
+    with pytest.raises(RingPlanningError, match="zero times"):
+        plan_cofunded_ring(parties, taker_participates=False, rng=random.Random(7))
 
 
 def test_channel_overhead_is_charged_only_to_opener_floor() -> None:

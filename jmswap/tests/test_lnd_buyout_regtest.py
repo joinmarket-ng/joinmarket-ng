@@ -152,12 +152,16 @@ class BuyoutRegtest:
     project: str
     secrets_dir: Path
     node_ids: dict[str, str]
+    compose_override_file: str | None = None
 
     # -- Compose ------------------------------------------------------------ #
 
     def compose(self, *args: str, timeout: int = COMPOSE_TIMEOUT) -> str:
+        files = ["-f", str(COMPOSE_FILE)]
+        if self.compose_override_file:
+            files.extend(("-f", self.compose_override_file))
         done = subprocess.run(
-            ["docker", "compose", "-p", self.project, "-f", str(COMPOSE_FILE), *args],
+            ["docker", "compose", "-p", self.project, *files, *args],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -229,6 +233,45 @@ class BuyoutRegtest:
             (node_dir / "tls.cert").read_bytes(),
             (node_dir / "channelescrow.macaroon").read_bytes(),
         )
+
+
+def test_compose_override_is_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    stack = BuyoutRegtest(project="isolated", secrets_dir=tmp_path, node_ids={})
+    assert stack.compose("config") == "ok"
+    assert commands[-1] == [
+        "docker",
+        "compose",
+        "-p",
+        "isolated",
+        "-f",
+        str(COMPOSE_FILE),
+        "config",
+    ]
+    isolated = BuyoutRegtest(
+        project="isolated",
+        secrets_dir=tmp_path,
+        node_ids={},
+        compose_override_file=str(tmp_path / "ipam.yml"),
+    )
+    assert isolated.compose("config") == "ok"
+    assert commands[-1] == [
+        "docker",
+        "compose",
+        "-p",
+        "isolated",
+        "-f",
+        str(COMPOSE_FILE),
+        "-f",
+        str(tmp_path / "ipam.yml"),
+        "config",
+    ]
 
 
 @asynccontextmanager
@@ -377,13 +420,23 @@ def _wait_for_sync(stack: BuyoutRegtest, node: str) -> str:
     raise RegtestError(f"{node} was not ready within {READY_TIMEOUT}s: {last}")
 
 
-def _isolated_stack() -> Iterator[BuyoutRegtest]:
+def _isolated_stack(*, maker_stack: bool = False) -> Iterator[BuyoutRegtest]:
     """Start one throwaway stack, fund both nodes, and always tear it down."""
     _require_docker()
     REPO_TMP.mkdir(exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="buyout-regtest-", dir=REPO_TMP))
     directory.chmod(0o700)
-    running = BuyoutRegtest(f"jm-buyout-{secrets.token_hex(6)}", directory, {})
+    override_env = (
+        "JM_BUYOUT_MAKER_COMPOSE_OVERRIDE_FILE"
+        if maker_stack
+        else "JM_BUYOUT_COMPOSE_OVERRIDE_FILE"
+    )
+    running = BuyoutRegtest(
+        f"jm-buyout-{secrets.token_hex(6)}",
+        directory,
+        {},
+        compose_override_file=os.environ.get(override_env),
+    )
     try:
         running.compose("up", "-d", "--wait", "--wait-timeout", "180")
         running.bitcoin("createwallet", WALLET)
@@ -419,7 +472,7 @@ def maker_stack() -> Iterator[BuyoutRegtest]:
     # Earlier crash-recovery tests leave quiescent channels whose timers can
     # disconnect the shared peer during this scenario. Each maker/reorg case
     # needs its own nodes to assert the cooperative path deterministically.
-    yield from _isolated_stack()
+    yield from _isolated_stack(maker_stack=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -434,15 +487,40 @@ SPLIT_FEE = 1_000
 BUYOUT_FEE = 500
 
 
+def _open_channel_rpc(stack: BuyoutRegtest, opener: str, peer: str, *args: str) -> Any:
+    """Open a channel, reconnecting a peer that an idle channel timer disconnected.
+
+    Earlier tests on the shared stack leave quiescent channels whose timers can
+    drop the peer link; a funding negotiation that fails on a disconnected peer
+    broadcasts nothing, so reconnecting and retrying is safe.
+    """
+    node_id = stack.node_ids[peer]
+    for attempt in range(3):
+        peers = (stack.lncli(opener, "listpeers") or {}).get("peers", [])
+        if not any(entry.get("pub_key") == node_id for entry in peers):
+            try:
+                stack.lncli(opener, "connect", f"{node_id}@{peer}:9735")
+            except RegtestError as exc:
+                if "already connected" not in str(exc):
+                    raise
+        try:
+            return stack.lncli(opener, "openchannel", "--node_key", node_id, *args)
+        except RegtestError as exc:
+            transient = "disconnected" in str(exc) or "not connected" in str(exc)
+            if not transient or attempt == 2:
+                raise
+            time.sleep(1.0)
+    raise AssertionError("unreachable")
+
+
 def _open_private_taproot_channel(
     stack: BuyoutRegtest, opener: str = "alice", peer: str = "bob", *, push_sat: int = CHANNEL_PUSH
 ) -> Outpoint:
     """Open a private channel, including a route-less first hop when settlement must fail without hints."""
-    opened = stack.lncli(
+    opened = _open_channel_rpc(
+        stack,
         opener,
-        "openchannel",
-        "--node_key",
-        stack.node_ids[peer],
+        peer,
         "--local_amt",
         str(CHANNEL_CAPACITY),
         "--push_amt",
@@ -484,11 +562,10 @@ def _open_announced_channel(
     stack: BuyoutRegtest, opener: str, peer: str, *, push_sat: int
 ) -> Outpoint:
     """Open a public route channel so settlement can traverse the graph after a buyout spends its channel."""
-    opened = stack.lncli(
+    opened = _open_channel_rpc(
+        stack,
         opener,
-        "openchannel",
-        "--node_key",
-        stack.node_ids[peer],
+        peer,
         "--local_amt",
         str(CHANNEL_CAPACITY),
         "--push_amt",
@@ -961,8 +1038,9 @@ async def test_private_signing_runtime_and_durable_replay(stack: BuyoutRegtest) 
         buyer_store = resources.enter_context(BuyoutStore(buyer_dir / "sessions.sqlite"))
         cp_store = resources.enter_context(BuyoutStore(counterparty_dir / "sessions.sqlite"))
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
+        payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
         policy = BuyoutPolicy()
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payout)
+        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
         parent_received, release_parent = asyncio.Event(), asyncio.Event()
 
         async def handle(peer: str, message: Any) -> Any:
@@ -980,7 +1058,7 @@ async def test_private_signing_runtime_and_durable_replay(stack: BuyoutRegtest) 
         request = transport.request
 
         buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
-        session_id = await buyer.prepare(stack.node_ids["bob"], [point], payout)
+        session_id = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         terms = buyer.terms(session_id)
         assert terms.claim_sat == CHANNEL_PUSH
         change = CHANNEL_CAPACITY + ordinary_prevout.value - 500_000 - PARENT_FEE
@@ -1019,7 +1097,7 @@ async def test_private_signing_runtime_and_durable_replay(stack: BuyoutRegtest) 
             == buyer_store.get(session_id).data["split_tx"]
         )
         # Drop process-local escrow nonces and replay only durable signatures.
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payout)
+        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
         buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
 
         async def disconnected(peer: str, message: Any) -> Any:
@@ -1059,8 +1137,9 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
             BuyoutStore(stack.secrets_dir / "recovery-c" / "sessions.sqlite")
         )
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
+        payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
         policy = BuyoutPolicy()
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payout)
+        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
 
         async def request(peer: str, message: Any) -> Any:
             response = await counterparty.handle(stack.node_ids["alice"], message)
@@ -1069,7 +1148,7 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
             return response
 
         buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
-        sid = await buyer.prepare(stack.node_ids["bob"], [point], payout)
+        sid = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         terms = buyer.terms(sid)
         inputs = [TxInput.from_hex(point.txid, point.vout), ordinary]
         outputs = [
@@ -1090,7 +1169,7 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
         assert cp_store.get(sid).state == "NONCES"
         assert not buyer_store.get(sid).parent_signing_started
         assert not cp_store.get(sid).parent_signing_started
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payout)
+        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
         buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
         cancel = bob.cancel
 
@@ -1104,7 +1183,7 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
         assert buyer_store.get(sid).state == "CANCELING"
         assert cp_store.get(sid).state == "CANCELING"
         monkeypatch.setattr(bob, "cancel", cancel)
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payout)
+        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
         buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
         await buyer.cancel(sid)
         assert buyer_store.get(sid).state == "CANCELED"
@@ -1161,13 +1240,14 @@ async def test_taker_builds_and_signs_channel_funded_coinjoin(
         )
         policy = BuyoutPolicy(settlement_enabled=True)
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payout)
+        payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
+        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
 
         async def request(peer: str, message: Any) -> Any:
             return await counterparty.handle(stack.node_ids["alice"], message)
 
         buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
-        sid = await buyer.prepare(stack.node_ids["bob"], [point], payout)
+        sid = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         buyout = ChannelBuyout(buyer, sid)
         buyout.begin_round()
         with pytest.raises(ProtocolError, match="already reserved"):
@@ -1393,7 +1473,10 @@ async def _confirmed_settlement(
             )
         )
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
-        counterparty = CounterpartySigner(counterparty_store, bob, bob_peer, height, policy, payout)
+        payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
+        counterparty = CounterpartySigner(
+            counterparty_store, bob, bob_peer, height, policy, payouts
+        )
 
         async def request(peer: str, message: Any) -> Any:
             assert peer == stack.node_ids["bob"]
@@ -1402,7 +1485,7 @@ async def _confirmed_settlement(
         buyer = BuyoutBuyer(
             buyer_store, alice, alice_peer, request, height, policy, recovery_authorized=True
         )
-        session_id = await buyer.prepare(stack.node_ids["bob"], [point], payout)
+        session_id = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         terms = buyer.terms(session_id)
         ordinary, ordinary_prevout = _p2tr_wallet_input(stack)
         escrow_value = CHANNEL_CAPACITY + ordinary_prevout.value - 500_000 - PARENT_FEE
@@ -1481,7 +1564,10 @@ def _deadline_settings(
         "bitcoin_rpc_user": RPC_USER,
         "bitcoin_rpc_password": RPC_PASSWORD,
         "allowed_peers": (peer_identity,),
-        "payout_address": scriptpubkey_to_address(_p2tr_script(secrets.token_bytes(32)), "regtest"),
+        "payout_addresses": [
+            scriptpubkey_to_address(_p2tr_script(secrets.token_bytes(32)), "regtest")
+            for _ in range(8)
+        ],
         "mixdepth": 0,
         "poll_interval_seconds": 1.0,
     }

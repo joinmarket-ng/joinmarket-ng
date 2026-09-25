@@ -1,4 +1,4 @@
-# Four-party co-funded channel-ring regtest stack (three makers plus one taker).
+# Five-party mixed co-funded channel-ring regtest stack (four makers plus one taker).
 #
 # LND runs the patched image built by lnd/Dockerfile, the same backend the
 # channel-buyout regtest suite uses, so a ring open and a later buyout exercise
@@ -48,12 +48,12 @@ x-maker-environment: &maker-environment
   MAKER__SIZE_FACTOR: 0
   MAKER__NO_FIDELITY_BOND: "true"
   MAKER__OFFER_REANNOUNCE_DELAY_MAX: 0
-  # Keep the session routable through a ring phase timeout and cancellation.
-  MAKER__SESSION_TIMEOUT_SEC: 900
-  MAKER__PRE_SIGN_TIMEOUT_SEC: 900
+  # A ring setup adds a 30-second hold slack beyond its timeout and safety margin.
+  MAKER__SESSION_TIMEOUT_SEC: 660
+  MAKER__PRE_SIGN_TIMEOUT_SEC: 660
   MAKER__ONION_SERVING_HOST: 0.0.0.0
   MAKER__CHANNEL_RING__ENABLED: "true"
-  MAKER__CHANNEL_RING__LND_GRPC_URL: https://127.0.0.1:10009
+  MAKER__CHANNEL_RING__NODE_BINDING_DIRECTORY: /node-bindings
   MAKER__CHANNEL_RING__MINIMUM_MAKERS: 3
   MAKER__CHANNEL_RING__MIN_CHANNEL_CAPACITY: 1000000
   MAKER__CHANNEL_RING__MAX_CHANNEL_CAPACITY: 20000000
@@ -69,6 +69,9 @@ x-maker-environment: &maker-environment
   MAKER__CHANNEL_RING__PHASE_TIMEOUT_SECONDS: 300
   MAKER__CHANNEL_RING__OPEN_TIMEOUT_SECONDS: 300
   MAKER__CHANNEL_RING__READINESS_TIMEOUT_SECONDS: 120
+  MAKER__CHANNEL_RING__SETUP_TIMEOUT_SECONDS: 600
+  MAKER__CHANNEL_RING__HOLD_SAFETY_MARGIN_SECONDS: 30
+  MAKER__CHANNEL_RING__MAKER_SETUP_HOLD_SECONDS: 660
   MAKER__CHANNEL_RING__MAX_ACTIVE_SESSIONS: 4
   MAKER__CHANNEL_RING__MAX_VERIFIED_SESSIONS: 2
   TOR__SOCKS_HOST: ring-tor
@@ -104,8 +107,8 @@ services:
       - -c
       - >-
         mkdir -p /data/tor /data/lnd-maker1 /data/lnd-maker2 /data/lnd-maker3
-        /data/lnd-taker /data/maker1 /data/maker2 /data/maker3 &&
-        chown -R 1000:1000 /data/tor /data/maker1 /data/maker2 /data/maker3
+        /data/lnd-maker4 /data/lnd-taker /data/maker1 /data/maker2 /data/maker3 /data/maker4 /data/node-bindings &&
+        chown -R 1000:1000 /data/tor /data/maker1 /data/maker2 /data/maker3 /data/maker4 /data/node-bindings
     volumes:
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}:/data
     profiles: [ring-e2e]
@@ -200,6 +203,8 @@ services:
         condition: service_started
       ring-onion-maker3:
         condition: service_started
+      ring-onion-maker4:
+        condition: service_started
       ring-onion-taker:
         condition: service_started
     healthcheck:
@@ -224,6 +229,12 @@ services:
   ring-onion-maker3:
     image: alpine/socat:1.8.0.3
     command: ["tcp-listen:9735,fork,reuseaddr", "tcp:lnd-maker3:9735"]
+    networks: [ring-network]
+    profiles: [ring-e2e]
+
+  ring-onion-maker4:
+    image: alpine/socat:1.8.0.3
+    command: ["tcp-listen:9735,fork,reuseaddr", "tcp:lnd-maker4:9735"]
     networks: [ring-network]
     profiles: [ring-e2e]
 
@@ -260,6 +271,15 @@ services:
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker3:/root/.lnd
 
+  lnd-maker4:
+    <<: *lnd
+    environment:
+      LND_NODE: lnd-maker4
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker4:/root/.lnd
+
   lnd-taker:
     <<: *lnd
     environment:
@@ -276,12 +296,14 @@ services:
       <<: *maker-environment
       LND_NODE: lnd-maker1
       MNEMONIC: avoid whisper mesh corn already blur sudden fine planet chicken hover sniff
+      MAKER__NO_FIDELITY_BOND: ${RING_E2E_MAKER1_NO_BOND:-true}
       TOR__TARGET_HOST: lnd-maker1
     volumes:
       - ../scripts:/scripts:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker1:/lnd:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/maker1:/home/jm/.joinmarket-ng
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/node-bindings:/node-bindings
     depends_on:
       lnd-maker1:
         condition: service_healthy
@@ -303,6 +325,7 @@ services:
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker2:/lnd:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/maker2:/home/jm/.joinmarket-ng
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/node-bindings:/node-bindings
     depends_on:
       lnd-maker2:
         condition: service_healthy
@@ -325,8 +348,31 @@ services:
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker3:/lnd:ro
       - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/maker3:/home/jm/.joinmarket-ng
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/node-bindings:/node-bindings
     depends_on:
       lnd-maker3:
+        condition: service_healthy
+      ring-directory:
+        condition: service_healthy
+      ring-wallet-funder:
+        condition: service_completed_successfully
+
+  ring-maker4:
+    <<: *maker
+    network_mode: service:lnd-maker4
+    environment:
+      <<: *maker-environment
+      LND_NODE: lnd-maker4
+      MNEMONIC: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+      MAKER__CHANNEL_RING__ENABLED: "false"
+      TOR__TARGET_HOST: lnd-maker4
+    volumes:
+      - ../scripts:/scripts:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/tor:/tor:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/lnd-maker4:/lnd:ro
+      - ${RING_E2E_DATA_DIR:-../tmp/ring-e2e}/maker4:/home/jm/.joinmarket-ng
+    depends_on:
+      lnd-maker4:
         condition: service_healthy
       ring-directory:
         condition: service_healthy

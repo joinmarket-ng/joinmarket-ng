@@ -254,3 +254,67 @@ def test_start_uses_per_pit_nick_state_component(
     assert callable(callback)
     callback("J5PitMaker", "J5RotatedPitMaker")
     write_nick_state.assert_any_call(tmp_path, expected_component, "J5RotatedPitMaker")
+
+
+def _stored_ring_secret(data_dir: Path) -> str:
+    """Persist one invited maker record and return its secret for leak checks."""
+    from bitcointx.core.key import CKey
+    from jmcore.channel_ring import RingNodeBinding
+    from jmcore.channel_ring_store import (
+        Outpoint,
+        RingParticipantRecord,
+        RingParticipantRole,
+        RingParticipantStore,
+    )
+
+    record = RingParticipantRecord.fresh(
+        node_binding=RingNodeBinding(
+            network="regtest",
+            wallet_identity="00" * 32,
+            source_mixdepth=0,
+            node_name="local",
+            local_node_id=CKey(b"\x01" * 32).pub.hex(),
+        ),
+        round_nonce="31" * 32,
+        revision=0,
+        taker_session_identity="taker:session",
+        local_role=RingParticipantRole.MAKER,
+        local_position=1,
+        local_input_outpoints=(Outpoint(txid="0e" * 32, vout=3),),
+        input_lock_owner="maker:owner",
+    )
+    RingParticipantStore(
+        data_dir / "channel-ring", max_active_sessions=4, max_verified_sessions=2
+    ).save(record)
+    return record.ring_secret
+
+
+def test_ring_records_lists_recovery_facts_without_secrets(tmp_path: Path) -> None:
+    import json
+
+    secret = _stored_ring_secret(tmp_path)
+    (tmp_path / "channel-ring" / "broken.json").write_text("{", encoding="ascii")
+
+    result = runner.invoke(app, ["ring-records", "--data-dir", str(tmp_path)], prog_name="jm-maker")
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout[result.stdout.index("{") :])
+    [summary] = report["records"]
+    assert summary["state"] == "invited"
+    assert summary["active"] is True
+    assert summary["retirement_action"] == "shim_cancel"
+    assert summary["inputs"] == [f"{'0e' * 32}:3"]
+    assert summary["input_lock_owner"] == "maker:owner"
+    assert [item["file"] for item in report["corrupt"]] == ["broken.json"]
+    assert secret not in result.stdout
+
+
+def test_ring_records_does_not_create_absent_journal(tmp_path: Path) -> None:
+    import json
+
+    result = runner.invoke(app, ["ring-records", "--data-dir", str(tmp_path)], prog_name="jm-maker")
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout[result.stdout.index("{") :])
+    assert report["records"] == [] and report["corrupt"] == []
+    assert not (tmp_path / "channel-ring").exists()

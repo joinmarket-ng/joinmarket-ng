@@ -18,10 +18,9 @@ For full documentation, see [maker Documentation](https://joinmarket-ng.github.i
 ## Experimental Channel Buyout Funding
 
 A Taproot maker can use one explicitly prepared private channel buyout with
-`jm-maker start --buyout-config buyer.toml --buyout-session SESSION_ID`.
-Install the maker's `buyout` optional dependencies and follow the
-[buyout setup and recovery instructions](../jmswap/README.md) first. This remains
-experimental and is intended for isolated regtest validation.
+`jm-maker start --buyout-config buyer.toml --buyout-session SESSION_ID`. This is
+experimental and disabled unless both options are given; read
+[Experimental Ring Market](../docs/experimental-ring-market.md) first.
 
 The configuration must match the wallet fingerprint, Bitcoin network, and source
 mixdepth. A Bitcoin Core backend and an ordinary wallet input for authentication

@@ -52,6 +52,7 @@ PROJECT_PYTHONPATH=$(printf '%s:' \
     "$PROJECT_ROOT/tumbler/src" \
     "$PROJECT_ROOT/orderbook_watcher/src" \
     "$PROJECT_ROOT/maker/src" \
+    "$PROJECT_ROOT/jmswap/src" \
     "$PROJECT_ROOT/taker/src")
 export PYTHONPATH="${PROJECT_PYTHONPATH%:}${PYTHONPATH:+:$PYTHONPATH}"
 
@@ -134,6 +135,17 @@ PORT_BAND_BASE="${JM_TEST_PORT_BASE:-20000}"
 INSTANCE_STRIDE=2000   # host ports reserved per instance
 SUITE_STRIDE=64        # host ports reserved per suite within an instance
 
+# Optional explicit Docker subnets for hosts whose automatic address pools are
+# exhausted by retained fixtures. Opt in with JM_TEST_STATIC_IPAM=1; do not
+# delete old networks or signed ring fixtures to make space. Each suite gets
+# two /24 networks in 10.240.0.0/13, isolated by instance and suite index.
+# Leave this disabled on hosts that route this private range (for example VPNs).
+JM_TEST_STATIC_IPAM="${JM_TEST_STATIC_IPAM:-0}"
+if [[ "$JM_TEST_STATIC_IPAM" != 0 && "$JM_TEST_STATIC_IPAM" != 1 ]]; then
+    echo "JM_TEST_STATIC_IPAM must be 0 or 1" >&2
+    exit 2
+fi
+
 # Suite slot index (also the canonical list of Docker-backed suites).
 declare -A SUITE_SLOT=(
     [e2e]=0
@@ -147,6 +159,10 @@ declare -A SUITE_SLOT=(
     [reference-maker]=8
     [tumbler]=9
     [reference-migration]=10
+    [jmswap]=11
+    [ring]=12
+    [lnd-external]=13
+    [ring-no-taker]=14
 )
 
 # Service slot index within a suite's port window.
@@ -163,6 +179,11 @@ declare -A SVC_SLOT=(
     [jam_pw]=9
     [tor_socks]=10
     [tor_ctrl]=11
+    [lnd1]=16
+    [lnd2]=17
+    [lnd3]=18
+    [lnd4]=19
+    [lnd_taker]=20
 )
 
 # Compute the host port for a given suite/service in the current instance.
@@ -170,6 +191,48 @@ host_port() {
     local suite=$1 svc=$2
     local s=${SUITE_SLOT[$suite]} v=${SVC_SLOT[$svc]}
     echo $((PORT_BAND_BASE + INSTANCE * INSTANCE_STRIDE + s * SUITE_STRIDE + v))
+}
+
+# Subnet index: instances own 32 /24s; suite slot uses two (primary and
+# Compose's implicit default). The second octet crosses 240..242, never the
+# public internet or another instance's allocation.
+suite_subnet() {
+    local suite=$1 network_index=$2
+    local index=$((INSTANCE * 32 + SUITE_SLOT[$suite] * 2 + network_index))
+    printf '10.%d.%d.0/24' "$((240 + index / 256))" "$((index % 256))"
+}
+
+generate_swap_ipam_override() {
+    local suite=$1 network=$2 network_index=${3:-0}
+    if [[ "$JM_TEST_STATIC_IPAM" != 1 ]]; then
+        return 0
+    fi
+    # The native buyout module stack and one isolated maker stack coexist.
+    # They must use both of this suite's reserved /24s, not the same subnet.
+    local suffix=""
+    if [[ "$network_index" == 1 && "$network" == default ]]; then
+        suffix=".maker"
+    elif [[ "$network_index" != 0 ]]; then
+        echo "unsupported network index for $suite" >&2
+        return 2
+    fi
+    local file="${PARALLEL_DIR}/docker-compose.${suite}.ipam${suffix}.yml"
+    cat > "$file" <<YAML
+networks:
+  ${network}:
+    ipam:
+      config:
+        - subnet: $(suite_subnet "$suite" "$network_index")
+YAML
+    if [[ "$network" != default ]]; then
+        cat >> "$file" <<YAML
+  default:
+    ipam:
+      config:
+        - subnet: $(suite_subnet "$suite" 1)
+YAML
+    fi
+    printf '%s' "$file"
 }
 
 # =============================================================================
@@ -449,6 +512,20 @@ services:
         aliases:
           - jm-taker-neutrino
 YAML
+
+    if [[ "$JM_TEST_STATIC_IPAM" == 1 ]]; then
+        cat >> "$override_file" <<YAML
+networks:
+  jm-network:
+    ipam:
+      config:
+        - subnet: $(suite_subnet "$suite" 0)
+  default:
+    ipam:
+      config:
+        - subnet: $(suite_subnet "$suite" 1)
+YAML
+    fi
 
     echo "$override_file"
 }
@@ -769,6 +846,9 @@ restart_makers() {
 # =============================================================================
 cleanup_suite() {
     local suite=$1
+    # Native escrow tests own their disposable projects. Ring runners retain
+    # failed/uncertain signed fixtures and must never be swept by generic cleanup.
+    case "$suite" in jmswap|ring|ring-no-taker|lnd-external) return 0 ;; esac
     log_info "Cleaning up suite: $suite"
     compose_cmd "$suite" --profile e2e --profile reference --profile neutrino --profile reference-maker --profile reference-migration down -v 2>/dev/null || true
     compose_cmd "$suite" down --remove-orphans -v 2>/dev/null || true
@@ -808,6 +888,9 @@ setup_reference_implementation() {
             "$PROJECT_ROOT/joinmarket-clientserver"
     fi
 
+    # These are the host-side reference helpers. The reference Docker image
+    # installs its own exact upstream versions; do not downgrade the project
+    # venv's mnemonic or PyJWT to upstream's incompatible pins here.
     pip install -q \
         chromalog==1.0.5 \
         service-identity==21.1.0 \
@@ -816,8 +899,6 @@ setup_reference_implementation() {
         argon2_cffi==21.3.0 \
         autobahn==20.12.3 \
         fastbencode==0.3.6 \
-        mnemonic==0.20 \
-        pyjwt==2.4.0 \
         klein \
         werkzeug
 }
@@ -882,6 +963,8 @@ build_images() {
         --profile neutrino --profile reference --profile reference-maker --profile reference-migration \
         --profile taker \
         build --parallel 2>&1 | tee "${PARALLEL_DIR}/build.log"
+    docker build -t "${JM_BUYOUT_LND_IMAGE:-jm-buyout-lnd:v0.21.3-beta}" \
+        lnd 2>&1 | tee "${PARALLEL_DIR}/build-lnd.log"
     configure_shared_images
     log_success "Docker images built"
 }
@@ -892,15 +975,22 @@ build_images() {
 
 run_suite_unit() {
     local log="${PARALLEL_DIR}/unit.log"
+    # The operator's real config must never be loaded by unit tests. Isolate
+    # the fallback home and data directory without forcing an explicit config
+    # path: CLI tests must still be able to load their own --data-dir config.
+    local config_dir
+    config_dir=$(mktemp -d "${PARALLEL_DIR}/unit-config.XXXXXX")
     log_suite "Starting: Unit Tests"
-    {
+    (
+        export HOME="$config_dir" JOINMARKET_DATA_DIR="$config_dir"
+        unset JOINMARKET_CONFIG_FILE
         COVERAGE_FILE=.coverage.unit pytest -c pytest.ini --fail-on-skip \
             -lv \
             --cov=jmcore --cov=jmwallet --cov=directory_server --cov=jmwalletd \
-            --cov=tumbler \
+            --cov=tumbler --cov=jmswap \
             --cov=orderbook_watcher --cov=maker --cov=taker \
             --cov-report=term-missing \
-            jmcore/ jmwallet/ directory_server/ jmwalletd/ tumbler/ orderbook_watcher/ maker/ taker/
+            jmcore/ jmwallet/ directory_server/ jmwalletd/ tumbler/ orderbook_watcher/ maker/ taker/ jmswap/
 
         # Repo-root tests use a separate invocation because component packages
         # each expose a top-level tests module that conflicts during collection.
@@ -910,7 +1000,74 @@ run_suite_unit() {
             --cov=scripts --cov=jmcore \
             --cov-report=term-missing \
             tests/
-    } > "$log" 2>&1
+    ) > "$log" 2>&1
+}
+
+run_suite_jmswap() {
+    log_suite "Starting: Native escrow and LND buyout regtest"
+    local ipam_file maker_ipam_file
+    ipam_file=$(generate_swap_ipam_override jmswap default)
+    maker_ipam_file=$(generate_swap_ipam_override jmswap default 1)
+    JM_BUYOUT_COMPOSE_OVERRIDE_FILE="$ipam_file" COVERAGE_FILE=.coverage.jmswap \
+        JM_BUYOUT_MAKER_COMPOSE_OVERRIDE_FILE="$maker_ipam_file" \
+        pytest -c pytest.ini jmswap/ \
+        -m docker --fail-on-skip --no-cov -lv > "${PARALLEL_DIR}/jmswap.log" 2>&1
+}
+
+run_suite_ring() {
+    log_suite "Starting: Private ring, mixed makers, rentals, and buyout"
+    local ipam_file
+    ipam_file=$(generate_swap_ipam_override ring ring-network)
+    RING_E2E_PROJECT="${PROJECT_PREFIX}-ring" \
+    RING_E2E_IPAM_FILE="$ipam_file" \
+    RING_E2E_DATA_DIR="${PARALLEL_DIR}/ring-state" \
+    RING_E2E_BITCOIN_PORT="$(host_port ring btc_rpc)" \
+    RING_E2E_DIRECTORY_PORT="$(host_port ring dir)" \
+    RING_E2E_ORDERBOOK_PORT="$(host_port ring obwatch)" \
+    RING_E2E_TOR_SOCKS_PORT="$(host_port ring tor_socks)" \
+    RING_E2E_MAKER1_GRPC_PORT="$(host_port ring lnd1)" \
+    RING_E2E_MAKER2_GRPC_PORT="$(host_port ring lnd2)" \
+    RING_E2E_MAKER3_GRPC_PORT="$(host_port ring lnd3)" \
+    RING_E2E_MAKER4_GRPC_PORT="$(host_port ring lnd4)" \
+    RING_E2E_TAKER_GRPC_PORT="$(host_port ring lnd_taker)" \
+    RING_E2E_NO_BUILD="$SKIP_BUILD" \
+    E2E_RESET=0 RING_E2E_NO_RESET=0 \
+        "${SCRIPT_DIR}/run-ring-e2e.sh" ring > "${PARALLEL_DIR}/ring.log" 2>&1
+}
+
+run_suite_ring_no_taker() {
+    log_suite "Starting: Three-maker private ring without taker LND"
+    local ipam_file
+    ipam_file=$(generate_swap_ipam_override ring-no-taker ring-network)
+    RING_E2E_PROJECT="${PROJECT_PREFIX}-ring-no-taker" \
+    RING_E2E_IPAM_FILE="$ipam_file" \
+    RING_E2E_DATA_DIR="${PARALLEL_DIR}/ring-no-taker-state" \
+    RING_E2E_BITCOIN_PORT="$(host_port ring-no-taker btc_rpc)" \
+    RING_E2E_DIRECTORY_PORT="$(host_port ring-no-taker dir)" \
+    RING_E2E_ORDERBOOK_PORT="$(host_port ring-no-taker obwatch)" \
+    RING_E2E_TOR_SOCKS_PORT="$(host_port ring-no-taker tor_socks)" \
+    RING_E2E_MAKER1_GRPC_PORT="$(host_port ring-no-taker lnd1)" \
+    RING_E2E_MAKER2_GRPC_PORT="$(host_port ring-no-taker lnd2)" \
+    RING_E2E_MAKER3_GRPC_PORT="$(host_port ring-no-taker lnd3)" \
+    RING_E2E_NO_BUILD="$SKIP_BUILD" \
+    E2E_RESET=0 RING_E2E_NO_RESET=0 \
+        "${SCRIPT_DIR}/run-ring-e2e.sh" ring-no-taker \
+        > "${PARALLEL_DIR}/ring-no-taker.log" 2>&1
+}
+
+run_suite_lnd_external() {
+    log_suite "Starting: External private channel funding"
+    local ipam_file
+    ipam_file=$(generate_swap_ipam_override lnd-external default)
+    LND_EXTERNAL_PROJECT="${PROJECT_PREFIX}-lnd-external" \
+    LND_EXTERNAL_IPAM_FILE="$ipam_file" \
+    LND_EXTERNAL_DATA_DIR="${PARALLEL_DIR}/lnd-external-state" \
+    LND_EXTERNAL_BITCOIN_PORT="$(host_port lnd-external btc_rpc)" \
+    LND_EXTERNAL_OPENER_GRPC_PORT="$(host_port lnd-external lnd1)" \
+    LND_EXTERNAL_FUNDEE_GRPC_PORT="$(host_port lnd-external lnd2)" \
+    E2E_RESET=0 RING_E2E_NO_RESET=0 \
+        "${SCRIPT_DIR}/run-ring-e2e.sh" lnd-external \
+        > "${PARALLEL_DIR}/lnd-external.log" 2>&1
 }
 
 run_suite_e2e() {
@@ -1493,6 +1650,7 @@ run_suite_reference_maker() {
     local log="${PARALLEL_DIR}/${suite}.log"
     local btc_jam_rpc=$(host_port "$suite" btc_jam_rpc)
     local dir_port=$(host_port "$suite" dir)
+    local dir2_port=$(host_port "$suite" dir2)
     local obwatch_port=$(host_port "$suite" obwatch)
     local prefix="${CONTAINER_PREFIX}-${suite}"
 
@@ -1532,6 +1690,7 @@ run_suite_reference_maker() {
         BITCOIN_RPC_USER=test \
         BITCOIN_RPC_PASSWORD=test \
         DIRECTORY_PORT="${dir_port}" \
+        DIRECTORY2_PORT="${dir2_port}" \
         OBWATCH_URL="http://127.0.0.1:${obwatch_port}" \
         JM_CONTAINER_PREFIX="${prefix}" \
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
@@ -1714,6 +1873,10 @@ main() {
 
     # Unit tests (no Docker)
     launch_suite "unit" run_suite_unit
+    launch_suite "jmswap" run_suite_jmswap
+    launch_suite "ring" run_suite_ring
+    launch_suite "ring-no-taker" run_suite_ring_no_taker
+    launch_suite "lnd-external" run_suite_lnd_external
 
     # Docker test suites (each with isolated compose project)
     launch_suite "e2e" run_suite_e2e
@@ -1806,6 +1969,10 @@ if ! [[ "$INSTANCE" =~ ^[0-9]+$ ]]; then
     log_error "Instance id must be a non-negative integer (got '$INSTANCE')"
     exit 1
 fi
+if [[ "$JM_TEST_STATIC_IPAM" == 1 && "$INSTANCE" -gt 22 ]]; then
+    log_error "JM_TEST_STATIC_IPAM supports instances 0 through 22"
+    exit 1
+fi
 
 # Re-derive instance-scoped globals now that INSTANCE is final.
 apply_instance
@@ -1835,6 +2002,10 @@ case "${1:-}" in
         # Map suite name to runner function
         case "$suite" in
             unit)                  run_suite_unit ;;
+            jmswap)                run_suite_jmswap ;;
+            ring)                  run_suite_ring ;;
+            ring-no-taker)         run_suite_ring_no_taker ;;
+            lnd-external)          run_suite_lnd_external ;;
             e2e)                   run_suite_e2e ;;
             playwright)            run_suite_playwright ;;
             jmwallet)              run_suite_jmwallet ;;
@@ -1879,6 +2050,10 @@ Environment:
   JM_TEST_PORT_BASE=<port>        First host port of instance 0 (default 20000)
   JM_SHARED_IMAGE_PROJECT=<name>  Compose project used for shared image tags
   SKIP_BUILD=1                    Same as --no-build
+  JM_TEST_STATIC_IPAM=1           Use disjoint /24s in 10.240.0.0/13 when
+                                    Docker's automatic subnet pools are full;
+                                    verify this range does not overlap VPNs or
+                                    host routes (instances 0 through 22 only)
 
 Running two suites at once:
   Give each invocation a distinct instance id so their Compose projects,
@@ -1888,6 +2063,9 @@ Running two suites at once:
 
 Available suites:
   unit                  Unit tests (no Docker)
+  jmswap                Native Core escrow and LND buyout regtest
+  ring                  Mixed private ring, credential rentals, and buyout
+  lnd-external          External private channel funding
   e2e                   E2E + Docker integration tests
   playwright            Playwright browser tests
   jmwallet              jmwallet Docker tests
@@ -1901,6 +2079,9 @@ Available suites:
   tumbler               Tumbler end-to-end tests
 
 Logs are written to: tmp/parallel-tests/i<instance>/<suite>.log
+Failed ring/lnd-external fixtures are preserved, even by --cleanup. Use a new
+instance for a fresh attempt, or review and explicitly reset the retained fixture
+with scripts/run-ring-e2e.sh. The parallel runner never authorizes that reset.
 
 How it works:
   Each Docker-dependent suite runs in an isolated Docker Compose project

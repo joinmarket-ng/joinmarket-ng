@@ -59,7 +59,7 @@ def _settings(tmp_path: Path, **overrides: object) -> BuyoutSettings:
         "bitcoin_rpc_user": "buyout",
         "bitcoin_rpc_password": "regtest-placeholder",
         "allowed_peers": (_pubkey("taker-peer"),),
-        "payout_address": PAYOUT_ADDRESS,
+        "payout_addresses": [PAYOUT_ADDRESS],
         "mixdepth": 0,
         "wallet_fingerprint": FINGERPRINT,
         "poll_interval_seconds": 0.01,
@@ -207,7 +207,7 @@ async def test_ordinary_coinjoin_never_loads_or_opens_a_buyout(taker: MagicMock)
     [
         ({"enabled": False}, {}, "disabled"),
         (
-            {"network": "signet", "payout_address": SIGNET_PAYOUT_ADDRESS},
+            {"network": "signet", "payout_addresses": [SIGNET_PAYOUT_ADDRESS]},
             {},
             "networks differ",
         ),

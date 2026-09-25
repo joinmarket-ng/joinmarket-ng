@@ -92,7 +92,7 @@ bitcoin_rpc_url = "http://127.0.0.1:18443/"
 bitcoin_rpc_user = "buyout"
 bitcoin_rpc_password = "regtest-placeholder"
 allowed_peers = ["{PEER}"]
-payout_address = "{PAYOUT}"
+payout_addresses = ["{PAYOUT}"]
 mixdepth = 0
 wallet_fingerprint = "0123abcd"
 """

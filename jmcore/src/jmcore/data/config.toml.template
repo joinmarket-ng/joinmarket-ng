@@ -190,6 +190,7 @@
 # Wallet address type: "p2wpkh" (BIP84 native segwit, the default) or "p2tr"
 # (BIP86 Taproot key-path). A p2tr wallet takes part in tr0 Taproot CoinJoins
 # (JMP-0010) and cannot mix with p2wpkh makers in the same round (rigid pit).
+# EXPERIMENTAL: read docs/experimental-ring-market.md before enabling p2tr.
 # address_type = "p2wpkh"
 
 # Number of mixing depths (1-10)
@@ -513,16 +514,25 @@
 # Both offers stay in the pit selected by wallet.address_type (sw0 or tr0).
 # dual_offers = false
 
-# Experimental co-funded private Taproot channel ring. Disabled means no LND
-# connection and no capability advertisement. Enabling requires a p2tr wallet,
-# only tr0 offers, local TLS-authenticated LND, and a v3 onion Lightning URI.
+# EXPERIMENTAL private Taproot channel ring, see docs/experimental-ring-market.md.
+# Disabled means no new rings or
+# capability advertisement. Configured nodes can still recover retained rings.
+# Enabling requires explicit node enrollment, a shared binding directory, a
+# p2tr wallet, only tr0 offers, local TLS-authenticated LND, and a v3 onion
+# Lightning URI.
 [maker.channel_ring]
 # enabled = false
-# lnd_grpc_url = "https://127.0.0.1:10009"
-# lnd_tls_cert_path = "/home/user/.lnd/tls.cert"
-# lnd_macaroon_path = "/home/user/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
-# onion_endpoint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion:9735"
-# minimum_makers = 3
+# node_binding_directory = "/home/user/.joinmarket-ng/ln-node-bindings"
+# Map each eligible source mixdepth to a distinct named LND node. Equal outputs
+# go to the next mixdepth, which must not share this node identity.
+# mixdepth_nodes = { 0 = "local" }
+# Define named endpoints here or as [*.channel_ring.nodes.<name>] subtables.
+# nodes = {}
+# Minimum acceptable ring cycle size (at least three endpoints). A maker
+# cannot tell whether the taker is an endpoint. Increase this to reject small
+# cycles regardless of who participates; this does not change the taker's
+# minimum number of ring-capable makers.
+# minimum_makers = 2
 # min_channel_capacity = 1000000
 # max_channel_capacity = 20000000
 # max_push = 500000
@@ -538,6 +548,12 @@
 # phase_timeout_seconds = 120.0
 # open_timeout_seconds = 60.0
 # readiness_timeout_seconds = 120.0
+# Strict taker setup deadline. Makers must retain selected inputs through it.
+# setup_timeout_seconds = 600.0
+# Maker input-retention settings. The default 660 is setup timeout (600) +
+# configured margin (30) + fixed ring setup slack (30); lower values are rejected.
+# hold_safety_margin_seconds = 30.0
+# maker_setup_hold_seconds = 660.0
 # max_active_sessions = 4
 # max_verified_sessions = 2
 # persistence_directory = "/home/user/.joinmarket-ng/channel-ring-maker"
@@ -594,7 +610,8 @@
 # taker_utxo_age = 5          # Minimum confirmations on the PoDLE input
 # taker_utxo_retries = 3      # Max PoDLE index retries per UTXO
 # taker_utxo_amtpercent = 20  # Min UTXO value as % of CJ amount
-# Set to "only" to consume imported external PoDLE credentials. Their backing
+# EXPERIMENTAL (docs/experimental-ring-market.md). Set to "only" to consume
+# imported external PoDLE credentials. Their backing
 # UTXOs are independently verified and are never selected as CoinJoin inputs.
 # external_podle_mode = "disabled"
 
@@ -642,16 +659,24 @@
 # Set to 0 to disable replacement. Default: 3 (range: 0-10).
 # max_maker_replacement_attempts = 3
 
-# Taker-side policy uses the same strict model and safety bounds as the maker.
-# It only recognizes validated maker capability for now; normal CoinJoin maker
-# selection is unchanged while this feature is disabled or not orchestrated.
+# EXPERIMENTAL taker ring coordination, see docs/experimental-ring-market.md.
+# Uses the same strict model and safety bounds as the maker ring settings.
 [taker.channel_ring]
 # enabled = false
-# lnd_grpc_url = "https://127.0.0.1:10009"
-# lnd_tls_cert_path = "/home/user/.lnd/tls.cert"
-# lnd_macaroon_path = "/home/user/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
-# onion_endpoint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.onion:9735"
-# minimum_makers = 3
+# With LND nodes mapped, participate in channels by default. Set false to
+# coordinate a maker-only ring instead. With no mapped LND node, maker-only is
+# automatic; true without a mapping is rejected. The ring still requires three
+# channel participants, independently of the number of ordinary makers.
+# taker_participates = false
+# node_binding_directory = "/home/user/.joinmarket-ng/ln-node-bindings"
+# Use the same binding directory as every maker/taker profile on this host.
+# mixdepth_nodes = { 0 = "local" }
+# Define named endpoints here or as [*.channel_ring.nodes.<name>] subtables.
+# nodes = {}
+# Minimum ring-capable makers when the taker joins; two makers and the taker
+# form a three-member ring. Without taker channel participation, at least
+# three ring-capable makers are required regardless of this setting.
+# minimum_makers = 2
 # min_channel_capacity = 1000000
 # max_channel_capacity = 20000000
 # max_push = 500000
@@ -667,6 +692,12 @@
 # phase_timeout_seconds = 120.0
 # open_timeout_seconds = 60.0
 # readiness_timeout_seconds = 120.0
+# Strict taker setup deadline. Makers must retain selected inputs through it.
+# setup_timeout_seconds = 600.0
+# Maker input-retention settings. The default 660 is setup timeout (600) +
+# configured margin (30) + fixed ring setup slack (30); lower values are rejected.
+# hold_safety_margin_seconds = 30.0
+# maker_setup_hold_seconds = 660.0
 # max_active_sessions = 4
 # max_verified_sessions = 2
 # persistence_directory = "/home/user/.joinmarket-ng/channel-ring-taker"

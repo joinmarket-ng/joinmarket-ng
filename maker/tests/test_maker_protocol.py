@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 
 import pytest
 from bitcointx.core.key import CKey
+from jmcore.channel_ring import ChannelRingConfig
 from jmcore.encryption import CryptoSession
 from loguru import logger
 
@@ -116,8 +118,9 @@ async def test_encrypted_ioauth_response():
     cj_addr = "bcrt1qmakercj"
     change_addr = "bcrt1qmakerchange"
     btc_sig = "304402" + "bb" * 35  # DER signature
+    hold_seconds = "180"
 
-    ioauth_plaintext = f"{utxo_list} {auth_pub} {cj_addr} {change_addr} {btc_sig}"
+    ioauth_plaintext = f"{utxo_list} {auth_pub} {cj_addr} {change_addr} {btc_sig} {hold_seconds}"
 
     # Encrypt
     encrypted_ioauth = maker_crypto.encrypt(ioauth_plaintext)
@@ -128,12 +131,13 @@ async def test_encrypted_ioauth_response():
 
     # Parse decrypted ioauth
     parts = decrypted.split()
-    assert len(parts) == 5
+    assert len(parts) == 6
     assert parts[0] == utxo_list
     assert parts[1] == auth_pub
     assert parts[2] == cj_addr
     assert parts[3] == change_addr
     assert parts[4] == btc_sig
+    assert parts[5] == hold_seconds
 
 
 @pytest.mark.asyncio
@@ -707,6 +711,69 @@ def test_pre_sign_wait_shortens_only_the_remaining_session_deadline() -> None:
     )
 
 
+def test_pre_sign_wait_does_not_extend_an_existing_deadline() -> None:
+    """Repeated pre-sign preparation may renew locks but never renews the deadline."""
+    from unittest.mock import MagicMock, patch
+
+    from maker.maker_session import MakerSession
+
+    inner = MagicMock()
+    inner.session_timeout_sec = 300
+    inner.pre_sign_timeout_sec = 180
+    inner.input_lock_owner = "owner"
+    inner.our_utxos = {("aa" * 32, 0): MagicMock()}
+    inner.wallet.renew_coinjoin_inputs.return_value = True
+    with patch(
+        "maker.maker_session.time.monotonic", side_effect=(100.0, 100.0, 100.0, 150.0, 150.0)
+    ):
+        session = MakerSession(inner)
+        assert session.begin_pre_sign_wait()
+        assert session.begin_pre_sign_wait()
+
+    assert session.deadline == 280.0
+    assert inner.wallet.renew_coinjoin_inputs.call_args_list[0].kwargs["ttl"] == 180.0
+    assert inner.wallet.renew_coinjoin_inputs.call_args_list[1].kwargs["ttl"] == 130.0
+
+
+def test_ring_pre_sign_wait_reports_hold_beyond_strict_taker_setup_deadline() -> None:
+    from unittest.mock import MagicMock, patch
+
+    from maker.maker_session import MakerSession
+
+    inner = MagicMock()
+    inner.session_timeout_sec = 300
+    inner.pre_sign_timeout_sec = 180
+    inner.input_lock_owner = "owner"
+    inner.our_utxos = {("aa" * 32, 0): MagicMock()}
+    inner.wallet.renew_coinjoin_inputs.return_value = True
+    bot = MagicMock()
+    bot.config.channel_ring = ChannelRingConfig().model_copy(update={"enabled": True})
+    with patch("maker.maker_session.time.monotonic", side_effect=(100.0, 100.0, 100.0, 100.1)):
+        session = MakerSession(inner)
+        assert session.begin_pre_sign_wait(bot)
+        reported_hold_seconds = math.floor(session.remaining_timeout())
+
+    assert session.deadline == 760.0
+    assert reported_hold_seconds == 659
+    received_at = 100.1
+    required_until = received_at + (
+        bot.config.channel_ring.setup_timeout_seconds
+        + bot.config.channel_ring.hold_safety_margin_seconds
+    )
+    assert received_at + reported_hold_seconds > required_until
+    assert (
+        received_at
+        + bot.config.channel_ring.setup_timeout_seconds
+        + bot.config.channel_ring.hold_safety_margin_seconds
+        <= required_until
+    )
+    inner.wallet.renew_coinjoin_inputs.assert_called_once_with(
+        set(inner.our_utxos),
+        owner="owner",
+        ttl=bot.config.channel_ring.maker_setup_hold_seconds,
+    )
+
+
 @pytest.mark.asyncio
 async def test_select_our_utxos_forwards_exclude_to_wallet():
     """_select_our_utxos forwards committed outpoints to the wallet selector.
@@ -1277,6 +1344,9 @@ async def test_on_auth_releases_reservation_only_after_persistence(
         assert bot.active_sessions[_session_key(taker_nick)] is session
         assert session.state == CoinJoinState.IOAUTH_SENT
         inner.wallet.renew_coinjoin_inputs.assert_called_once()
+        sent_response = session.send_response.await_args.args[2]
+        assert sent_response["hold_seconds"].isdigit()
+        assert int(sent_response["hold_seconds"]) <= inner.pre_sign_timeout_sec
         inner.wallet.release_coinjoin_inputs.assert_not_called()
         if persistence_success:
             bot._release_commitment_reservation.assert_called_once_with(commitment)

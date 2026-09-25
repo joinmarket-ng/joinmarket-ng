@@ -1,4 +1,4 @@
-"""Maker participant state machine for JMP-0010 co-funded channel rings."""
+"""Maker participant state machine for JMP-0014 co-funded channel rings."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import base64
 import hashlib
 import secrets
 import time
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, cast
+from collections.abc import Awaitable, Sequence
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from jmcore.bitcoin import address_to_scriptpubkey, get_txid, parse_transaction
 from jmcore.channel_ring import ChannelRingConfig
@@ -62,6 +62,7 @@ from jmcore.cofunded_ring import (
     verify_payload,
     verify_ready_set,
 )
+from jmcore.constants import GENESIS_BLOCK_HASHES
 from jmcore.models import calculate_cj_fee, is_taproot_offer_type
 from jmswap.lnd import (
     AcceptorBounds,
@@ -84,9 +85,10 @@ from jmswap.lnd import (
 from jmswap.lnd import (
     TransactionPresence as LndTransactionPresence,
 )
+from loguru import logger
 
 if TYPE_CHECKING:
-    from jmswap.channel_ring import InitializedChannelRingBackend
+    from jmswap.channel_ring_nodes import BoundChannelRingNode, ChannelRingNodePool
     from jmwallet.backends.base import BlockchainBackend
 
     from maker.maker_session import MakerSession
@@ -96,17 +98,9 @@ class MakerRingError(Exception):
     """A ring request is invalid for this authenticated maker session."""
 
 
-_CHAIN_HASHES = {
-    "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-    "testnet": "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
-    "signet": "00000008819873e925422c1ff0f99f7c3bdb3adc1d93b6f4e2af5f996e3157b",
-    "regtest": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
-}
-
-
 def _chain_hash(network: str) -> bytes:
     try:
-        return bytes.fromhex(_CHAIN_HASHES[network])[::-1]
+        return bytes.fromhex(GENESIS_BLOCK_HASHES[network])[::-1]
     except KeyError as exc:
         raise MakerRingError(f"unsupported channel-ring network {network!r}") from exc
 
@@ -181,10 +175,15 @@ class MakerRingParticipant:
         *,
         config: ChannelRingConfig,
         store: RingParticipantStore,
-        initialized_backend: InitializedChannelRingBackend,
+        initialized_backend: BoundChannelRingNode,
         chain_backend: BlockchainBackend,
     ) -> None:
         self.session = session
+        if any(
+            utxo.mixdepth != initialized_backend.binding.source_mixdepth
+            for utxo in session.our_utxos.values()
+        ):
+            raise MakerRingError("ring inputs must all belong to the bound source mixdepth")
         self.config = config
         self.store = store
         self.initialized_backend = initialized_backend
@@ -315,6 +314,7 @@ class MakerRingParticipant:
                 raise MakerRingError("previous ring revision is not fully retired")
 
         record = RingParticipantRecord.fresh(
+            node_binding=self.initialized_backend.binding,
             round_nonce=payload.round_nonce,
             revision=payload.revision,
             taker_session_identity=self.session_identity,
@@ -420,6 +420,7 @@ class MakerRingParticipant:
         edge = plan.incoming_edge
         policy = edge.policy
         return InboundChannelExpectation(
+            scid_alias=True,
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             opener_node_id=plan.predecessor.node_id,
             chain_hash=_chain_hash(plan.network),
@@ -456,8 +457,11 @@ class MakerRingParticipant:
         if record.state is not RingLifecycleState.INVITED or record.invite is None:
             raise MakerRingError("ring_plan is out of order")
         validate_plan_for_invite(record.invite, payload)
-        if len(payload.cycle_keys) < self.config.minimum_makers + 1:
-            raise MakerRingError("ring plan has too few makers")
+        # The coordinator can be outside this cycle, and maker endpoints cannot
+        # infer which (if any) endpoint belongs to the taker. Check cycle size,
+        # never a guessed number of participating makers.
+        if len(payload.cycle_keys) < max(3, self.config.minimum_makers):
+            raise MakerRingError("ring plan has too few channel participants")
         if payload.cycle_keys[payload.position] != record.ring_public_key:
             raise MakerRingError("ring plan local position does not identify this maker")
         self._validate_policy(payload)
@@ -531,6 +535,7 @@ class MakerRingParticipant:
         edge = plan.outgoing_edge
         policy = edge.policy
         request = ExternalChannelRequest(
+            scid_alias=True,
             pending_channel_id=bytes.fromhex(edge.pending_channel_id),
             peer_node_id=plan.successor.node_id,
             peer_host=plan.successor.onion_endpoint,
@@ -549,7 +554,10 @@ class MakerRingParticipant:
             updates={"outgoing_open_started": True},
         )
         outgoing, incoming = await asyncio.gather(
-            self.lnd.start_external_channel(request), self.acceptor_task
+            _log_preparation_leg(
+                "outgoing channel negotiation", self.lnd.start_external_channel(request)
+            ),
+            _log_preparation_leg("incoming channel acceptance", self.acceptor_task),
         )
         if not isinstance(incoming, AcceptorObservation):
             raise MakerRingError("incoming acceptor returned an invalid observation")
@@ -591,7 +599,7 @@ class MakerRingParticipant:
             "outgoing_funding_address": outgoing.funding_address,
             **self._cache_updates(record, payload, [response]),
         }
-        self.store.transition(record.key, RingLifecycleState.PREPARED, updates=updates)
+        self.store.transition(record.key, RingLifecycleState.PREPARED_NOT_VERIFIED, updates=updates)
         return [response]
 
     def _validate_manifest(
@@ -771,7 +779,7 @@ class MakerRingParticipant:
     async def _unsigned(
         self, payload: RingUnsignedPayload, record: RingParticipantRecord
     ) -> list[RingPayloadType]:
-        if record.state is not RingLifecycleState.PREPARED:
+        if record.state is not RingLifecycleState.PREPARED_NOT_VERIFIED:
             raise MakerRingError("ring_unsigned is out of order")
         self._validate_manifest(payload, record)
         witnesses = await self._resolve_witness_utxos(payload.unsigned_tx)
@@ -783,6 +791,19 @@ class MakerRingParticipant:
             raise MakerRingError("ring PSBT transaction ID differs from manifest")
         outgoing_expected, incoming_expected = self._pending_expectations(payload.manifest, record)
         negotiation = _funding_negotiation(record)
+        # LND can consume its funding shim before returning from PsbtVerify.
+        # A crash at that boundary must not leave a PREPARED journal that permits
+        # pre-verification shim cancellation.
+        record = self.store.transition(
+            record.key,
+            RingLifecycleState.VERIFYING,
+            updates={
+                "unsigned_psbt": expected_psbt.hex(),
+                "unsigned_tx": payload.unsigned_tx,
+                "manifest": payload.manifest,
+                "chain_status": RingChainStatus(exact_txid=payload.manifest.unsigned_txid),
+            },
+        )
         verified = await self.lnd.verify_external_funding(
             negotiation,
             payload.unsigned_tx,
@@ -791,6 +812,8 @@ class MakerRingParticipant:
             witnesses,
             timeout_seconds=self.config.readiness_timeout_seconds,
         )
+        if verified.unsigned_psbt != expected_psbt:
+            raise MakerRingError("LND returned a different unsigned funding PSBT")
         # PsbtVerify consumes the opener's funding shim. Persist that point of no
         # return before querying either endpoint so a partial observation failure
         # cannot fall back to pre-verification shim cancellation.
@@ -1111,37 +1134,75 @@ class MakerRingParticipant:
         return [response]
 
 
+_T = TypeVar("_T")
+
+
+async def _log_preparation_leg(label: str, leg: Awaitable[_T]) -> _T:
+    """Log which private-channel preparation leg finished or stalled, and when."""
+    started = time.monotonic()
+    try:
+        result = await leg
+    except BaseException as exc:
+        logger.warning(
+            "Channel-ring {} failed after {:.0f}s: {}",
+            label,
+            time.monotonic() - started,
+            type(exc).__name__,
+        )
+        raise
+    logger.info("Channel-ring {} ready after {:.0f}s", label, time.monotonic() - started)
+    return result
+
+
 async def reconcile_ring_records(
     store: RingParticipantStore,
-    initialized_backend: InitializedChannelRingBackend,
+    nodes: ChannelRingNodePool,
     chain_backend: BlockchainBackend,
     acceptor_tasks: dict[str, asyncio.Task[object]] | None = None,
     *,
     acceptor_timeout_seconds: float = 600.0,
     active_session_identities: frozenset[str] = frozenset(),
-) -> None:
+) -> tuple[RingParticipantRecord, ...]:
     """Inspect retained participant records without deleting unresolved evidence.
 
     Records whose taker session is still live in this process are resumed but never
     escalated: escalation targets restart-orphaned state, not in-flight rounds.
+
+    Returns invitations retired because their session is gone. An ``INVITED``
+    maker has sent only a signed hello: no plan, LND operation, or signature
+    exists, so the caller may release that owner's input leases.
     """
 
     report = store.load_all()
     if report.corruptions:
-        return
+        return ()
+    expired_invites: list[RingParticipantRecord] = []
     for record in report.records:
         if not record.active:
+            continue
+        # Ownership failures must not rewrite evidence or use the current mapping.
+        initialized_backend = nodes.for_binding(record.node_binding)
+        if (
+            record.state is RingLifecycleState.INVITED
+            and record.taker_session_identity not in active_session_identities
+            and time.time() - record.updated_at >= acceptor_timeout_seconds
+        ):
+            # Without a live session the taker cannot deliver a plan, and the
+            # grace period covers a session registered just after the invite.
+            retiring = store.transition(record.key, RingLifecycleState.RETIRING)
+            expired_invites.append(store.transition(retiring.key, RingLifecycleState.RETIRED))
             continue
         try:
             if record.plan is not None and record.state in {
                 RingLifecycleState.ACCEPTOR_ARMED,
-                RingLifecycleState.PREPARED,
+                RingLifecycleState.PREPARED_NOT_VERIFIED,
                 RingLifecycleState.PSBT_VERIFIED,
                 RingLifecycleState.READY,
                 RingLifecycleState.SIGNING,
             }:
                 plan = record.plan
                 incoming = InboundChannelExpectation(
+                    scid_alias=True,
                     pending_channel_id=bytes.fromhex(plan.incoming_edge.pending_channel_id),
                     opener_node_id=plan.predecessor.node_id,
                     chain_hash=_chain_hash(plan.network),
@@ -1245,7 +1306,12 @@ async def reconcile_ring_records(
             for point in points:
                 await initialized_backend.backend.pending_channel_present(point)
             if record.taker_session_identity not in active_session_identities and (
-                record.state is RingLifecycleState.PLANNED
+                record.state
+                in {
+                    RingLifecycleState.PLANNED,
+                    RingLifecycleState.PREPARED,
+                    RingLifecycleState.VERIFYING,
+                }
                 or (
                     record.state is RingLifecycleState.SIGNING
                     and record.local_input_signature_created
@@ -1275,3 +1341,4 @@ async def reconcile_ring_records(
                         "retry": current.retry.model_copy(update={"last_error": str(exc)[:2000]})
                     },
                 )
+    return tuple(expired_invites)

@@ -1403,17 +1403,23 @@ class TestNewSettingsWiring:
 
 
 def test_channel_ring_settings_round_trip_and_require_tr0_wallet(tmp_path: Path) -> None:
-    from jmcore.channel_ring import ChannelRingSettings
+    from jmcore.channel_ring import ChannelRingNodeSettings, ChannelRingSettings
     from jmcore.settings import JoinMarketSettings, MakerSettings, WalletSettings
 
     from maker.cli import build_maker_config
 
     ring = ChannelRingSettings(
         enabled=True,
-        lnd_grpc_url="https://127.0.0.1:10009",
-        lnd_tls_cert_path=tmp_path / "tls.cert",
-        lnd_macaroon_path=tmp_path / "admin.macaroon",
-        onion_endpoint="a" * 56 + ".onion:9735",
+        nodes={
+            "local": ChannelRingNodeSettings(
+                lnd_grpc_url="https://127.0.0.1:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint="a" * 56 + ".onion:9735",
+            )
+        },
+        mixdepth_nodes={0: "local"},
+        node_binding_directory=tmp_path / "node-bindings",
         max_active_sessions=6,
         max_verified_sessions=3,
     )
@@ -1424,7 +1430,9 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(tmp_path: Path)
     config = build_maker_config(settings, mnemonic=TEST_MNEMONIC, passphrase="")
     assert config.channel_ring.enabled
     assert config.channel_ring.max_active_sessions == 6
-    assert config.channel_ring.lnd_macaroon_path == tmp_path / "admin.macaroon"
+    assert config.channel_ring.nodes["local"].lnd_macaroon_path == tmp_path / "admin.macaroon"
+    assert config.channel_ring.mixdepth_nodes == {0: "local"}
+    assert config.channel_ring.node_binding_directory == tmp_path / "node-bindings"
 
     incompatible = JoinMarketSettings(
         wallet=WalletSettings(address_type="p2wpkh"),
@@ -1440,6 +1448,22 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(tmp_path: Path)
     with pytest.raises(ValueError, match="tr0 maker offers"):
         build_maker_config(wrong_offer, mnemonic=TEST_MNEMONIC, passphrase="")
 
+    no_maker_node = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        maker=MakerSettings(
+            offer_type="tr0absoffer",
+            channel_ring=ring.model_copy(update={"mixdepth_nodes": {}}),
+        ),
+    )
+    with pytest.raises(ValueError, match="enabled maker channel ring requires local"):
+        build_maker_config(no_maker_node, mnemonic=TEST_MNEMONIC, passphrase="")
+
+    with pytest.raises(ValueError, match="taker_participates"):
+        MakerSettings(
+            offer_type="tr0absoffer",
+            channel_ring={**ring.model_dump(), "taker_participates": False},
+        )
+
 
 def test_disabled_channel_ring_round_trip_preserves_default_behavior() -> None:
     from jmcore.settings import JoinMarketSettings
@@ -1448,4 +1472,5 @@ def test_disabled_channel_ring_round_trip_preserves_default_behavior() -> None:
 
     config = build_maker_config(JoinMarketSettings(), mnemonic=TEST_MNEMONIC, passphrase="")
     assert config.channel_ring.enabled is False
-    assert config.channel_ring.lnd_grpc_url == ""
+    assert config.channel_ring.nodes == {}
+    assert config.channel_ring.mixdepth_nodes == {}

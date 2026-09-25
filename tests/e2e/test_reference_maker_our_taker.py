@@ -1064,7 +1064,13 @@ async def test_our_taker_replaces_failed_reference_maker_without_duplicate_auth(
             "rpc_user": rpc_user,
             "rpc_password": rpc_password,
         },
-        directory_servers=[f"127.0.0.1:{os.environ.get('DIRECTORY_PORT', '5222')}"],
+        # A starting maker announces through whichever directory it reaches
+        # first and adds the others later by periodic reconnection. Watch both,
+        # as a multi-directory taker would, so the replacement is discoverable.
+        directory_servers=[
+            f"127.0.0.1:{os.environ.get('DIRECTORY_PORT', '5222')}",
+            f"127.0.0.1:{os.environ.get('DIRECTORY2_PORT', '5223')}",
+        ],
         allow_clearnet_connections=True,
         counterparty_count=2,
         minimum_makers=2,

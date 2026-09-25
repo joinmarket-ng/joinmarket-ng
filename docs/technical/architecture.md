@@ -14,7 +14,8 @@ The implementation separates concerns into distinct packages:
 | Package | Purpose |
 |---------|---------|
 | `jmcore` | Core library: crypto, protocol definitions, models |
-| `jmwallet` | Wallet: BIP32/39/84, UTXO management, signing |
+| `jmwallet` | Wallet: BIP32/39/84/86, UTXO management, signing |
+| `jmswap` | Private-channel funding and channel-buyout escrow lifecycle |
 | `directory_server` | Directory node: message routing, peer registry |
 | `maker` | Maker bot: offer management, CoinJoin participation |
 | `taker` | Taker bot: CoinJoin orchestration, maker selection |
@@ -148,6 +149,22 @@ no wallet or ring format migration is required. A live lease belonging to anothe
 owner, a partially present set of leases, a corrupt record, or an older record
 without an owner token blocks ring recovery. Missing metadata alone never
 authorizes restoration, and recovery does not overwrite another owner's lease.
+If a running maker cannot reconcile ring records or renew their input leases,
+it stops accepting all fills (including ordinary offers) and exits with an
+operator-recovery error. The existing leases still expire with time; this
+fail-closed process exit does not make deleted journals or another process using
+the same wallet safe. Stop every wallet-sharing process until the state is
+resolved rather than restarting the maker or spending the inputs.
+
+A maker invitation that never receives a ring plan is retired once its
+ordinary CoinJoin session is gone and one ring phase timeout has passed since
+the invitation. At that point the maker has sent only a signed hello (no plan,
+LND operation, or signature), so it releases the invitation's own input leases.
+Planned and later states are never expired this way.
+
+`jm-maker ring-records` prints retained ring records read-only for recovery; see
+[Experimental Ring Market](../experimental-ring-market.md#stop-conditions-and-recovery).
+No command retires records automatically.
 
 Ring deployments must budget the maker's `session_timeout_sec` and
 `pre_sign_timeout_sec` for negotiation and cancellation. If the ordinary session
@@ -173,3 +190,91 @@ commitments are UTXO-derived and the blacklist is network-shared),
 `ignored_makers.txt`, and `config.toml`.
 
 ---
+
+## Private Channel Rings
+
+`private_channel_ring` is the single public capability for private Taproot
+channel rings. It is negotiated per session; it is not an older cofunded-v1
+capability and has no legacy fallback. The ring needs at least three channel
+participants: the taker plus two ring-capable makers, or three ring-capable
+makers when the taker does not participate. Ordinary makers can fill
+other slots without joining the ring. The separate CoinJoin maker-count floor
+still applies, and the default target remains eight to ten makers. When the
+taker has no configured LND node, or explicitly opts out of joining despite
+having one configured, a separate coordinator journal permits a three-maker
+channel cycle with ordinary P2TR taker change. This maker-only
+path remains experimental: interruption before an exact signed final
+transaction cannot be automatically canceled after authenticated maker
+sessions end. Do not use it with funds that require unattended recovery.
+Coordinator messages use a separate per-round signing key, not the taker's
+channel endpoint key, so the protocol signer alone does not identify a member
+of the channel cycle. This does not hide a node whose Lightning identity was
+already linked to a JoinMarket participant through other observations.
+The default taker maker floor is two when participating, or three when not.
+A maker enforces a minimum of three channel endpoints
+regardless of the configured `minimum_makers`, but cannot determine which
+endpoint, if any, is the taker. A scarce orderbook or observed Lightning peers
+can still make participation inferable despite the separate coordinator key.
+In a maker-only round with exactly three makers and no ordinary maker,
+the manifest identifies all channel output indices, leaving the taker's change
+as the only ordinary output visible to ring makers. This three-member minimum
+is allowed by policy but does not hide that change from those makers. An
+additional ordinary maker can remove the immediate one-output inference, not
+guarantee anonymity against colluding makers.
+
+Funding verification writes an exact unsigned transaction and PSBT intent
+before calling LND. If LND's response is lost, the journal remains unresolved
+and cannot cancel the shim automatically; operator-assisted recovery is required.
+Older `prepared` records cannot prove whether verification already happened and
+are likewise kept unresolved rather than canceled.
+Maker-only coordinator records persist reached maker identities, selected inputs,
+and signing intent independently of any local LND endpoint. After a taker crash,
+reconciliation rebroadcasts only a durable final transaction or confirms the
+exact manifested transaction; it cannot recreate the authenticated maker
+sessions needed to cancel an unfinished round. Leave the input reservations
+in place and obtain affirmative maker and chain evidence before any manual
+release. A corrupt or partial coordinator journal stops taker startup, but
+time-limited wallet leases can then expire: stop **every process** sharing the
+wallet and do not spend from it until the journal and maker states are resolved.
+Missing journal fields are not evidence that the round never started.
+
+For a mixed transaction with `N` total participants and `R` ring participants,
+the output set contains `N` equal P2TR outputs, `R` private channel outputs,
+and `N-R` exact ordinary P2TR change outputs, for `2N` outputs total. Ordinary
+makers receive only their usual CoinJoin messages and change output; they do
+not receive ring messages or ring contact information. They must nevertheless
+advertise an input hold long enough for ring setup; an unmodified reference
+maker that sends legacy five-field `!ioauth` cannot safely serve as an ordinary
+maker in a ring round. That format remains accepted for non-ring CoinJoins.
+
+The setup deadline is `[taker.channel_ring].setup_timeout_seconds`, whose
+default is 600 seconds. `[maker.channel_ring].hold_safety_margin_seconds`
+defaults to 30 seconds, and `[maker.channel_ring].maker_setup_hold_seconds`
+defaults to 660 seconds. The maker hold must cover the setup deadline, the
+configured margin, and a further 30-second ring setup slack. Selected ordinary
+makers must also retain their inputs until setup completes. If the taker specifies
+exact input outpoints, both ring modes abort rather than silently select more
+wallet inputs when authenticated fees exceed the estimate.
+
+Ring makers currently cannot enforce their configured minimum *final* miner-fee
+rate before releasing signatures: the ring path verifies the manifest and
+chain-resolved prevouts but does not run the ordinary maker's estimated fee
+check. An unsigned P2TR or P2WSH input does not bound its eventual witness
+size, so adding a template estimate would not prove the signed transaction's
+fee rate. An honest taker checks actual signed vsize before broadcasting; that
+does not constrain a malicious taker holding maker signatures. Do not rely on
+the maker fee-floor setting as a ring-parent relayability guarantee.
+
+### Testing
+
+The ring, maker-only ring, and buyout lifecycles run in Docker regtest fixtures:
+
+```sh
+docker build -t jm-buyout-lnd:v0.21.3-beta lnd
+scripts/run-ring-e2e.sh ring
+scripts/run-ring-e2e.sh ring-no-taker
+```
+
+A failed or interrupted fixture keeps its chain, journals, and channels for
+review. `E2E_RESET=1` deletes one reviewed fixture; it is never a retry of an
+uncertain signed round.

@@ -36,7 +36,7 @@ from jmcore.market_faults import MarketFaultCache
 from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
 from jmcore.paths import get_default_data_dir, get_nick_state_component, read_nick_state
-from jmcore.protocol import FEATURE_COFUNDED_CHANNEL_RING_V1, FEATURE_NEUTRINO_COMPAT, JM_VERSION
+from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
 from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from jmwallet.history import (
@@ -50,6 +50,7 @@ from jmwallet.wallet.signing import (
 from jmwallet.wallet.spend import resolve_input_utxos
 from loguru import logger
 
+from taker.channel_ring_coordinator_store import CoordinatorStore
 from taker.coinjoin_session import CoinJoinSession
 from taker.config import Schedule, TakerConfig, resolve_counterparty_count
 from taker.eligibility import (
@@ -64,7 +65,7 @@ from taker.orderbook import (
     OrderbookManager,
     calculate_cj_fee,
     maker_selection_keys,
-    offer_supports_cofunded_channel_ring_v1,
+    offer_supports_private_channel_ring,
 )
 from taker.podle import ExtendedPoDLECommitment
 from taker.podle_manager import BondKey, ExternalPoDLEPreview, PoDLEManager
@@ -438,8 +439,9 @@ class Taker(TakerMonitoringMixin):
         # Background task tracking
         self.running = False
         self._background_tasks: list[asyncio.Task[None]] = []
-        self._channel_ring_backend: Any | None = None
+        self._channel_ring_nodes: Any | None = None
         self._channel_ring_store: RingParticipantStore | None = None
+        self._channel_ring_coordinator_store: CoordinatorStore | None = None
         self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
         if config.channel_ring.enabled:
             data_directory = Path(config.data_dir or get_default_data_dir())
@@ -570,7 +572,7 @@ class Taker(TakerMonitoringMixin):
 
         This should be called after sync_wallet() and any fund validation.
         """
-        if self.config.channel_ring.enabled:
+        if self.config.channel_ring.enabled or self.config.channel_ring.nodes:
             if not self.backend.has_mempool_access() or not (
                 self.backend.can_get_confirmations_by_txid()
             ):
@@ -578,28 +580,72 @@ class Taker(TakerMonitoringMixin):
                     "Channel-ring taker requires a full backend that can prove mempool "
                     "and chain absence"
                 )
-            from jmswap.channel_ring import initialize_channel_ring_backend
+            from jmswap.channel_ring_nodes import (
+                channel_ring_wallet_identity,
+                initialize_channel_ring_nodes,
+            )
 
-            self._channel_ring_backend = await initialize_channel_ring_backend(
+            wallet_identity = channel_ring_wallet_identity(
+                self.wallet.master_key.get_public_key_bytes()
+            )
+            data_directory = Path(self.config.data_dir or get_default_data_dir())
+            # Preflight strict coordinator state before inspecting a local LND
+            # node. Reload under the runtime lease after node initialization.
+            from taker.channel_ring_coordinator_store import CoordinatorStore
+
+            preflight = CoordinatorStore(
+                self.config.channel_ring.persistence_path(data_directory),
+                network=cast(Any, self.config.network.value),
+                wallet_identity=wallet_identity,
+                max_active_sessions=self.config.channel_ring.max_active_sessions,
+                max_verified_sessions=self.config.channel_ring.max_verified_sessions,
+            )
+            preflight.load_all()
+
+            self._channel_ring_nodes = await initialize_channel_ring_nodes(
                 self.config.channel_ring,
                 network=self.config.network.value,
                 offer_type=self.config.preferred_offer_type.value,
+                wallet_identity=wallet_identity,
+                mixdepth_count=self.wallet.mixdepth_count,
+                data_directory=data_directory,
             )
-            assert self._channel_ring_store is not None
+            self._channel_ring_store = self._channel_ring_nodes.store
+            self._channel_ring_coordinator_store = CoordinatorStore(
+                self._channel_ring_store.directory,
+                network=cast(Any, self.config.network.value),
+                wallet_identity=wallet_identity,
+                participant_store=self._channel_ring_store,
+                max_active_sessions=self.config.channel_ring.max_active_sessions,
+                max_verified_sessions=self.config.channel_ring.max_verified_sessions,
+            )
+            # Validate ownership and all field states before any LND recovery or
+            # funding action. Unknown coordinator evidence is never ignored.
+            coordinator_records = self._channel_ring_coordinator_store.load_all()
             from taker.channel_ring import reconcile_taker_ring_records
 
             await reconcile_taker_ring_records(
                 self._channel_ring_store,
-                self._channel_ring_backend,
+                self._channel_ring_nodes,
                 self.backend,
                 self._channel_ring_recovery_tasks,
                 acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
             )
             if not self._renew_channel_ring_input_locks():
                 raise RuntimeError("could not restore an active channel-ring input reservation")
+            from taker.channel_ring_maker_only import reconcile_maker_only_ring_records
+
+            await reconcile_maker_only_ring_records(
+                self._channel_ring_coordinator_store, self.backend
+            )
             report = self._channel_ring_store.load_all()
-            active = sum(record.active for record in report.records)
-            verified = sum(record.verified_unresolved for record in report.records)
+            coordinator_records = self._channel_ring_coordinator_store.load_all()
+            active = sum(record.active for record in report.records) + sum(
+                record.active for record in coordinator_records
+            )
+            verified = sum(record.verified_unresolved for record in report.records) + sum(
+                record.verified_unresolved for record in coordinator_records
+            )
             if (
                 report.corruptions
                 or active >= self.config.channel_ring.max_active_sessions
@@ -608,6 +654,8 @@ class Taker(TakerMonitoringMixin):
                 raise RuntimeError(
                     "Channel-ring durable capacity is exhausted or contains corrupt records"
                 )
+            if self.config.channel_ring.enabled and self.config.channel_ring.taker_joins:
+                await self._channel_ring_nodes.enable_funding()
 
         # Connect to directory servers
         logger.info("Connecting to directory servers...")
@@ -643,7 +691,7 @@ class Taker(TakerMonitoringMixin):
         # Start periodic directory connection status logging task
         conn_status_task = asyncio.create_task(self._periodic_directory_connection_status())
         self._background_tasks.append(conn_status_task)
-        if self._channel_ring_backend is not None:
+        if self._channel_ring_nodes is not None:
             ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
             self._background_tasks.append(ring_task)
 
@@ -670,7 +718,11 @@ class Taker(TakerMonitoringMixin):
         if self._session and self._session.reserved_inputs:
             try:
                 coordinator = self._session.ring_coordinator
-                if coordinator is not None and coordinator._record().active:
+                if (
+                    coordinator is not None
+                    and getattr(coordinator, "has_durable_record", True)
+                    and coordinator._record().active
+                ):
                     logger.warning("Retaining taker input locks for an active channel-ring record")
                     return
                 self.wallet.release_coinjoin_inputs(
@@ -853,6 +905,17 @@ class Taker(TakerMonitoringMixin):
         """
         min_conf = self.config.taker_utxo_age
 
+        source_mixdepth = (
+            mixdepth if mixdepth is not None else (None if self.config.select_utxos else 0)
+        )
+        if (
+            self.config.channel_ring.enabled
+            and self.config.channel_ring.taker_joins
+            and source_mixdepth is not None
+            and source_mixdepth not in self.config.channel_ring.mixdepth_nodes
+        ):
+            return "Source mixdepth has no configured channel-ring node"
+
         if input_utxos is not None:
             if self.config.select_utxos:
                 return "Cannot specify both --select-utxos and --input-utxo"
@@ -877,6 +940,12 @@ class Taker(TakerMonitoringMixin):
             )
             utxos = []
             for md in mixdepths:
+                if (
+                    self.config.channel_ring.enabled
+                    and self.config.channel_ring.taker_joins
+                    and md not in self.config.channel_ring.mixdepth_nodes
+                ):
+                    continue
                 utxos.extend(await self.wallet.get_utxos(md))
             reserved = self.wallet.get_locked_input_outpoints()
             if not selectable_for_interactive(utxos, min_conf, excluded_outpoints=reserved):
@@ -983,6 +1052,17 @@ class Taker(TakerMonitoringMixin):
             logger.info(f"Source mixdepth: {resolved_mixdepth} (from selection)")
         else:
             resolved_mixdepth = mixdepth if mixdepth is not None else 0
+
+        if (
+            self.config.channel_ring.enabled
+            and self.config.channel_ring.taker_joins
+            and resolved_mixdepth not in self.config.channel_ring.mixdepth_nodes
+        ):
+            self._session.last_failure_reason = (
+                "Source mixdepth has no configured channel-ring node"
+            )
+            self.state = TakerState.FAILED
+            return None
 
         if explicitly_selected is None:
             eligibility_reason = await self.check_utxo_eligibility(amount, resolved_mixdepth)
@@ -1189,9 +1269,16 @@ class Taker(TakerMonitoringMixin):
 
         self.podle_manager.close()
         await self.directory_client.close_all()
-        if self._channel_ring_backend is not None:
-            await self._channel_ring_backend.backend.close()
-            self._channel_ring_backend = None
+        if self._channel_ring_nodes is not None:
+            # The foreground round is also a journal writer. Do not release
+            # its process lease merely because background tasks have stopped.
+            async with self._round_lock:
+                coordinator = self._session.ring_coordinator
+                if coordinator is not None and coordinator.acceptor_task is not None:
+                    coordinator.acceptor_task.cancel()
+                    await asyncio.gather(coordinator.acceptor_task, return_exceptions=True)
+                await self._channel_ring_nodes.close()
+                self._channel_ring_nodes = None
         if close_wallet:
             await self.wallet.close()
         logger.info("Taker stopped")
@@ -1201,10 +1288,10 @@ class Taker(TakerMonitoringMixin):
 
         while self.running:
             assert self._channel_ring_store is not None
-            assert self._channel_ring_backend is not None
+            assert self._channel_ring_nodes is not None
             await reconcile_taker_ring_records(
                 self._channel_ring_store,
-                self._channel_ring_backend,
+                self._channel_ring_nodes,
                 self.backend,
                 self._channel_ring_recovery_tasks,
                 acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
@@ -1216,6 +1303,14 @@ class Taker(TakerMonitoringMixin):
                     "reservation could not be renewed"
                 )
                 return
+            if self._channel_ring_coordinator_store is not None:
+                from taker.channel_ring_maker_only import reconcile_maker_only_ring_records
+
+                await reconcile_maker_only_ring_records(
+                    self._channel_ring_coordinator_store,
+                    self.backend,
+                    active_session_identities=self._active_ring_session_identities(),
+                )
             await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
 
     def _active_ring_session_identities(self) -> frozenset[str]:
@@ -1236,13 +1331,22 @@ class Taker(TakerMonitoringMixin):
         if report.corruptions:
             return False
         ttl = self._session.input_lock_ttl_sec()
-        for record in report.records:
-            if not record.active or not record.local_input_outpoints:
-                continue
-            owner = record.input_lock_owner
+        active_records = [
+            (record.input_lock_owner, record.local_input_outpoints)
+            for record in report.records
+            if record.active and record.local_input_outpoints
+        ]
+        coordinator_store = getattr(self, "_channel_ring_coordinator_store", None)
+        if coordinator_store is not None:
+            active_records.extend(
+                (record.input_lock_owner, record.input_outpoints)
+                for record in coordinator_store.load_all()
+                if record.active
+            )
+        for owner, inputs in active_records:
             if owner is None:
                 return False
-            outpoints = {(item.txid, item.vout) for item in record.local_input_outpoints}
+            outpoints = {(item.txid, item.vout) for item in inputs}
             # Renew live leases before restoring missing ones from the durable
             # record. Acquisition deliberately rejects even our own live lease.
             if self.wallet.renew_coinjoin_inputs(outpoints, ttl=ttl, owner=owner):
@@ -1467,7 +1571,7 @@ class Taker(TakerMonitoringMixin):
         if not self.config.channel_ring.enabled:
             return None
         self._session.strict_maker_count = maker_count
-        minimum = max(self.config.minimum_makers, self.config.channel_ring.minimum_makers)
+        minimum = max(self.config.minimum_makers, self._ring_maker_floor())
         if buyout is not None:
             return RING_BUYOUT_CONFLICT
         if amount == 0:
@@ -1485,73 +1589,187 @@ class Taker(TakerMonitoringMixin):
         self._session.last_failure_reason = error
         raise ValueError(error)
 
-    def _ring_filter_offers(
-        self, offers: list[Any], maker_count: int
-    ) -> tuple[list[Any], str | None]:
-        if not self.config.channel_ring.enabled:
-            return offers, None
-        filtered = [
+    def _ring_maker_floor(self) -> int:
+        """Keep at least three channel endpoints without guessing maker roles."""
+        return max(
+            self.config.channel_ring.minimum_makers,
+            2 if self.config.channel_ring.taker_joins else 3,
+        )
+
+    def _select_channel_ring_makers(
+        self,
+        offers: list[Offer],
+        maker_count: int,
+        required_features: set[str] | None,
+        *,
+        ring_slots: int | None = None,
+        hard_exclude_nicks: set[str] | None = None,
+        exclude_nicks: set[str] | None = None,
+        penalized_maker_keys: set[str] | None = None,
+    ) -> tuple[dict[str, Offer], int]:
+        """Reserve ring and ordinary slots using the normal orderbook chooser.
+
+        Select as many eligible non-ignored ring makers as fit the requested
+        total. Only relax soft exclusions to reach the ring minimum; do not
+        prefer an ignored ring maker over a usable ordinary maker. Then fill
+        remaining slots from the combined orderbook.
+        """
+        if self.config.channel_ring.enabled is True and (
+            self._session.ring_maker_sessions or self._session.ordinary_maker_sessions
+        ):
+            raise ValueError(
+                "Channel-ring maker roles are frozen; replacements are no longer allowed"
+            )
+        if self.config.channel_ring.enabled is not True:
+            return self.orderbook_manager.select_makers(
+                cj_amount=self._session.cj_amount,
+                n=maker_count,
+                required_features=required_features,
+                hard_exclude_nicks=hard_exclude_nicks,
+                exclude_nicks=exclude_nicks,
+                penalized_maker_keys=penalized_maker_keys,
+            )
+        ring_slots = self._ring_maker_floor() if ring_slots is None else ring_slots
+        remaining_slots = maker_count - ring_slots
+        if remaining_slots < 0:
+            raise ValueError("Channel-ring request has fewer makers than required ring slots")
+        base_hard_exclude = set(hard_exclude_nicks or ())
+        ring_pool = [
             offer
             for offer in offers
-            if offer_supports_cofunded_channel_ring_v1(offer)
+            if offer_supports_private_channel_ring(offer)
             and offer.ordertype is self.config.preferred_offer_type
         ]
-        if len(filtered) < maker_count:
-            return filtered, (
-                "Not enough makers explicitly advertise the exact configured "
-                "cofunded_channel_ring_v1 tr0 offer"
-            )
-        return filtered, None
 
-    def _ring_selection_error(self, selected_count: int, requested_count: int) -> str | None:
-        if self.config.channel_ring.enabled and selected_count != requested_count:
-            return "Channel-ring selection did not return the exact requested maker set"
-        return None
+        def select_from(
+            pool: list[Offer], count: int, hard: set[str]
+        ) -> tuple[dict[str, Offer], int]:
+            original = self.orderbook_manager.offers
+            self.orderbook_manager.offers = pool
+            try:
+                return self.orderbook_manager.select_makers(
+                    cj_amount=self._session.cj_amount,
+                    n=count,
+                    required_features=required_features,
+                    hard_exclude_nicks=hard,
+                    exclude_nicks=exclude_nicks,
+                    penalized_maker_keys=penalized_maker_keys,
+                )
+            finally:
+                self.orderbook_manager.offers = original
 
-    def _prepare_ring_offer_selection(
-        self,
-        offers: list[Any],
-        required_features: set[str] | None,
-        maker_count: int,
-    ) -> tuple[list[Any], set[str] | None]:
-        if self.config.channel_ring.enabled:
-            required_features = set(required_features or ())
-            required_features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
-        filtered, error = self._ring_filter_offers(offers, maker_count)
-        if error is not None:
-            self._session.last_failure_reason = error
-            raise ValueError(error)
-        return filtered, required_features
+        soft_exclude = self.orderbook_manager.ignored_makers | set(exclude_nicks or ())
+        preferred_ring_pool = [
+            offer for offer in ring_pool if offer.counterparty not in soft_exclude
+        ]
+        ring, ring_fee = select_from(preferred_ring_pool, maker_count, base_hard_exclude)
+        if len(ring) < ring_slots:
+            ring, ring_fee = select_from(ring_pool, ring_slots, base_hard_exclude)
+        if len(ring) < ring_slots:
+            raise ValueError("Not enough private_channel_ring makers for reserved ring slots")
+        remaining_slots = maker_count - len(ring)
+        network = (self.config.bitcoin_network or self.config.network).value
+        ring_bonds = {
+            bond
+            for bond in (verified_bond_key(offer, network) for offer in ring.values())
+            if bond is not None
+        }
+        remaining_pool = [
+            offer
+            for offer in offers
+            if offer.ordertype is self.config.preferred_offer_type
+            and offer.counterparty not in ring
+            and verified_bond_key(offer, network) not in ring_bonds
+        ]
+        remaining, remaining_fee = select_from(
+            remaining_pool, remaining_slots, base_hard_exclude | set(ring)
+        )
+        if len(remaining) != remaining_slots:
+            raise ValueError("Not enough makers for the remaining channel-ring slots")
+        return {**ring, **remaining}, ring_fee + remaining_fee
 
-    def _enforce_ring_selection(self, selected_count: int, requested_count: int) -> None:
-        error = self._ring_selection_error(selected_count, requested_count)
-        if error is None:
-            return
-        self._session.last_failure_reason = error
-        raise ValueError(error)
+    def _ring_replacement_slots(self, needed: int) -> int:
+        """Return how many pending replacement slots must remain ring-capable."""
+        if self.config.channel_ring.enabled is not True:
+            return 0
+        active_ring = set(self._session.maker_sessions) & self._session.ring_candidate_nicks
+        missing_ring = self._ring_maker_floor() - len(active_ring)
+        return min(needed, max(0, missing_ring))
+
+    def _drop_capability_flipped_ring_candidates(self) -> set[str]:
+        """Discard stale ring candidates before roles are frozen."""
+        if self.config.channel_ring.enabled is not True:
+            return set()
+        dropped = {
+            nick
+            for nick in self._session.ring_candidate_nicks & set(self._session.maker_sessions)
+            if not offer_supports_private_channel_ring(self._session.maker_sessions[nick].offer)
+        }
+        for nick in dropped:
+            self._session.remove_maker_session(nick)
+        return dropped
 
     async def _prepare_channel_ring(self, destination: str, mixdepth: int) -> bool:
-        if self._channel_ring_backend is None or self._channel_ring_store is None:
+        if self._channel_ring_nodes is None or self._channel_ring_store is None:
             self._session.last_failure_reason = "Channel-ring backend was not safely initialized"
             logger.error(self._session.last_failure_reason)
             return False
-        from taker.channel_ring import TakerRingCoordinator
-
         self.state = TakerState.RING_INVITING
         assert self._session.podle_commitment is not None
-        coordinator = TakerRingCoordinator(
-            self._session,
-            config=self.config.channel_ring,
-            store=self._channel_ring_store,
-            initialized_backend=self._channel_ring_backend,
-            chain_backend=self.backend,
-            session_identity=f"{self.nick}:{self._session.podle_commitment.to_commitment_str()}",
-        )
+        session_identity = f"{self.nick}:{self._session.podle_commitment.to_commitment_str()}"
+        if self.config.channel_ring.taker_joins:
+            from taker.channel_ring import TakerRingCoordinator
+
+            coordinator = TakerRingCoordinator(
+                self._session,
+                config=self.config.channel_ring,
+                store=self._channel_ring_store,
+                initialized_backend=self._channel_ring_nodes.for_mixdepth(mixdepth),
+                chain_backend=self.backend,
+                session_identity=session_identity,
+            )
+        else:
+            from taker.channel_ring_maker_only import MakerOnlyRingCoordinator
+
+            if self._channel_ring_coordinator_store is None:
+                raise RuntimeError("Maker-only ring coordinator journal was not initialized")
+            coordinator = MakerOnlyRingCoordinator(
+                self._session,
+                config=self.config.channel_ring,
+                store=self._channel_ring_coordinator_store,
+                chain_backend=self.backend,
+                session_identity=session_identity,
+            )
         self._session.ring_coordinator = coordinator
         if await coordinator.prepare(destination, mixdepth):
             return True
         self._session.last_failure_reason = "Strict channel-ring negotiation aborted"
         return False
+
+    def _initial_maker_details(self, fee_plan: dict[str, int]) -> list[dict[str, Any]]:
+        """Snapshot the offer and directory details shown at initial confirmation."""
+        details: list[dict[str, Any]] = []
+        for nick, session in self._session.maker_sessions.items():
+            # Preserve the directory's original first-serving-peer ordering.
+            # If none serve, the last observed location is shown as before.
+            location = None
+            for client in self.directory_client.clients.values():
+                location = client._active_peers.get(nick)
+                if not location or location == "NOT-SERVING-ONION":
+                    continue
+                break
+            details.append(
+                {
+                    "nick": nick,
+                    "fee": fee_plan[nick],
+                    "advertised_fee": calculate_cj_fee(
+                        session.offer, self._session.cj_amount, False
+                    ),
+                    "bond_value": session.offer.fidelity_bond_value,
+                    "location": location,
+                }
+            )
+        return details
 
     async def _build_transaction_phase(self, destination: str, mixdepth: int) -> bool:
         if self.config.channel_ring.enabled:
@@ -1592,7 +1810,6 @@ class Taker(TakerMonitoringMixin):
                     != (self.config.bitcoin_network or self.config.network).value
                 ):
                     raise ValueError("Buyout and CoinJoin Bitcoin networks differ")
-                buyout.begin_round()
                 session.buyout = buyout
             self._session = session
             self.state = TakerState.IDLE
@@ -1684,6 +1901,30 @@ class Taker(TakerMonitoringMixin):
             if requested_inputs is None:
                 return None
             explicitly_selected_utxos, manually_selected_utxos, mixdepth = requested_inputs
+            if self._session.buyout is not None:
+                binding = self._session.buyout.buyer.runtime_binding
+                binding_mixdepth = binding.get("mixdepth")
+                if type(binding_mixdepth) is not int or binding_mixdepth != mixdepth:
+                    self._session.last_failure_reason = (
+                        "Buyout LND binding does not match the wallet source mixdepth"
+                    )
+                    logger.error(self._session.last_failure_reason)
+                    return None
+                fingerprint = binding.get("wallet_fingerprint")
+                if (
+                    not isinstance(fingerprint, str)
+                    or not fingerprint
+                    or fingerprint != self.wallet.wallet_fingerprint
+                ):
+                    self._session.last_failure_reason = (
+                        "Buyout LND binding does not match the wallet identity"
+                    )
+                    logger.error(self._session.last_failure_reason)
+                    return None
+                # Input selection (including interactive selection) is complete.
+                # Refuse a cross-mixdepth buyout before reserving its journal or
+                # revealing a PoDLE commitment to the makers.
+                self._session.buyout.begin_round()
 
             # Determine destination address
             if destination == "INTERNAL":
@@ -1728,9 +1969,6 @@ class Taker(TakerMonitoringMixin):
             required_features: set[str] | None = None
             if self.backend.requires_neutrino_metadata():
                 required_features = {FEATURE_NEUTRINO_COMPAT}
-            offers, required_features = self._prepare_ring_offer_selection(
-                offers, required_features, n_makers
-            )
 
             # Early compatibility pre-check for neutrino takers: count how many offers
             # are from makers known to support neutrino_compat (via peerlist_features or
@@ -1927,10 +2165,10 @@ class Taker(TakerMonitoringMixin):
 
                 await self._prepare_external_podle(self._session.cj_amount)
 
-                selected_offers, total_fee = self.orderbook_manager.select_makers(
-                    cj_amount=self._session.cj_amount,
-                    n=n_makers,
-                    required_features=required_features,
+                selected_offers, total_fee = self._select_channel_ring_makers(
+                    offers,
+                    n_makers,
+                    required_features,
                     exclude_nicks=exclude_nicks,
                     hard_exclude_nicks=self._seller_separation.excluded_nicks(),
                     penalized_maker_keys=penalized_maker_keys,
@@ -1943,7 +2181,10 @@ class Taker(TakerMonitoringMixin):
                     self._session.last_failure_reason = reason
                     self.state = TakerState.FAILED
                     return None
-                self._enforce_ring_selection(len(selected_offers), n_makers)
+                if self.config.channel_ring.enabled and len(selected_offers) != n_makers:
+                    raise ValueError(
+                        "Channel-ring selection did not return the exact requested maker set"
+                    )
 
                 # Pre-select UTXOs for CoinJoin, then generate PoDLE from one of them
                 # This ensures the PoDLE UTXO is one we'll actually use in the transaction
@@ -2027,6 +2268,11 @@ class Taker(TakerMonitoringMixin):
                 nick: MakerSession(nick=nick, offer=offer, supports_neutrino_compat=False)
                 for nick, offer in selected_offers.items()
             }
+            self._session.ring_candidate_nicks = {
+                nick
+                for nick, offer in selected_offers.items()
+                if offer_supports_private_channel_ring(offer)
+            }
             initial_fee_plan = self._session.maker_fee_plan()
             total_fee = sum(initial_fee_plan.values())
 
@@ -2059,31 +2305,7 @@ class Taker(TakerMonitoringMixin):
             # Prompt for confirmation after maker selection
             if hasattr(self, "confirmation_callback") and self.confirmation_callback:
                 try:
-                    # Build maker details for confirmation
-                    maker_details = []
-                    for nick, session in self._session.maker_sessions.items():
-                        fee = initial_fee_plan[nick]
-                        advertised_fee = calculate_cj_fee(
-                            session.offer,
-                            self._session.cj_amount,
-                            False,
-                        )
-                        bond_value = session.offer.fidelity_bond_value
-                        # Get maker's location from any connected directory
-                        location = None
-                        for client in self.directory_client.clients.values():
-                            location = client._active_peers.get(nick)
-                            if location and location != "NOT-SERVING-ONION":
-                                break
-                        maker_details.append(
-                            {
-                                "nick": nick,
-                                "fee": fee,
-                                "advertised_fee": advertised_fee,
-                                "bond_value": bond_value,
-                                "location": location,
-                            }
-                        )
+                    maker_details = self._initial_maker_details(initial_fee_plan)
 
                     confirmation_timeout = float(self.config.initial_confirmation_timeout_sec)
                     confirmed = await self._request_confirmation(
@@ -2247,6 +2469,12 @@ class Taker(TakerMonitoringMixin):
                 else [u for u in available_utxos if u.mixdepth == mixdepth]
             )
             locked_inputs = self.wallet.get_locked_input_outpoints()
+            if self.config.channel_ring.enabled and self.config.channel_ring.taker_joins:
+                locked_inputs = locked_inputs | {
+                    (utxo.txid, utxo.vout)
+                    for utxo in available_utxos
+                    if utxo.mixdepth not in self.config.channel_ring.mixdepth_nodes
+                }
             if not selectable_for_interactive(
                 candidates, min_age, excluded_outpoints=locked_inputs
             ):
@@ -2325,6 +2553,10 @@ class Taker(TakerMonitoringMixin):
         while True:
             auth_result = await self._session._phase_auth()
 
+            flipped = self._drop_capability_flipped_ring_candidates()
+            if flipped:
+                auth_result.failed_makers.extend(sorted(flipped))
+
             current_makers = len(self._session.maker_sessions)
             if auth_result.success and current_makers >= target_makers:
                 return True
@@ -2364,15 +2596,16 @@ class Taker(TakerMonitoringMixin):
                 )
 
                 current_session_nicks = set(self._session.maker_sessions.keys())
-                replacement_offers, _ = self.orderbook_manager.select_makers(
-                    cj_amount=self._session.cj_amount,
-                    n=needed,
+                replacement_offers, _ = self._select_channel_ring_makers(
+                    self.orderbook_manager.offers,
+                    needed,
+                    required_features,
+                    ring_slots=self._ring_replacement_slots(needed),
                     hard_exclude_nicks=(
                         current_session_nicks
                         | failed_nicks
                         | self._seller_separation.excluded_nicks()
                     ),
-                    required_features=required_features,
                     penalized_maker_keys=penalized_maker_keys,
                 )
 
@@ -2472,6 +2705,8 @@ class Taker(TakerMonitoringMixin):
             self._session.maker_sessions[nick] = MakerSession(
                 nick=nick, offer=offer, supports_neutrino_compat=False
             )
+            if offer_supports_private_channel_ring(offer):
+                self._session.ring_candidate_nicks.add(nick)
             logger.debug(f"Added replacement maker for auth: {nick}")
         logger.debug("Running fill phase for replacement makers...")
         new_maker_nicks = list(replacement_offers.keys())
@@ -2526,7 +2761,7 @@ class Taker(TakerMonitoringMixin):
             else:
                 logger.warning(f"Replacement maker {nick} didn't respond to !fill")
             if not ready:
-                self._session.maker_sessions.pop(nick, None)
+                self._session.remove_maker_session(nick)
                 failed_nicks.add(nick)
                 self.orderbook_manager.add_ignored_maker(nick)
         return True
@@ -2667,6 +2902,12 @@ class Taker(TakerMonitoringMixin):
                         if nick not in self.orderbook_manager.ignored_makers
                         and nick not in failed_nicks
                     }
+                    self._session.ring_candidate_nicks = {
+                        nick
+                        for nick, offer in selected_offers.items()
+                        if nick in self._session.maker_sessions
+                        and offer_supports_private_channel_ring(offer)
+                    }
                     continue
 
                 logger.error(
@@ -2710,13 +2951,14 @@ class Taker(TakerMonitoringMixin):
             )
 
             current_session_nicks = set(self._session.maker_sessions.keys())
-            replacement_offers, _ = self.orderbook_manager.select_makers(
-                cj_amount=self._session.cj_amount,
-                n=needed,
+            replacement_offers, _ = self._select_channel_ring_makers(
+                self.orderbook_manager.offers,
+                needed,
+                required_features,
+                ring_slots=self._ring_replacement_slots(needed),
                 hard_exclude_nicks=(
                     current_session_nicks | failed_nicks | self._seller_separation.excluded_nicks()
                 ),
-                required_features=required_features,
                 penalized_maker_keys=penalized_maker_keys,
             )
             self._seller_separation.record_offered_makers(replacement_offers.values())
@@ -2747,6 +2989,8 @@ class Taker(TakerMonitoringMixin):
                 self._session.maker_sessions[nick] = MakerSession(
                     nick=nick, offer=offer, supports_neutrino_compat=False
                 )
+                if offer_supports_private_channel_ring(offer):
+                    self._session.ring_candidate_nicks.add(nick)
                 logger.info(f"Added replacement maker: {nick}")
             selected_offers.update(replacement_offers)
 
