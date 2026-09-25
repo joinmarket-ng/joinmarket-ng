@@ -46,6 +46,7 @@ from jmcore.nick_auth import (
 )
 from jmcore.protocol import (
     COMMAND_PREFIX,
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
@@ -250,6 +251,7 @@ class DirectoryClient:
         max_message_size: int = 2097152,
         on_disconnect: Callable[[], None] | None = None,
         neutrino_compat: bool = False,
+        cofunded_channel_ring_v1: bool = False,
         peerlist_timeout: float = 60.0,
         socks_username: str | None = None,
         socks_password: str | None = None,
@@ -323,6 +325,7 @@ class DirectoryClient:
         if self.nick_auth_directory_id is None:
             with contextlib.suppress(ValueError):
                 self.nick_auth_directory_id = directory_id_for_endpoint(self.host, self.port)
+        self.cofunded_channel_ring_v1 = cofunded_channel_ring_v1
 
         # Version negotiation state (set after handshake)
         self.negotiated_version: int | None = None
@@ -602,6 +605,8 @@ class DirectoryClient:
             and self.nick_auth_directory_id is not None
         ):
             our_features.add(FEATURE_NICK_AUTH)
+        if self.cofunded_channel_ring_v1:
+            our_features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
         feature_set = FeatureSet(features=our_features)
 
         # Send our handshake with current version and features

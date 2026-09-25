@@ -708,3 +708,63 @@ class TestPreferredOfferTypeRoundTrip:
                 amount=100_000,
                 destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             )
+
+
+def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
+    tmp_path, sample_mnemonic: str
+) -> None:
+    from jmcore.channel_ring import ChannelRingSettings
+    from jmcore.models import OfferType
+    from jmcore.settings import JoinMarketSettings, TakerSettings, WalletSettings
+
+    from taker.config_builder import build_taker_config
+
+    ring = ChannelRingSettings(
+        enabled=True,
+        lnd_grpc_url="https://localhost:10009",
+        lnd_tls_cert_path=tmp_path / "tls.cert",
+        lnd_macaroon_path=tmp_path / "admin.macaroon",
+        onion_endpoint="b" * 56 + ".onion:9735",
+        confirmation_depth=6,
+    )
+    settings = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.TR0_RELATIVE,
+            channel_ring=ring,
+        ),
+    )
+    config = build_taker_config(settings, mnemonic=sample_mnemonic, passphrase="")
+    assert config.channel_ring.enabled
+    assert config.channel_ring.confirmation_depth == 6
+    assert config.channel_ring.onion_endpoint == "b" * 56 + ".onion:9735"
+
+    incompatible = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2wpkh"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.TR0_RELATIVE,
+            channel_ring=ring,
+        ),
+    )
+    with pytest.raises(ValueError, match="p2tr wallet"):
+        build_taker_config(incompatible, mnemonic=sample_mnemonic, passphrase="")
+
+    wrong_offer = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.SW0_RELATIVE,
+            channel_ring=ring,
+        ),
+    )
+    with pytest.raises(ValueError, match="tr0 preferred offer"):
+        build_taker_config(wrong_offer, mnemonic=sample_mnemonic, passphrase="")
+
+
+def test_disabled_channel_ring_round_trip_preserves_default_behavior(sample_mnemonic: str) -> None:
+    from jmcore.settings import JoinMarketSettings
+
+    from taker.config_builder import build_taker_config
+
+    config = build_taker_config(JoinMarketSettings(), mnemonic=sample_mnemonic, passphrase="")
+    assert config.channel_ring.enabled is False
+    assert config.channel_ring.onion_endpoint == ""

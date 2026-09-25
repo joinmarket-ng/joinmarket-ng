@@ -7,17 +7,30 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import parse_transaction_bytes, scriptpubkey_to_address
+from jmcore.channel_ring import ChannelRingConfig
 from jmcore.models import NetworkType, OfferType
 from jmwallet.wallet.models import UTXOInfo
 
 from taker.coinjoin_session import CoinJoinSession
 from taker.config import TakerConfig
-from taker.taker import Taker
+from taker.taker import RING_BUYOUT_CONFLICT, Taker
 
 SCRIPT = b"\x51\x20" + bytes(CKey(b"\x11" * 32).xonly_pub)
 ESCROW = b"\x51\x20" + bytes(CKey(b"\x22" * 32).xonly_pub)
 CHANNEL = "33" * 32
 MNEMONIC = "abandon " * 11 + "about"
+
+
+def _ring_config(tmp_path) -> ChannelRingConfig:
+    """A minimal valid enabled ring policy (loopback lnd, v3 onion, own store)."""
+    return ChannelRingConfig(
+        enabled=True,
+        lnd_grpc_url="https://127.0.0.1:10009",
+        lnd_tls_cert_path=tmp_path / "tls.cert",
+        lnd_macaroon_path=tmp_path / "admin.macaroon",
+        onion_endpoint="a" * 56 + ".onion:9735",
+        persistence_directory=tmp_path / "rings",
+    )
 
 
 def _prepared_adapter(total_value: int, minimum_change: int) -> MagicMock:
@@ -234,3 +247,42 @@ async def test_buyout_rejects_sweep_and_non_taproot_pit_before_reservation(
     with pytest.raises(ValueError, match="non-sweep Taproot"):
         await taker.do_coinjoin(amount, "INTERNAL", buyout=buyout)
     buyout.begin_round.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_buyout_and_channel_ring_cannot_share_one_round(tmp_path) -> None:
+    """A ring spends every residual into channels, so no escrow change can exist."""
+    taker = Taker.__new__(Taker)
+    taker._round_lock = asyncio.Lock()
+    taker.config = TakerConfig(
+        mnemonic=MNEMONIC,
+        network=NetworkType.REGTEST,
+        preferred_offer_type=OfferType.TR0_ABSOLUTE,
+        address_type="p2tr",
+        channel_ring=_ring_config(tmp_path),
+    )
+    buyout = MagicMock()
+
+    with pytest.raises(ValueError, match="cannot fund a private channel buyout"):
+        await taker.do_coinjoin(500_000, "INTERNAL", buyout=buyout)
+
+    buyout.begin_round.assert_not_called()
+
+
+def test_ring_request_error_rejects_an_attached_buyout(tmp_path) -> None:
+    """The in-round guard also refuses a buyout attached to the session."""
+    taker = Taker.__new__(Taker)
+    taker.config = TakerConfig(
+        mnemonic=MNEMONIC,
+        network=NetworkType.REGTEST,
+        preferred_offer_type=OfferType.TR0_ABSOLUTE,
+        address_type="p2tr",
+        channel_ring=_ring_config(tmp_path),
+    )
+    taker._session = CoinJoinSession()
+    taker._session.attach(taker)
+
+    assert taker._ring_request_error(500_000, 5, None) is None
+    assert taker._ring_request_error(500_000, 5, MagicMock()) == RING_BUYOUT_CONFLICT
+    with pytest.raises(ValueError, match="cannot fund a private channel buyout"):
+        taker._enforce_ring_request(500_000, 5, MagicMock())
