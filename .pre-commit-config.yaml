@@ -28,7 +28,9 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: ^lnd/patches/.*\.patch$
       - id: end-of-file-fixer
+        exclude: ^lnd/patches/.*\.patch$
       - id: check-yaml
         exclude: ^mkdocs\.yml$
       - id: check-yaml
