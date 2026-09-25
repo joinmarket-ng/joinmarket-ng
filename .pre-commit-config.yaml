@@ -46,5 +46,6 @@ repos:
     rev: v1.19.1
     hooks:
       - id: mypy
+        exclude: ^jmswap/src/jmswap/lndrpc/
         additional_dependencies: [pydantic>=2.5.0, pydantic-settings>=2.1.0, types-PyYAML>=6.0.0]
         args: [--ignore-missing-imports, --explicit-package-bases, --check-untyped-defs]

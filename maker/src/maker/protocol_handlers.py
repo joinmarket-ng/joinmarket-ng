@@ -688,6 +688,10 @@ class ProtocolHandlersMixin:
             if inspect.iscoroutinefunction(refresh_fee_policy):
                 await refresh_fee_policy(announce=False)
             minimum_fee_rate = getattr(self, "minimum_fee_rate_sat_vb", None)
+            # The same prepared buyout instance backs every round this maker
+            # serves; its durable record, not any in-memory flag, decides
+            # whether a second concurrent fill may actually consume it.
+            buyout = getattr(self, "buyout", None)
 
             session_inner = CoinJoinSession(
                 taker_nick=taker_nick,
@@ -704,6 +708,7 @@ class ProtocolHandlersMixin:
                 minimum_fee_rate_sat_vb=(
                     minimum_fee_rate if isinstance(minimum_fee_rate, (int, float)) else None
                 ),
+                buyout=buyout,
             )
             session = MakerSession(inner=session_inner, generation_id=generation_id)
 

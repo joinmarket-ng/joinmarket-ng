@@ -1,0 +1,86 @@
+# Disposable regtest stack for the channel-buyout escrow proof.
+#
+# Every run gets its own Compose project name, so the containers, the network
+# and the LND volumes are unique to that run and are destroyed with
+# `down --volumes`. Nothing here touches a developer's signet or mainnet nodes:
+# bitcoind makes no outbound connections and no service publishes a port. The
+# test reaches bitcoind through `bitcoin-cli` and each node's gRPC port through
+# a private loopback tunnel over `docker exec`, which also works on a rootless
+# daemon that does not forward published ports to the host.
+services:
+  bitcoin:
+    image: ${JM_BUYOUT_BITCOIN_IMAGE:-bitcoin/bitcoin:30.0}
+    entrypoint: [bitcoind]
+    command:
+      - -regtest
+      - -server
+      - -rpcuser=buyout
+      - -rpcpassword=buyout
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=18443
+      - -fallbackfee=0.0002
+      # The escrow output is not a wallet output, so the parent and its child
+      # are only queryable through the transaction index.
+      - -txindex=1
+      # Restart scenarios exercise loss of unconfirmed transactions explicitly.
+      - -persistmempool=0
+      - -connect=0
+      - -dnsseed=0
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    healthcheck:
+      test: [CMD, bitcoin-cli, -regtest, -rpcuser=buyout, -rpcpassword=buyout, getblockchaininfo]
+      interval: 1s
+      timeout: 5s
+      retries: 90
+
+  alice:
+    image: ${JM_BUYOUT_LND_IMAGE:-jm-buyout-lnd:v0.21.3-beta}
+    entrypoint: [lnd]
+    command: &lnd-command
+      - --lnddir=/lnd
+      - --noseedbackup
+      - --nobootstrap
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoin:18443
+      - --bitcoind.rpcuser=buyout
+      - --bitcoind.rpcpass=buyout
+      - --bitcoind.zmqpubrawblock=tcp://bitcoin:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoin:28333
+      - --listen=0.0.0.0:9735
+      - --rpclisten=0.0.0.0:10009
+      - --tlsextraip=127.0.0.1
+      - --protocol.simple-taproot-chans
+    volumes:
+      - alice-data:/lnd
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+
+  bob:
+    image: ${JM_BUYOUT_LND_IMAGE:-jm-buyout-lnd:v0.21.3-beta}
+    entrypoint: [lnd]
+    command: *lnd-command
+    volumes:
+      - bob-data:/lnd
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+
+  carol:
+    image: ${JM_BUYOUT_LND_IMAGE:-jm-buyout-lnd:v0.21.3-beta}
+    entrypoint: [lnd]
+    command: *lnd-command
+    volumes:
+      - carol-data:/lnd
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+
+volumes:
+  alice-data:
+  bob-data:
+  carol-data:

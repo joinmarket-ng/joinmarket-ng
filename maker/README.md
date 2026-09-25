@@ -15,6 +15,26 @@ Earn fees by providing liquidity for CoinJoin transactions. Makers passively ear
 
 For full documentation, see [maker Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-maker/).
 
+## Experimental Channel Buyout Funding
+
+A Taproot maker can use one explicitly prepared private channel buyout with
+`jm-maker start --buyout-config buyer.toml --buyout-session SESSION_ID`.
+Install the maker's `buyout` optional dependencies and follow the
+[buyout setup and recovery instructions](../jmswap/README.md) first. This remains
+experimental and is intended for isolated regtest validation.
+
+The configuration must match the wallet fingerprint, Bitcoin network, and source
+mixdepth. A Bitcoin Core backend and an ordinary wallet input for authentication
+are required. The maker reserves escrow change, offers only the bound mixdepth,
+and consumes the prepared session for at most one round. After reservation or
+cancellation, it withdraws offers with the normal publication delay and continues
+monitoring settlement. It does not switch to ordinary wallet funding. Stopping
+the maker leaves the journal intact; resume monitoring with
+`jm-buyout --config buyer.toml serve`.
+
+Existing makers started without both buyout options behave as before. Startup
+does not discover or migrate buyout journals.
+
 ## Multiple Local Instances
 
 If you want to run more than one maker on the same machine, give each maker

@@ -14,6 +14,7 @@ import asyncio
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
@@ -45,6 +46,7 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from maker.background_tasks import BackgroundTasksMixin
+from maker.coinjoin import bound_buyout_mixdepth
 from maker.config import MakerConfig
 from maker.direct_connection import DirectConnectionMixin, DirectConnectionState
 from maker.directory_pool import MakerDirectoryPool
@@ -73,6 +75,10 @@ from maker.rate_limiting import (
     OrderbookRateLimiter,
     ProcessWideTokenBucket,
 )
+
+if TYPE_CHECKING:
+    # A maker without a prepared channel buyout never imports jmswap at runtime.
+    from jmswap.coinjoin_funding import ChannelBuyout
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
 MAX_LOG_RATE_LIMIT_ENTRIES = 200000
@@ -113,6 +119,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         backend: BlockchainBackend,
         config: MakerConfig,
         nick_change_callback: Callable[[str, str], None] | None = None,
+        *,
+        buyout: ChannelBuyout | None = None,
     ):
         self.wallet = wallet
         self.backend = backend
@@ -142,6 +150,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 "backend cannot, so it could never sign a tr0 CoinJoin. Use a Core backend "
                 "or configure a p2wpkh (sw0) wallet instead."
             )
+        # One prepared channel buyout, shared by every offer manager and every
+        # CoinJoin session this bot creates, including those of rotated
+        # identities: the durable record behind it is single-use, so there is
+        # nothing to copy per identity. Validated once here so a buyout bound
+        # to another wallet, network, mixdepth or backend never reaches a round.
+        self.buyout = buyout
+        self.buyout_mixdepth = (
+            -1
+            if buyout is None
+            else bound_buyout_mixdepth(buyout, wallet, backend, config.address_type)
+        )
         self.directory_clients: dict[str, DirectoryClient] = {}
         # Shared connection plumbing (parsing, SOCKS isolation creds,
         # DirectoryClient construction, retry loop). The pool stores its
@@ -154,7 +173,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             neutrino_compat=backend.can_provide_neutrino_metadata(),
         )
         self._directory_pool.clients = self.directory_clients
-        self.offer_manager = OfferManager(self.wallet, config, self.nick)
+        self.offer_manager = OfferManager(
+            self.wallet,
+            config,
+            self.nick,
+            buyout=self.buyout,
+            buyout_mixdepth=self.buyout_mixdepth,
+        )
         self.active_sessions: dict[tuple[int, str], MakerSession] = {}
         self._reserved_commitments: set[str] = set()
         self._active_podle_outpoints: dict[tuple[str, int], MakerSession] = {}
@@ -581,7 +606,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         generation_id = max(self.generations, default=-1) + 1
         identity = NickIdentity(JM_VERSION)
-        offer_manager = OfferManager(self.wallet, self.config, identity.nick)
+        offer_manager = OfferManager(
+            self.wallet,
+            self.config,
+            identity.nick,
+            buyout=self.buyout,
+            buyout_mixdepth=self.buyout_mixdepth,
+        )
         offers = await offer_manager.create_offers()
         listener: HiddenServiceListener | None = None
         tor_control: TorControlClient | None = None

@@ -11,8 +11,10 @@ Configuration is loaded with the following priority (highest to lowest):
 from __future__ import annotations
 
 import asyncio
+import re
+from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
@@ -34,7 +36,18 @@ from maker.config import MakerConfig, MergeAlgorithm, OfferConfig
 from maker.fidelity import ExpiredFidelityBondCertificateError
 from maker.mixdepth_selection import MixdepthSelectionPolicy
 
+if TYPE_CHECKING:
+    # A maker without a prepared channel buyout never imports jmswap.
+    from jmswap.buyout_config import BuyoutSettings
+    from jmswap.coinjoin_funding import ChannelBuyout
+
 app = SortedTyper(no_args_is_help=True)
+
+_BUYOUT_SESSION_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+"""Shape of a buyout session id, checked before any file or journal is touched."""
+
+_BUYOUT_OFFERABLE_STATE = "ACCEPTED"
+"""The only journal state whose channels may still back advertised offers."""
 
 
 def run_async(coro: Any) -> Any:
@@ -477,6 +490,94 @@ def create_wallet_service(config: MakerConfig) -> WalletService:
     return wallet
 
 
+def _validated_buyout_settings(
+    path: Path, *, config: MakerConfig, wallet_fingerprint: str
+) -> BuyoutSettings:
+    """Check one explicit buyout file against this maker, before anything opens.
+
+    The file is named on the command line and is never discovered, adopted or
+    migrated: a maker started without it is an ordinary maker. Every rule here
+    is decided before a journal, a node connection or a channel signature
+    exists, so a file that does not describe *this* wallet, network or pit
+    cannot reach a durable resource. The mixdepth is only bounds-checked here;
+    the binding that decides which rounds may spend the channels is re-derived
+    from the journal by :func:`maker.coinjoin.bound_buyout_mixdepth`.
+    """
+    from jmswap.buyout_config import load_buyout_settings
+
+    settings = load_buyout_settings(path)
+    if not settings.enabled:
+        raise ValueError("The buyout service is disabled in the given configuration file")
+    if config.address_type != "p2tr":
+        # Escrow spends and maker inputs share one Taproot round: a segwit v0
+        # pit could never sign it.
+        raise ValueError("A channel buyout requires a Taproot wallet and a Taproot pit")
+    if settings.network != (config.bitcoin_network or config.network).value:
+        raise ValueError("Buyout and maker Bitcoin networks differ")
+    if not settings.wallet_fingerprint:
+        raise ValueError("A buyer session requires a configured wallet_fingerprint")
+    if settings.wallet_fingerprint != wallet_fingerprint:
+        raise ValueError("The buyout configuration is bound to a different wallet fingerprint")
+    mixdepth = settings.mixdepth
+    if mixdepth is None or isinstance(mixdepth, bool):
+        raise ValueError("An enabled buyout service requires an integer mixdepth")
+    if not 0 <= mixdepth < config.mixdepth_count:
+        raise ValueError(
+            f"The configured buyout mixdepth {mixdepth} is outside this "
+            f"wallet's {config.mixdepth_count} mixdepths"
+        )
+    return settings
+
+
+async def _open_prepared_buyout(
+    stack: AsyncExitStack, settings: BuyoutSettings, session_id: str
+) -> ChannelBuyout:
+    """Open one prepared buyout for the maker's whole lifetime.
+
+    The runtime refuses a session it is not bound to, so a session id from
+    another endpoint never becomes an offer. Its settlement monitor runs inside
+    a task group that spans the maker: a monitor that dies takes the maker down
+    with it, instead of leaving it advertising channels behind an endpoint that
+    answers nobody. ``stack`` unwinds in registration order reversed, so the
+    monitor is signalled and awaited before the journal and nodes close.
+
+    Nothing here cancels, force-closes or otherwise resolves a session: the
+    journal owns that decision, and a maker that stops leaves it as it was.
+    """
+    from jmswap.buyout_runtime import BuyoutRuntime
+    from jmswap.coinjoin_funding import ChannelBuyout
+
+    runtime = await stack.enter_async_context(BuyoutRuntime(settings))
+    runtime.require_buyer_session(session_id)
+    adapter = ChannelBuyout(runtime.buyer, session_id)
+    stop = asyncio.Event()
+    group = await stack.enter_async_context(asyncio.TaskGroup())
+    # Registered after the group, so unwinding stops the monitor before the
+    # group waits for it and before the runtime releases the journal.
+    stack.callback(stop.set)
+    group.create_task(runtime.run(stop))
+    return adapter
+
+
+def _buyout_still_offerable(buyout: ChannelBuyout) -> bool:
+    """Whether the durable record still backs the advertised channel liquidity.
+
+    Only an accepted, unused record can fund a new CoinJoin: once a round has
+    reserved it, or the operator or the journal has resolved it, the channels
+    behind the offers are gone. A journal read that fails is never answered
+    with a guess; it propagates and stops the maker.
+    """
+    return bool(buyout.buyer.store.get(buyout.session_id).state == _BUYOUT_OFFERABLE_STATE)
+
+
+def _task_group_failure(group: BaseExceptionGroup[BaseException]) -> BaseException:
+    """The single failure behind a task group wrapper, or the group itself."""
+    error: BaseException = group
+    while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
+        error = error.exceptions[0]
+    return error
+
+
 # Use a sentinel value for CLI defaults to distinguish "not provided" from explicit values
 # This allows us to know when to use settings vs CLI override
 _NOT_PROVIDED = object()
@@ -528,6 +629,22 @@ def start(
     backend_type: Annotated[
         str | None,
         typer.Option(help="Backend type: descriptor_wallet | neutrino"),
+    ] = None,
+    buyout_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--buyout-config",
+            help="Explicit buyout TOML file (no location is ever guessed). Requires "
+            "--buyout-session; without both, this maker uses wallet inputs only.",
+        ),
+    ] = None,
+    buyout_session: Annotated[
+        str | None,
+        typer.Option(
+            "--buyout-session",
+            help="Session id of an accepted, unused buyout this maker offers channel "
+            "liquidity from. Requires --buyout-config.",
+        ),
     ] = None,
     rpc_url: Annotated[
         str | None, typer.Option(envvar="BITCOIN_RPC_URL", help="Bitcoin full node RPC URL")
@@ -679,6 +796,15 @@ def start(
     Configuration is loaded from ~/.joinmarket-ng/config.toml (or $JOINMARKET_DATA_DIR/config.toml),
     environment variables, and CLI arguments. CLI arguments have the highest priority.
     """
+    # Opt-in channel buyout: only an explicit file plus session id enables it,
+    # and both are checked before any settings, wallet or buyout code loads.
+    if (buyout_config is None) != (buyout_session is None):
+        logger.error("--buyout-config and --buyout-session must be given together")
+        raise typer.Exit(1)
+    if buyout_session is not None and _BUYOUT_SESSION_RE.fullmatch(buyout_session) is None:
+        logger.error("--buyout-session must be 64 lowercase hex characters")
+        raise typer.Exit(1)
+
     from jmcore.process_hardening import harden_current_process
 
     # Disable core dumps and ptrace before loading wallet secrets.
@@ -763,12 +889,20 @@ def start(
     def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
         write_nick_state(config.data_dir, nick_component, new_nick)
 
-    bot = MakerBot(
-        wallet,
-        wallet.backend,
-        config,
-        nick_change_callback=_publish_maker_nick,
-    )
+    buyout_settings: BuyoutSettings | None = None
+    if buyout_config is not None:
+        try:
+            from jmswap.buyout_config import BuyoutConfigError
+        except ImportError:
+            logger.error("Channel buyout support requires the jmswap package")
+            raise typer.Exit(1)
+        try:
+            buyout_settings = _validated_buyout_settings(
+                buyout_config, config=config, wallet_fingerprint=wallet.wallet_fingerprint
+            )
+        except (BuyoutConfigError, ValueError) as exc:
+            logger.error(str(exc))
+            raise typer.Exit(1)
 
     # Store the specific fidelity bond selection if provided
     if fidelity_bond and no_fidelity_bond:
@@ -789,33 +923,101 @@ def start(
             )
             raise typer.Exit(1)
 
-    async def run_bot() -> None:
-        try:
-            # Write nick state file for external tracking and cross-component protection
-            nick = bot.nick
-            data_dir = config.data_dir
-            write_nick_state(data_dir, nick_component, nick)
-            logger.info("Maker nick state written")
-            logger.bind(sensitive=True).info(
-                f"Nick state written to {data_dir}/state/{nick_component}.nick"
-            )
+    # The bot is built inside the event loop because a prepared buyout only
+    # exists there; it is published here so an interrupt can still stop it.
+    bot: MakerBot | None = None
 
-            # Send startup notification immediately (including nick)
-            notifier = get_notifier(settings, component_name="Maker")
-            await notifier.notify_startup(
-                component="Maker",
-                network=config.network.value,
-                nick=nick,
-            )
-            await bot.start()
-            while True:
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            # Clean up nick state file on shutdown
-            remove_nick_state(config.data_dir, nick_component)
-            await bot.stop()
+    async def shutdown_maker(maker: MakerBot) -> None:
+        # Clean up nick state file on shutdown
+        remove_nick_state(config.data_dir, nick_component)
+        await maker.stop()
+
+    async def run_bot() -> None:
+        nonlocal bot
+        try:
+            async with AsyncExitStack() as stack:
+                buyout: ChannelBuyout | None = None
+                if buyout_settings is not None and buyout_session is not None:
+                    try:
+                        buyout = await _open_prepared_buyout(stack, buyout_settings, buyout_session)
+                    except Exception as exc:
+                        logger.error("The prepared buyout session could not be opened")
+                        logger.bind(sensitive=True).error("Buyout session failure: {}", exc)
+                        raise typer.Exit(1) from None
+                    logger.info(f"Offering channel liquidity from buyout session {buyout_session}")
+
+                try:
+                    bot = MakerBot(
+                        wallet,
+                        wallet.backend,
+                        config,
+                        nick_change_callback=_publish_maker_nick,
+                        buyout=buyout,
+                    )
+                except ValueError as exc:
+                    if buyout is None:
+                        raise
+                    logger.error("The prepared buyout cannot fund this maker")
+                    logger.bind(sensitive=True).error("Buyout binding failure: {}", exc)
+                    raise typer.Exit(1) from None
+                # Registered before the nick state is written, so every exit
+                # path removes it and stops the maker, and registered after the
+                # buyout so the maker is stopped before the runtime closes.
+                stack.push_async_callback(shutdown_maker, bot)
+
+                try:
+                    # Write nick state file for external tracking and
+                    # cross-component protection
+                    nick = bot.nick
+                    data_dir = config.data_dir
+                    write_nick_state(data_dir, nick_component, nick)
+                    logger.info("Maker nick state written")
+                    logger.bind(sensitive=True).info(
+                        f"Nick state written to {data_dir}/state/{nick_component}.nick"
+                    )
+
+                    # Send startup notification immediately (including nick)
+                    notifier = get_notifier(settings, component_name="Maker")
+                    await notifier.notify_startup(
+                        component="Maker",
+                        network=config.network.value,
+                        nick=nick,
+                    )
+                    await bot.start()
+                    while True:
+                        await asyncio.sleep(1)
+                        if (
+                            buyout is not None
+                            and bot.current_offers
+                            and not _buyout_still_offerable(buyout)
+                        ):
+                            # The advertised channel liquidity no longer exists,
+                            # so withdraw it now instead of leaving it up until
+                            # the ordinary rescan interval. The observed offer
+                            # balance is zero, which keeps the publication lock
+                            # and the privacy delay and rebuilds the offers from
+                            # wallet state without forcing a rescan. Offers are
+                            # cleared by that refresh, so this runs once.
+                            await bot._update_offers(expected_balance=0)
+                except asyncio.CancelledError:
+                    pass
+        except BaseExceptionGroup as group:
+            # The settlement monitor shares a task group with the maker, so a
+            # failure on either side arrives wrapped. A lone maker failure keeps
+            # its own CLI handling; anything else ends the maker cleanly.
+            failure = _task_group_failure(group)
+            if isinstance(
+                failure,
+                typer.Exit
+                | KeyboardInterrupt
+                | SystemExit
+                | asyncio.CancelledError
+                | ExpiredFidelityBondCertificateError,
+            ):
+                raise failure from None
+            logger.error("Maker stopped: the prepared buyout lifetime failed")
+            logger.bind(sensitive=True).error("Buyout lifetime failure: {}", failure)
+            raise typer.Exit(1) from None
 
     try:
         run_async(run_bot())
@@ -825,7 +1027,8 @@ def start(
         raise typer.Exit(1)
     except KeyboardInterrupt:
         logger.info("Shutting down maker bot...")
-        run_async(bot.stop())
+        if bot is not None:
+            run_async(bot.stop())
 
 
 @app.command()
