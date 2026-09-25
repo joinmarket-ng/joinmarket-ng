@@ -20,7 +20,7 @@ from jmcore.models import Offer, OfferType
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, MessageType
 
 from orderbook_watcher.aggregator import OrderbookAggregator
-from orderbook_watcher.health_checker import MakerHealthChecker
+from orderbook_watcher.health_checker import MakerHealthChecker, MakerHealthStatus
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -365,6 +365,72 @@ class TestCheckMakersBatchPriority:
         assert set(third_chunk) == {"fifth"}
 
     @pytest.mark.asyncio
+    async def test_cached_failures_do_not_use_scan_slots(self) -> None:
+        checker = MakerHealthChecker(network="regtest", max_checks_per_batch=2)
+        cached_location = "cached.onion:5222"
+        cached = MakerHealthStatus(
+            location=cached_location,
+            nick="cached",
+            reachable=False,
+            last_check_time=time.time(),
+            last_success_time=None,
+            consecutive_failures=1,
+            features=MagicMock(),
+        )
+        checker._store_status(cached)
+        checked: list[str] = []
+
+        async def check(nick: str, location: str, force: bool = False) -> MakerHealthStatus:
+            assert not force
+            checked.append(nick)
+            return MakerHealthStatus(location, nick, False, time.time(), None, 1, MagicMock())
+
+        makers = [
+            ("cached", cached_location),
+            ("first", "first.onion:5222"),
+            ("second", "second.onion:5222"),
+            ("third", "third.onion:5222"),
+        ]
+        with patch.object(checker, "check_maker", side_effect=check):
+            statuses = await checker.check_makers_batch(makers)
+
+        assert checked == ["first", "second"]
+        assert statuses[cached_location] is cached
+        assert "third.onion:5222" not in statuses
+
+    @pytest.mark.asyncio
+    async def test_budget_returns_completed_results_and_cancels_slow_checks(self) -> None:
+        checker = MakerHealthChecker(
+            network="regtest", max_concurrent_checks=2, max_checks_per_batch=3
+        )
+        canceled = asyncio.Event()
+        checked: list[str] = []
+
+        async def check(nick: str, location: str, force: bool = False) -> MakerHealthStatus:
+            assert not force
+            checked.append(nick)
+            if nick == "slow":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    canceled.set()
+            return MakerHealthStatus(location, nick, True, time.time(), time.time(), 0, MagicMock())
+
+        with patch.object(checker, "check_maker", side_effect=check):
+            statuses = await checker.check_makers_batch(
+                [
+                    ("fast", "fast.onion:5222"),
+                    ("slow", "slow.onion:5222"),
+                    ("later", "later.onion:5222"),
+                ],
+                max_duration=0.2,
+            )
+
+        assert checked == ["fast", "slow"]
+        assert set(statuses) == {"fast.onion:5222"}
+        assert canceled.is_set()
+
+    @pytest.mark.asyncio
     async def test_exception_in_chunk_does_not_block_next(self) -> None:
         """Exceptions within a chunk should not prevent subsequent chunks."""
         checker = MakerHealthChecker(
@@ -458,7 +524,7 @@ class TestCheckMakersWithoutFeaturesPriority:
     """Verify _check_makers_without_features passes sorted list to batch."""
 
     @pytest.mark.asyncio
-    async def test_large_scan_keeps_concurrency_bounded(self) -> None:
+    async def test_large_scan_limits_work_and_keeps_concurrency_bounded(self) -> None:
         offers = [(f"maker{i}", f"{i}.onion:5222", _make_offer(f"maker{i}")) for i in range(300)]
         agg = _build_aggregator_with_offers(offers)
         active = 0
@@ -480,6 +546,54 @@ class TestCheckMakersWithoutFeaturesPriority:
         assert checked == 300
         assert peak == 5
         assert agg.health_checker.max_checks_per_batch == 4096
+
+    @pytest.mark.asyncio
+    async def test_scan_cap_preserves_prioritized_selection(self) -> None:
+        offers = [
+            (f"maker{i}", f"{i}.onion:5222", _make_offer(f"maker{i}", cjfee="0.01"))
+            for i in range(4100)
+        ]
+        offers.append(("preferred", "preferred.onion:5222", _make_offer("preferred", cjfee="0")))
+        agg = _build_aggregator_with_offers(offers)
+        checked: list[str] = []
+
+        async def check(nick: str, _location: str, _force: bool = False) -> MagicMock:
+            checked.append(nick)
+            return MagicMock(reachable=False)
+
+        with patch.object(agg.health_checker, "check_maker", side_effect=check):
+            await agg._check_makers_without_features()
+
+        assert len(checked) == 4096
+        assert checked[0] == "preferred"
+
+    @pytest.mark.asyncio
+    async def test_overlapping_discovery_is_skipped(self) -> None:
+        agg = _build_aggregator_with_offers([("maker", "maker.onion:5222", _make_offer("maker"))])
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_batch(
+            _makers: list[tuple[str, str]],
+            force: bool = False,
+        ) -> dict:
+            assert not force
+            assert agg.health_checker.max_batch_duration == 300.0
+            entered.set()
+            await release.wait()
+            return {}
+
+        with patch.object(
+            agg.health_checker, "check_makers_batch", side_effect=slow_batch
+        ) as batch:
+            first = asyncio.create_task(agg._check_makers_without_features())
+            await entered.wait()
+            try:
+                await asyncio.wait_for(agg._check_makers_without_features(), timeout=0.1)
+                batch.assert_awaited_once()
+            finally:
+                release.set()
+                await first
 
     @pytest.mark.asyncio
     async def test_bonded_makers_checked_before_sybil(self) -> None:

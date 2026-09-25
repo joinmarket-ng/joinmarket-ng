@@ -104,6 +104,7 @@ async def _run_one_refresh_iteration(agg: OrderbookAggregator) -> None:
     try:
         # The task catches CancelledError internally and returns normally.
         await agg._periodic_peerlist_refresh()
+        agg._check_makers_without_features.assert_not_awaited()
     finally:
         agg_mod.asyncio.sleep = original  # type: ignore[assignment]
 

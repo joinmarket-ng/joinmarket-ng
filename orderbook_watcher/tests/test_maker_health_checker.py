@@ -103,6 +103,33 @@ class TestMakerHealthChecker:
     """Test MakerHealthChecker functionality."""
 
     @pytest.mark.asyncio
+    async def test_batch_deadline_closes_stalled_handshake(self) -> None:
+        checker = MakerHealthChecker(
+            network="regtest", timeout=10, max_concurrent_checks=1, max_batch_duration=0.2
+        )
+
+        async def stall() -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        connection = MagicMock()
+        connection.send = AsyncMock()
+        connection.receive = AsyncMock(side_effect=stall)
+        connection.close = AsyncMock()
+        locations = ["first.onion:5222", "later.onion:5222"]
+
+        with patch(
+            "orderbook_watcher.health_checker.connect_via_tor", return_value=connection
+        ) as dial:
+            result = await checker.check_makers_batch(
+                [("first", locations[0]), ("later", locations[1])]
+            )
+
+        assert result == {}
+        dial.assert_awaited_once()
+        connection.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_not_serving_onion_skipped(self, health_checker: MakerHealthChecker) -> None:
         """Test that NOT-SERVING-ONION makers are skipped."""
         status = await health_checker.check_maker("J5test", "NOT-SERVING-ONION")

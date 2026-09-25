@@ -72,6 +72,7 @@ class MakerHealthChecker:
         allow_clearnet_connections: bool = False,
         socks_username: str | None = None,
         socks_password: str | None = None,
+        max_batch_duration: float | None = None,
     ) -> None:
         """
         Initialize MakerHealthChecker.
@@ -88,6 +89,7 @@ class MakerHealthChecker:
             allow_clearnet_connections: Permit non-onion health-check destinations
             socks_username: SOCKS5 username for Tor stream isolation (optional)
             socks_password: SOCKS5 password for Tor stream isolation (optional)
+            max_batch_duration: Optional wall-clock budget for each batch
         """
         self.network = network
         self.socks_host = socks_host
@@ -101,8 +103,11 @@ class MakerHealthChecker:
             raise ValueError("max_checks_per_batch must be positive")
         if max_status_entries <= 0:
             raise ValueError("max_status_entries must be positive")
+        if max_batch_duration is not None and max_batch_duration <= 0:
+            raise ValueError("max_batch_duration must be positive")
         self.max_checks_per_batch = max_checks_per_batch
         self.max_status_entries = max_status_entries
+        self.max_batch_duration = max_batch_duration
         self.allow_clearnet_connections = network == "regtest" or allow_clearnet_connections
 
         # Health status tracking: location -> status
@@ -311,7 +316,10 @@ class MakerHealthChecker:
         return status
 
     async def check_makers_batch(
-        self, makers: list[tuple[str, str]], force: bool = False
+        self,
+        makers: list[tuple[str, str]],
+        force: bool = False,
+        max_duration: float | None = None,
     ) -> dict[str, MakerHealthStatus]:
         """
         Check health of multiple makers in priority-ordered chunks.
@@ -326,19 +334,33 @@ class MakerHealthChecker:
             makers: List of (nick, location) tuples, ideally pre-sorted by
                 priority (bonded first, then fee-ascending).
             force: Force check even if recently checked.
+            max_duration: Optional wall-clock budget in seconds. Completed
+                checks are returned if the budget expires mid-chunk.
 
         Returns:
             Dict mapping location to MakerHealthStatus.
         """
         status_map: dict[str, MakerHealthStatus] = {}
         chunk_size = self.max_concurrent_checks
+        if max_duration is not None and max_duration <= 0:
+            raise ValueError("max_duration must be positive")
+        if max_duration is None:
+            max_duration = self.max_batch_duration
+        deadline = asyncio.get_running_loop().time() + max_duration if max_duration else None
 
         bounded_makers: list[tuple[str, str]] = []
         seen_locations: set[str] = set()
+        now = time.time()
         for maker in makers:
             if maker[1] in seen_locations:
                 continue
             seen_locations.add(maker[1])
+            # Cached locations must not consume the limited scan slots. Include
+            # their statuses so callers can still use previously found features.
+            cached = self.health_status.get(maker[1])
+            if not force and cached and now - cached.last_check_time < self.check_interval:
+                status_map[maker[1]] = cached
+                continue
             bounded_makers.append(maker)
             if len(bounded_makers) == self.max_checks_per_batch:
                 break
@@ -348,12 +370,37 @@ class MakerHealthChecker:
             )
 
         for chunk_start in range(0, len(bounded_makers), chunk_size):
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                break
             chunk = bounded_makers[chunk_start : chunk_start + chunk_size]
-            tasks = [self.check_maker(nick, location, force) for nick, location in chunk]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            tasks = [
+                asyncio.create_task(self.check_maker(nick, location, force))
+                for nick, location in chunk
+            ]
+            timed_out = False
+            try:
+                if deadline is None:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                else:
+                    async with asyncio.timeout_at(deadline):
+                        await asyncio.gather(*tasks, return_exceptions=True)
+            except TimeoutError:
+                timed_out = True
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
-            for (nick, location), result in zip(chunk, results, strict=True):
-                if isinstance(result, BaseException):
+            for (nick, location), task in zip(chunk, tasks, strict=True):
+                if not task.done() or task.cancelled():
+                    continue
+                result: MakerHealthStatus | Exception
+                try:
+                    result = task.result()
+                except Exception as e:
+                    result = e
+                if isinstance(result, Exception):
                     logger.bind(sensitive=True).error(
                         f"Health check for {nick} at {location} raised exception: {result}"
                     )
@@ -381,6 +428,9 @@ class MakerHealthChecker:
                     )
                 else:
                     status_map[location] = result
+
+            if timed_out:
+                break
 
         return status_map
 

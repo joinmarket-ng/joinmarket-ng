@@ -34,6 +34,7 @@ BOND_RETRY_CACHE_TTL_SECONDS = 60.0
 BOND_RETRY_CACHE_MAX_SIZE = 4096
 MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE = 256
 MEMPOOL_VERIFICATION_CONCURRENCY = 5
+FEATURE_SCAN_BUDGET_SECONDS = 300.0
 
 
 class _LatestOrderbookQueue(asyncio.Queue[OrderBook]):
@@ -263,10 +264,12 @@ class OrderbookAggregator:
             check_interval=600.0,  # Check each maker at most once per 10 minutes
             max_concurrent_checks=5,
             max_checks_per_batch=4096,
+            max_batch_duration=FEATURE_SCAN_BUDGET_SECONDS,
             allow_clearnet_connections=allow_clearnet_connections,
             socks_username=self._hc_username,
             socks_password=self._hc_password,
         )
+        self._feature_scan_lock = asyncio.Lock()
 
         for onion_address, port in directory_nodes:
             node_id = f"{onion_address}:{port}"
@@ -455,9 +458,8 @@ class OrderbookAggregator:
         3. For directories without GETPEERLIST support (e.g. legacy reference
            implementation), fall back to age-based cleanup via
            ``cleanup_stale_offers``.
-        4. After peerlist refresh, run feature discovery for makers we still
-           don't have features for. Direct probes never remove offers; they
-           are strictly informational / for feature population.
+        Feature discovery runs independently so slow direct probes cannot
+        postpone the next authoritative refresh.
 
         This replaces the previous cross-directory union model, where an
         offer was kept as long as ANY directory still reported the maker.
@@ -517,15 +519,6 @@ class OrderbookAggregator:
                         f"{refresh_failures} failed, "
                         f"{total_removed} offers pruned from disconnected nicks, "
                         f"{fallback_cleanups} stale offers pruned by age"
-                    )
-
-                # After peerlist refresh, populate features for makers we're
-                # still missing. This is informational and never removes offers.
-                try:
-                    await self._check_makers_without_features()
-                except Exception as e:
-                    logger.bind(sensitive=True).debug(
-                        f"Error checking makers without features: {e}"
                     )
 
                 await asyncio.sleep(refresh_interval)
@@ -614,14 +607,22 @@ class OrderbookAggregator:
     async def _check_makers_without_features(self) -> None:
         """Check makers that have offers but no features discovered yet.
 
-        This is called after peerlist refresh to ensure we discover features
-        for makers whose features weren't included in the peerlist (e.g., from
-        reference implementation directories that don't support peerlist_features).
+        This runs separately from peerlist refresh to discover features for
+        makers whose directories do not support peerlist_features.
 
         Makers are scanned in priority order: bonded makers first (descending
         bond value), then zero fees, advertised features, and ascending fees. This ensures
         legitimate makers get their features discovered before sybil spam.
         """
+        # Startup and periodic discovery may coincide. Never queue a duplicate
+        # scan behind one already in progress.
+        if self._feature_scan_lock.locked():
+            return
+
+        async with self._feature_scan_lock:
+            await self._scan_makers_without_features()
+
+    async def _scan_makers_without_features(self) -> None:
         makers_to_check: list[tuple[str, str]] = []
 
         for _node_id, client in self.clients.items():
@@ -635,7 +636,7 @@ class OrderbookAggregator:
                     if location and location != "NOT-SERVING-ONION":
                         makers_to_check.append((nick, location))
 
-        # Deduplicate by location (keep first nick per location after priority sort)
+        # Deduplicate by location before sorting the remaining makers.
         unique_makers = {loc: (nick, loc) for nick, loc in makers_to_check}
         makers_list = self._prioritize_makers_for_scan(list(unique_makers.values()))
 
@@ -645,7 +646,7 @@ class OrderbookAggregator:
         logger.info(f"Feature discovery: Checking {len(makers_list)} makers without features")
 
         # Check makers and extract features from handshake
-        health_statuses = await self.health_checker.check_makers_batch(makers_list, force=True)
+        health_statuses = await self.health_checker.check_makers_batch(makers_list)
 
         # Update features in directory clients' peer_features cache
         features_discovered = 0
@@ -678,11 +679,11 @@ class OrderbookAggregator:
         and this probe will mostly be a no-op since makers without missing
         features are skipped by ``_check_makers_without_features``.
         """
-        # Initial wait to let orderbook populate; feature discovery also
-        # runs after each peerlist refresh, so this loop is the slow path.
+        # Initial wait lets the orderbook populate. The early one-shot scan
+        # runs first; this periodic task is the only recurring scan trigger.
         await asyncio.sleep(120)
 
-        check_interval = 900.0
+        check_interval = 300.0
 
         while True:
             try:
