@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JoinMarket NG <dev@joinmarket-ng.local>
+Date: Fri, 25 Sep 2026 12:00:00 +0200
+Subject: [PATCH 2/2] fix(htlcswitch): resolve late local quiescence request
+
+A local InitStfu that arrives after the channel already became quiescent (the
+remote initiated and we auto-responded with our owed Stfu) used to hang until
+the quiescence timeout. Resolve it immediately with the already established
+initiator, without retroactively claiming the initiator role.
+
+This is required by the channel buyout flow, where both sides may ask for
+quiescence concurrently before the escrow parent is cosigned.
+---
+ htlcswitch/quiescer.go      | 13 +++++++++++
+ htlcswitch/quiescer_test.go | 45 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/htlcswitch/quiescer.go b/htlcswitch/quiescer.go
+index dc1c117..d8f9fd9 100644
+--- a/htlcswitch/quiescer.go
++++ b/htlcswitch/quiescer.go
+@@ -478,6 +478,19 @@ func (q *QuiescerLive) initStfu(req StfuReq) {
+ 		return
+ 	}
+ 
++	// The channel may already be quiescent because the remote party
++	// initiated and we auto-responded with our owed Stfu before this
++	// request arrived. In that case there is nothing left to negotiate, so
++	// we resolve the request immediately with the initiator that was
++	// already settled. We deliberately do not set localInit here: doing so
++	// would retroactively claim the initiator role for a negotiation that
++	// has already concluded.
++	if q.isQuiescent() {
++		req.Resolve(q.quiescenceInitiator())
++
++		return
++	}
++
+ 	q.localInit = true
+ 	q.activeQuiescenceReq = fn.Some(req)
+ }
+diff --git a/htlcswitch/quiescer_test.go b/htlcswitch/quiescer_test.go
+index c970249..0388aa5 100644
+--- a/htlcswitch/quiescer_test.go
++++ b/htlcswitch/quiescer_test.go
+@@ -208,6 +208,51 @@ func TestQuiescenceInitiator(t *testing.T) {
+ 	}
+ }
+ 
++// TestQuiescenceInitStfuAfterAlreadyQuiescent ensures that a local quiescence
++// request that arrives after the channel has already become quiescent (because
++// the remote party initiated and we auto-responded with our owed Stfu) is
++// resolved immediately with the already established initiator instead of
++// hanging until the quiescence timeout.
++func TestQuiescenceInitStfuAfterAlreadyQuiescent(t *testing.T) {
++	t.Parallel()
++
++	// The local party is the channel initiator here so that a wrongly
++	// retied initiator would surface as lntypes.Local.
++	harness := initQuiescerTestHarness(lntypes.Local)
++
++	msg := lnwire.Stfu{
++		ChanID:    cid,
++		Initiator: true,
++	}
++
++	require.NoError(t, harness.quiescer.RecvStfu(msg))
++	require.NoError(t, harness.quiescer.SendOwedStfu())
++	require.True(t, harness.quiescer.IsQuiescent())
++
++	req, res := fn.NewReq[fn.Unit, fn.Result[lntypes.ChannelParty]](
++		fn.Unit{},
++	)
++	harness.quiescer.InitStfu(req)
++
++	select {
++	case party := <-res:
++		require.Equal(t, fn.Ok(lntypes.Remote), party)
++	default:
++		t.Fatal("quiescence request not resolved while quiescent")
++	}
++
++	// The already settled negotiation must not be mutated by the late
++	// request.
++	require.False(t, harness.quiescer.localInit)
++	require.True(t, harness.quiescer.remoteInit)
++	require.True(t, harness.quiescer.IsQuiescent())
++	require.Equal(
++		t, fn.Ok(lntypes.Remote),
++		harness.quiescer.QuiescenceInitiator(),
++	)
++	require.True(t, harness.quiescer.activeQuiescenceReq.IsNone())
++}
++
+ // TestQuiescenceCantReceiveUpdatesAfterStfu tests that we can receive channel
+ // updates prior to but not after we receive Stfu.
+ func TestQuiescenceCantReceiveUpdatesAfterStfu(t *testing.T) {
+-- 
+2.55.0
+
