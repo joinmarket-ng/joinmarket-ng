@@ -44,15 +44,21 @@ Defaults:
 Common options:
 
 ```bash
-# run plain HTTP (useful in local Docker)
+# run plain HTTP on loopback (for a local TLS-terminating reverse proxy)
 jmwalletd --no-tls
 
-# listen on all interfaces
-jmwalletd --host 0.0.0.0 --no-tls
+# listen on all interfaces with TLS enabled
+jmwalletd --host 0.0.0.0
 
 # custom data dir
 jmwalletd --data-dir /path/to/data
 ```
+
+The wallet API accepts passwords and returns bearer tokens. Never expose it over
+plain HTTP to an untrusted network. `--no-tls` should be used only on loopback,
+or on an isolated container network behind an access-controlled, TLS-terminating
+reverse proxy. Binding to `0.0.0.0` makes the API reachable on any interface
+allowed by the firewall; clients must verify the daemon's TLS certificate.
 
 ## Configuration
 

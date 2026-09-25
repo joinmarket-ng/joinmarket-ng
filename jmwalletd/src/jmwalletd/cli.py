@@ -84,6 +84,13 @@ def serve(
         ssl_context.load_cert_chain(str(cert_file), str(key_file))
 
     scheme = "http" if no_tls else "https"
+    if no_tls and host not in {"127.0.0.1", "::1", "localhost"}:
+        logger.warning(
+            "Plain HTTP on {} can expose wallet passwords and bearer tokens to network peers. "
+            "Use TLS, or restrict access to an isolated network behind an access-controlled "
+            "TLS-terminating reverse proxy.",
+            host,
+        )
     logger.info("Starting jmwalletd on {}://{}:{}", scheme, host, port)
 
     uvicorn.run(
