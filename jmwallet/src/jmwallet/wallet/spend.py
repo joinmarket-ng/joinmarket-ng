@@ -485,7 +485,7 @@ async def _reconstruct_conflicted_input(
         if locktime is None:
             msg = f"Input UTXO {outpoint} fidelity bond metadata is unavailable"
             raise ValueError(msg)
-        path = f"{wallet.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{locktime}"
+        path = f"{wallet.get_fidelity_bond_path(index)}:{locktime}"
     elif branch in (0, 1):
         path = f"{wallet.root_path}/{owner_mixdepth}'/{branch}/{index}"
     else:
