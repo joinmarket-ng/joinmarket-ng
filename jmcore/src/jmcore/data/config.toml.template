@@ -594,6 +594,15 @@
 # taker_utxo_age = 5          # Minimum confirmations on the PoDLE input
 # taker_utxo_retries = 3      # Max PoDLE index retries per UTXO
 # taker_utxo_amtpercent = 20  # Min UTXO value as % of CJ amount
+# Set to "only" to consume imported external PoDLE credentials. Their backing
+# UTXOs are independently verified and are never selected as CoinJoin inputs.
+# external_podle_mode = "disabled"
+
+# Opt in to experimental maker exclusion based on independently verified market
+# fault evidence. Separate from credential trading; false preserves ordinary maker
+# selection and does not load existing fault-cache files. Remains opt-in during
+# the experimental phase (a future release may change the default to opt-out).
+# market_fault_exclusion = false
 
 # Network/miner transaction fee settings
 # fee_rate takes precedence over fee_block_target when set

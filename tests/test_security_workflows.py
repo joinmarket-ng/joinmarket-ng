@@ -205,6 +205,14 @@ def test_bitcointx_standalone_scripts_document_the_same_pin() -> None:
         assert expected_pin in script
 
 
+def test_components_do_not_depend_on_coincurve() -> None:
+    for production_lock in PRODUCTION_LOCKS:
+        component = (REPO_ROOT / production_lock).parent
+        for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt"):
+            path = component / name
+            assert "coincurve" not in path.read_text(encoding="utf-8").lower(), path
+
+
 def test_main_and_release_promotions_depend_on_image_scans() -> None:
     ci_jobs = _workflow("ci.yaml")["jobs"]
     release_jobs = _workflow("release.yaml")["jobs"]

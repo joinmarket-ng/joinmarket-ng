@@ -50,6 +50,10 @@ expiry and publicly links the bond to the maker. It is optional, not a startup
 requirement. Read [fidelity bond operations](fidelity-bond-operations.md) before
 locking funds; external-signing bonds require separate recovery material.
 
+For experimental delegated or externally owned bonds and the separate
+offline-owner market authorization flow, see the
+[Experimental Credential Market](credential-market.md).
+
 ## Migration From JoinMarket Reference
 
 The network protocol is compatible; wallet files and configuration are not

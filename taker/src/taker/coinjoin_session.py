@@ -34,6 +34,7 @@ from jmcore.bitcoin import (
     taproot_tweak_pubkey,
 )
 from jmcore.constants import BITCOIN_DUST_THRESHOLD, DUST_THRESHOLD
+from jmcore.credential_market import BondReference
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     MinimumFeeRateExceedsCapError,
@@ -64,6 +65,7 @@ from taker.config import BroadcastPolicy
 from taker.models import MakerSession, PhaseResult
 from taker.orderbook import calculate_cj_fee, calculate_cj_fee_plan
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
+from taker.podle_manager import BondKey, ExternalPoDLEPreview
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx, compute_tx_locktime
 
 if TYPE_CHECKING:
@@ -134,6 +136,18 @@ class CoinJoinSession:
 
         # PoDLE commitment used for this CoinJoin. Rotated on majority-blacklist.
         self.podle_commitment: ExtendedPoDLECommitment | None = None
+
+        # External credential chosen before maker selection and user
+        # confirmation, and claimed (burned) only once the round commits to it.
+        self.external_podle_preview: ExternalPoDLEPreview | None = None
+        # Fidelity bond identities of every maker this round selected or
+        # contacted, retained even after a maker fails, is replaced, or stops
+        # advertising: a credential sold by one of them can never be revealed.
+        self.round_maker_bond_keys: set[BondKey] = set()
+        # Seller bonds of every credential this round committed to using. Kept
+        # as full bond references (not nicks) so each selection pass can
+        # re-derive the exclusion from the offers advertised at that moment.
+        self.podle_seller_bonds: list[BondReference] = []
 
         # Transaction bytes at successive phases:
         # ``unsigned_tx`` is the constructed-but-unsigned PSBT-equivalent;
@@ -251,6 +265,9 @@ class CoinJoinSession:
         self.maker_sessions = {}
         self.maker_target_count = 0
         self.podle_commitment = None
+        self.external_podle_preview = None
+        self.podle_seller_bonds = []
+        self.round_maker_bond_keys = set()
         self.unsigned_tx = b""
         self.tx_metadata = {}
         self.final_tx = b""

@@ -27,6 +27,7 @@ from jmwallet.backends.base import BondVerificationRequest
 
 from orderbook_watcher.directory_client import DirectoryClient
 from orderbook_watcher.health_checker import MakerHealthChecker
+from orderbook_watcher.market import MarketListingCache
 
 BOND_CACHE_TTL_SECONDS = 60.0
 BOND_CACHE_MAX_SIZE = 4096
@@ -244,6 +245,7 @@ class OrderbookAggregator:
         self.current_orderbook: OrderBook = OrderBook()
         self._lock = asyncio.Lock()
         self.clients: dict[str, DirectoryClient] = {}
+        self._market_listings = MarketListingCache(network)
         self.listener_tasks: list[asyncio.Task[Any]] = []
         self._bond_calculation_task: asyncio.Task[Any] | None = None
         self._bond_queue = _LatestOrderbookQueue()
@@ -499,6 +501,7 @@ class OrderbookAggregator:
                         stale_nicks = client_nicks - snapshot.nicks
                         for nick in stale_nicks:
                             total_removed += client.remove_offers_for_nick(nick)
+                        self._market_listings.forget_absent_sellers(node_id, snapshot.nicks)
                         logger.bind(sensitive=True).debug(
                             f"Directory {node_id}: {len(snapshot.nicks)} active nicks, "
                             f"removed offers for {len(stale_nicks)} disconnected nicks"
@@ -770,6 +773,9 @@ class OrderbookAggregator:
                 self.clients[node_id] = client
                 task = asyncio.create_task(client.listen_continuously())
                 self.listener_tasks.append(task)
+                self.listener_tasks.append(
+                    asyncio.create_task(self._request_market_listings(client))
+                )
                 logger.bind(sensitive=True).info(
                     f"Successfully reconnected to directory: {node_id}"
                 )
@@ -816,6 +822,9 @@ class OrderbookAggregator:
                 self.clients[node_id] = result
                 task = asyncio.create_task(result.listen_continuously())
                 self.listener_tasks.append(task)
+                self.listener_tasks.append(
+                    asyncio.create_task(self._request_market_listings(result))
+                )
                 logger.bind(sensitive=True).info(f"Started listener task for {node_id}")
             else:
                 retry_task = asyncio.create_task(self._retry_failed_connection(onion_address, port))
@@ -825,6 +834,21 @@ class OrderbookAggregator:
         # Start early feature discovery task - runs once after initial connections settle
         early_feature_task = asyncio.create_task(self._early_feature_discovery())
         self.listener_tasks.append(early_feature_task)
+
+    async def _request_market_listings(self, client: DirectoryClient) -> None:
+        """Ask once per directory connection; sellers push later updates themselves."""
+        try:
+            await asyncio.wait_for(client.send_public_message("mbook"), timeout=10)
+        except Exception:
+            logger.debug("Credential listing discovery request failed")
+
+    def get_market_offers(self) -> dict[str, list[dict[str, Any]]]:
+        """Drain signed public listings without affecting CoinJoin offer state."""
+        now = int(time.time())
+        for directory, client in tuple(self.clients.items()):
+            for seller_nick, raw in client.drain_market_listings():
+                self._market_listings.observe(seller_nick, raw, directory, now)
+        return self._market_listings.snapshot(now)
 
     async def _early_feature_discovery(self) -> None:
         """Run feature discovery shortly after startup to populate features quickly.

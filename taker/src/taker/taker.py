@@ -19,7 +19,7 @@ import inspect
 import math
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -28,9 +28,11 @@ from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
+from jmcore.credential_market import BondReference
 from jmcore.crypto import NickIdentity
 from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
+from jmcore.market_faults import MarketFaultCache
 from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
 from jmcore.paths import get_default_data_dir, get_nick_state_component, read_nick_state
@@ -64,7 +66,8 @@ from taker.orderbook import (
     maker_selection_keys,
     offer_supports_cofunded_channel_ring_v1,
 )
-from taker.podle_manager import PoDLEManager
+from taker.podle import ExtendedPoDLECommitment
+from taker.podle_manager import BondKey, ExternalPoDLEPreview, PoDLEManager
 
 if TYPE_CHECKING:
     from taker.buyout import ChannelBuyout
@@ -178,6 +181,140 @@ def warn_if_destination_script_mismatch(destination: str) -> str | None:
     return dest_type
 
 
+def verified_bond_key(offer: Offer, network: str) -> BondKey | None:
+    """Return the complete bond identity an offer independently proved, if any.
+
+    Only a bond that passed normal backend verification and carries the whole
+    tuple (outpoint, public key, locktime) yields a key. An unverified bond, a
+    different key on the same outpoint, or incomplete proof data yields
+    ``None``, so nothing is ever matched on partial evidence.
+    """
+    if offer.fidelity_bond_verified is not True:
+        return None
+    data = offer.fidelity_bond_data
+    if not isinstance(data, dict):
+        return None
+    txid = data.get("utxo_txid")
+    vout = data.get("utxo_vout")
+    pubkey = data.get("utxo_pub")
+    locktime = data.get("locktime")
+    if (
+        not isinstance(txid, str)
+        or type(vout) is not int
+        or not isinstance(pubkey, str)
+        or type(locktime) is not int
+    ):
+        return None
+    return (network, txid, vout, pubkey, locktime)
+
+
+def bond_reference_key(bond: BondReference) -> BondKey:
+    """Return the same identity tuple for a signed market bond reference."""
+    return (bond.network, bond.outpoint.txid, bond.outpoint.vout, bond.pubkey, bond.locktime)
+
+
+def nicks_proving_bonds(offers: Iterable[Offer], bond_keys: set[BondKey], network: str) -> set[str]:
+    """Return the nicks currently proving one of these exact bond identities."""
+    if not bond_keys:
+        return set()
+    return {
+        offer.counterparty
+        for offer in offers
+        if verified_bond_key(offer, network) in bond_keys  # None never matches a key
+    }
+
+
+class _RoundSellerSeparation:
+    """Keep every credential seller used in a round out of that round's makers.
+
+    Both directions are permanent for the round and nick-independent, because
+    knowledge cannot be taken back and a nick is not an identity:
+
+    * every maker bond the round selected or contacted (including makers that
+      later failed, were replaced, or stopped advertising) blocks any
+      credential sold by that bond, and
+    * every seller bond the round committed to blocks any maker nick currently
+      proving that bond, recomputed on each selection pass so a nick that only
+      starts advertising the bond later is still excluded.
+    """
+
+    def __init__(self, taker: Taker) -> None:
+        self._taker = taker
+
+    @property
+    def _network(self) -> str:
+        configured = self._taker.config.bitcoin_network or self._taker.config.network
+        return str(configured.value)
+
+    def _seller_key(self, seller_bond: BondReference) -> BondKey | None:
+        """Return the seller identity, or ``None`` when it is off this network."""
+        key = bond_reference_key(seller_bond)
+        return key if key[0] == self._network else None
+
+    def record_offered_makers(self, offers: Iterable[Offer]) -> None:
+        """Remember the bond identity of makers this round selected or contacted.
+
+        Candidates are recorded before they are contacted, so a credential can
+        never be revealed to a maker the round is about to fill.
+        """
+        keys = {
+            key
+            for key in (verified_bond_key(offer, self._network) for offer in offers)
+            if key is not None
+        }
+        self._taker._session.round_maker_bond_keys |= keys
+
+    def _round_maker_keys(self) -> set[BondKey]:
+        """Return every maker identity this round recorded or is still holding."""
+        session = self._taker._session
+        live = (maker.offer for maker in session.maker_sessions.values())
+        return session.round_maker_bond_keys | {
+            key
+            for key in (verified_bond_key(offer, self._network) for offer in live)
+            if key is not None
+        }
+
+    def allows(self, seller_bond: BondReference | None) -> bool:
+        """Reject a credential sold by any maker identity seen in this round."""
+        if seller_bond is None:
+            # No verified provenance: this pool makes no seller claim, and the
+            # pre-existing external credential contract is unchanged.
+            return True
+        key = self._seller_key(seller_bond)
+        if key is None:
+            logger.warning(
+                "Rejecting an external PoDLE credential whose seller bond is on another network"
+            )
+            return False
+        if key in self._round_maker_keys():
+            logger.warning(
+                "Rejecting an external PoDLE credential: its seller bond belongs to a maker "
+                "selected or contacted in this CoinJoin round"
+            )
+            return False
+        return True
+
+    def record_claim(self, seller_bond: BondReference | None) -> None:
+        """Retain the seller identity for every later selection pass of the round."""
+        if seller_bond is None:
+            return
+        if seller_bond not in self._taker._session.podle_seller_bonds:
+            self._taker._session.podle_seller_bonds.append(seller_bond)
+            logger.info(
+                "Excluding the fidelity bond of an external PoDLE credential seller from "
+                "maker selection for the rest of this CoinJoin round"
+            )
+
+    def excluded_nicks(self) -> set[str]:
+        """Return the nicks currently proving a seller bond used in this round."""
+        keys = {
+            key
+            for key in (self._seller_key(bond) for bond in self._taker._session.podle_seller_bonds)
+            if key is not None
+        }
+        return nicks_proving_bonds(self._taker.orderbook_manager.offers, keys, self._network)
+
+
 class Taker(TakerMonitoringMixin):
     """
     Main Taker class for executing CoinJoin transactions.
@@ -199,6 +336,16 @@ class Taker(TakerMonitoringMixin):
             config: Taker configuration
             confirmation_callback: Optional callback for user confirmation before proceeding
         """
+        podle_data_dir = config.data_dir
+        wallet_data_dir = getattr(wallet, "data_dir", None)
+        if isinstance(wallet_data_dir, Path):
+            podle_data_dir = (
+                get_default_data_dir() if podle_data_dir is None else podle_data_dir
+            ).resolve()
+            # Bind before activation too: this wallet may activate while the taker is running.
+            if wallet_data_dir.resolve() != podle_data_dir:
+                raise ValueError("Wallet and taker must use the same data directory")
+
         self.wallet = wallet
         self.backend = backend
         self.config = config
@@ -263,9 +410,17 @@ class Taker(TakerMonitoringMixin):
             equalize_cj_fees=config.equalize_cj_fees,
             allowed_types=offer_types_for_family(config.preferred_offer_type),
         )
+        # Do not load or rewrite a previous run's fault evidence unless the
+        # operator enabled the experimental maker-selection policy explicitly.
+        self.market_fault_cache = MarketFaultCache(
+            config.data_dir if config.market_fault_exclusion else None
+        )
 
         # PoDLE manager for commitment tracking
-        self.podle_manager = PoDLEManager(config.data_dir)
+        wallet_id = getattr(wallet, "market_wallet_id", None)
+        self.podle_manager = PoDLEManager(
+            podle_data_dir, wallet_id=wallet_id if isinstance(wallet_id, str) else None
+        )
 
         # Per-CoinJoin state and protocol phases live in a dedicated
         # ``CoinJoinSession``. ``Taker`` owns persistent infrastructure
@@ -645,11 +800,14 @@ class Taker(TakerMonitoringMixin):
                 raise ValueError(msg)
             # The PoDLE commitment covers the CoinJoin amount itself, so channel
             # value never lowers the wallet UTXO size this requires.
-            if not podle_threshold_met(
-                selected,
-                amount,
-                self.config.taker_utxo_age,
-                self.config.taker_utxo_amtpercent,
+            if (
+                not podle_threshold_met(
+                    selected,
+                    amount,
+                    self.config.taker_utxo_age,
+                    self.config.taker_utxo_amtpercent,
+                )
+                and self.config.external_podle_mode != "only"
             ):
                 min_value = int(amount * self.config.taker_utxo_amtpercent / 100)
                 msg = (
@@ -750,8 +908,11 @@ class Taker(TakerMonitoringMixin):
         # PoDLE necessary condition: a commitment needs a UTXO worth at least
         # ``taker_utxo_amtpercent`` of the amount. Without one the round always
         # fails at commitment generation, so reject early with a clear message.
-        if not podle_threshold_met(
-            breakdown.eligible, amount, min_conf, self.config.taker_utxo_amtpercent
+        if (
+            not podle_threshold_met(
+                breakdown.eligible, amount, min_conf, self.config.taker_utxo_amtpercent
+            )
+            and self.config.external_podle_mode != "only"
         ):
             min_value = int(amount * self.config.taker_utxo_amtpercent / 100)
             return (
@@ -841,7 +1002,14 @@ class Taker(TakerMonitoringMixin):
         private_key_getter: Callable[[str], bytes | None],
         excluded_outpoints: set[tuple[str, int]],
     ) -> list[UTXOInfo]:
-        """Select funding inputs containing at least one fresh PoDLE UTXO."""
+        """Select funding inputs containing a usable local PoDLE UTXO when enabled."""
+        if self.config.external_podle_mode == "only":
+            return self.wallet.select_utxos(
+                mixdepth,
+                target_amount,
+                self.config.taker_utxo_age,
+                exclude=excluded_outpoints,
+            )
         available = self.wallet.get_all_utxos(
             mixdepth,
             self.config.taker_utxo_age,
@@ -894,6 +1062,103 @@ class Taker(TakerMonitoringMixin):
             raise selection_error
         raise ValueError(f"Unable to select a PoDLE-capable UTXO in mixdepth {mixdepth}")
 
+    async def _allocate_podle_commitment(
+        self,
+        wallet_utxos: list[UTXOInfo],
+        get_private_key: Callable[[str], bytes | None],
+    ) -> ExtendedPoDLECommitment | None:
+        """Allocate exactly the configured PoDLE source without changing funding inputs."""
+        if self.config.external_podle_mode == "only":
+            preview = self._session.external_podle_preview
+            if preview is not None:
+                # The round already excluded this seller from maker selection,
+                # so it must burn this exact record or none at all.
+                self._session.external_podle_preview = None
+                return self._claim_previewed_external(preview)
+            return await self.podle_manager.consume_external(
+                backend=self.backend,
+                network=(self.config.bitcoin_network or self.config.network).value,
+                cj_amount=self._session.cj_amount,
+                min_confirmations=self.config.taker_utxo_age,
+                min_percent=self.config.taker_utxo_amtpercent,
+                max_retries=self.config.taker_utxo_retries,
+                seller_policy=self._seller_separation,
+            )
+        return self.podle_manager.generate_fresh_commitment(
+            wallet_utxos=wallet_utxos,
+            cj_amount=self._session.cj_amount,
+            private_key_getter=get_private_key,
+            min_confirmations=self.config.taker_utxo_age,
+            min_percent=self.config.taker_utxo_amtpercent,
+            max_retries=self.config.taker_utxo_retries,
+        )
+
+    @property
+    def _seller_separation(self) -> _RoundSellerSeparation:
+        """Return the seller separation view of the current round.
+
+        It owns no state of its own: the round's maker identities and seller
+        bonds live in the session, so a fresh view is always consistent with
+        the round that is running.
+        """
+        return _RoundSellerSeparation(self)
+
+    async def _prepare_external_podle(self, cj_amount_bound: int) -> None:
+        """Pick the external credential this round will use, before selecting makers.
+
+        Nothing is consumed here: a cancelled or failed round leaves the
+        credential usable. The preview exists so the seller's own fidelity bond
+        can be hard-excluded from maker selection before any maker is contacted.
+
+        ``cj_amount_bound`` is the CoinJoin amount for normal rounds. A sweep
+        does not know its amount until makers are chosen, so it passes the
+        total input value, an upper bound: a credential whose backing UTXO is
+        only just large enough for the eventual CoinJoin amount can be rejected
+        here even though it would have been eligible.
+
+        Finding no usable credential is not decided here. The round continues
+        and fails at commitment allocation, exactly as it did before previews
+        existed; any credential allocated there is still filtered by the same
+        seller separation policy.
+        """
+        if self.config.external_podle_mode != "only":
+            return
+        preview = await self.podle_manager.preview_external(
+            backend=self.backend,
+            network=(self.config.bitcoin_network or self.config.network).value,
+            cj_amount=cj_amount_bound,
+            min_confirmations=self.config.taker_utxo_age,
+            min_percent=self.config.taker_utxo_amtpercent,
+            max_retries=self.config.taker_utxo_retries,
+            seller_policy=self._seller_separation,
+        )
+        if preview is None:
+            logger.warning(
+                "No usable external PoDLE credential is available yet for this CoinJoin "
+                "(external_podle_mode=only)"
+            )
+            return
+        self._session.external_podle_preview = preview
+        # Exclude the seller before selection, not after: makers chosen now
+        # would otherwise learn a commitment their own bond authorized.
+        self._seller_separation.record_claim(preview.seller_bond)
+
+    def _claim_previewed_external(
+        self, preview: ExternalPoDLEPreview
+    ) -> ExtendedPoDLECommitment | None:
+        """Burn exactly the previewed credential, never a different seller's."""
+        if not self._seller_separation.allows(preview.seller_bond):
+            return None
+        commitment = self.podle_manager.claim_previewed_external(
+            preview, seller_policy=self._seller_separation
+        )
+        if commitment is None:
+            logger.error(
+                "The selected external PoDLE credential is no longer available; not "
+                "substituting a different seller after makers were selected"
+            )
+        return commitment
+
     async def stop(self, *, close_wallet: bool = True) -> None:
         """Stop the taker and close connections.
 
@@ -922,6 +1187,7 @@ class Taker(TakerMonitoringMixin):
             await asyncio.gather(*recovery_tasks.values(), return_exceptions=True)
             recovery_tasks.clear()
 
+        self.podle_manager.close()
         await self.directory_client.close_all()
         if self._channel_ring_backend is not None:
             await self._channel_ring_backend.backend.close()
@@ -985,7 +1251,7 @@ class Taker(TakerMonitoringMixin):
                 return False
         return True
 
-    async def _update_offers_with_bond_values(self, offers: list[Offer]) -> None:
+    async def _update_offers_with_bond_values(self, offers: list[Offer]) -> int | None:
         """
         Verify fidelity bonds and calculate their values.
 
@@ -998,23 +1264,24 @@ class Taker(TakerMonitoringMixin):
         """
         for offer in offers:
             offer.fidelity_bond_value = 0
+            offer.fidelity_bond_verified = None
 
         bonded_offers = [offer for offer in offers if offer.fidelity_bond_data]
         if not bonded_offers:
-            return
+            return None
 
         try:
             current_block_height = await self.backend.get_block_height()
         except Exception as e:
             logger.warning("Cannot verify fidelity bond certificate expiry")
             logger.bind(sensitive=True).warning("Fidelity bond expiry detail: {}", e)
-            return
+            return None
         if type(current_block_height) is not int or current_block_height < 0:
             logger.warning(
                 f"Cannot verify fidelity bond certificate expiry: backend returned "
                 f"invalid block height {current_block_height!r}"
             )
-            return
+            return None
 
         # Deduplicate identical claims while verifying conflicting script claims
         # independently. A claim is the outpoint plus its proof-derived script.
@@ -1030,11 +1297,13 @@ class Taker(TakerMonitoringMixin):
             cert_expiry_height = bond_data.get("cert_expiry")
 
             if not isinstance(cert_expiry_height, int):
+                offer.fidelity_bond_verified = False
                 logger.bind(sensitive=True).debug(
                     "Bond {}:{} missing certificate expiry, skipping", txid, vout
                 )
                 continue
             if current_block_height > cert_expiry_height:
+                offer.fidelity_bond_verified = False
                 logger.debug(
                     f"Bond {txid}:{vout} certificate expired at block "
                     f"{cert_expiry_height} (current block {current_block_height})"
@@ -1045,6 +1314,7 @@ class Taker(TakerMonitoringMixin):
             utxo_pub = bond_data.get("utxo_pub")
 
             if not utxo_pub:
+                offer.fidelity_bond_verified = False
                 logger.bind(sensitive=True).debug(
                     "Bond {}:{} missing utxo_pub, skipping", txid, vout
                 )
@@ -1052,8 +1322,13 @@ class Taker(TakerMonitoringMixin):
 
             try:
                 utxo_pub_bytes = bytes.fromhex(utxo_pub) if isinstance(utxo_pub, str) else utxo_pub
-                bond_addr = derive_bond_address(utxo_pub_bytes, locktime, self.config.network)
+                bond_addr = derive_bond_address(
+                    utxo_pub_bytes,
+                    locktime,
+                    self.config.bitcoin_network or self.config.network,
+                )
             except Exception as e:
+                offer.fidelity_bond_verified = False
                 logger.debug("Failed to derive bond address")
                 logger.bind(sensitive=True).debug(
                     "Bond address derivation detail for {}:{}: {}", txid, vout, e
@@ -1077,7 +1352,7 @@ class Taker(TakerMonitoringMixin):
             claim_to_offers[claim_key] = [offer]
 
         if not claim_to_request:
-            return
+            return current_block_height
 
         logger.info(f"Verifying {len(claim_to_request)} fidelity bonds...")
 
@@ -1088,12 +1363,12 @@ class Taker(TakerMonitoringMixin):
         except Exception as e:
             logger.warning("Bond verification failed")
             logger.bind(sensitive=True).warning("Bond verification detail: {}", e)
-            return
+            return None
         if len(results) != len(requests):
             logger.warning(
                 f"Bond verification returned {len(results)} results for {len(requests)} requests"
             )
-            return
+            return None
 
         current_time = int(time.time())
         claim_values: dict[tuple[str, int, str], int] = {}
@@ -1106,10 +1381,17 @@ class Taker(TakerMonitoringMixin):
                 )
                 continue
             if not result.valid:
+                claim_key = (request.txid, request.vout, request.scriptpubkey)
+                for offer in claim_to_offers[claim_key]:
+                    offer.fidelity_bond_verified = False
                 logger.bind(sensitive=True).debug(
                     "Bond {}:{} invalid: {}", result.txid, result.vout, result.error
                 )
                 continue
+
+            claim_key = (request.txid, request.vout, request.scriptpubkey)
+            for offer in claim_to_offers[claim_key]:
+                offer.fidelity_bond_verified = True
 
             bond_value = calculate_timelocked_fidelity_bond_value(
                 utxo_value=result.value,
@@ -1119,7 +1401,6 @@ class Taker(TakerMonitoringMixin):
             )
 
             if bond_value > 0:
-                claim_key = (request.txid, request.vout, request.scriptpubkey)
                 claim_values[claim_key] = bond_value
 
         # Update only offers whose certificate and proof data were eligible.
@@ -1130,6 +1411,31 @@ class Taker(TakerMonitoringMixin):
                 updated_count += 1
 
         logger.info(f"Updated {updated_count} offers with verified fidelity bond values")
+        return current_block_height
+
+    def _drain_and_apply_market_faults(
+        self, offers: list[Offer], current_block_height: int | None
+    ) -> list[Offer]:
+        """Ingest directory evidence and hard-remove only exact verified bond matches."""
+        if not self.config.market_fault_exclusion:
+            return offers
+        for client in self.directory_client.clients.values():
+            for proof in client.drain_market_faults():
+                self.market_fault_cache.ingest(proof)
+        if current_block_height is None:
+            return offers
+        excluded_nicks = self.market_fault_cache.excluded_nicks(
+            offers,
+            network=(self.config.bitcoin_network or self.config.network).value,
+            height=current_block_height,
+        )
+        if not excluded_nicks:
+            return offers
+        logger.warning(
+            "Hard-excluding {} maker nick(s) with verified market fault evidence",
+            len(excluded_nicks),
+        )
+        return [offer for offer in offers if offer.counterparty not in excluded_nicks]
 
     def _log_initial_maker_fee_plan(self, fee_plan: dict[str, int]) -> None:
         """Explain the opt-in fee equalization policy before makers are contacted."""
@@ -1481,8 +1787,10 @@ class Taker(TakerMonitoringMixin):
                         f"support peerlist_features."
                     )
 
-            # Verify and calculate fidelity bond values
-            await self._update_offers_with_bond_values(offers)
+            # Verify bonds once, then apply any independently matching fault
+            # proof before this offer set can enter selection or replacements.
+            current_block_height = await self._update_offers_with_bond_values(offers)
+            offers = self._drain_and_apply_market_faults(offers, current_block_height)
 
             self.orderbook_manager.update_offers(offers)
 
@@ -1582,6 +1890,10 @@ class Taker(TakerMonitoringMixin):
                 # so we MUST use this same value at build time to avoid residual fees.
                 self._session._sweep_tx_fee_budget = estimated_tx_fee
 
+                # The sweep amount is only known after selection, so the
+                # credential is validated against the total input value.
+                await self._prepare_external_podle(total_input_value)
+
                 # Use sweep order selection - this calculates exact cj_amount for zero change
                 selected_offers, self._session.cj_amount, total_fee = (
                     self.orderbook_manager.select_makers_for_sweep(
@@ -1590,9 +1902,11 @@ class Taker(TakerMonitoringMixin):
                         n=n_makers,
                         required_features=required_features,
                         exclude_nicks=exclude_nicks,
+                        hard_exclude_nicks=self._seller_separation.excluded_nicks(),
                         penalized_maker_keys=penalized_maker_keys,
                     )
                 )
+                self._seller_separation.record_offered_makers(selected_offers.values())
 
                 if len(selected_offers) < self.config.minimum_makers:
                     reason = f"Not enough makers for sweep: {len(selected_offers)}"
@@ -1611,13 +1925,17 @@ class Taker(TakerMonitoringMixin):
                     "Selecting {} makers for {:,} sats...", n_makers, self._session.cj_amount
                 )
 
+                await self._prepare_external_podle(self._session.cj_amount)
+
                 selected_offers, total_fee = self.orderbook_manager.select_makers(
                     cj_amount=self._session.cj_amount,
                     n=n_makers,
                     required_features=required_features,
                     exclude_nicks=exclude_nicks,
+                    hard_exclude_nicks=self._seller_separation.excluded_nicks(),
                     penalized_maker_keys=penalized_maker_keys,
                 )
+                self._seller_separation.record_offered_makers(selected_offers.values())
 
                 if len(selected_offers) < self.config.minimum_makers:
                     reason = f"Not enough makers selected: {len(selected_offers)}"
@@ -1798,15 +2116,9 @@ class Taker(TakerMonitoringMixin):
                     self.state = TakerState.FAILED
                     return None
 
-            # Generate PoDLE from pre-selected UTXOs only
-            # This ensures the commitment is from a UTXO that will be in the transaction
-            self._session.podle_commitment = self.podle_manager.generate_fresh_commitment(
-                wallet_utxos=self._session.preselected_utxos,  # Only from pre-selected UTXOs!
-                cj_amount=self._session.cj_amount,
-                private_key_getter=get_private_key,
-                min_confirmations=self.config.taker_utxo_age,
-                min_percent=self.config.taker_utxo_amtpercent,
-                max_retries=self.config.taker_utxo_retries,
+            self._session.podle_commitment = await self._allocate_podle_commitment(
+                self._session.preselected_utxos,
+                get_private_key,
             )
 
             if not self._session.podle_commitment:
@@ -2055,13 +2367,21 @@ class Taker(TakerMonitoringMixin):
                 replacement_offers, _ = self.orderbook_manager.select_makers(
                     cj_amount=self._session.cj_amount,
                     n=needed,
-                    hard_exclude_nicks=current_session_nicks | failed_nicks,
+                    hard_exclude_nicks=(
+                        current_session_nicks
+                        | failed_nicks
+                        | self._seller_separation.excluded_nicks()
+                    ),
                     required_features=required_features,
                     penalized_maker_keys=penalized_maker_keys,
                 )
 
                 if not replacement_offers:
                     break
+
+                # These candidates are about to be contacted, so a commitment
+                # rotated below must not come from any of their bonds.
+                self._seller_separation.record_offered_makers(replacement_offers.values())
 
                 if len(replacement_offers) < needed:
                     logger.info(
@@ -2070,7 +2390,7 @@ class Taker(TakerMonitoringMixin):
                     )
 
                 if not replacement_commitment_ready:
-                    if not self._rotate_commitment_for_auth_replacement(get_private_key):
+                    if not await self._rotate_commitment_for_auth_replacement(get_private_key):
                         break
                     replacement_commitment_ready = True
 
@@ -2106,7 +2426,7 @@ class Taker(TakerMonitoringMixin):
             self.state = TakerState.FAILED
             return False
 
-    def _rotate_commitment_for_auth_replacement(self, get_private_key: Any) -> bool:
+    async def _rotate_commitment_for_auth_replacement(self, get_private_key: Any) -> bool:
         """Prepare a fresh PoDLE proof after an auth-stage commitment disclosure."""
         if any(
             not maker_session.responded_auth
@@ -2115,13 +2435,9 @@ class Taker(TakerMonitoringMixin):
             logger.error("Cannot rotate PoDLE while an unauthenticated maker session remains")
             return False
 
-        new_commitment = self.podle_manager.generate_fresh_commitment(
-            wallet_utxos=self._session.preselected_utxos,
-            cj_amount=self._session.cj_amount,
-            private_key_getter=get_private_key,
-            min_confirmations=self.config.taker_utxo_age,
-            min_percent=self.config.taker_utxo_amtpercent,
-            max_retries=self.config.taker_utxo_retries,
+        new_commitment = await self._allocate_podle_commitment(
+            self._session.preselected_utxos,
+            get_private_key,
         )
         if new_commitment is None:
             logger.warning("No fresh PoDLE commitment remains for auth-stage maker replacement")
@@ -2311,15 +2627,11 @@ class Taker(TakerMonitoringMixin):
                         f"(attempt {podle_retry + 2}/{max_podle_retries})..."
                     )
                     podle_retry += 1
-                    new_commitment = self.podle_manager.generate_fresh_commitment(
-                        wallet_utxos=self._session.preselected_utxos,
-                        cj_amount=self._session.cj_amount,
-                        private_key_getter=get_private_key,
-                        min_confirmations=self.config.taker_utxo_age,
-                        min_percent=self.config.taker_utxo_amtpercent,
-                        max_retries=self.config.taker_utxo_retries,
+                    new_commitment = await self._allocate_podle_commitment(
+                        self._session.preselected_utxos,
+                        get_private_key,
                     )
-                    if new_commitment is None:
+                    if new_commitment is None and self.config.external_podle_mode != "only":
                         added = self._session._expand_preselected_utxos_same_mixdepth(mixdepth)
                         if added > 0:
                             logger.info(
@@ -2327,13 +2639,9 @@ class Taker(TakerMonitoringMixin):
                                 f"additional UTXO(s) from mixdepth {mixdepth}, which will "
                                 "also be spent in the CoinJoin."
                             )
-                            new_commitment = self.podle_manager.generate_fresh_commitment(
-                                wallet_utxos=self._session.preselected_utxos,
-                                cj_amount=self._session.cj_amount,
-                                private_key_getter=get_private_key,
-                                min_confirmations=self.config.taker_utxo_age,
-                                min_percent=self.config.taker_utxo_amtpercent,
-                                max_retries=self.config.taker_utxo_retries,
+                            new_commitment = await self._allocate_podle_commitment(
+                                self._session.preselected_utxos,
+                                get_private_key,
                             )
                     if new_commitment is None:
                         if self._session.strict_input_selection:
@@ -2405,10 +2713,13 @@ class Taker(TakerMonitoringMixin):
             replacement_offers, _ = self.orderbook_manager.select_makers(
                 cj_amount=self._session.cj_amount,
                 n=needed,
-                hard_exclude_nicks=current_session_nicks | failed_nicks,
+                hard_exclude_nicks=(
+                    current_session_nicks | failed_nicks | self._seller_separation.excluded_nicks()
+                ),
                 required_features=required_features,
                 penalized_maker_keys=penalized_maker_keys,
             )
+            self._seller_separation.record_offered_makers(replacement_offers.values())
 
             if not replacement_offers:
                 if fill_result.success and current_makers >= self._session.required_maker_count:

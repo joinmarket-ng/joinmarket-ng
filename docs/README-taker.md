@@ -56,6 +56,10 @@ Set fee limits in `[taker]` in your configuration. Consult the installed
 `jm-taker coinjoin --help` for per-run overrides. The
 [configuration reference](technical/configuration.md) explains precedence.
 
+For externally acquired PoDLE credentials and the opt-in credential market,
+including the `external_podle_mode = "only"` no-local-fallback policy, see
+[Experimental Credential Market](credential-market.md).
+
 Maker fees and mining fees are separate costs. More participants and inputs
 usually make a larger transaction. Additional equal outputs do not represent
 a guaranteed anonymity set. If there are too few suitable offers, wait or

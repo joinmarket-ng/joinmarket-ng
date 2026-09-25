@@ -13,7 +13,10 @@ COPY orderbook_watcher /build/orderbook_watcher
 COPY jmwalletd /build/jmwalletd
 COPY tumbler /build/tumbler
 
-RUN /opt/venv/bin/pip install --no-cache-dir --no-deps --force-reinstall \
+# New checkout dependencies may not exist in the pinned remote base.
+RUN /opt/venv/bin/pip install --no-cache-dir \
+        --require-hashes -r /build/taker/requirements.txt \
+    && /opt/venv/bin/pip install --no-cache-dir --no-deps --force-reinstall \
         /build/jmcore \
         /build/jmwallet \
         /build/maker \
