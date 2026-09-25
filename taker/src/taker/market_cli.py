@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from bitcointx.core.key import CKey, CPubKey  # type: ignore[import-not-found]
+from jmcore import experimental
 from jmcore.btc_script import derive_bond_address
 from jmcore.cli_common import resolve_backend_settings, setup_cli
 from jmcore.credential_market import (
@@ -48,6 +49,7 @@ from jmcore.credential_market import (
     verify_authorization,
 )
 from jmcore.crypto import NickIdentity
+from jmcore.experimental import warn_experimental
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_faults import MarketFaultCache
 from jmcore.market_store import MarketStore
@@ -351,6 +353,7 @@ def _new_transport(
     listen_port: int = 0,
     fault_cache: MarketFaultCache | None = None,
 ) -> MarketTransport:
+    warn_experimental([experimental.CREDENTIAL_MARKET], _network(settings))
     cache = fault_cache if fault_cache is not None else MarketFaultCache(settings.get_data_dir())
 
     def receive_fault(raw: bytes) -> None:

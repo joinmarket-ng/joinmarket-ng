@@ -59,6 +59,10 @@ async def test_funding_enablement_follows_durable_capacity_check(
             ),
             network=SimpleNamespace(value="regtest"),
             preferred_offer_type=SimpleNamespace(value="tr0absoffer"),
+            address_type="p2tr",
+            external_podle_mode="disabled",
+            market_fault_exclusion=False,
+            bitcoin_network=None,
             data_dir=tmp_path,
         ),
     )
@@ -123,6 +127,10 @@ async def test_unknown_coordinator_journal_blocks_lnd_inspection(
             channel_ring=ChannelRingConfig(enabled=True),
             network=SimpleNamespace(value="regtest"),
             preferred_offer_type=SimpleNamespace(value="tr0absoffer"),
+            address_type="p2tr",
+            external_podle_mode="disabled",
+            market_fault_exclusion=False,
+            bitcoin_network=None,
             data_dir=tmp_path,
         ),
     )

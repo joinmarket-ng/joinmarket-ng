@@ -53,6 +53,12 @@ from jmswap.lnd_escrow import LndEscrowError
 from jmswap.lnd_peer import LndPeerError
 
 
+def _without_experimental_warning(stderr: str) -> str:
+    return "".join(
+        line for line in stderr.splitlines(keepends=True) if not line.startswith("EXPERIMENTAL")
+    )
+
+
 def _pubkey(tag: str) -> str:
     return bytes(CKey(hashlib.sha256(tag.encode()).digest()).pub).hex()
 
@@ -353,7 +359,7 @@ class TestTaskGroupFailures:
         assert [type(leaf) for leaf in leaves] == [TypeError]
         assert "unexpected keyword argument" in str(leaves[0])
         assert SECRET_INVOICE not in repr(failure.value)
-        assert capsys.readouterr().err == ""
+        assert _without_experimental_warning(capsys.readouterr().err) == ""
         assert runtime.exited == 1
 
     def test_a_plain_programming_error_is_not_sanitized(
@@ -377,7 +383,7 @@ class TestTaskGroupFailures:
 
         assert [type(leaf) for leaf in _leaves(failure.value)] == [asyncio.CancelledError]
         assert SECRET_INVOICE not in repr(failure.value)
-        assert capsys.readouterr().err == ""
+        assert _without_experimental_warning(capsys.readouterr().err) == ""
 
 
 class TestDisabledConfiguration:
@@ -744,3 +750,17 @@ class TestRuntimeBindingSummary:
             "runtime_binding_present",
         }
         assert SECRET_INVOICE not in json.dumps(summary)
+
+
+def test_enabled_commands_print_the_experimental_warning(
+    tmp_path: Path, runtime: Recorder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--config", str(_config(tmp_path)), "cancel", "--session", SESSION_B]) == 0
+    assert "EXPERIMENTAL features enabled: private channel buyouts" in capsys.readouterr().err
+
+
+def test_status_does_not_print_the_experimental_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["--config", str(_config(tmp_path, DISABLED_TOML)), "status"])
+    assert "EXPERIMENTAL" not in capsys.readouterr().err
