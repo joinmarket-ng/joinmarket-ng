@@ -25,6 +25,7 @@ import base58
 import bech32 as bech32_lib
 from bitcointx.core.key import CKey, XOnlyPubKey, compute_tap_tweak_hash
 from bitcointx.core.key import tap_tweak_pubkey as _tap_tweak_pubkey
+from bitcointx.segwit_addr import decode as decode_segwit_address
 from pydantic import validate_call
 from pydantic.dataclasses import dataclass
 
@@ -497,22 +498,6 @@ def bech32m_encode(hrp: str, witver: int, witprog: bytes) -> str:
     return hrp + "1" + "".join([bech32_lib.CHARSET[d] for d in data + checksum])
 
 
-def bech32m_decode(hrp: str, addr: str) -> tuple[int | None, list[int] | None]:
-    """Decode a bech32m segwit address, returning (witver, 5-bit witprog data)."""
-    pos = addr.rfind("1")
-    if pos < 1 or pos + 7 > len(addr) or len(addr) > 90:
-        return None, None
-    if not addr.lower().startswith(hrp + "1"):
-        return None, None
-    data = [bech32_lib.CHARSET.find(x) for x in addr.lower()[pos + 1 :]]
-    if any(x == -1 for x in data):
-        return None, None
-    values = bech32_lib.bech32_hrp_expand(hrp) + data
-    if bech32_lib.bech32_polymod(values) != BECH32M_CONST:
-        return None, None
-    return data[0], data[1:-6]
-
-
 @validate_call
 def pubkey_to_p2tr_address(
     output_xonly_pubkey: bytes | str, network: str | NetworkType = "mainnet"
@@ -618,24 +603,13 @@ def address_to_scriptpubkey(address: str) -> bytes:
         scriptPubKey bytes
     """
     # Bech32 (SegWit) addresses
-    if address.startswith(("bc1", "tb1", "bcrt1")):
-        hrp_end = 4 if address.startswith("bcrt") else 2
-        hrp = address[:hrp_end]
-
-        bech32_decoded = bech32_lib.decode(hrp, address)
-        witver = bech32_decoded[0]
-        if witver is not None and bech32_decoded[1] is not None:
-            witprog = bytes(bech32_decoded[1])
-        else:
-            # Witness v1+ (P2TR) uses bech32m, which the bech32 decoder rejects.
-            m_witver, m_data = bech32m_decode(hrp, address)
-            if m_witver is None or m_data is None:
-                raise ValueError(f"Invalid bech32/bech32m address: {address}")
-            converted = bech32_lib.convertbits(m_data, 5, 8, False)
-            if converted is None:
-                raise ValueError(f"Invalid witness program padding: {address}")
-            witver = m_witver
-            witprog = bytes(converted)
+    if address.lower().startswith(("bc1", "tb1", "bcrt1")):
+        hrp = address.lower().rsplit("1", 1)[0]
+        # BIP350 binds the checksum variant to the witness version and forbids
+        # mixed case. Do not normalize the address before validating it.
+        witver, witprog = decode_segwit_address(hrp, address)
+        if witver is None or witprog is None:
+            raise ValueError(f"Invalid bech32/bech32m address: {address}")
 
         if witver == 0:
             if len(witprog) == 20:
@@ -1347,24 +1321,11 @@ def get_address_type(address: str) -> str:
         ValueError: If address is invalid or unknown type
     """
     # Bech32 (SegWit)
-    if address.startswith(("bc1", "tb1", "bcrt1")):
-        hrp_end = 4 if address.startswith("bcrt") else 2
-        hrp = address[:hrp_end]
-
-        decoded = bech32_lib.decode(hrp, address)
-        witver = decoded[0]
-        if witver is not None and decoded[1] is not None:
-            witprog = bytes(decoded[1])
-        else:
-            # Witness v1+ (P2TR) uses bech32m, which the bech32 decoder rejects.
-            m_witver, m_data = bech32m_decode(hrp, address)
-            if m_witver is None or m_data is None:
-                raise ValueError(f"Invalid bech32/bech32m address: {address}")
-            converted = bech32_lib.convertbits(m_data, 5, 8, False)
-            if converted is None:
-                raise ValueError(f"Invalid witness program padding: {address}")
-            witver = m_witver
-            witprog = bytes(converted)
+    if address.lower().startswith(("bc1", "tb1", "bcrt1")):
+        hrp = address.lower().rsplit("1", 1)[0]
+        witver, witprog = decode_segwit_address(hrp, address)
+        if witver is None or witprog is None:
+            raise ValueError(f"Invalid bech32/bech32m address: {address}")
 
         if witver == 0:
             if len(witprog) == 20:
