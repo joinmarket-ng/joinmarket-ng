@@ -82,6 +82,8 @@ if TYPE_CHECKING:
 
 
 MAX_IOAUTH_HOLD_SECONDS = 3_600
+# Resend !tx through a directory to a direct-routed maker still silent after this.
+_DIRECT_TX_FALLBACK_SEC = 30.0
 
 
 def _ioauth_hold_seconds(fields: list[str], *, ring_enabled: bool) -> int:
@@ -2190,6 +2192,7 @@ class CoinJoinSession:
             return False
 
         # Send ENCRYPTED !tx to each maker
+        encrypted_txs: dict[str, str] = {}
         for nick, session in self.maker_sessions.items():
             if session.crypto is None:
                 logger.error(f"No encryption session for {nick}")
@@ -2202,6 +2205,7 @@ class CoinJoinSession:
             )
 
             encrypted_tx = session.crypto.encrypt(tx_b64)
+            encrypted_txs[nick] = encrypted_tx
             # Verify ownership immediately before every delivery. Maker-only
             # signatures cannot spend taker inputs, so they do not cross the
             # local signing boundary.
@@ -2221,12 +2225,43 @@ class CoinJoinSession:
         expected_nicks = list(self.maker_sessions.keys())
         signatures: dict[str, list[dict[str, Any]]] = {}
 
+        lock_renewal_failed = False
+
+        async def resend_stalled_direct_tx(stalled: set[str]) -> None:
+            # A direct Tor stream can stall silently after !auth; the heartbeat
+            # only notices after minutes. Resend the same !tx once through a
+            # directory. Our makers ignore a !tx after signing; reference makers
+            # may return signatures again, which response collection deduplicates.
+            nonlocal lock_renewal_failed
+            for nick in sorted(stalled):
+                session = self.maker_sessions.get(nick)
+                if session is None or session.comm_channel != "direct":
+                    continue
+                if nick not in encrypted_txs:
+                    continue
+                if not self.renew_input_locks(f"resend !tx to maker {nick}"):
+                    lock_renewal_failed = True
+                    return
+                logger.warning(
+                    f"No !sig from {nick} over direct connection, resending via directory"
+                )
+                try:
+                    session.comm_channel = await self.directory_client.send_privmsg(
+                        nick, "tx", encrypted_txs[nick], log_routing=True, force_channel="directory"
+                    )
+                except Exception as e:
+                    logger.warning("Directory fallback for !tx failed ({})", type(e).__name__)
+                    logger.bind(sensitive=True).debug("Fallback to {} failed: {}", nick, e)
+
         responses = await self.directory_client.wait_for_responses(
             expected_nicks=expected_nicks,
             expected_command="!sig",
             timeout=timeout,
             expected_counts=expected_counts,
+            on_stalled=(min(_DIRECT_TX_FALLBACK_SEC, timeout / 2), resend_stalled_direct_tx),
         )
+        if lock_renewal_failed:
+            return False
 
         # Deserialize transaction for signature verification
         # We use verification-based matching: verify each signature against inputs
