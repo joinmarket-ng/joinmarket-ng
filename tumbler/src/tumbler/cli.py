@@ -23,7 +23,7 @@ import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
 from jmcore.cli_help import SortedTyper
 from jmcore.models import NetworkType
-from jmcore.paths import remove_nick_state, write_nick_state
+from jmcore.paths import get_nick_state_component, remove_nick_state, write_nick_state
 from jmcore.settings import ensure_config_file
 from jmwallet.wallet.service import WalletService
 from loguru import logger
@@ -1056,7 +1056,7 @@ async def _run_plan(
             tor_socks_host=tor_socks_host,
             tor_socks_port=tor_socks_port,
         )
-        # Tumbler maker sessions must run as 0-fee sw0absoffer with no
+        # Tumbler maker sessions must run as zero-fee absolute offers with no
         # fidelity bond; otherwise the offer is unlikely to be picked
         # (bondless + non-zero fee) or, if a bond is reused, the session
         # links every phase under the same identity. See
@@ -1066,7 +1066,9 @@ async def _run_plan(
         _ = create_maker_wallet  # silence unused-import; reserved for future fork
 
         def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
-            write_nick_state(config.data_dir, "maker", new_nick)
+            write_nick_state(
+                config.data_dir, get_nick_state_component("maker", config.address_type), new_nick
+            )
 
         return MakerBot(
             wallet=wallet,

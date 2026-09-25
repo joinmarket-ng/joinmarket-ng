@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
 import pytest
-from jmcore.models import NetworkType
+from jmcore.models import NetworkType, OfferType
 from jmcore.nick_auth import NickAuthMode
 from typer.testing import CliRunner
 
@@ -206,6 +206,8 @@ async def test_coinjoin_success_prints_txid_and_tags_log_details(
     config.network.value = "regtest"
     config.bitcoin_network = None
     config.data_dir = MagicMock()
+    # The CLI derives the CoinJoin pit (and nick filename) from address_type.
+    config.address_type = "p2wpkh"
     config.mnemonic.get_secret_value.return_value = "test mnemonic"
     config.passphrase.get_secret_value.return_value = ""
     backend = MagicMock()
@@ -314,8 +316,10 @@ class TestBuildTakerConfig:
         settings.taker.taker_utxo_retries = 3
         settings.taker.taker_utxo_amtpercent = 20
         settings.taker.max_maker_utxos = 15
+        settings.taker.preferred_offer_type = OfferType.SW0_RELATIVE
 
         # Wallet config
+        settings.wallet.address_type = "p2wpkh"
         settings.wallet.mixdepth_count = 5
         settings.wallet.gap_limit = 6
         settings.wallet.scan_range = 1000
@@ -508,6 +512,30 @@ class TestBuildTakerConfig:
         )
 
         assert config.max_maker_utxos == 4
+
+    def test_wallet_address_type_forwarded(self, sample_mnemonic: str) -> None:
+        """wallet.address_type must reach the TakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings()
+        assert settings.wallet.address_type == "p2wpkh"
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+        )
+        assert config.address_type == "p2wpkh"
+
+        settings.wallet.address_type = "p2tr"
+        settings.taker.preferred_offer_type = OfferType.TR0_RELATIVE
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+        )
+        assert config.address_type == "p2tr"
 
     def test_taker_fee_rate_setting_honored_without_cli_flag(
         self, sample_mnemonic: str, mock_settings: MagicMock

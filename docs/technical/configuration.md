@@ -224,6 +224,20 @@ The `[directory_server]` section supports heartbeat liveness controls:
 
 These values are tuned to match joinmarket-rs defaults for interoperability.
 
+## Nick State Files
+
+Running maker and taker processes publish their current nick under
+`<data_dir>/state/`, so that a wallet running both roles can exclude itself from
+its own CoinJoin rounds. Peers only meet in the pit matching their address type,
+so the filename is fixed per role and per pit:
+
+- `wallet.address_type = "p2wpkh"` (default): `maker.nick`, `taker.nick`
+- `wallet.address_type = "p2tr"`: `maker_taproot.nick`, `taker_taproot.nick`
+
+The SegWit v0 names are unchanged, so existing installations and external tooling
+keep working after an upgrade. Run at most one maker and one taker per pit per
+data directory; two processes sharing a pit would overwrite each other's file.
+
 ## Notes
 
 - BIP39 passphrases are not intended to be stored in config for normal operations.

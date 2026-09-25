@@ -187,6 +187,11 @@
 # ============================================================================
 
 [wallet]
+# Wallet address type: "p2wpkh" (BIP84 native segwit, the default) or "p2tr"
+# (BIP86 Taproot key-path). A p2tr wallet takes part in tr0 Taproot CoinJoins
+# (JMP-0010) and cannot mix with p2wpkh makers in the same round (rigid pit).
+# address_type = "p2wpkh"
+
 # Number of mixing depths (1-10)
 # mixdepth_count = 5
 
@@ -384,6 +389,13 @@
 # Offer type options:
 #   "sw0reloffer" - relative fee (uses cj_fee_relative) [DEFAULT]
 #   "sw0absoffer" - absolute fee (uses cj_fee_absolute)
+#   "tr0reloffer" - relative fee, Taproot (P2TR) pit (JMP-0010)
+#   "tr0absoffer" - absolute fee, Taproot (P2TR) pit (JMP-0010)
+#
+# The family must match wallet.address_type above: a p2wpkh wallet serves sw0
+# offers and a p2tr wallet serves tr0 offers. A mismatch is rejected at startup,
+# and a round never mixes P2WPKH and P2TR (rigid pit). One maker process serves
+# one pit; run a separate process with its own wallet type for the other pit.
 #
 # Example: To use absolute fees, set BOTH:
 #   offer_type = "sw0absoffer"
@@ -498,6 +510,7 @@
 # Dual-offer mode: advertise both a relative and an absolute fee offer simultaneously.
 # Equivalent to passing --dual-offers on the CLI. The CLI flag takes precedence
 # when both are set. Default: false (single offer determined by offer_type above).
+# Both offers stay in the pit selected by wallet.address_type (sw0 or tr0).
 # dual_offers = false
 
 # ============================================================================
@@ -510,6 +523,15 @@
 # the upstream JoinMarket sendpayment default and avoids fingerprinting via a
 # fixed counterparty count). Set explicitly to override.
 # counterparty_count = 10
+
+# Preferred offer family (rigid pit, JMP-0010). Selects which makers this taker
+# joins with and fixes the CoinJoin's uniform script type: "sw0reloffer" /
+# "sw0absoffer" produce a native-segwit (P2WPKH) pit, "tr0reloffer" /
+# "tr0absoffer" a Taproot (P2TR) pit. The taker only contacts makers of the
+# chosen family, and its own equal output, change and inputs all use that type,
+# so this MUST match the wallet.address_type above (a p2tr wallet for a tr0
+# pit). A round never mixes P2WPKH and P2TR. Default: sw0reloffer.
+# preferred_offer_type = "sw0reloffer"
 
 # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
 # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker

@@ -9,7 +9,7 @@ ensure consistency.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
@@ -300,6 +300,10 @@ class WalletConfig(BaseModel):
     )
 
     # HD wallet structure
+    address_type: Literal["p2wpkh", "p2tr"] = Field(
+        default="p2wpkh",
+        description="Wallet address type: 'p2wpkh' (BIP84) or 'p2tr' (BIP86 Taproot).",
+    )
     mixdepth_count: int = Field(
         default=5,
         ge=1,

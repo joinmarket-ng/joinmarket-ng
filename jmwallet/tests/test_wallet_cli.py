@@ -947,6 +947,7 @@ def _mock_send_execution(tmp_path: Path) -> Iterator[tuple[ResolvedBackendSettin
 async def _run_mock_send(
     backend_settings: ResolvedBackendSettings,
     *,
+    amount: int = 0,
     broadcast: bool = True,
     skip_confirmation: bool = True,
     interactive_utxo_selection: bool = False,
@@ -957,7 +958,7 @@ async def _run_mock_send(
     await _send_transaction(
         mnemonic="abandon " * 11 + "about",
         destination="bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
-        amount=0,
+        amount=amount,
         mixdepth=0,
         fee_rate=1.0,
         block_target=None,
@@ -987,6 +988,41 @@ async def test_send_serializes_locktime_and_requested_rbf_policy(
     assert parsed.version == 2
     assert 839_901 <= parsed.locktime <= 840_000
     assert {tx_input.sequence for tx_input in parsed.inputs} == {expected_sequence}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change_addr",
+    [
+        "bcrt1p4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w4spc6qv8",
+        "bcrt1qehxumnwdehxumnwdehxumnwdehxumnwd02ez2k",
+    ],
+)
+async def test_send_change_output_script_matches_change_address(
+    tmp_path: Path,
+    change_addr: str,
+) -> None:
+    """The broadcast transaction must pay change to the address the wallet chose.
+
+    Taproot change previously got a hardcoded P2WPKH script, hiding the funds
+    from the wallet's own tr() descriptors.
+    """
+    from bitcointx import ChainParams
+    from bitcointx.wallet import CCoinAddress
+
+    with ChainParams("bitcoin/regtest"):
+        expected_script = bytes(CCoinAddress(change_addr).to_scriptPubKey())
+
+    with _mock_send_execution(tmp_path) as (backend_settings, mocks):
+        mocks.wallet.get_new_internal_address.return_value = change_addr
+        await _run_mock_send(backend_settings, amount=50_000)
+
+    tx_hex = mocks.backend.broadcast_transaction.call_args.args[0]
+    parsed = parse_transaction(tx_hex)
+    change_value = 100_000 - 50_000 - 200
+    change_outputs = [output for output in parsed.outputs if output.value == change_value]
+    assert len(change_outputs) == 1
+    assert change_outputs[0].script == expected_script
 
 
 @pytest.mark.asyncio
@@ -3103,6 +3139,61 @@ def test_rescan_scan_depth_honors_start_height(monkeypatch) -> None:
         mock_backend.start_background_rescan.assert_awaited_once()
         assert mock_backend.start_background_rescan.await_args.kwargs["start_height"] == 200000
         sync_mock.assert_awaited_once()
+
+
+def test_rescan_uses_configured_address_type(monkeypatch, tmp_path: Path) -> None:
+    """``rescan`` must build the wallet with ``wallet.address_type`` (regression:
+    a p2tr wallet re-imported and rescanned wpkh descriptors, so its Taproot
+    branch stayed unwatched by Bitcoin Core).
+    """
+    from jmcore.settings import reset_settings
+
+    monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[wallet]\naddress_type = "p2tr"\n\n[network]\nnetwork = "regtest"\n')
+
+    setup_mock = AsyncMock()
+    sync_mock = AsyncMock()
+    built: list[str] = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _make_default_wallet(tmpdir)
+        mock_backend = _make_rescan_scan_depth_backend()
+
+        from jmwallet.wallet.service import WalletService
+
+        original_init = WalletService.__init__
+
+        def recording_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            original_init(self, *args, **kwargs)
+            built.append(self.descriptor_function)
+
+        reset_settings()
+        previous_config_file = os.environ.get("JOINMARKET_CONFIG_FILE")
+        try:
+            with (
+                patch.object(Path, "home", return_value=Path(tmpdir)),
+                patch(
+                    "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                    _stub_backend_class(mock_backend),
+                ),
+                patch.object(WalletService, "__init__", recording_init),
+                patch.object(WalletService, "setup_descriptor_wallet", setup_mock),
+                patch.object(WalletService, "sync_with_registered_bonds", sync_mock),
+            ):
+                result = runner.invoke(
+                    app,
+                    ["rescan", "--scan-depth", "8000", "--config-file", str(config_file)],
+                )
+        finally:
+            if previous_config_file is None:
+                os.environ.pop("JOINMARKET_CONFIG_FILE", None)
+            else:
+                os.environ["JOINMARKET_CONFIG_FILE"] = previous_config_file
+            reset_settings()
+
+    assert result.exit_code == 0, f"rescan failed: {result.stdout}"
+    assert built == ["tr"]
 
 
 def test_rescan_scan_depth_capped_at_core_limit(monkeypatch) -> None:

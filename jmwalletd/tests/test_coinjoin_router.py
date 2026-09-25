@@ -1355,6 +1355,9 @@ class TestStartMaker:
         authed_client: tuple[TestClient, str],
     ) -> None:
         """Starting the maker via jmwalletd must write the nick state file."""
+        # The patched MakerConfig must expose a real address_type: the router
+        # derives the CoinJoin pit (and therefore the nick filename) from it.
+        mock_config.return_value.address_type = "p2wpkh"
         client, token = authed_client
         state = get_daemon_state()
         mock_maker = AsyncMock()
@@ -1391,6 +1394,66 @@ class TestStartMaker:
         ]
         mock_remove_nick.assert_called_once_with(state.data_dir, "maker")
 
+    @patch("jmwalletd.routers.coinjoin.remove_nick_state")
+    @patch("jmwalletd.routers.coinjoin.write_nick_state")
+    @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+    @patch("maker.bot.MakerBot")
+    def test_start_maker_nick_state_follows_selected_pit(
+        self,
+        mock_maker_cls: Mock,
+        mock_backend: AsyncMock,
+        mock_write_nick: Mock,
+        mock_remove_nick: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+        authed_client: tuple[TestClient, str],
+    ) -> None:
+        """A Taproot daemon maker must use the Taproot pit's nick file."""
+        import jmwalletd.maker_config as maker_config_module
+        from maker.config import MakerConfig
+
+        real_builder = maker_config_module.build_daemon_maker_config
+
+        def taproot_builder(*args: object, **kwargs: object) -> MakerConfig:
+            config = real_builder(*args, **kwargs)  # type: ignore[arg-type]
+            config.address_type = "p2tr"
+            return config
+
+        monkeypatch.setattr(maker_config_module, "build_daemon_maker_config", taproot_builder)
+
+        client, token = authed_client
+        state = get_daemon_state()
+        mock_maker = AsyncMock()
+        mock_maker.nick = "J5TaprootNickWalletd"
+        mock_maker.current_offers = []
+
+        async def rotate_then_stop() -> None:
+            callback = mock_maker_cls.call_args.kwargs["nick_change_callback"]
+            callback("J5TaprootNickWalletd", "J5RotatedTaprootWalletd")
+
+        mock_maker.start.side_effect = rotate_then_stop
+        mock_maker_cls.return_value = mock_maker
+
+        resp = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/maker/start",
+            json={
+                "txfee": "1000",
+                "cjfee_a": "500",
+                "cjfee_r": "0.002",
+                "ordertype": "sw0reloffer",
+                "minsize": "100000",
+            },
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 202
+
+        time.sleep(0.1)
+
+        assert mock_write_nick.call_args_list == [
+            call(state.data_dir, "maker_taproot", "J5TaprootNickWalletd"),
+            call(state.data_dir, "maker_taproot", "J5RotatedTaprootWalletd"),
+        ]
+        mock_remove_nick.assert_called_once_with(state.data_dir, "maker_taproot")
+
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("maker.bot.MakerBot")
     @patch("maker.config.MakerConfig")
@@ -1401,6 +1464,8 @@ class TestStartMaker:
         mock_backend: AsyncMock,
         authed_client: tuple[TestClient, str],
     ) -> None:
+        # See test_start_maker_writes_nick_state: the router reads address_type.
+        mock_config.return_value.address_type = "p2wpkh"
         client, token = authed_client
         state = get_daemon_state()
         mock_maker = AsyncMock()

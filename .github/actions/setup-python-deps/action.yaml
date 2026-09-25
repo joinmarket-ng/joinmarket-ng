@@ -22,7 +22,12 @@ runs:
       run: |
         if [ "$RUNNER_OS" = "Linux" ]; then
           sudo apt-get update
-          sudo apt-get install -y libsecp256k1-dev
+          sudo apt-get install -y libsecp256k1-dev cmake build-essential
+          python3 scripts/build_secp256k1.py \
+            --prefix "$RUNNER_TEMP/secp256k1-native" \
+            --build-dir "$RUNNER_TEMP/secp256k1-build"
+          printf '%s\n' "$RUNNER_TEMP/secp256k1-native/lib" | sudo tee /etc/ld.so.conf.d/jmng-secp256k1.conf > /dev/null
+          sudo ldconfig
         elif [ "$RUNNER_OS" = "macOS" ]; then
           brew install secp256k1
         fi
@@ -50,3 +55,8 @@ runs:
           echo "Installing $component..."
           pip install -e "${component}${DEV_FLAG}"
         done
+
+    - name: Verify loaded native MuSig support
+      shell: bash
+      run: |
+        python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig, "Loaded libsecp256k1 lacks MuSig support"'

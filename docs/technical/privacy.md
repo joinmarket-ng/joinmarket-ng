@@ -99,8 +99,15 @@ KJ = s * J - e * P2
 
 and checks the challenge hash and `SHA256(P2) = C`.
 
+For a tr0 BIP86 UTXO, `k` is the Taproot output scalar rather than the wallet's
+internal scalar. The taker normalizes the internal key to even Y, applies the
+BIP341 `TapTweak`, and normalizes the resulting output key to even Y before
+constructing the proof. The maker binds `P` directly to the P2TR witness
+program. Legacy and P2WPKH PoDLE proofs continue to use the untweaked private
+scalar.
+
 The nonce is derived with a domain-separated RFC 6979-style HMAC-SHA256
-construction keyed by the UTXO private key. Its transcript binds the UTXO
+construction keyed by the proof scalar `k`. Its transcript binds the UTXO
 reference, NUMS index, `P`, and `P2`, preventing nonce reuse across distinct
 proofs. Secret response multiplication and addition are delegated to
 libsecp256k1 key-tweak operations rather than Python bigint arithmetic.

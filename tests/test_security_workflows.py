@@ -188,6 +188,23 @@ def test_bitcointx_dependency_is_pinned_to_release_wheel() -> None:
             assert BITCOINTX_WHEEL_SHA256 in lock
 
 
+def test_bitcointx_standalone_scripts_document_the_same_pin() -> None:
+    """The standalone bond scripts install python-bitcointx outside the locks."""
+    expected_pin = (
+        "https://github.com/m0wer/python-bitcointx/releases/download/"
+        f"python-bitcointx-v{BITCOINTX_VERSION}/"
+        f"python_bitcointx-{BITCOINTX_VERSION}-py3-none-any.whl"
+        f"#sha256={BITCOINTX_WHEEL_SHA256}"
+    )
+    for script_name in (
+        "derive_bond_pubkey.py",
+        "sign_bond_cert_reference.py",
+        "sign_bond_mnemonic.py",
+    ):
+        script = (REPO_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+        assert expected_pin in script
+
+
 def test_main_and_release_promotions_depend_on_image_scans() -> None:
     ci_jobs = _workflow("ci.yaml")["jobs"]
     release_jobs = _workflow("release.yaml")["jobs"]

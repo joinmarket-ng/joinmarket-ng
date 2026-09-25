@@ -2339,5 +2339,132 @@ async def test_on_tx_masks_non_fee_verification_error_from_taker():
     )
 
 
+@pytest.mark.asyncio
+async def test_select_our_utxos_uses_absolute_fee_for_tr0abs():
+    """A tr0 absolute offer must treat cjfee as satoshis during selection."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from jmcore.constants import DUST_THRESHOLD
+    from jmcore.models import Offer, OfferType
+    from jmwallet.wallet.models import UTXOInfo
+
+    from maker.coinjoin import CoinJoinSession
+
+    mock_wallet = MagicMock()
+    mock_wallet.address_type = "p2tr"
+    mock_wallet.mixdepth_count = 5
+    mock_wallet.get_balance_for_offers = AsyncMock(return_value=10_000_000)
+    mock_wallet.get_maker_rotation_lineage_outpoints = AsyncMock(return_value=set())
+    mock_wallet.get_next_address_index.return_value = 0
+    mock_wallet.get_change_address.return_value = "bcrt1pcjorchange"
+    mock_wallet.get_locked_input_outpoints.return_value = set()
+    mock_wallet.reserve_coinjoin_inputs.return_value = True
+    mock_wallet.select_utxos_with_merge.return_value = [
+        UTXOInfo(
+            txid="ab" * 32,
+            vout=1,
+            value=5_000_000,
+            address="bcrt1pmakerinput",
+            confirmations=10,
+            scriptpubkey="5120" + "ab" * 32,
+            path="m/86'/0'/1'/0/0",
+            mixdepth=1,
+        )
+    ]
+
+    mock_backend = MagicMock()
+    mock_backend.requires_neutrino_metadata.return_value = False
+    offer = Offer(
+        counterparty="J5Tr0AbsMaker",
+        ordertype=OfferType.TR0_ABSOLUTE,
+        oid=0,
+        minsize=10_000,
+        maxsize=100_000_000,
+        txfee=1000,
+        cjfee=5000,
+    )
+    session = CoinJoinSession(
+        taker_nick="J5SomeTaker", offer=offer, wallet=mock_wallet, backend=mock_backend
+    )
+    session.amount = 1_000_000
+
+    utxos_dict, _, _, mixdepth = await session._select_our_utxos()
+
+    assert mixdepth >= 0
+    assert ("ab" * 32, 1) in utxos_dict
+    expected_required = 1_000_000 + 1000 + DUST_THRESHOLD + 1 - 5000
+    assert mock_wallet.select_utxos_with_merge.call_args.args[1] == expected_required
+
+
+def test_pit_script_type_from_offer_family():
+    """The offer family fixes the maker's rigid pit script type."""
+    from unittest.mock import MagicMock
+
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession
+
+    mock_backend = MagicMock()
+    mock_backend.requires_neutrino_metadata.return_value = False
+
+    def _offer(ordertype: OfferType) -> Offer:
+        return Offer(
+            counterparty="J5TypeMaker",
+            ordertype=ordertype,
+            oid=0,
+            minsize=10_000,
+            maxsize=100_000_000,
+            txfee=1000,
+            cjfee="0.0003",
+        )
+
+    sw0_wallet = MagicMock()
+    sw0_wallet.address_type = "p2wpkh"
+    sw0 = CoinJoinSession(
+        taker_nick="J5T",
+        offer=_offer(OfferType.SW0_RELATIVE),
+        wallet=sw0_wallet,
+        backend=mock_backend,
+    )
+    assert sw0.pit_script_type == "p2wpkh"
+
+    tr0_wallet = MagicMock()
+    tr0_wallet.address_type = "p2tr"
+    tr0 = CoinJoinSession(
+        taker_nick="J5T",
+        offer=_offer(OfferType.TR0_RELATIVE),
+        wallet=tr0_wallet,
+        backend=mock_backend,
+    )
+    assert tr0.pit_script_type == "p2tr"
+
+
+def test_offer_family_must_match_wallet_type():
+    """A single-type wallet cannot serve an offer from the other pit family."""
+    from unittest.mock import MagicMock
+
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession
+
+    mock_backend = MagicMock()
+    mock_backend.requires_neutrino_metadata.return_value = False
+    p2wpkh_wallet = MagicMock()
+    p2wpkh_wallet.address_type = "p2wpkh"
+    tr0_offer = Offer(
+        counterparty="J5Mismatch",
+        ordertype=OfferType.TR0_RELATIVE,
+        oid=0,
+        minsize=10_000,
+        maxsize=100_000_000,
+        txfee=1000,
+        cjfee="0.0003",
+    )
+    with pytest.raises(ValueError, match="rigid JMP-0010 pit"):
+        CoinJoinSession(
+            taker_nick="J5T", offer=tr0_offer, wallet=p2wpkh_wallet, backend=mock_backend
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
