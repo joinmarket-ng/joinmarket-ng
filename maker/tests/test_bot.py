@@ -257,6 +257,44 @@ class TestBotInitialization:
 
         assert "Starting maker bot (version=0.37.1, commit=9a3b6dd, ref=main)" in messages
 
+    def test_tr0_maker_rejects_light_client_backend(self):
+        """A tr0 (Taproot) maker on a backend that cannot resolve foreign
+        prevouts (light client) must fail fast at startup rather than
+        advertise offers it can never sign."""
+        wallet = MagicMock()
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        wallet.address_type = "p2tr"
+        backend = MagicMock()
+        backend.can_resolve_foreign_prevouts.return_value = False
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.TR0_RELATIVE,
+            address_type="p2tr",
+        )
+        with pytest.raises(ValueError, match="resolve arbitrary prevouts"):
+            MakerBot(wallet=wallet, backend=backend, config=config)
+
+    def test_tr0_maker_accepts_core_backend(self):
+        """A tr0 maker on a Core/descriptor backend (resolves prevouts) starts."""
+        wallet = MagicMock()
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        wallet.address_type = "p2tr"
+        backend = MagicMock()
+        backend.can_resolve_foreign_prevouts.return_value = True
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.TR0_RELATIVE,
+            address_type="p2tr",
+        )
+        bot = MakerBot(wallet=wallet, backend=backend, config=config)
+        assert bot.nick
+
     def test_bot_respects_no_fidelity_bond_config(self, mock_wallet, mock_backend):
         """Test that no_fidelity_bond=True is stored on the config.
 

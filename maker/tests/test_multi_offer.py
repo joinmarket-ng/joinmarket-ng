@@ -166,6 +166,78 @@ class TestMakerConfigMultiOffer:
         assert abs_cfg.get_cjfee() == 500
 
 
+class TestOfferManagerWalletPitValidation:
+    """MakerConfig rejects an offer family outside the configured pit, and
+    OfferManager still rejects a wallet that disagrees with that config at
+    announce time (maker startup) instead of discovering the mismatch later
+    at !fill time via CoinJoinSession.__init__ (which wastes a round-trip and
+    looks like a flaky maker to the taker)."""
+
+    def _wallet(self, address_type: str) -> MagicMock:
+        wallet = MagicMock()
+        wallet.address_type = address_type
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        return wallet
+
+    def test_rejects_tr0_offer_on_p2wpkh_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            address_type="p2tr",
+            offer_type=OfferType.TR0_RELATIVE,
+        )
+        with pytest.raises(ValueError, match="rigid JMP-0010 pit"):
+            OfferManager(self._wallet("p2wpkh"), config, "J5TestMaker")
+
+    def test_rejects_sw0_offer_on_p2tr_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.SW0_ABSOLUTE,
+            cj_fee_absolute=1000,
+        )
+        with pytest.raises(ValueError, match="rigid JMP-0010 pit"):
+            OfferManager(self._wallet("p2tr"), config, "J5TestMaker")
+
+    def test_rejects_mismatched_offer_in_dual_offer_configs(self) -> None:
+        """Even one offer_config among several dual-offer entries mismatching
+        the configured pit must be rejected, not just the first/legacy one."""
+        with pytest.raises(ValueError, match="requires a 'p2tr' wallet"):
+            MakerConfig(
+                mnemonic="test " * 12,
+                directory_servers=["localhost:5222"],
+                network=NetworkType.REGTEST,
+                offer_configs=[
+                    OfferConfig(offer_type=OfferType.SW0_RELATIVE, cj_fee_relative="0.001"),
+                    OfferConfig(offer_type=OfferType.TR0_ABSOLUTE, cj_fee_absolute=500),
+                ],
+            )
+
+    def test_accepts_matching_sw0_offer_on_p2wpkh_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.SW0_RELATIVE,
+        )
+        # Must not raise.
+        OfferManager(self._wallet("p2wpkh"), config, "J5TestMaker")
+
+    def test_accepts_matching_tr0_offer_on_p2tr_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            address_type="p2tr",
+            offer_type=OfferType.TR0_RELATIVE,
+        )
+        # Must not raise.
+        OfferManager(self._wallet("p2tr"), config, "J5TestMaker")
+
+
 class TestOfferManagerMultiOffer:
     """Tests for OfferManager multi-offer creation."""
 

@@ -303,6 +303,37 @@ async def test_podle_generation(mock_wallet, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_podle_generation_uses_bip86_output_key_for_p2tr_utxo(tmp_path):
+    from bitcointx.core.key import CKey
+    from jmcore.bitcoin import taproot_tweak_pubkey
+
+    private_key = CKey.from_secret_bytes((1).to_bytes(32, "big"))
+    _, output_key = taproot_tweak_pubkey(bytes(private_key.xonly_pub))
+    utxo = UTXOInfo(
+        txid="c" * 64,
+        vout=2,
+        value=30_000_000,
+        address="bcrt1ptest",
+        confirmations=10,
+        scriptpubkey=(b"\x51\x20" + output_key).hex(),
+        path="m/86'/1'/0'/0/0",
+        mixdepth=0,
+    )
+    manager = PoDLEManager(data_dir=tmp_path)
+
+    commitment = manager.generate_fresh_commitment(
+        wallet_utxos=[utxo],
+        cj_amount=10_000_000,
+        private_key_getter=lambda _address: private_key.secret_bytes,
+        min_confirmations=1,
+        min_percent=20,
+    )
+
+    assert commitment is not None
+    assert commitment.p == b"\x02" + output_key
+
+
+@pytest.mark.asyncio
 async def test_podle_retry_limit(mock_wallet, tmp_path):
     """Test that PoDLE respects max_retries limit."""
     # Create a single UTXO
@@ -2626,7 +2657,9 @@ class TestPhaseAuthMakerAuthentication:
         else:
             extra = ",".join(f"{i:064x}:{vout}" for i in range(declared_utxos - 1))
             utxo_list = f"{txid}:{vout}" + (f",{extra}" if extra else "")
-        ioauth = f"{utxo_list} {auth_pub.hex()} bcrt1qcj bcrt1qchange {btc_sig}"
+        cj_addr = "bcrt1ql3e9pgs3mmwuwrh95fecme0s0qtn2880hlwwpw"
+        change_addr = "bcrt1q2vfxp232rx0z9rzn0hay9jptagk8c86ddphpjv"
+        ioauth = f"{utxo_list} {auth_pub.hex()} {cj_addr} {change_addr} {btc_sig}"
         encrypted = maker_crypto.encrypt(ioauth)
 
         nick = "J5maker"

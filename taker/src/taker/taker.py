@@ -28,9 +28,9 @@ from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
-from jmcore.models import Offer
+from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
-from jmcore.paths import read_nick_state
+from jmcore.paths import get_nick_state_component, read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
 from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
@@ -190,6 +190,16 @@ class Taker(TakerMonitoringMixin):
         self.config = config
         self.confirmation_callback = confirmation_callback
 
+        pit_script_type = offer_output_script_type(config.preferred_offer_type)
+        wallet_type = getattr(wallet, "address_type", None)
+        if wallet_type in ("p2wpkh", "p2tr") and pit_script_type != wallet_type:
+            raise ValueError(
+                f"preferred_offer_type {config.preferred_offer_type.value!r} implies a "
+                f"{pit_script_type!r} pit but the wallet is {wallet_type!r}; a rigid "
+                f"JMP-0010 pit requires them to match (use a {pit_script_type!r} wallet or a "
+                f"matching offer family)."
+            )
+
         self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
         self.state = TakerState.IDLE
@@ -220,8 +230,10 @@ class Taker(TakerMonitoringMixin):
 
         # Orderbook manager
         # Read maker nick from state file to exclude from peer selection (self-CoinJoin protection)
+        # Only the maker trading in the same pit can meet us in a CoinJoin.
+        self._maker_nick_component = get_nick_state_component("maker", config.address_type)
         own_wallet_nicks: set[str] = set()
-        maker_nick = read_nick_state(config.data_dir, "maker")
+        maker_nick = read_nick_state(config.data_dir, self._maker_nick_component)
         if maker_nick:
             own_wallet_nicks.add(maker_nick)
             logger.info(f"Self-CoinJoin protection: excluding maker nick {maker_nick}")
@@ -235,6 +247,7 @@ class Taker(TakerMonitoringMixin):
             require_quantized_cj_fees=config.require_quantized_cj_fees,
             round_up_cj_fees=config.round_up_cj_fees,
             equalize_cj_fees=config.equalize_cj_fees,
+            allowed_types=offer_types_for_family(config.preferred_offer_type),
         )
 
         # PoDLE manager for commitment tracking
@@ -1055,7 +1068,7 @@ class Taker(TakerMonitoringMixin):
             # in tumbler runs), so the nick read at __init__ time would be
             # stale.  Refreshing here ensures the hard exclusion is always
             # current regardless of startup order.
-            current_maker_nick = read_nick_state(self.config.data_dir, "maker")
+            current_maker_nick = read_nick_state(self.config.data_dir, self._maker_nick_component)
             if current_maker_nick:
                 if current_maker_nick not in self.orderbook_manager.own_wallet_nicks:
                     logger.bind(sensitive=True).info(

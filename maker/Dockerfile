@@ -26,6 +26,7 @@ ARG DEBIAN_SNAPSHOT
 RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-apt-install.sh \
     sh /tmp/docker-apt-install.sh \
     build-essential \
+    cmake \
     git \
     libffi-dev \
     libsodium-dev \
@@ -35,6 +36,10 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
 # When not provided, pip install runs without it (non-reproducible but works)
 # Usage: docker build --build-arg SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ...
 ARG SOURCE_DATE_EPOCH
+
+# MuSig2 needs a newer native library than the distribution package.
+RUN --mount=type=bind,source=scripts/build_secp256k1.py,target=/tmp/build_secp256k1.py \
+    python /tmp/build_secp256k1.py --prefix /app --build-dir /build/secp256k1
 
 # Stamp the commit/ref into the built wheels so the running TUI can
 # show "main / abc1234" instead of falling back to the static version
@@ -128,7 +133,8 @@ RUN useradd -m -u 1000 jm && \
 
 # Copy Python packages from builder and set permissions
 COPY --from=builder /app /app
-RUN chmod -R a+rX /app
+RUN chmod -R a+rX /app && \
+    printf '/app/lib\n' > /etc/ld.so.conf.d/jmng-secp256k1.conf && ldconfig
 
 # Enable tab completion for the bundled CLIs in interactive shells
 # (docker compose exec maker bash). The bash-completion package is not
@@ -147,6 +153,7 @@ ENV PATH=/app/bin:$PATH
 
 # Make sure packages are in Python PATH
 ENV PYTHONPATH=/app/lib/python${PYTHON_VERSION%.*}/site-packages
+RUN python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig'
 
 # Create data directory for JoinMarket files
 # This includes commitment blacklist, history, and other persistent data

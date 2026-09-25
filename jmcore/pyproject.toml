@@ -72,6 +72,11 @@ target-version = "py311"
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# musig2.py uses BIP327/BIP340 single-letter point names (P, Q, R) verbatim so
+# the implementation stays readable against the spec.
+"src/jmcore/musig2.py" = ["N806"]
+
 [tool.mypy]
 python_version = "3.11"
 warn_return_any = true
