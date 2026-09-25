@@ -1075,6 +1075,20 @@ class TakerSettings(BaseModel):
             "PoDLE commitments (reference default: 20)."
         ),
     )
+    external_podle_mode: Literal["disabled", "only"] = Field(
+        default="disabled",
+        description=(
+            "Use imported external PoDLE credentials only, without selecting their backing "
+            "UTXOs as CoinJoin funding inputs."
+        ),
+    )
+    market_fault_exclusion: bool = Field(
+        default=False,
+        description=(
+            "Opt in to experimental exclusion of makers with verified credential-market "
+            "fault evidence. Independent of buying or selling credentials."
+        ),
+    )
     max_cj_fee_rel: str = Field(
         default="0.001",
         description="Maximum relative CoinJoin fee (0.001 = 0.1%)",

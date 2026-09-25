@@ -17,9 +17,26 @@
             </div>
         </header>
 
+        <div class="offer-tabs" role="tablist" aria-label="Offer markets">
+            <button id="coinjoin-offers-tab" class="offer-tab active" type="button" role="tab"
+                    data-offer-tab="coinjoin" aria-selected="true" aria-controls="coinjoin-offers-panel" tabindex="0">
+                CoinJoin <span id="coinjoin-offer-count" class="offer-tab-count">0</span>
+            </button>
+            <button id="podle-offers-tab" class="offer-tab" type="button" role="tab"
+                    data-offer-tab="podle" aria-selected="false" aria-controls="podle-offers-panel" tabindex="-1">
+                PoDLE <span id="podle-offer-count" class="offer-tab-count">-</span>
+            </button>
+            <button id="bond-offers-tab" class="offer-tab" type="button" role="tab"
+                    data-offer-tab="bond" aria-selected="false" aria-controls="bond-offers-panel" tabindex="-1">
+                Fidelity Bonds <span id="bond-offer-count" class="offer-tab-count">-</span>
+            </button>
+        </div>
+
+        <section id="coinjoin-offers-panel" class="offer-panel" role="tabpanel"
+                 aria-labelledby="coinjoin-offers-tab">
         <div class="stats-grid">
             <div class="stat-card">
-                <div class="stat-label">Total Offers</div>
+                <div class="stat-label">CoinJoin Offers</div>
                 <div class="stat-value" id="total-offers">0</div>
             </div>
             <div class="stat-card">
@@ -27,7 +44,7 @@
                 <div class="stat-value" id="directory-nodes">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Fidelity Bonds</div>
+                <div class="stat-label">Maker Bonds</div>
                 <div class="stat-value" id="fidelity-bonds">0</div>
             </div>
             <div class="stat-card">
@@ -126,6 +143,81 @@
                 </tbody>
             </table>
         </div>
+        </section>
+
+        <section id="podle-offers-panel" class="offer-panel credential-market-panel" role="tabpanel"
+                 aria-labelledby="podle-offers-tab" hidden>
+            <div class="credential-market-heading">
+                <h2>PoDLE Offers</h2>
+            </div>
+            <div class="credential-controls">
+                <label for="podle-search">Search seller</label>
+                <input type="search" id="podle-search" placeholder="Search seller...">
+                <label for="podle-sort">Sort by</label>
+                <select id="podle-sort">
+                    <option value="price_sats">Price</option>
+                    <option value="expires_at">Expiry</option>
+                    <option value="seller_nick">Seller</option>
+                </select>
+                <button id="podle-sort-direction" type="button" title="Sort ascending"
+                        aria-label="Sort ascending">&#8593;</button>
+            </div>
+            <p id="podle-market-status" class="credential-market-status" role="status">
+                Loading PoDLE offers...
+            </p>
+            <div class="credential-table-container">
+                <table id="podle-offers-table" class="credential-table">
+                    <thead>
+                        <tr>
+                            <th>Seller</th>
+                            <th>Seller Key</th>
+                            <th>Price (sats)</th>
+                            <th>Period</th>
+                            <th>Expires</th>
+                            <th>Directories</th>
+                        </tr>
+                    </thead>
+                    <tbody id="podle-offers-tbody"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <section id="bond-offers-panel" class="offer-panel credential-market-panel" role="tabpanel"
+                 aria-labelledby="bond-offers-tab" hidden>
+            <div class="credential-market-heading">
+                <h2>Fidelity Bond Offers</h2>
+            </div>
+            <div class="credential-controls">
+                <label for="bond-search">Search seller</label>
+                <input type="search" id="bond-search" placeholder="Search seller...">
+                <label for="bond-sort">Sort by</label>
+                <select id="bond-sort">
+                    <option value="price_sats">Price</option>
+                    <option value="expires_at">Expiry</option>
+                    <option value="seller_nick">Seller</option>
+                </select>
+                <button id="bond-sort-direction" type="button" title="Sort ascending"
+                        aria-label="Sort ascending">&#8593;</button>
+            </div>
+            <p id="bond-market-status" class="credential-market-status" role="status">
+                Loading fidelity bond offers...
+            </p>
+            <div class="credential-table-container">
+                <table id="bond-offers-table" class="credential-table">
+                    <thead>
+                        <tr>
+                            <th>Seller</th>
+                            <th>Seller Key</th>
+                            <th>Price (sats)</th>
+                            <th>Period</th>
+                            <th>Expires</th>
+                            <th>Directories</th>
+                        </tr>
+                    </thead>
+                    <tbody id="bond-offers-tbody"></tbody>
+                </table>
+            </div>
+        </section>
 
     </div>
 

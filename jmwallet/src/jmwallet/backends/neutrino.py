@@ -30,6 +30,7 @@ from typing import Any, TypeGuard
 from urllib.parse import urlsplit
 
 import httpx
+from jmcore.constants import GENESIS_BLOCK_HASHES as GENESIS_BLOCK_HASHES
 from jmcore.constants import MAX_MONEY
 from jmcore.secure_files import atomic_write_private
 from loguru import logger
@@ -44,16 +45,6 @@ from jmwallet.backends.base import (
     UTXOVerificationResult,
     WalletTxEntry,
 )
-
-# Genesis block hashes per Bitcoin network. Used to detect when the neutrino
-# server is serving a different chain than JoinMarket is configured for, which
-# would otherwise silently produce an empty wallet on the wrong network.
-GENESIS_BLOCK_HASHES: dict[str, str] = {
-    "mainnet": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-    "testnet": "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
-    "signet": "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
-    "regtest": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
-}
 
 _HASH_TO_NETWORK: dict[str, str] = {h: n for n, h in GENESIS_BLOCK_HASHES.items()}
 

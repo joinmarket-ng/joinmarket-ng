@@ -21,6 +21,23 @@ from taker.config import (
 )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_market_fault_exclusion_settings_round_trip(sample_mnemonic: str, enabled: bool) -> None:
+    from jmcore.settings import JoinMarketSettings, TakerSettings
+
+    from taker.cli import build_taker_config
+    from taker.config_builder import build_taker_config_kwargs
+
+    settings = JoinMarketSettings(taker=TakerSettings(market_fault_exclusion=enabled))
+    assert TakerSettings().market_fault_exclusion is False
+    cli_config = build_taker_config(settings, mnemonic=sample_mnemonic, passphrase="")
+    daemon_config = TakerConfig(
+        **build_taker_config_kwargs(settings, mnemonic=sample_mnemonic, passphrase="")
+    )
+    assert cli_config.market_fault_exclusion is enabled
+    assert daemon_config.market_fault_exclusion is enabled
+
+
 class TestResolveCounterpartyCount:
     """Tests for resolve_counterparty_count helper."""
 
@@ -127,6 +144,11 @@ class TestTakerConfig:
         assert config.bondless_makers_allowance == 0.05
         assert config.bondless_makers_allowance_require_zero_fee is True
         assert config.initial_confirmation_timeout_sec == 300
+        assert config.external_podle_mode == "disabled"
+
+    def test_external_podle_mode_only_is_explicit(self, sample_mnemonic: str) -> None:
+        config = TakerConfig(mnemonic=sample_mnemonic, external_podle_mode="only")
+        assert config.external_podle_mode == "only"
 
     def test_direct_config_rejects_production_clearnet_directory(
         self, sample_mnemonic: str
