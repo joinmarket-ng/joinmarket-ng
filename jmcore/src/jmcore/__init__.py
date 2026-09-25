@@ -111,8 +111,8 @@ from jmcore.podle import (
     verify_podle,
 )
 from jmcore.protocol import (
-    FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_NEUTRINO_COMPAT,
+    FEATURE_PRIVATE_CHANNEL_RING,
     FEATURE_PUSH_ENCRYPTED,
     JM_VERSION,
     JM_VERSION_MIN,
@@ -274,7 +274,7 @@ __all__ = [
     "serialize_revelation",
     "verify_podle",
     # Protocol
-    "FEATURE_COFUNDED_CHANNEL_RING_V1",
+    "FEATURE_PRIVATE_CHANNEL_RING",
     "FEATURE_NEUTRINO_COMPAT",
     "FEATURE_PUSH_ENCRYPTED",
     "FeatureSet",

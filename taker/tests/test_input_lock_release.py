@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from _taker_test_helpers import make_taker_config, make_utxo
+from jmcore.channel_ring import RingNodeBinding
 from jmcore.channel_ring_store import (
     Outpoint,
     RingParticipantRecord,
@@ -231,6 +232,22 @@ def test_active_ring_lock_is_retained_when_round_cleanup_runs() -> None:
     assert taker._session.reserved_inputs == reserved
 
 
+def test_pre_invite_ring_failure_releases_inputs_without_reading_a_missing_journal() -> None:
+    wallet = _make_wallet([])
+    taker = Taker(wallet, _backend(), make_taker_config())
+    reserved = {("a" * 64, 1)}
+    taker._session.reserved_inputs = set(reserved)
+    owner = taker._session.input_lock_owner
+    record = Mock(side_effect=AssertionError("no invitation or journal exists"))
+    taker._session.ring_coordinator = SimpleNamespace(has_durable_record=False, _record=record)
+
+    taker.release_input_locks()
+
+    record.assert_not_called()
+    wallet.release_coinjoin_inputs.assert_called_once_with(reserved, owner=owner)
+    assert taker._session.reserved_inputs == set()
+
+
 def test_new_round_detaches_active_ring_lock_and_rotates_owner() -> None:
     wallet = _make_wallet([])
     taker = Taker(wallet, _backend(), make_taker_config())
@@ -307,6 +324,13 @@ def test_ring_reconciliation_preserves_wallet_lock_ownership(
     )
     ring_store.save(
         RingParticipantRecord.fresh(
+            node_binding=RingNodeBinding(
+                network="regtest",
+                wallet_identity="00" * 32,
+                source_mixdepth=0,
+                node_name="local",
+                local_node_id="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            ),
             round_nonce="34" * 32,
             revision=0,
             taker_session_identity="taker:round",

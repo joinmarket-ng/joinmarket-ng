@@ -1,4 +1,4 @@
-"""Strict co-funded channel-ring planner for JMP-0010."""
+"""Strict co-funded channel-ring planner for JMP-0014."""
 
 from __future__ import annotations
 
@@ -6,10 +6,9 @@ import secrets
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
+from jmcore.cofunded_ring import MAX_RING_PARTICIPANTS, MIN_RING_PARTICIPANTS
 from jmcore.constants import MAX_MONEY
 
-MIN_RING_PARTICIPANTS = 4
-MAX_RING_PARTICIPANTS = 32
 DEFAULT_MAX_ATTEMPTS = 50_000
 TAKER_PARTICIPANT_ID = "taker"
 
@@ -230,22 +229,26 @@ def plan_cofunded_ring(
     parties: list[RingParty],
     *,
     taker_id: str = TAKER_PARTICIPANT_ID,
+    taker_participates: bool = True,
     rng: RingRandom | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> CofundedRingPlan:
     """Plan all supplied parties or raise without returning a partial result."""
 
+    if type(taker_participates) is not bool:
+        raise RingPlanningError("taker_participates must be a boolean")
     if not MIN_RING_PARTICIPANTS <= len(parties) <= MAX_RING_PARTICIPANTS:
         raise RingPlanningError(
             f"co-funded ring requires {MIN_RING_PARTICIPANTS} through "
-            f"{MAX_RING_PARTICIPANTS} parties including the taker"
+            f"{MAX_RING_PARTICIPANTS} channel participants"
         )
     party_ids = [party.party_id for party in parties]
     if len(set(party_ids)) != len(party_ids):
         raise RingPlanningError("co-funded ring contains duplicate party IDs")
-    if party_ids.count(taker_id) != 1:
+    if party_ids.count(taker_id) != int(taker_participates):
         raise RingPlanningError(
-            f"co-funded ring must contain reserved taker ID {taker_id!r} exactly once"
+            f"co-funded ring must contain reserved taker ID {taker_id!r} "
+            f"{'exactly once' if taker_participates else 'zero times'}"
         )
     if type(max_attempts) is not int or max_attempts < 1 or max_attempts > 1_000_000:
         raise RingPlanningError("max_attempts must be an integer from 1 through 1000000")

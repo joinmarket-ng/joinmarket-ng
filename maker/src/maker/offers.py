@@ -124,6 +124,12 @@ class OfferManager:
         )
         balances: dict[int, int] = {}
         for mixdepth in range(self.wallet.mixdepth_count):
+            if (
+                self.config.channel_ring.enabled
+                and mixdepth not in self.config.channel_ring.mixdepth_nodes
+            ):
+                balances[mixdepth] = 0
+                continue
             balances[mixdepth] = await self.wallet.get_balance_for_offers(
                 mixdepth,
                 min_confirmations=self.config.min_confirmations,

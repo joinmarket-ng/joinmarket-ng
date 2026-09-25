@@ -371,13 +371,17 @@ adopted the keyword argument.
 ## Maker policy in tumbler-driven sessions
 
 Maker phases inside a tumbler plan run with a forced policy: absolute
-fee `cjfee_a = 0` and `ordertype = sw0absoffer`. This means the wallet
-is offering free CoinJoin liquidity for the duration of the maker
+fee `cjfee_a = 0` and `ordertype = sw0absoffer` (or `tr0absoffer` for a
+Taproot wallet). This means the wallet is offering free CoinJoin liquidity
+for the duration of the maker
 session - which is exactly the role-mixing signal we want, since a
 profit-motivated maker has a different on-chain footprint than a
-mixing-motivated one. The `cjfee_r` field is left at the configured
-value to keep relative-offer-only takers from rejecting our offer
-outright (the reference taker implementation refuses `cjfee_r=0`).
+mixing-motivated one. The unused `cjfee_r` field is pinned to `0.001`.
+Fidelity bonds and new channel-ring participation are disabled: reusing either
+a bond or a Lightning node across transient maker phases would correlate them.
+Configured ring nodes and journal locations remain available for recovery of
+prior active rounds. A malformed ring journal still blocks startup rather than
+letting the tumbler spend its unresolved inputs.
 
 The mutator lives in `tumbler.maker_policy` and is wired into both maker
 factories. Tests in `tumbler/tests/test_maker_policy.py` pin the behavior.

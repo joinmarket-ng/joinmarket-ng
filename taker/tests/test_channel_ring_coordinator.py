@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
+import pytest
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import scriptpubkey_to_address
-from jmcore.channel_ring import ChannelRingConfig
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig, RingNodeBinding
 from jmcore.channel_ring_store import RingLifecycleState, RingParticipantStore
 from jmcore.cofunded_ring import (
     BackendLimits,
@@ -33,9 +36,10 @@ from jmcore.cofunded_ring import (
     ring_hash,
     sign_attestation,
     sign_payload,
+    verify_payload,
 )
 from jmcore.models import Offer, OfferType
-from jmswap.channel_ring import InitializedChannelRingBackend
+from jmswap.channel_ring_nodes import BoundChannelRingNode
 from jmswap.lnd import (
     AcceptorObservation,
     FundingNegotiation,
@@ -51,7 +55,13 @@ from jmswap.lnd import EndpointRole as LndEndpointRole
 from jmwallet.backends.base import UTXO, Transaction
 from jmwallet.wallet.models import UTXOInfo
 
-from taker.channel_ring import TakerRingCoordinator, _chain_hash, reconcile_taker_ring_records
+import taker.channel_ring as channel_ring
+from taker.channel_ring import (
+    TakerRingCoordinator,
+    TakerRingError,
+    _chain_hash,
+    reconcile_taker_ring_records,
+)
 from taker.coinjoin_session import CoinJoinSession
 from taker.models import MakerSession
 
@@ -88,10 +98,10 @@ def _funding_script(pending_id: bytes | str) -> str:
     return "5120" + hashlib.sha256(raw).hexdigest()
 
 
-def _limits() -> BackendLimits:
+def _limits(offer_type: str = "tr0absoffer") -> BackendLimits:
     return BackendLimits(
         network="regtest",
-        offer_type="tr0absoffer",
+        offer_type=offer_type,
         min_channel_capacity=500_000,
         max_channel_capacity=2_000_000,
         max_push_amount=499_999,
@@ -102,14 +112,20 @@ def _limits() -> BackendLimits:
     )
 
 
-def _config(tmp_path: Path) -> ChannelRingConfig:
+def _config(tmp_path: Path, minimum_makers: int = 3) -> ChannelRingConfig:
     return ChannelRingConfig(
         enabled=True,
-        lnd_grpc_url="https://127.0.0.1:10009",
-        lnd_tls_cert_path=tmp_path / "tls.cert",
-        lnd_macaroon_path=tmp_path / "admin.macaroon",
-        onion_endpoint=ONION,
-        minimum_makers=3,
+        nodes={
+            "local": ChannelRingNodeConfig(
+                lnd_grpc_url="https://127.0.0.1:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint=ONION,
+            )
+        },
+        mixdepth_nodes={0: "local"},
+        node_binding_directory=tmp_path / "node-bindings",
+        minimum_makers=minimum_makers,
         min_channel_capacity=500_000,
         max_channel_capacity=2_000_000,
         max_push=499_999,
@@ -125,6 +141,15 @@ def _config(tmp_path: Path) -> ChannelRingConfig:
         readiness_timeout_seconds=10.0,
         persistence_directory=tmp_path / "rings",
     )
+
+
+class FakeNodePool:
+    def __init__(self, node: BoundChannelRingNode) -> None:
+        self.node = node
+
+    def for_binding(self, binding: RingNodeBinding) -> BoundChannelRingNode:
+        assert binding == self.node.binding
+        return self.node
 
 
 class FakeWallet:
@@ -319,7 +344,10 @@ class MockCoordinator(TakerRingCoordinator):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.peer_secrets = {f"maker-{index}": _secret(index) for index in range(1, 4)}
+        self.peer_secrets = {f"maker-{index}": _secret(index) for index in range(1, 6)}
+        self.sent_payloads: list[RingPayloadType] = []
+        self.sent_nicks: list[str] = []
+        self.exchange_recipients: list[frozenset[str]] = []
         self.malicious_ready = malicious_ready
         self.missing_sign_ack = missing_sign_ack
 
@@ -327,7 +355,8 @@ class MockCoordinator(TakerRingCoordinator):
         return sign_payload(payload, self.peer_secrets[nick])
 
     async def _send(self, nick: str, payload: RingPayloadType) -> None:
-        del nick, payload
+        self.sent_nicks.append(nick)
+        self.sent_payloads.append(payload)
 
     def _prepared(self, key: str) -> RingPreparedPayload:
         record = self._record()
@@ -448,6 +477,8 @@ class MockCoordinator(TakerRingCoordinator):
         timeout: float | None = None,
     ) -> dict[str, list[RingPayloadType]]:
         del expected_counts, timeout
+        self.exchange_recipients.append(frozenset(payloads))
+        self.sent_payloads.extend(payloads.values())
         record = self._record()
         result: dict[str, list[RingPayloadType]] = {}
         if expected_type is RingHelloPayload:
@@ -464,7 +495,9 @@ class MockCoordinator(TakerRingCoordinator):
                                 participant_key=key,
                                 node_id=_node(int(nick[-1])),
                                 onion_endpoint=ONION,
-                                backend_limits=_limits(),
+                                backend_limits=_limits(
+                                    self.session.config.preferred_offer_type.value
+                                ),
                             ),
                         ),
                     )
@@ -539,9 +572,15 @@ class MockCoordinator(TakerRingCoordinator):
 
 
 def _harness(
-    tmp_path: Path, *, malicious_ready: bool = False, missing_sign_ack: bool = False
+    tmp_path: Path,
+    *,
+    malicious_ready: bool = False,
+    missing_sign_ack: bool = False,
+    mixed: bool = False,
+    ring_makers: int = 3,
+    offer_type: OfferType = OfferType.TR0_ABSOLUTE,
 ) -> MockCoordinator:
-    config = _config(tmp_path)
+    config = _config(tmp_path, minimum_makers=ring_makers)
     local = UTXOInfo(
         txid="01" * 32,
         vout=0,
@@ -557,11 +596,13 @@ def _harness(
     session = CoinJoinSession()
     taker_config = SimpleNamespace(
         minimum_makers=3,
-        preferred_offer_type=OfferType.TR0_ABSOLUTE,
+        preferred_offer_type=offer_type,
         network=SimpleNamespace(value="regtest"),
         taker_utxo_age=1,
         dust_threshold=354,
         data_dir=tmp_path,
+        round_up_cj_fees=False,
+        equalize_cj_fees=False,
     )
     session.attach(
         SimpleNamespace(
@@ -576,17 +617,17 @@ def _harness(
     session.reserved_inputs = {(local.txid, local.vout)}
     session._fee_rate = 1.0
     session._randomized_fee_rate = 1.0
-    for index in range(1, 4):
+    for index in range(1, ring_makers + (2 if mixed else 1)):
         nick = f"maker-{index}"
         offer = Offer(
             counterparty=nick,
-            ordertype=OfferType.TR0_ABSOLUTE,
+            ordertype=offer_type,
             oid=index,
             minsize=100_000,
             maxsize=5_000_000,
             txfee=2_000,
-            cjfee=1_000,
-            features={"cofunded_channel_ring_v1": True},
+            cjfee="0.0001" if offer_type is OfferType.TR0_RELATIVE else 1_000,
+            features={"private_channel_ring": True} if index <= ring_makers else {},
         )
         session.maker_sessions[nick] = MakerSession(
             nick=nick,
@@ -603,9 +644,20 @@ def _harness(
             cj_address=_address(300 + index),
             change_address=_address(400 + index),
             responded_auth=True,
+            hold_seconds=1_000,
+            hold_deadline=time.monotonic() + 1_000,
         )
+    if mixed:
+        session.ring_candidate_nicks = {f"maker-{index}" for index in range(1, ring_makers + 1)}
     lnd = FakeLnd()
-    initialized = InitializedChannelRingBackend(
+    initialized = BoundChannelRingNode(
+        binding=RingNodeBinding(
+            network="regtest",
+            wallet_identity="00" * 32,
+            source_mixdepth=0,
+            node_name="local",
+            local_node_id=_node(20),
+        ),
         backend=cast(Any, lnd),
         node_info=LndNodeInfo(
             identity_pubkey=_node(20),
@@ -617,7 +669,7 @@ def _harness(
             advertised_uris=(f"{_node(20)}@{ONION}",),
         ),
         onion_endpoint=ONION,
-        backend_limits=_limits(),
+        backend_limits=_limits(offer_type.value),
     )
     store = RingParticipantStore(
         config.persistence_path(tmp_path), max_active_sessions=4, max_verified_sessions=2
@@ -649,6 +701,259 @@ async def test_complete_coordinator_reaches_signing_with_exact_ring(tmp_path: Pa
 
     await coordinator.cancel("too_late")
     assert coordinator._record().state is RingLifecycleState.SIGNING
+
+
+async def test_coordinator_signer_is_not_a_channel_endpoint(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path, mixed=True, ring_makers=2)
+    assert await coordinator.prepare(_address(300), 0)
+    record = coordinator._record()
+    assert record.manifest is not None
+    assert coordinator.coordinator_key not in record.manifest.participant_keys
+    assert coordinator.coordinator_key != record.ring_public_key
+    restarted = _harness(tmp_path, mixed=True, ring_makers=2)
+    restarted.record_key = record.key
+    assert restarted.coordinator_key == coordinator.coordinator_key
+    for plan in record.coordinator_plans.values():
+        assert plan.signer_key == coordinator.coordinator_key
+        assert coordinator.coordinator_key not in plan.cycle_keys
+        assert verify_payload(plan)
+    assert set(record.coordinator_plans) == set(record.manifest.participant_keys)
+    assert coordinator.sent_payloads
+    assert all(
+        payload.signer_key == coordinator.coordinator_key and verify_payload(payload)
+        for payload in coordinator.sent_payloads
+    )
+
+
+async def test_mixed_coordinator_contacts_only_ring_makers_and_builds_two_n_outputs(
+    tmp_path: Path,
+) -> None:
+    coordinator = _harness(tmp_path, mixed=True)
+
+    assert await coordinator.prepare(_address(300), 0)
+    record = coordinator._record()
+    assert set(coordinator.session.ring_maker_sessions) == {"maker-1", "maker-2", "maker-3"}
+    assert set(coordinator.session.ordinary_maker_sessions) == {"maker-4"}
+    assert set(coordinator._peer_by_key.values()) == {"maker-1", "maker-2", "maker-3"}
+    assert coordinator.exchange_recipients
+    assert all(
+        recipients == frozenset({"maker-1", "maker-2", "maker-3"})
+        for recipients in coordinator.exchange_recipients
+    )
+    assert set(coordinator.sent_nicks) <= {"maker-1", "maker-2", "maker-3"}
+    assert record.manifest is not None
+    assert len(record.manifest.outputs) == 10
+
+
+async def test_three_ring_participants_with_one_ordinary_maker(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path, mixed=True, ring_makers=2)
+    assert await coordinator.prepare(_address(300), 0)
+    record = coordinator._record()
+    assert record.state is RingLifecycleState.SIGNING
+    assert set(coordinator.session.ring_maker_sessions) == {"maker-1", "maker-2"}
+    assert set(coordinator.session.ordinary_maker_sessions) == {"maker-3"}
+    assert len(coordinator._peer_by_key) == 2
+    assert record.manifest is not None
+    assert len(record.manifest.participant_keys) == 3
+    assert len(record.manifest.outputs) == 8
+
+
+async def test_rounds_non_grid_relative_fees_once_for_an_all_ring_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = _harness(tmp_path, offer_type=OfferType.TR0_RELATIVE)
+    coordinator.session.config.round_up_cj_fees = True
+    for maker in coordinator.session.maker_sessions.values():
+        maker.offer.cjfee = "0.00015"
+
+    observed: dict[str, int] = {}
+    original_build = channel_ring.build_coinjoin_tx
+
+    def record_fee_data(**kwargs: Any) -> tuple[bytes, dict[str, Any]]:
+        observed.update({nick: int(data["cjfee"]) for nick, data in kwargs["maker_data"].items()})
+        return original_build(**kwargs)
+
+    monkeypatch.setattr(channel_ring, "build_coinjoin_tx", record_fee_data)
+
+    assert await coordinator.prepare(_address(300), 0)
+    assert coordinator.session.maker_fee_plan() == {
+        "maker-1": 200,
+        "maker-2": 200,
+        "maker-3": 200,
+    }
+    assert observed == coordinator.session.maker_fee_plan()
+    assert set(coordinator.session.ordinary_maker_sessions) == set()
+
+
+async def test_equalized_mixed_plan_uses_frozen_fees_for_ring_and_ordinary_makers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = _harness(tmp_path, mixed=True)
+    coordinator.session.config.equalize_cj_fees = True
+    for fee, maker in zip(
+        (1_000, 2_000, 3_000, 4_000),
+        coordinator.session.maker_sessions.values(),
+        strict=True,
+    ):
+        maker.offer.cjfee = fee
+
+    coordinator._preconditions()
+    frozen_plan = coordinator.session.maker_fee_plan()
+    assert frozen_plan == dict.fromkeys(coordinator.session.maker_sessions, 4_000)
+    for maker in coordinator.session.maker_sessions.values():
+        maker.offer.cjfee = 1
+
+    observed: dict[str, int] = {}
+    original_build = channel_ring.build_coinjoin_tx
+
+    def record_fee_data(**kwargs: Any) -> tuple[bytes, dict[str, Any]]:
+        observed.update({nick: int(data["cjfee"]) for nick, data in kwargs["maker_data"].items()})
+        return original_build(**kwargs)
+
+    monkeypatch.setattr(channel_ring, "build_coinjoin_tx", record_fee_data)
+
+    assert await coordinator.prepare(_address(300), 0)
+    assert observed == frozen_plan
+    assert coordinator._residuals["maker-4"] == 1_003_000
+    assert all(
+        coordinator._residuals[nick] == 1_003_000 for nick in ("maker-1", "maker-2", "maker-3")
+    )
+
+
+async def test_all_ring_plan_keeps_fees_frozen_after_preconditions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator._preconditions()
+    frozen_plan = coordinator.session.maker_fee_plan()
+    for maker in coordinator.session.maker_sessions.values():
+        maker.offer.cjfee = 9_999
+
+    observed: dict[str, int] = {}
+    original_build = channel_ring.build_coinjoin_tx
+
+    def record_fee_data(**kwargs: Any) -> tuple[bytes, dict[str, Any]]:
+        observed.update({nick: int(data["cjfee"]) for nick, data in kwargs["maker_data"].items()})
+        return original_build(**kwargs)
+
+    monkeypatch.setattr(channel_ring, "build_coinjoin_tx", record_fee_data)
+
+    assert await coordinator.prepare(_address(300), 0)
+    assert observed == frozen_plan
+    assert not coordinator.session.ordinary_maker_sessions
+
+
+async def test_equalized_fee_plan_rejects_local_channel_floor_before_invitation(
+    tmp_path: Path,
+) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator.session.config.equalize_cj_fees = True
+    for fee, maker in zip(
+        (350_000, 1_000, 1_000), coordinator.session.maker_sessions.values(), strict=True
+    ):
+        maker.offer.cjfee = fee
+
+    assert not await coordinator.prepare(_address(300), 0)
+    assert coordinator.record_key is None
+    assert cast(FakeLnd, coordinator.lnd).negotiation is None
+
+
+async def test_expired_maker_hold_aborts_before_invitation_or_lnd_work(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator.session.maker_sessions["maker-1"].hold_deadline = time.monotonic()
+
+    assert not await coordinator.prepare(_address(300), 0)
+    assert coordinator.record_key is None
+    assert cast(FakeLnd, coordinator.lnd).negotiation is None
+
+
+async def test_short_ordinary_hold_aborts_before_any_ring_invitation(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path, mixed=True)
+    coordinator.session.maker_sessions["maker-4"].hold_deadline = time.monotonic()
+
+    assert not await coordinator.prepare(_address(300), 0)
+    assert coordinator.record_key is None
+    assert cast(FakeLnd, coordinator.lnd).negotiation is None
+
+
+async def test_failed_ring_candidate_can_be_replaced_before_freeze(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path, mixed=True)
+    failed = coordinator.session.maker_sessions.pop("maker-3")
+    coordinator.session.remove_maker_session("maker-3")
+    replacement = failed
+    replacement.nick = "maker-5"
+    coordinator.session.maker_sessions["maker-5"] = replacement
+    coordinator.session.ring_candidate_nicks.add("maker-5")
+
+    assert await coordinator.prepare(_address(300), 0)
+    assert set(coordinator.session.ring_maker_sessions) == {"maker-1", "maker-2", "maker-5"}
+    assert set(coordinator.session.ordinary_maker_sessions) == {"maker-4"}
+
+
+async def test_ordinary_replacement_preserves_role_counts_before_freeze(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path, mixed=True)
+    ordinary = coordinator.session.maker_sessions.pop("maker-4")
+    coordinator.session.remove_maker_session("maker-4")
+    ordinary.nick = "maker-6"
+    coordinator.session.maker_sessions["maker-6"] = ordinary
+
+    assert await coordinator.prepare(_address(300), 0)
+    assert len(coordinator.session.ring_maker_sessions) == 3
+    assert len(coordinator.session.ordinary_maker_sessions) == 1
+    assert set(coordinator.session.ordinary_maker_sessions) == {"maker-6"}
+
+
+def test_frozen_roles_deny_replacement_selection(tmp_path: Path) -> None:
+    from taker.taker import Taker
+
+    coordinator = _harness(tmp_path, mixed=True)
+    coordinator._preconditions()
+    taker = Taker.__new__(Taker)
+    taker._session = coordinator.session
+    taker.config = SimpleNamespace(channel_ring=SimpleNamespace(enabled=True))
+
+    with pytest.raises(ValueError, match="roles are frozen"):
+        taker._select_channel_ring_makers([], 0, None)
+
+
+def test_ring_never_expands_explicit_inputs_after_fees(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator.session.strict_input_selection = True
+    coordinator.session.cj_amount = coordinator.session.preselected_utxos[0].value
+    coordinator._preconditions()
+
+    with patch.object(coordinator.session.wallet, "select_utxos") as select:
+        with pytest.raises(TakerRingError, match="Explicit input UTXOs are insufficient"):
+            coordinator._finalize_fees_and_inputs(0)
+        select.assert_not_called()
+    assert not coordinator.has_durable_record
+    assert coordinator.session.selected_utxos == []
+
+
+async def test_setup_deadline_bounds_and_stops_the_next_action(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator._setup_deadline = time.monotonic() + 2.0
+    assert coordinator._bounded_setup_timeout(10.0) <= 2.0
+    coordinator._setup_deadline = time.monotonic()
+    called = False
+
+    async def external_action() -> None:
+        nonlocal called
+        called = True
+
+    with pytest.raises(TakerRingError, match="deadline expired"):
+        await coordinator._await_setup_action(external_action, 10.0)
+    assert called is False
+
+
+def test_capability_flip_before_freeze_is_not_a_ring_session(tmp_path: Path) -> None:
+    coordinator = _harness(tmp_path)
+    coordinator.session.ring_candidate_nicks = {"maker-1", "maker-2", "maker-3"}
+    coordinator.session.maker_sessions["maker-3"].offer.features = {}
+
+    with pytest.raises(TakerRingError, match="no longer advertises"):
+        coordinator._preconditions()
+    assert not coordinator.session.ring_maker_sessions
 
 
 async def test_malicious_readiness_aborts_and_safely_retires(tmp_path: Path) -> None:
@@ -702,6 +1007,26 @@ async def test_partial_psbt_verification_uses_verified_retirement(tmp_path: Path
     assert len(lnd.retired) == 2
 
 
+async def test_interrupted_local_psbt_verification_preserves_uncertain_state(
+    tmp_path: Path,
+) -> None:
+    coordinator = _harness(tmp_path)
+    lnd = cast(FakeLnd, coordinator.lnd)
+
+    async def fail_verify(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError("connection lost during PsbtVerify")
+
+    lnd.verify_external_funding = fail_verify  # type: ignore[method-assign]
+    assert not await coordinator.prepare(_address(300), 0)
+    intent = coordinator._record()
+    assert intent.state in {RingLifecycleState.VERIFYING, RingLifecycleState.RECOVERY_REQUIRED}
+    assert intent.unsigned_psbt is not None
+    assert intent.manifest is not None
+    assert lnd.canceled == []
+    assert lnd.retired == []
+
+
 async def test_missing_sign_ack_is_retained_without_cancellation(tmp_path: Path) -> None:
     coordinator = _harness(tmp_path, missing_sign_ack=True)
     assert not await coordinator.prepare(_address(300), 0)
@@ -720,7 +1045,7 @@ async def test_stranded_negotiation_escalates_only_without_a_live_round(tmp_path
     # A live round still owns this record, so reconciliation must not disturb it.
     await reconcile_taker_ring_records(
         coordinator.store,
-        coordinator.initialized_backend,
+        FakeNodePool(coordinator.initialized_backend),
         cast(Any, coordinator.chain_backend),
         active_session_identities=frozenset({record.taker_session_identity}),
     )
@@ -730,7 +1055,7 @@ async def test_stranded_negotiation_escalates_only_without_a_live_round(tmp_path
     # escalated for the operator instead of holding ring capacity silently.
     await reconcile_taker_ring_records(
         coordinator.store,
-        coordinator.initialized_backend,
+        FakeNodePool(coordinator.initialized_backend),
         cast(Any, coordinator.chain_backend),
     )
     escalated = coordinator._record()
@@ -749,7 +1074,7 @@ async def test_restart_rebroadcasts_and_confirms_exact_final_transaction(tmp_pat
     chain = cast(FakeChain, coordinator.chain_backend)
 
     await reconcile_taker_ring_records(
-        coordinator.store, coordinator.initialized_backend, cast(Any, chain)
+        coordinator.store, FakeNodePool(coordinator.initialized_backend), cast(Any, chain)
     )
     assert chain.broadcasts == [unsigned]
 
@@ -761,7 +1086,7 @@ async def test_restart_rebroadcasts_and_confirms_exact_final_transaction(tmp_pat
         block_height=100,
     )
     await reconcile_taker_ring_records(
-        coordinator.store, coordinator.initialized_backend, cast(Any, chain)
+        coordinator.store, FakeNodePool(coordinator.initialized_backend), cast(Any, chain)
     )
     assert coordinator._record().state is RingLifecycleState.CONFIRMED_OPEN
     assert chain.broadcasts == [unsigned]

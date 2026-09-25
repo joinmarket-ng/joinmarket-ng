@@ -39,7 +39,7 @@ from jmswap.buyout_messages import (
     encode_buyout_payload,
     proposal_hash,
 )
-from jmswap.buyout_store import BuyoutStore, StoredSession
+from jmswap.buyout_store import PAYOUT_SCRIPT_KEY, BuyoutStore, StoredSession
 from jmswap.buyout_terms import (
     BuyoutTerms,
     ProtocolError,
@@ -169,6 +169,12 @@ def _attempt_data(attempts: Sequence[SigningAttempt]) -> list[dict[str, str]]:
     ]
 
 
+def _payout_candidates(scripts: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(scripts, str) or not scripts:
+        raise ValueError("payout scripts must be a non-empty sequence")
+    return tuple(scripts)
+
+
 async def _eligible(
     peer: LndPeerClient,
     points: Sequence[Outpoint],
@@ -273,14 +279,16 @@ class CounterpartySigner:
         peer: LndPeerClient,
         height: Height,
         policy: BuyoutPolicy,
-        payout_script: str,
+        payout_scripts: Sequence[str],
         *,
         runtime_binding: dict[str, str | int] | None = None,
         recovery_authorized: bool = False,
         force_close_authorized: bool = False,
     ) -> None:
         self.store, self.escrow, self.peer = store, escrow, peer
-        self.height, self.policy, self.payout_script = height, policy, payout_script
+        self.height, self.policy = height, policy
+        # One fresh script per session: the journal never reuses a payout.
+        self.payout_scripts = _payout_candidates(payout_scripts)
         self.runtime_binding = dict(runtime_binding or {})
         self.recovery_authorized = recovery_authorized
         self.force_close_authorized = force_close_authorized
@@ -425,6 +433,7 @@ class CounterpartySigner:
             tuple(f"{p.txid}:{p.vout}" for p in proposal.channel_points),
             data={
                 "proposal": proposal.model_dump(),
+                PAYOUT_SCRIPT_KEY: self.store.next_payout_script(self.payout_scripts),
                 "escrow_secret": _secret(),
                 "preimage": secrets.token_hex(32),
                 "settlement_authorized": self.policy.settlement_enabled,
@@ -438,6 +447,10 @@ class CounterpartySigner:
         return await self._accept(proposal)
 
     async def _accept(self, proposal: BuyoutPropose) -> BuyoutAccept:
+        record = self.store.get(proposal.epoch_id)
+        if not isinstance(record.data.get(PAYOUT_SCRIPT_KEY), str):
+            # Recorded before per-session payouts; refuse before freezing anything.
+            raise ProtocolError("session has no recorded payout script; it cannot be accepted")
         channels = await _freeze(self.escrow, proposal)
         record = self.store.get(proposal.epoch_id)
         data = cast(dict[str, Any], record.data)
@@ -449,7 +462,7 @@ class CounterpartySigner:
             proposal_hash=proposal_hash(proposal),
             K_C=_pub(data["escrow_secret"]),
             payment_hash=hashlib.sha256(bytes.fromhex(data["preimage"])).hexdigest(),
-            split_script_C=self.payout_script,
+            split_script_C=data[PAYOUT_SCRIPT_KEY],
             entitlement_C=sum(c.local_claim_sat for c in channels),
             buyout_fee=self.policy.buyout_fee,
             timeout_compensation=self.policy.timeout_compensation,
@@ -611,14 +624,19 @@ class BuyoutBuyer:
         self.force_close_authorized = force_close_authorized
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def prepare(self, peer: str, points: Sequence[Outpoint], split_script: str) -> str:
+    async def prepare(
+        self, peer: str, points: Sequence[Outpoint], payout_scripts: Sequence[str]
+    ) -> str:
+        """Propose a buyout paying out to the first unused of ``payout_scripts``."""
+        candidates = _payout_candidates(payout_scripts)
         with self.store.exclusive_operation():
-            return await self._prepare_session(peer, points, split_script)
+            return await self._prepare_session(peer, points, candidates)
 
     async def _prepare_session(
-        self, peer: str, points: Sequence[Outpoint], split_script: str
+        self, peer: str, points: Sequence[Outpoint], payout_scripts: tuple[str, ...]
     ) -> str:
         await _eligible(self.peer, points, peer, self.policy.network)
+        split_script = self.store.next_payout_script(payout_scripts)
         secret, claim = _secret(), _secret()
         sid = secrets.token_hex(32)
         p = self.policy
@@ -652,6 +670,7 @@ class BuyoutBuyer:
             tuple(f"{item.txid}:{item.vout}" for item in points),
             data={
                 "proposal": proposal.model_dump(),
+                PAYOUT_SCRIPT_KEY: split_script,
                 "escrow_secret": secret,
                 "claim_secret": claim,
                 "settlement_authorized": p.settlement_enabled,

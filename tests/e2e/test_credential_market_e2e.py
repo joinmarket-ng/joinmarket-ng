@@ -967,7 +967,9 @@ async def test_signed_market_fault_excludes_matching_verified_makers(
             backend=bitcoin_core_backend,
             network="regtest",
             mixdepth_count=5,
-            data_dir=tmp_path / "fault-taker-wallet",
+            # Wallet and taker share credential/PoDLE state for this one actor.
+            # The fault seller has its own independent store above.
+            data_dir=tmp_path / "fault-taker",
         )
         taker = Taker(
             wallet,

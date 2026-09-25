@@ -10,10 +10,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from jmcore.channel_ring import RingNodeBinding
 from jmcore.cofunded_ring import (
     LocalContribution,
     PreparedIncomingState,
@@ -47,6 +48,8 @@ class RingLifecycleState(StrEnum):
     PLANNED = "planned"
     ACCEPTOR_ARMED = "acceptor_armed"
     PREPARED = "prepared"
+    PREPARED_NOT_VERIFIED = "prepared_not_verified"
+    VERIFYING = "verifying"
     PSBT_VERIFIED = "psbt_verified"
     READY = "ready"
     SIGNING = "signing"
@@ -79,6 +82,15 @@ class RingRetirementAction(StrEnum):
 
 class StrictStoreModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+def _reject_duplicate_json_keys(items: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in items:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
 
 
 class Outpoint(StrictStoreModel):
@@ -163,11 +175,15 @@ _PRE_VERIFIED_STATES = frozenset(
         RingLifecycleState.INVITED,
         RingLifecycleState.PLANNED,
         RingLifecycleState.ACCEPTOR_ARMED,
-        RingLifecycleState.PREPARED,
+        RingLifecycleState.PREPARED_NOT_VERIFIED,
     }
 )
 _VERIFIED_UNRESOLVED_STATES = frozenset(
     {
+        # Old PREPARED records may have passed LND verification just before a
+        # crash; no persisted fact distinguishes them from unverified records.
+        RingLifecycleState.PREPARED,
+        RingLifecycleState.VERIFYING,
         RingLifecycleState.PSBT_VERIFIED,
         RingLifecycleState.READY,
         RingLifecycleState.SIGNING,
@@ -199,17 +215,25 @@ _ALLOWED_TRANSITIONS: Mapping[RingLifecycleState, frozenset[RingLifecycleState]]
     ),
     RingLifecycleState.ACCEPTOR_ARMED: frozenset(
         {
-            RingLifecycleState.PREPARED,
+            RingLifecycleState.PREPARED_NOT_VERIFIED,
             RingLifecycleState.RETIRING,
             RingLifecycleState.RECOVERY_REQUIRED,
         }
     ),
     RingLifecycleState.PREPARED: frozenset(
         {
-            RingLifecycleState.PSBT_VERIFIED,
+            RingLifecycleState.RECOVERY_REQUIRED,
+        }
+    ),
+    RingLifecycleState.PREPARED_NOT_VERIFIED: frozenset(
+        {
+            RingLifecycleState.VERIFYING,
             RingLifecycleState.RETIRING,
             RingLifecycleState.RECOVERY_REQUIRED,
         }
+    ),
+    RingLifecycleState.VERIFYING: frozenset(
+        {RingLifecycleState.PSBT_VERIFIED, RingLifecycleState.RECOVERY_REQUIRED}
     ),
     RingLifecycleState.PSBT_VERIFIED: frozenset(
         {
@@ -269,6 +293,8 @@ _ALLOWED_TRANSITIONS: Mapping[RingLifecycleState, frozenset[RingLifecycleState]]
 class RingParticipantRecord(StrictStoreModel):
     """Complete private state for one local participant in one ring revision."""
 
+    journal_kind: Literal["private_channel_ring"]
+    node_binding: RingNodeBinding
     round_nonce: str
     revision: int = Field(ge=0, le=2_147_483_647)
     ring_secret: str = Field(repr=False)
@@ -323,6 +349,7 @@ class RingParticipantRecord(StrictStoreModel):
         *,
         round_nonce: str,
         revision: int,
+        node_binding: RingNodeBinding,
         taker_session_identity: str,
         local_role: RingParticipantRole,
         local_position: int,
@@ -333,6 +360,8 @@ class RingParticipantRecord(StrictStoreModel):
         key_pair = RingKeyPair.generate()
         timestamp = time.time() if now is None else now
         return cls(
+            journal_kind="private_channel_ring",
+            node_binding=node_binding,
             round_nonce=round_nonce,
             revision=revision,
             ring_secret=key_pair.secret_key.hex(),
@@ -402,11 +431,30 @@ class RingParticipantRecord(StrictStoreModel):
                 and status.chain is TransactionPresence.ABSENT
             ):
                 return RingRetirementAction.ABANDON_VERIFIED
-            if status.exact_txid is None and self.unsigned_psbt is None:
-                return RingRetirementAction.SHIM_CANCEL
+            # Recovery-required alone proves nothing about whether LND already
+            # consumed the shim, especially for retained legacy PREPARED records.
+            # Never infer safe cancellation from missing unsigned evidence.
         if self.state is RingLifecycleState.CONFIRMED_OPEN:
             return RingRetirementAction.NORMAL_CHANNEL_RETIREMENT
         return RingRetirementAction.BLOCKED
+
+    def operator_summary(self) -> dict[str, Any]:
+        """Return the local recovery facts an operator needs, never key material."""
+        return {
+            "file": self.key.filename,
+            "state": self.state.value,
+            "role": self.local_role.value,
+            "active": self.active,
+            "retirement_action": self.retirement_action().value,
+            "inputs": [f"{item.txid}:{item.vout}" for item in self.local_input_outpoints],
+            "input_lock_owner": self.input_lock_owner,
+            "exact_txid": self.chain_status.exact_txid,
+            "final_tx_recorded": self.final_tx is not None,
+            "local_signature_created": self.local_input_signature_created,
+            "local_signature_sent": self.local_input_signature_sent,
+            "last_error": self.retry.last_error,
+            "updated_at": self.updated_at,
+        }
 
     @field_validator(
         "round_nonce",
@@ -529,6 +577,13 @@ class RingParticipantRecord(StrictStoreModel):
                 or self.chain_status.confirmations < 1
             ):
                 raise ValueError("confirmed/open requires a confirmed exact transaction")
+        if self.state is RingLifecycleState.VERIFYING and (
+            self.manifest is None
+            or self.unsigned_tx is None
+            or self.unsigned_psbt is None
+            or self.chain_status.exact_txid != self.manifest.unsigned_txid
+        ):
+            raise ValueError("verification intent requires exact unsigned funding evidence")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at cannot precede created_at")
         return self
@@ -548,7 +603,13 @@ class RingParticipantRecord(StrictStoreModel):
             )
         values = self.model_dump()
         if updates:
-            immutable = {"round_nonce", "revision", "ring_secret", "ring_public_key"}
+            immutable = {
+                "round_nonce",
+                "revision",
+                "ring_secret",
+                "ring_public_key",
+                "node_binding",
+            }
             changed_immutable = immutable.intersection(updates)
             if changed_immutable:
                 raise RingTransitionError(
@@ -666,7 +727,16 @@ class RingParticipantStore:
         if mode != 0o600:
             raise RingStoreError(f"participant record has unsafe mode {mode:o}")
         try:
-            record = RingParticipantRecord.model_validate_json(path.read_bytes())
+            raw = path.read_bytes()
+            payload = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+            if not isinstance(payload, dict):
+                raise ValueError("participant record must be a JSON object")
+            expected_keys = set(RingParticipantRecord.model_fields)
+            if set(payload) != expected_keys:
+                raise ValueError("participant record JSON fields differ from the current journal")
+            if payload["journal_kind"] != "private_channel_ring":
+                raise ValueError("participant record has an unknown journal kind")
+            record = RingParticipantRecord.model_validate_json(raw)
         except ValueError as exc:
             raise RingStoreError("participant record failed strict validation") from exc
         if path.name != record.key.filename:
@@ -677,6 +747,11 @@ class RingParticipantStore:
         current = self.load_all()
         if current.corruptions:
             raise RingStoreError("cannot update participant store while corrupt records exist")
+        if any(
+            item.key == record.key and item.node_binding != record.node_binding
+            for item in current.records
+        ):
+            raise RingStoreError("cannot change durable ring node ownership")
         existing = [item for item in current.records if item.key != record.key]
         self._enforce_limits(record, existing)
         payload = json.dumps(

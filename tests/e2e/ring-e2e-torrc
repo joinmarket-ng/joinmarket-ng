@@ -1,4 +1,4 @@
-# Test-only Tor daemon for the four LND peer endpoints.
+# Test-only Tor daemon for the five LND peer endpoints.
 DataDirectory /var/lib/tor
 Log notice stdout
 SocksPort 0.0.0.0:9050
@@ -18,6 +18,10 @@ HiddenServiceVersion 3
 
 HiddenServiceDir /var/lib/tor/lnd-maker3
 HiddenServicePort 9735 ring-onion-maker3:9735
+HiddenServiceVersion 3
+
+HiddenServiceDir /var/lib/tor/lnd-maker4
+HiddenServicePort 9735 ring-onion-maker4:9735
 HiddenServiceVersion 3
 
 HiddenServiceDir /var/lib/tor/lnd-taker

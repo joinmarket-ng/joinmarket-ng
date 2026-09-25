@@ -1,5 +1,7 @@
 # Private channel-buyout service configuration (JMP-0011 draft).
 #
+# EXPERIMENTAL: read docs/experimental-ring-market.md before enabling.
+#
 # Copy this file, edit the [buyout] table and point the service at it with an
 # explicit path. Nothing is discovered: this file is read, validated and that is
 # all. No certificate, macaroon or journal named here is opened at load time,
@@ -94,9 +96,16 @@ allowed_peers = [
     "0292f803dd1db5884b5c616db7bf6e3e9541d3ca2f4bb87ee4e2f1e03311eeb1e9",
 ]
 
-# Where this node is paid on chain (its side of the escrow split). Must be a
-# P2TR (witness v1) address of the configured network. Required when enabled.
-payout_address = "bcrt1pksg0vjls5jwvrjxvx46hrj5lnpawelc9h4l0gppy6wts2aaapc9ssgsfk3"
+# Fresh addresses where this node is paid on chain (its side of the escrow
+# split), in order. Every session, buyer or counterparty, takes the first one no
+# earlier session in the journal used, so no address is paid twice; a new session
+# is refused once all are used. Reserve them in the source mixdepth with
+# `jm-wallet address new --mixdepth N --label buyout` so the wallet never hands
+# them out elsewhere. P2TR (witness v1) addresses of the configured network.
+# Required (non-empty, no duplicates) when enabled.
+payout_addresses = [
+    "bcrt1pksg0vjls5jwvrjxvx46hrj5lnpawelc9h4l0gppy6wts2aaapc9ssgsfk3",
+]
 
 # JoinMarket wallet mixdepth the buyer side spends from and pays back into.
 # Non-negative integer. Required when enabled.

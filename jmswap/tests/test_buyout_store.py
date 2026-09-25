@@ -26,6 +26,7 @@ import pytest
 from jmswap.buyout_store import (
     MAX_DATA_BYTES,
     MAX_UNRESOLVED_SESSIONS,
+    PAYOUT_SCRIPT_KEY,
     SCHEMA_VERSION,
     BuyoutStore,
     ConflictError,
@@ -351,6 +352,87 @@ def test_taken_over_session_can_never_start_signing(store: BuyoutStore) -> None:
     with pytest.raises(InvalidRecordError):
         store.update(canceled, state="SIGNING", data={}, parent_signing_started=True)
     assert store.get(session_id(1)) == canceled
+
+
+def test_buyer_cannot_buy_out_a_sibling_channel_of_the_same_funding_tx(
+    journal_path: Path,
+) -> None:
+    with BuyoutStore(journal_path) as store:
+        first = create_default(store, tag=1)
+        store.update(first, state="COMPLETED", data={})
+        with pytest.raises(ConflictError, match="same funding transaction"):
+            store.create(session_id(2), OTHER_PEER, "buyer", (channel_point(1, 1),))
+        # The refused attempt reserved nothing: an unrelated channel still works.
+        assert store.create(session_id(3), OTHER_PEER, "buyer", (channel_point(3, 1),))
+    # The rule survives a restart because it is derived from durable rows.
+    with (
+        BuyoutStore(journal_path) as store,
+        pytest.raises(ConflictError, match="same funding transaction"),
+    ):
+        store.create(session_id(4), OTHER_PEER, "buyer", (channel_point(1, 1),))
+
+
+def test_sibling_rule_ignores_counterparty_and_released_sessions(store: BuyoutStore) -> None:
+    store.create(session_id(1), PEER, "counterparty", (channel_point(1),))
+    # Selling one edge does not stop this node from buying out its other edge.
+    assert store.create(session_id(2), OTHER_PEER, "buyer", (channel_point(1, 1),))
+    canceled = create_default(store, tag=3)
+    store.update(canceled, state="CANCELED", data={})
+    # A canceled, never-signed buyout proves nothing was spent.
+    reused = store.create(session_id(4), OTHER_PEER, "buyer", (channel_point(3, 1),))
+    # Stay under the unresolved-session cap.
+    for tag in (1, 2):
+        store.update(store.get(session_id(tag)), state="COMPLETED", data={})
+    store.update(reused, state="COMPLETED", data={})
+    signed = create_default(store, tag=5)
+    store.update(signed, state="SIGNING", data={}, parent_signing_started=True)
+    with pytest.raises(ConflictError, match="same funding transaction"):
+        store.create(session_id(6), OTHER_PEER, "buyer", (channel_point(5, 1),))
+
+
+def test_each_session_takes_a_fresh_payout_script(journal_path: Path) -> None:
+    scripts = ("5120" + "11" * 32, "5120" + "22" * 32)
+    with BuyoutStore(journal_path) as store:
+        first = store.next_payout_script(scripts)
+        assert first == scripts[0]
+        record = create_default(store, tag=1, data={PAYOUT_SCRIPT_KEY: first})
+        # The payout script is fixed once recorded.
+        with pytest.raises(InvalidRecordError, match="payout script cannot change"):
+            store.update(record, state="CANCELED", data={})
+        # A canceled session still never gives its payout script back.
+        store.update(record, state="CANCELED", data={PAYOUT_SCRIPT_KEY: first})
+        assert store.next_payout_script(scripts) == scripts[1]
+        # A concurrent pick of an already recorded script is refused atomically.
+        with pytest.raises(ConflictError, match="payout address was already used"):
+            create_default(store, tag=2, data={PAYOUT_SCRIPT_KEY: first})
+        store.create(
+            session_id(3),
+            OTHER_PEER,
+            "counterparty",
+            (channel_point(3),),
+            data={PAYOUT_SCRIPT_KEY: scripts[1]},
+        )
+    with (
+        BuyoutStore(journal_path) as store,
+        pytest.raises(ConflictError, match="jm-wallet address new"),
+    ):
+        store.next_payout_script(scripts)
+
+
+def test_payout_script_cannot_be_added_after_create(store: BuyoutStore) -> None:
+    script = "5120" + "44" * 32
+    create_default(store, tag=1, data={PAYOUT_SCRIPT_KEY: script})
+    record = create_default(store, tag=2)
+    # Adding it later would skip the uniqueness check in create.
+    with pytest.raises(InvalidRecordError, match="payout script cannot change"):
+        store.update(record, state="FREEZING", data={PAYOUT_SCRIPT_KEY: script})
+
+
+def test_split_scripts_in_older_sessions_count_as_used(store: BuyoutStore) -> None:
+    script = "5120" + "33" * 32
+    create_default(store, tag=1, data={"proposal": {"split_script_B": script}})
+    with pytest.raises(ConflictError):
+        store.next_payout_script((script,))
 
 
 def test_unresolved_session_limit(store: BuyoutStore) -> None:

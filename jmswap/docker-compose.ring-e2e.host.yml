@@ -28,6 +28,10 @@ services:
     ports:
       - "127.0.0.1:${RING_E2E_MAKER3_GRPC_PORT:-23009}:10009"
 
+  lnd-maker4:
+    ports:
+      - "127.0.0.1:${RING_E2E_MAKER4_GRPC_PORT:-25009}:10009"
+
   lnd-taker:
     ports:
       - "127.0.0.1:${RING_E2E_TAKER_GRPC_PORT:-24009}:10009"

@@ -1287,11 +1287,11 @@ def test_bare_invocation_prints_full_help_and_succeeds(capsys) -> None:
         assert command in captured.out
 
 
-def test_entry_help_explains_the_purchase_flow_and_points_at_the_overview() -> None:
+def test_entry_help_explains_the_purchase_flow_and_points_at_the_guide() -> None:
     """The top-level description must orient a new user before they pick a command."""
     help_text = market_cli.build_parser().format_help()
 
-    assert "docs/credential-market-overview.md" in help_text
+    assert "docs/experimental-ring-market.md" in help_text
     assert "Lightning" in help_text
     # Buyer and seller roles must both be named.
     assert "Buying a credential:" in help_text

@@ -55,6 +55,10 @@ BUYER_KEY = bytes(CKey(b"\x11" * 32).pub)
 COUNTERPARTY_KEY = bytes(CKey(b"\x22" * 32).pub)
 POINT = Outpoint(txid="33" * 32, vout=0)
 SCRIPT = b"\x51\x20" + bytes(CKey(b"\x44" * 32).xonly_pub)
+# Fresh payout scripts; every session takes the first unused one.
+SCRIPTS = (SCRIPT.hex(),) + tuple(
+    (b"\x51\x20" + bytes(CKey(bytes([0x45 + i]) * 32).xonly_pub)).hex() for i in range(7)
+)
 
 
 async def height() -> int:
@@ -82,12 +86,12 @@ class Runtime:
         return await self.counterparty.handle(BUYER_KEY.hex(), message)
 
     async def prepare(self) -> str:
-        return await self.buyer.prepare(COUNTERPARTY_KEY.hex(), [POINT], SCRIPT.hex())
+        return await self.buyer.prepare(COUNTERPARTY_KEY.hex(), [POINT], SCRIPTS)
 
     def restart(self) -> None:
         b, c = self.buyer, self.counterparty
         self.counterparty = CounterpartySigner(
-            c.store, c.escrow, c.peer, height, c.policy, c.payout_script
+            c.store, c.escrow, c.peer, height, c.policy, c.payout_scripts
         )
         self.buyer = BuyoutBuyer(b.store, b.escrow, b.peer, self.request, height, b.policy)
 
@@ -129,9 +133,7 @@ def runtime(tmp_path: Path) -> Iterator[Runtime]:
         BuyoutStore(tmp_path / "buyer" / "sessions.sqlite") as buyer_store,
         BuyoutStore(tmp_path / "counterparty" / "sessions.sqlite") as cp_store,
     ):
-        counterparty = CounterpartySigner(
-            cp_store, backends[1], peers[1], height, policy, SCRIPT.hex()
-        )
+        counterparty = CounterpartySigner(cp_store, backends[1], peers[1], height, policy, SCRIPTS)
         buyer = BuyoutBuyer(buyer_store, backends[0], peers[0], AsyncMock(), height, policy)
         result = Runtime(buyer, counterparty, *backends)
         buyer.request = result.request
@@ -825,3 +827,20 @@ async def test_claim_fee_budget_is_enforced(settlement: SettlementRuntime) -> No
     with pytest.raises(ProtocolError, match="fee budget"):
         await h.buyer.poll(h.sid)
     h.chain.broadcast.assert_not_awaited()
+
+
+async def test_counterparty_refuses_a_session_without_payout_before_freezing(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from jmswap.buyout_terms import ProtocolError
+
+    escrow = AsyncMock()
+    with BuyoutStore(tmp_path / "sessions.sqlite") as store:
+        # A row recorded before per-session payouts existed.
+        store.create("ab" * 32, BUYER_KEY.hex(), "counterparty", (f"{POINT.txid}:0",))
+        signer = CounterpartySigner(store, escrow, AsyncMock(), height, BuyoutPolicy(), SCRIPTS)
+        with pytest.raises(ProtocolError, match="no recorded payout script"):
+            await signer._accept(SimpleNamespace(epoch_id="ab" * 32))  # type: ignore[arg-type]
+    escrow.freeze.assert_not_called()

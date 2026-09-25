@@ -20,12 +20,12 @@ from jmcore.network import ConnectionError as NetworkConnectionError
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     COMMAND_PREFIX,
-    FEATURE_COFUNDED_CHANNEL_RING_V1,
     FEATURE_DIRECT_PING_V1,
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
+    FEATURE_PRIVATE_CHANNEL_RING,
     FeatureSet,
     MessageType,
     create_handshake_request,
@@ -483,7 +483,7 @@ class DirectConnectionMixin:
         if self.config.nick_auth_mode is not NickAuthMode.DISABLED:
             features.features.add(FEATURE_NICK_AUTH)
         if self.channel_ring_capability_validated:
-            features.features.add(FEATURE_COFUNDED_CHANNEL_RING_V1)
+            features.features.add(FEATURE_PRIVATE_CHANNEL_RING)
 
         # Determine our location string (onion address or NOT-SERVING-ONION)
         onion_host = generation.onion_host

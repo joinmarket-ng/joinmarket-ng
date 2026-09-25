@@ -123,6 +123,7 @@ class ExternalChannelRequest(StrictModel):
     opener_csv_delay: Annotated[int, Field(ge=1, le=2016)]
     fundee_csv_delay: Annotated[int, Field(ge=1, le=2016)]
     min_depth: Annotated[int, Field(ge=1, le=144)]
+    scid_alias: bool = False
     timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
 
     @model_validator(mode="after")
@@ -221,7 +222,7 @@ class VerifiedChannelRetirementOutcome(StrictModel):
     lnd_status: str = ""
 
 
-def can_advertise_cofunded_channel_ring_v1(
+def can_advertise_private_channel_ring(
     *,
     safe_verified_retirement_live_validated: bool,
     retained_state_reconciliation: bool,
@@ -234,11 +235,9 @@ def can_advertise_cofunded_channel_ring_v1(
 
 
 # This is set only because the stock-LND two-node test is a required CI job.
-COFUNDED_CHANNEL_RING_V1_SAFE_RETIREMENT_LIVE_VALIDATED = True
-COFUNDED_CHANNEL_RING_V1_CAPABLE = can_advertise_cofunded_channel_ring_v1(
-    safe_verified_retirement_live_validated=(
-        COFUNDED_CHANNEL_RING_V1_SAFE_RETIREMENT_LIVE_VALIDATED
-    ),
+PRIVATE_CHANNEL_RING_SAFE_RETIREMENT_LIVE_VALIDATED = True
+PRIVATE_CHANNEL_RING_CAPABLE = can_advertise_private_channel_ring(
+    safe_verified_retirement_live_validated=(PRIVATE_CHANNEL_RING_SAFE_RETIREMENT_LIVE_VALIDATED),
     retained_state_reconciliation=False,
     strict_anti_grief_limits=False,
 )
@@ -278,6 +277,7 @@ class InboundChannelExpectation(StrictModel):
     opener_csv_delay: Annotated[int, Field(ge=1, le=2016)]
     fundee_csv_delay: Annotated[int, Field(ge=1, le=2016)]
     min_depth: Annotated[int, Field(ge=1, le=144)]
+    scid_alias: bool = False
 
     @model_validator(mode="after")
     def validate_policy(self) -> InboundChannelExpectation:
@@ -477,7 +477,7 @@ def evaluate_channel_accept_request(
         (int(request.commitment_type) == FINAL_TAPROOT_COMMITMENT, "commitment type"),
         (int(request.channel_flags) == 0, "private channel flags"),
         (not bool(request.wants_zero_conf), "zero-conf flag"),
-        (not bool(request.wants_scid_alias), "SCID alias flag"),
+        (bool(request.wants_scid_alias) == expected.scid_alias, "SCID alias flag"),
         (int(request.channel_reserve) == expected.fundee_reserve_sat, "fundee reserve"),
         (int(request.csv_delay) == expected.fundee_csv_delay, "fundee CSV policy"),
         (
@@ -608,6 +608,17 @@ class LndBackend:
         self._channel = None
         self._stub = None
 
+    async def confirmed_onchain_balance(self, *, timeout_seconds: float = 10.0) -> int:
+        """Return LND's confirmed on-chain wallet balance in sats."""
+        self._ensure()
+        try:
+            response = await asyncio.wait_for(
+                self._stub.WalletBalance(ln.WalletBalanceRequest()), timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("WalletBalance timed out") from exc
+        return int(response.confirmed_balance)
+
     async def node_info(self, *, timeout_seconds: float = 10.0) -> LndNodeInfo:
         self._ensure()
         try:
@@ -653,7 +664,7 @@ class LndBackend:
             raise LndCapabilityError("LND does not advertise final Taproot feature bit 80/81")
         return info
 
-    async def check_production_cofunded_channel_ring_v1(
+    async def check_production_private_channel_ring(
         self,
         onion_endpoint: str,
         *,
@@ -661,10 +672,10 @@ class LndBackend:
     ) -> LndNodeInfo:
         """Validate the complete production backend and bind its onion URI to GetInfo."""
         info = await self.node_info(timeout_seconds=timeout_seconds)
-        if not COFUNDED_CHANNEL_RING_V1_SAFE_RETIREMENT_LIVE_VALIDATED:
+        if not PRIVATE_CHANNEL_RING_SAFE_RETIREMENT_LIVE_VALIDATED:
             raise LndCapabilityError("safe verified-channel retirement is not live validated")
-        if not COFUNDED_CHANNEL_RING_V1_CAPABLE:
-            raise LndCapabilityError("co-funded channel ring lifecycle is incomplete")
+        if not PRIVATE_CHANNEL_RING_CAPABLE:
+            raise LndCapabilityError("private channel ring lifecycle is incomplete")
         expected_uri = f"{info.identity_pubkey}@{onion_endpoint}"
         if expected_uri not in info.advertised_uris:
             raise LndCapabilityError(
@@ -713,8 +724,10 @@ class LndBackend:
             raise LndValidationError("pending channel ID was already used by this backend")
         self._seen_pending_ids.add(pending_id)
         deadline = time.monotonic() + request.timeout_seconds
+        connect_attempts = 0
         while True:
             remaining = deadline - time.monotonic()
+            connect_attempts += 1
             try:
                 await self.connect_peer(
                     request.peer_node_id,
@@ -722,9 +735,16 @@ class LndBackend:
                     timeout_seconds=max(0.1, min(_ONION_CONNECT_ATTEMPT_SECONDS, remaining)),
                 )
                 break
-            except Exception:
-                if ".onion" not in request.peer_host or deadline <= time.monotonic():
+            except Exception as exc:
+                if ".onion" not in request.peer_host:
                     raise
+                if deadline <= time.monotonic():
+                    # Name the stalled step: without this, a Tor dial failure is
+                    # indistinguishable from a stuck funding negotiation.
+                    raise LndTimeoutError(
+                        f"could not connect to the ring peer over Tor after "
+                        f"{connect_attempts} attempt(s)"
+                    ) from exc
                 await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         open_request = ln.OpenChannelRequest(
             node_pubkey=bytes.fromhex(request.peer_node_id),
@@ -733,7 +753,7 @@ class LndBackend:
             private=True,
             commitment_type=ln.TAPROOT,
             zero_conf=False,
-            scid_alias=False,
+            scid_alias=request.scid_alias,
             remote_csv_delay=request.fundee_csv_delay,
             max_local_csv=request.opener_csv_delay,
             remote_chan_reserve_sat=request.fundee_reserve_sat,

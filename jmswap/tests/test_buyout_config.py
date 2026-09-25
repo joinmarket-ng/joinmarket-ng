@@ -61,7 +61,7 @@ bitcoin_rpc_url = "http://127.0.0.1:18443/"
 bitcoin_rpc_user = "buyout"
 bitcoin_rpc_password = "regtest-placeholder"
 allowed_peers = ["{PEER}", "{OTHER_PEER}"]
-payout_address = "{PAYOUT_REGTEST}"
+payout_addresses = ["{PAYOUT_REGTEST}"]
 mixdepth = 0
 """
 
@@ -265,10 +265,10 @@ class TestEnabledConfiguration:
         settings = load_buyout_settings(_enabled(tmp_path))
         expected = bytes(CKey(hashlib.sha256(b"test-payout").digest()).pub)[1:]
 
-        assert settings.payout_script() == (b"\x51\x20" + expected).hex()
+        assert settings.payout_scripts() == ((b"\x51\x20" + expected).hex(),)
         assert scriptpubkey_to_address(b"\x51\x20" + expected, "regtest") == PAYOUT_REGTEST
 
-    @pytest.mark.parametrize("name", ["network", "journal", "lnd_identity", "payout_address"])
+    @pytest.mark.parametrize("name", ["network", "journal", "lnd_identity", "payout_addresses"])
     def test_enabled_service_requires_every_connection_field(
         self, tmp_path: Path, name: str
     ) -> None:
@@ -307,17 +307,29 @@ class TestRejectedConfiguration:
             load_buyout_settings(_enabled(tmp_path, extra=f"\n[buyout.policy]\n{option}\n"))
 
     def test_payout_address_for_another_network_is_rejected(self, tmp_path: Path) -> None:
-        path = _enabled(tmp_path, payout_address=f'"{PAYOUT_MAINNET}"')
+        path = _enabled(tmp_path, payout_addresses=f'["{PAYOUT_MAINNET}"]')
 
-        with pytest.raises(BuyoutConfigError, match="not a valid regtest address"):
+        with pytest.raises(BuyoutConfigError, match="invalid regtest address"):
             load_buyout_settings(path)
+
+    def test_duplicate_payout_address_is_rejected(self, tmp_path: Path) -> None:
+        path = _enabled(tmp_path, payout_addresses=f'["{PAYOUT_REGTEST}", "{PAYOUT_REGTEST}"]')
+
+        with pytest.raises(BuyoutConfigError, match="duplicate"):
+            load_buyout_settings(path)
+
+    def test_empty_payout_addresses_are_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(BuyoutConfigError):
+            load_buyout_settings(_enabled(tmp_path, payout_addresses="[]"))
 
     def test_non_taproot_payout_address_is_rejected(self, tmp_path: Path) -> None:
         witness = hashlib.sha256(b"test-payout-p2wpkh").digest()[:20]
         p2wpkh = scriptpubkey_to_address(b"\x00\x14" + witness, "regtest")
 
-        with pytest.raises(BuyoutConfigError, match="must be a P2TR"):
-            load_buyout_settings(_enabled(tmp_path, payout_address=f'"{p2wpkh}"'))
+        with pytest.raises(BuyoutConfigError, match="must be P2TR"):
+            load_buyout_settings(
+                _enabled(tmp_path, payout_addresses=f'["{PAYOUT_REGTEST}", "{p2wpkh}"]')
+            )
 
     def test_invalid_peer_identity_is_rejected(self, tmp_path: Path) -> None:
         off_curve = "02" + "ff" * 32
@@ -492,9 +504,9 @@ class TestSecretsAndPaths:
         settings = BuyoutSettings()
 
         assert settings.enabled is False
-        assert settings.payout_address is None
+        assert settings.payout_addresses is None
         with pytest.raises(BuyoutConfigError):
-            settings.payout_script()
+            settings.payout_scripts()
 
 
 def _hint_toml(**overrides: str) -> str:
@@ -636,7 +648,7 @@ class TestTemplate:
 
         assert settings.network == "regtest"
         assert settings.journal == tmp_path / "buyout-sessions.sqlite"
-        assert settings.payout_script().startswith("5120")
+        assert settings.payout_scripts()[0].startswith("5120")
         assert settings.build_signing_policy() == BuyoutPolicy(
             network="regtest", settlement_enabled=True
         )

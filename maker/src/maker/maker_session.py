@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -245,12 +246,20 @@ class MakerSession:
 
     def remaining_timeout(self) -> float:
         """Return the time left before the session's absolute deadline."""
-        return max(0.0, self.deadline - time.monotonic())
+        remaining = self.deadline - time.monotonic()
+        return max(0.0, remaining) if math.isfinite(remaining) else 0.0
 
-    def begin_pre_sign_wait(self) -> bool:
-        """Shorten the deadline and renew locks before disclosing maker inputs."""
-        phase_deadline = time.monotonic() + self.inner.pre_sign_timeout_sec
-        self.deadline = min(self.deadline, phase_deadline)
+    def begin_pre_sign_wait(self, bot: MakerBotProtocol | None = None) -> bool:
+        """Set the pre-sign deadline and renew locks before disclosing maker inputs."""
+        hold_seconds = float(self.inner.pre_sign_timeout_sec)
+        ring_enabled = False
+        if bot is not None and bot.config.channel_ring.enabled is True:
+            # Ring setup ends at !tx, so the explicit ring hold covers only the
+            # invitation-through-readiness window, not normal signature collection.
+            hold_seconds = bot.config.channel_ring.maker_setup_hold_seconds
+            ring_enabled = True
+        phase_deadline = time.monotonic() + hold_seconds
+        self.deadline = phase_deadline if ring_enabled else min(self.deadline, phase_deadline)
         self.inner.deadline = self.deadline
         return self.inner.wallet.renew_coinjoin_inputs(
             set(self.our_utxos),
@@ -262,6 +271,7 @@ class MakerSession:
         """Return whether this exact session may still progress."""
         return (
             not self.expired
+            and getattr(bot, "_stopping", False) is not True
             and bot.active_sessions.get((self.generation_id, self.taker_nick)) is self
         )
 
@@ -477,7 +487,7 @@ class MakerSession:
 
                 if not self.is_active(bot):
                     return
-                if not self.begin_pre_sign_wait():
+                if not self.begin_pre_sign_wait(bot):
                     logger.error("Maker input lock ownership was lost before !ioauth")
                     if bot.active_sessions.get((self.generation_id, taker_nick)) is self:
                         bot.active_sessions.pop((self.generation_id, taker_nick))
@@ -485,6 +495,7 @@ class MakerSession:
                         self.release_input_locks()
                         bot._release_commitment_reservation(commitment)
                     return
+                response["hold_seconds"] = str(math.floor(self.remaining_timeout()))
                 sent = await self.send_response(bot, "ioauth", response)
                 if not self.is_active(bot):
                     return
@@ -797,7 +808,7 @@ class MakerSession:
             logger.bind(sensitive=True).error(f"Failed to handle !tx: {e}")
 
     async def on_ring(self, bot: MakerBotProtocol, msg: str, source: str) -> None:
-        """Decrypt, authenticate, and dispatch one canonical JMP-0010 envelope."""
+        """Decrypt, authenticate, and dispatch one canonical JMP-0014 envelope."""
 
         self.validate_channel(source)
         if self.state != CoinJoinState.IOAUTH_SENT:
@@ -806,7 +817,7 @@ class MakerSession:
         if (
             not bot.config.channel_ring.enabled
             or not bot.channel_ring_capability_validated
-            or bot._channel_ring_backend is None
+            or bot._channel_ring_nodes is None
             or bot._channel_ring_store is None
         ):
             logger.warning(f"Rejecting !ring from {self.taker_nick}: feature is unavailable")
@@ -827,11 +838,14 @@ class MakerSession:
             if self.ring_participant is None:
                 from maker.channel_ring import MakerRingParticipant
 
+                node = bot._channel_ring_nodes.for_mixdepth(self.inner.mixdepth)
+                if any(utxo.mixdepth != self.inner.mixdepth for utxo in self.our_utxos.values()):
+                    raise ValueError("ring inputs must all belong to the bound source mixdepth")
                 self.ring_participant = MakerRingParticipant(
                     self,
                     config=bot.config.channel_ring,
                     store=bot._channel_ring_store,
-                    initialized_backend=bot._channel_ring_backend,
+                    initialized_backend=node,
                     chain_backend=bot.backend,
                 )
             responses = await self.ring_participant.handle(payload)
@@ -895,6 +909,7 @@ class MakerSession:
                         data["cj_addr"],
                         data["change_addr"],
                         data["btc_sig"],
+                        str(data["hold_seconds"]),
                     ]
                 )
                 msg_content = self.crypto.encrypt(plaintext)

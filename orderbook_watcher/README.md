@@ -17,8 +17,9 @@ A clean, performant, and secure orderbook watcher for JoinMarket that aggregates
 
 ## Credential Market Offers
 
-The watcher requests public `mbook` listings every 30 seconds over its existing
-directory connections. It verifies the announcing nick's signature and each
+Sellers push signed `moffer` listings, valid for one hour, and re-announce them
+every 30 minutes. The watcher also sends one `mbook` request per directory
+connection to learn listings published before it connected. It verifies the announcing nick's signature and each
 listing's seller signature, network, and expiry, then merges identical listings
 received from multiple directories. Listings expire locally and the in-memory
 cache is bounded to 256 advertisements. No wallet, keys, or payment service is
@@ -34,9 +35,6 @@ queries or change the cached CoinJoin fields.
 These advertisements do not prove available inventory, collateral, or the
 announcing nick's ownership of the seller key. A buyer must validate its quote
 and backing independently before payment. The watcher does not trade.
-
-Run the frontend regression suite from `tests/playwright` with
-`bun run test:obwatcher`. It uses local fixtures and does not contact a live market.
 
 ## Documentation
 
