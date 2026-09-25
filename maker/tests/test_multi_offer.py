@@ -638,6 +638,68 @@ class TestMakerBotMultiOfferFill:
         ]
         return bot
 
+    @pytest.mark.parametrize("ring", [False, True])
+    @pytest.mark.parametrize("overlap", [False, True])
+    async def test_duplicate_tx_across_routes_signs_only_once(
+        self, maker_bot, ring: bool, overlap: bool
+    ) -> None:
+        session = self._session("taker", "ab" * 32, state=CoinJoinState.IOAUTH_SENT)
+        session.inner.crypto.is_encrypted = True
+        session.inner.crypto.decrypt.return_value = "AA=="
+        session.inner.offer = maker_bot.current_offers[0]
+        session.inner.amount = 100_000
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def sign(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return (
+                ["signature"] if ring else (True, {"signatures": ["signature"], "txid": "cd" * 32})
+            )
+
+        signer = AsyncMock(side_effect=sign)
+        if ring:
+            session.ring_participant = MagicMock()
+            session.inner._sign_transaction = signer
+        else:
+            session.inner.handle_tx = signer
+        session.send_response = AsyncMock()
+        maker_bot._register_pending_signed_round = AsyncMock(return_value=True)
+        maker_bot._deferred_wallet_resync = AsyncMock()
+        maker_bot.active_sessions[_session_key("taker")] = session
+        tasks = []
+        with (
+            patch("maker.maker_session.get_txid", return_value="cd" * 32),
+            patch("maker.maker_session.update_awaiting_transaction_signed", return_value=True),
+            patch("maker.maker_session.get_notifier", return_value=AsyncMock()),
+        ):
+            try:
+                first = asyncio.create_task(
+                    maker_bot._handle_tx("taker", "tx ciphertext", source="direct:peer")
+                )
+                tasks.append(first)
+                await asyncio.wait_for(started.wait(), 2)
+                if not overlap:
+                    release.set()
+                    await asyncio.wait_for(first, 2)
+                second = asyncio.create_task(
+                    maker_bot._handle_tx("taker", "tx ciphertext", source="directory:server")
+                )
+                tasks.append(second)
+                await asyncio.sleep(0)
+                assert signer.await_count == 1
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 2)
+            finally:
+                release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        signer.assert_awaited_once()
+        session.send_response.assert_awaited_once_with(maker_bot, "sig", {"signature": "signature"})
+        maker_bot._register_pending_signed_round.assert_awaited_once()
+        assert session.state is CoinJoinState.COMPLETE
+
     @pytest.mark.asyncio
     async def test_fill_relative_offer(self, maker_bot, mock_backend):
         """Test !fill for relative fee offer (oid=0)."""
