@@ -772,13 +772,14 @@ class MultiDirectoryClient(DirectoryClientPool):
             timeout: Maximum time to wait in seconds
             expected_counts: For !sig, dict of nick -> expected signature count
         """
-        # Track if this command expects multiple messages per maker
-        accumulate_responses = expected_command == "!sig"
+        # Signature and ring-readiness phases intentionally return multiple
+        # authenticated messages from each peer.
+        accumulate_responses = expected_command == "!sig" or expected_counts is not None
 
         responses: dict[str, dict[str, Any]] = {}
         remaining_nicks = set(expected_nicks)
         deduplicator = ResponseDeduplicator()
-        # For !sig accumulation: track seen data per nick to drop cross-directory
+        # For multi-response phases: track seen data per nick to drop cross-directory
         # duplicates (the same signature relayed by multiple directory servers).
         seen_sig_data: dict[str, set[str]] = {}
         loop = asyncio.get_event_loop()
@@ -792,7 +793,7 @@ class MultiDirectoryClient(DirectoryClientPool):
             if remaining_nicks:
                 return False
             if accumulate_responses and expected_counts:
-                # For !sig, check if we have all expected signatures
+                # Check that every peer supplied its exact expected message count.
                 for nick, expected in expected_counts.items():
                     if nick not in responses:
                         return False

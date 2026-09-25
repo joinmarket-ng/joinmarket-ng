@@ -1221,6 +1221,7 @@ async def test_on_auth_releases_reservation_only_after_persistence(
     inner.pre_sign_timeout_sec = 180
     inner.state = CoinJoinState.PUBKEY_SENT
     inner.commitment = bytes.fromhex(commitment)
+    inner.input_lock_owner = f"maker:{taker_nick}:{commitment}"
     inner.crypto.is_encrypted = True
     inner.crypto.decrypt.return_value = f"{'bb' * 32}:0|02{'cc' * 32}|02{'dd' * 32}|11|22"
     outpoint = ("ce" * 32, 1)

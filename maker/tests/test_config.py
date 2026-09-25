@@ -1400,3 +1400,52 @@ class TestNewSettingsWiring:
         )
         # No explicit dual_offers -> single offer mode
         assert len(config.offer_configs) == 0
+
+
+def test_channel_ring_settings_round_trip_and_require_tr0_wallet(tmp_path: Path) -> None:
+    from jmcore.channel_ring import ChannelRingSettings
+    from jmcore.settings import JoinMarketSettings, MakerSettings, WalletSettings
+
+    from maker.cli import build_maker_config
+
+    ring = ChannelRingSettings(
+        enabled=True,
+        lnd_grpc_url="https://127.0.0.1:10009",
+        lnd_tls_cert_path=tmp_path / "tls.cert",
+        lnd_macaroon_path=tmp_path / "admin.macaroon",
+        onion_endpoint="a" * 56 + ".onion:9735",
+        max_active_sessions=6,
+        max_verified_sessions=3,
+    )
+    settings = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        maker=MakerSettings(offer_type="tr0absoffer", channel_ring=ring),
+    )
+    config = build_maker_config(settings, mnemonic=TEST_MNEMONIC, passphrase="")
+    assert config.channel_ring.enabled
+    assert config.channel_ring.max_active_sessions == 6
+    assert config.channel_ring.lnd_macaroon_path == tmp_path / "admin.macaroon"
+
+    incompatible = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2wpkh"),
+        maker=MakerSettings(offer_type="tr0absoffer", channel_ring=ring),
+    )
+    with pytest.raises(ValueError, match="p2tr wallet"):
+        build_maker_config(incompatible, mnemonic=TEST_MNEMONIC, passphrase="")
+
+    wrong_offer = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        maker=MakerSettings(offer_type="sw0absoffer", channel_ring=ring),
+    )
+    with pytest.raises(ValueError, match="tr0 maker offers"):
+        build_maker_config(wrong_offer, mnemonic=TEST_MNEMONIC, passphrase="")
+
+
+def test_disabled_channel_ring_round_trip_preserves_default_behavior() -> None:
+    from jmcore.settings import JoinMarketSettings
+
+    from maker.cli import build_maker_config
+
+    config = build_maker_config(JoinMarketSettings(), mnemonic=TEST_MNEMONIC, passphrase="")
+    assert config.channel_ring.enabled is False
+    assert config.channel_ring.lnd_grpc_url == ""

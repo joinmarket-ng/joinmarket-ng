@@ -140,6 +140,24 @@ change. An older binary cannot enforce ownership fields it does not understand,
 so mixed-version concurrent access is unsupported; advisory locking alone
 cannot make an old process apply new lease rules.
 
+Active channel-ring records retain the owner token for their wallet input leases.
+On startup and periodic reconciliation, makers and takers renew matching live
+leases before attempting to restore missing or expired leases from that durable
+record. After upgrade, existing owned records keep this restoration behavior;
+no wallet or ring format migration is required. A live lease belonging to another
+owner, a partially present set of leases, a corrupt record, or an older record
+without an owner token blocks ring recovery. Missing metadata alone never
+authorizes restoration, and recovery does not overwrite another owner's lease.
+
+Ring deployments must budget the maker's `session_timeout_sec` and
+`pre_sign_timeout_sec` for negotiation and cancellation. If the ordinary session
+expires first, its authenticated message route is removed while durable ring
+state can still require the inputs to remain locked.
+
+A durably retired cancellation also releases the session's in-flight PoDLE
+outpoint reservation, allowing a later round to authenticate with a fresh proof.
+Used-proof checks still apply.
+
 Active-wallet identity is resolved uniformly for all per-wallet read
 commands (see [Wallet](wallet.md)): explicit fingerprint, then `--mnemonic-file`,
 then the configured/default wallet's cached `.meta` fingerprint, then

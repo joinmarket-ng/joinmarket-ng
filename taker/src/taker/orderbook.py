@@ -21,7 +21,11 @@ from jmcore.bitcoin import (
 from jmcore.fee_quantization import QUANT_ABS, QUANT_REL, quantize_abs_up, quantize_rel_up
 from jmcore.models import Offer, OfferType, is_absolute_offer_type
 from jmcore.paths import get_ignored_makers_path
-from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, get_nick_version
+from jmcore.protocol import (
+    FEATURE_COFUNDED_CHANNEL_RING_V1,
+    FEATURE_NEUTRINO_COMPAT,
+    get_nick_version,
+)
 from jmcore.randomness import secure_random
 from loguru import logger
 
@@ -474,6 +478,11 @@ def _offer_confirms_features(offer: Offer, required_features: set[str]) -> bool:
         or (feature == FEATURE_NEUTRINO_COMPAT and offer.neutrino_compat)
         for feature in required_features
     )
+
+
+def offer_supports_cofunded_channel_ring_v1(offer: Offer) -> bool:
+    """Recognize backend-validated ring support without changing offer selection."""
+    return offer.features.get(FEATURE_COFUNDED_CHANNEL_RING_V1, False)
 
 
 def prefer_offers_with_confirmed_features(

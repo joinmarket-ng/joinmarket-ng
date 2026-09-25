@@ -113,20 +113,32 @@ class TestConfigTemplate:
         derived_env_names: set[str] = set()
         expected_env_names: set[str] = set()
 
-        for section in JoinMarketSettings.model_fields:
-            nested_settings = getattr(settings, section, None)
+        pending = [
+            (section, getattr(settings, section, None))
+            for section in JoinMarketSettings.model_fields
+        ]
+        while pending:
+            section, nested_settings = pending.pop()
             if not isinstance(nested_settings, BaseModel):
                 continue
-
+            child_models = {
+                name: value
+                for name in type(nested_settings).model_fields
+                if isinstance((value := getattr(nested_settings, name)), BaseModel)
+            }
             canonical_keys = template_keys.get(section)
             assert canonical_keys is not None, f"Missing [{section}] in config.toml.template"
-            expected_keys = set(type(nested_settings).model_fields) - excluded_fields.get(
-                section, set()
+            expected_keys = (
+                set(type(nested_settings).model_fields)
+                - set(child_models)
+                - excluded_fields.get(section, set())
             )
             assert canonical_keys == expected_keys
 
-            derived_env_names.update(f"{section}__{key}".upper() for key in canonical_keys)
-            expected_env_names.update(f"{section}__{key}".upper() for key in expected_keys)
+            env_section = section.replace(".", "__")
+            derived_env_names.update(f"{env_section}__{key}".upper() for key in canonical_keys)
+            expected_env_names.update(f"{env_section}__{key}".upper() for key in expected_keys)
+            pending.extend((f"{section}.{name}", value) for name, value in child_models.items())
 
         assert JoinMarketSettings.model_config["env_nested_delimiter"] == "__"
         assert derived_env_names == expected_env_names

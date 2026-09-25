@@ -17,13 +17,16 @@ from jmcore import transaction_policy
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
+    address_to_scriptpubkey,
     encode_varint,
     hash256,
     parse_transaction_bytes,
+    scriptpubkey_to_address,
     serialize_transaction,
 )
-from jmcore.constants import BITCOIN_DUST_THRESHOLD, DUST_THRESHOLD
+from jmcore.constants import BITCOIN_DUST_THRESHOLD, DUST_THRESHOLD, MAX_MONEY
 from jmcore.randomness import secure_random
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,108 @@ compute_tx_locktime = transaction_policy.compute_tx_locktime
 
 # Alias for backward compatibility
 varint = encode_varint
+
+
+class RingTransactionModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+class ChannelEndpointContribution(RingTransactionModel):
+    """One endpoint's private contribution to a shared funding output."""
+
+    participant_id: str = Field(min_length=1, max_length=128)
+    amount: int = Field(ge=1, le=MAX_MONEY)
+
+
+class FinalizedRingChannelOutput(RingTransactionModel):
+    """Exact negotiated shared output and both endpoint contributions."""
+
+    edge_id: str = Field(min_length=1, max_length=128)
+    script_pubkey: str = Field(min_length=2, max_length=10_000, pattern=r"^[0-9a-f]+$")
+    address: str = Field(min_length=1, max_length=320)
+    capacity: int = Field(ge=1, le=MAX_MONEY)
+    opener: ChannelEndpointContribution
+    fundee: ChannelEndpointContribution
+
+    @model_validator(mode="after")
+    def validate_contributions(self) -> FinalizedRingChannelOutput:
+        if len(self.script_pubkey) % 2:
+            raise ValueError("channel script_pubkey must have an even number of hex characters")
+        if len(self.script_pubkey) != 68 or not self.script_pubkey.startswith("5120"):
+            raise ValueError("channel script_pubkey must be P2TR")
+        if self.opener.participant_id == self.fundee.participant_id:
+            raise ValueError("channel endpoints must be distinct participants")
+        if self.opener.amount + self.fundee.amount != self.capacity:
+            raise ValueError("endpoint contributions must equal channel capacity")
+        return self
+
+
+class FinalizedRingTransactionPlan(RingTransactionModel):
+    """Final ring outputs and exact private residual accounting for one transaction."""
+
+    network: str = Field(pattern=r"^(mainnet|testnet|signet|regtest)$")
+    taker_id: str = "taker"
+    participant_ids: list[str] = Field(min_length=4, max_length=32)
+    residuals: dict[str, int] = Field(min_length=4, max_length=32)
+    channel_outputs: list[FinalizedRingChannelOutput] = Field(min_length=4, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> FinalizedRingTransactionPlan:
+        if len(set(self.participant_ids)) != len(self.participant_ids):
+            raise ValueError("ring transaction plan contains duplicate participants")
+        if self.participant_ids.count(self.taker_id) != 1:
+            raise ValueError("ring transaction plan must contain the taker exactly once")
+        if set(self.residuals) != set(self.participant_ids):
+            raise ValueError("ring residuals do not cover exactly all participants")
+        if any(
+            type(value) is not int or not 1 <= value <= MAX_MONEY
+            for value in self.residuals.values()
+        ):
+            raise ValueError("ring residual is outside Bitcoin money bounds")
+        if len(self.channel_outputs) != len(self.participant_ids):
+            raise ValueError("ring transaction plan requires one channel output per participant")
+        edge_ids = [output.edge_id for output in self.channel_outputs]
+        scripts = [output.script_pubkey for output in self.channel_outputs]
+        if len(set(edge_ids)) != len(edge_ids):
+            raise ValueError("ring transaction plan contains duplicate edge IDs")
+        if len(set(scripts)) != len(scripts):
+            raise ValueError("ring transaction plan contains duplicate channel scripts")
+
+        outgoing: dict[str, int] = {}
+        incoming: dict[str, int] = {}
+        for index, output in enumerate(self.channel_outputs):
+            try:
+                script = bytes.fromhex(output.script_pubkey)
+                decoded_script = address_to_scriptpubkey(output.address)
+                canonical_address = scriptpubkey_to_address(script, self.network)
+            except ValueError as exc:
+                raise ValueError(f"invalid channel output {output.edge_id}: {exc}") from exc
+            if decoded_script != script or output.address.lower() != canonical_address:
+                raise ValueError("channel address and script_pubkey do not match the plan network")
+            if output.opener.participant_id in outgoing:
+                raise ValueError("participant opens more than one ring channel")
+            if output.fundee.participant_id in incoming:
+                raise ValueError("participant accepts more than one ring channel")
+            if (
+                output.opener.participant_id != self.participant_ids[index]
+                or output.fundee.participant_id
+                != self.participant_ids[(index + 1) % len(self.participant_ids)]
+            ):
+                raise ValueError("ring channel outputs do not form the declared directed cycle")
+            outgoing[output.opener.participant_id] = output.opener.amount
+            incoming[output.fundee.participant_id] = output.fundee.amount
+
+        participants = set(self.participant_ids)
+        if set(outgoing) != participants or set(incoming) != participants:
+            raise ValueError("every participant must open one and accept one ring channel")
+        for participant_id, residual in self.residuals.items():
+            if outgoing[participant_id] + incoming[participant_id] != residual:
+                raise ValueError(
+                    f"channel contributions do not equal residual for {participant_id!r}"
+                )
+        if sum(output.capacity for output in self.channel_outputs) != sum(self.residuals.values()):
+            raise ValueError("channel output sum does not equal finalized residual sum")
+        return self
 
 
 @dataclass
@@ -55,6 +160,7 @@ class CoinJoinTxData:
     cj_amount: int
     total_maker_fee: int
     tx_fee: int
+    ring_plan: FinalizedRingTransactionPlan | None = None
 
 
 class CoinJoinTxBuilder:
@@ -97,20 +203,43 @@ class CoinJoinTxBuilder:
                 all_inputs.append((inp, nick))
 
         # Collect all outputs with owner info
-        all_outputs: list[tuple[TxOutput, str, str]] = []  # (output, owner, type)
+        all_outputs: list[tuple[TxOutput, str | None, str]] = []  # (output, owner, type)
 
         # CJ outputs (equal amounts)
         all_outputs.append((tx_data.taker_cj_output, "taker", "cj"))
         for nick, out in tx_data.maker_cj_outputs.items():
             all_outputs.append((out, nick, "cj"))
 
-        # Change outputs
-        if tx_data.taker_change_output:
-            all_outputs.append((tx_data.taker_change_output, "taker", "change"))
-        for nick, out in tx_data.maker_change_outputs.items():
-            all_outputs.append((out, nick, "change"))
+        if tx_data.ring_plan is None:
+            # Change outputs
+            if tx_data.taker_change_output:
+                all_outputs.append((tx_data.taker_change_output, "taker", "change"))
+            for nick, out in tx_data.maker_change_outputs.items():
+                all_outputs.append((out, nick, "change"))
+        else:
+            if tx_data.taker_change_output is not None or tx_data.maker_change_outputs:
+                raise ValueError("ring transactions cannot contain plain change outputs")
+            expected_participants = {"taker", *tx_data.maker_cj_outputs}
+            if set(tx_data.ring_plan.participant_ids) != expected_participants:
+                raise ValueError("ring transaction participants do not match CoinJoin participants")
+            equal_outputs = [tx_data.taker_cj_output, *tx_data.maker_cj_outputs.values()]
+            if any(
+                len(output.script) != 34 or output.script[:2] != b"\x51\x20"
+                for output in equal_outputs
+            ):
+                raise ValueError("ring transactions require tr0 P2TR equal outputs")
+            all_ring_scripts = [output.scriptpubkey for output in equal_outputs] + [
+                channel.script_pubkey for channel in tx_data.ring_plan.channel_outputs
+            ]
+            if len(set(all_ring_scripts)) != len(all_ring_scripts):
+                raise ValueError("ring transaction contains duplicate output scripts")
+            for channel in tx_data.ring_plan.channel_outputs:
+                all_outputs.append(
+                    (TxOutput.from_hex(channel.script_pubkey, channel.capacity), None, "channel")
+                )
 
-        # Shuffle for privacy
+        # Ring positions are public manifest commitments, and ordinary CoinJoin
+        # positions are privacy-sensitive, so both use OS-backed randomness.
         secure_random.shuffle(all_inputs)
         secure_random.shuffle(all_outputs)
 
@@ -121,6 +250,23 @@ class CoinJoinTxBuilder:
             "input_values": [inp.value for inp, _ in all_inputs],
             "fee": tx_data.tx_fee,
         }
+        if tx_data.ring_plan is not None:
+            channel_by_script = {
+                channel.script_pubkey: channel for channel in tx_data.ring_plan.channel_outputs
+            }
+            metadata["channel_edges"] = [
+                channel_by_script[output.scriptpubkey].edge_id if out_type == "channel" else None
+                for output, _, out_type in all_outputs
+            ]
+            metadata["channel_endpoints"] = [
+                (
+                    channel_by_script[output.scriptpubkey].opener.model_dump(),
+                    channel_by_script[output.scriptpubkey].fundee.model_dump(),
+                )
+                if out_type == "channel"
+                else None
+                for output, _, out_type in all_outputs
+            ]
 
         # Serialize transaction
         tx_bytes = self._serialize_tx(
@@ -287,6 +433,7 @@ def build_coinjoin_tx(
     network: str = "mainnet",
     dust_threshold: int = DUST_THRESHOLD,
     locktime: int = 0,
+    ring_plan: FinalizedRingTransactionPlan | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """
     Build a complete CoinJoin transaction.
@@ -304,6 +451,9 @@ def build_coinjoin_tx(
             coordination requires this to remain 27300.
         locktime: Current-height anti-fee-sniping locktime. Nonzero values use
             non-final, non-RBF input sequences.
+        ring_plan: Finalized co-funded channel ring plan. When set, every
+            participant residual is spent into a shared channel output instead
+            of a plain change output.
 
     Returns:
         (tx_bytes, metadata)
@@ -335,11 +485,14 @@ def build_coinjoin_tx(
     # Taker CJ output
     taker_cj_output = TxOutput.from_address(taker_cj_address, cj_amount)
 
+    if ring_plan is not None and ring_plan.network != network:
+        raise ValueError("ring transaction plan network does not match transaction network")
+
     # Taker change output (if any)
     taker_change_output = None
-    if taker_change > BITCOIN_DUST_THRESHOLD and taker_change_address:
+    if ring_plan is None and taker_change > BITCOIN_DUST_THRESHOLD and taker_change_address:
         taker_change_output = TxOutput.from_address(taker_change_address, taker_change)
-    elif taker_change > 0:
+    elif ring_plan is None and taker_change > 0:
         logger.warning(
             f"Taker change {taker_change} sats "
             + (
@@ -354,6 +507,7 @@ def build_coinjoin_tx(
     maker_inputs: dict[str, list[TxInput]] = {}
     maker_cj_outputs: dict[str, TxOutput] = {}
     maker_change_outputs: dict[str, TxOutput] = {}
+    finalized_residuals = {"taker": taker_change}
 
     for nick, data in maker_data.items():
         # Maker inputs
@@ -376,6 +530,7 @@ def build_coinjoin_tx(
         maker_total_input = sum(u["value"] for u in data["utxos"])
         maker_txfee = data.get("txfee", 0)
         maker_change = maker_total_input - cj_amount - maker_txfee + data["cjfee"]
+        finalized_residuals[nick] = maker_change
 
         logger.debug(
             f"Maker {nick} change calculation: "
@@ -392,14 +547,21 @@ def build_coinjoin_tx(
                 f"required={cj_amount + maker_txfee - data['cjfee']} sats, "
                 f"change={maker_change} sats. Maker's UTXOs may have been spent."
             )
-        elif maker_change >= DUST_THRESHOLD:
+        elif ring_plan is None and maker_change >= DUST_THRESHOLD:
             maker_change_outputs[nick] = TxOutput.from_address(data["change_addr"], maker_change)
-        else:
+        elif ring_plan is None:
             logger.warning(
                 f"Maker {nick} change {maker_change} sats is below dust threshold "
                 f"({DUST_THRESHOLD}), "
                 "no change output will be created"
             )
+
+    if ring_plan is not None:
+        expected_participants = {"taker", *maker_data}
+        if set(ring_plan.participant_ids) != expected_participants:
+            raise ValueError("ring transaction participants do not match taker and makers")
+        if ring_plan.residuals != finalized_residuals:
+            raise ValueError("ring transaction contributions do not match finalized residuals")
 
     tx_data = CoinJoinTxData(
         taker_inputs=taker_inputs,
@@ -411,6 +573,7 @@ def build_coinjoin_tx(
         cj_amount=cj_amount,
         total_maker_fee=total_maker_fee,
         tx_fee=tx_fee,
+        ring_plan=ring_plan,
     )
 
     return builder.build_unsigned_tx(tx_data)

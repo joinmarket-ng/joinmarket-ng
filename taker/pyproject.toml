@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "jmcore",
     "jmwallet",
+    "jmswap",
     "httpx>=0.25.0",
     "loguru>=0.7.0",
     "pydantic>=2.0.0",

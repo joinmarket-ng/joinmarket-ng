@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from jmwallet.wallet.service import WalletService
 
     from taker.buyout import ChannelBuyout
+    from taker.channel_ring import TakerRingCoordinator
     from taker.config import TakerConfig
     from taker.multi_directory import MultiDirectoryClient
     from taker.taker import Taker
@@ -202,6 +203,10 @@ class CoinJoinSession:
         self._fee_rate: float | None = None
         self._randomized_fee_rate: float | None = None
         self._minimum_fee_rate_sat_vb: float | None = None
+        # Co-funded channel ring state for this round. ``strict_maker_count``
+        # pins the exact counterparty count a ring requires.
+        self.ring_coordinator: TakerRingCoordinator | None = None
+        self.strict_maker_count: int | None = None
 
     def attach(self, taker: Taker) -> None:
         """Wire the owning ``Taker`` so the session can read persistent deps.
@@ -272,6 +277,13 @@ class CoinJoinSession:
         self._fee_rate = None
         self._randomized_fee_rate = None
         self._minimum_fee_rate_sat_vb = None
+        self.ring_coordinator = None
+        self.strict_maker_count = None
+
+    @property
+    def required_maker_count(self) -> int:
+        """Rings need every invited participant, ordinary rounds need the minimum."""
+        return self.strict_maker_count or self.config.minimum_makers
 
     def input_lock_ttl_sec(self) -> float:
         """Cover the remaining protocol plus the pending-broadcast window."""
@@ -522,7 +534,7 @@ class CoinJoinSession:
         # in _phase_auth will catch them later.
         if self.backend.requires_neutrino_metadata():
             incompatible = self._drop_neutrino_incompatible_sessions(pending_nicks)
-            if incompatible and len(self.maker_sessions) < self.config.minimum_makers:
+            if incompatible and len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
                     f"After filtering {len(incompatible)} neutrino-incompatible maker(s), "
                     f"only {len(self.maker_sessions)} remain (need "
@@ -663,7 +675,7 @@ class CoinJoinSession:
                     failed_makers.append(nick)
                     del self.maker_sessions[nick]
 
-        if len(self.maker_sessions) < self.config.minimum_makers:
+        if len(self.maker_sessions) < self.required_maker_count:
             logger.error(f"Not enough makers responded: {len(self.maker_sessions)}")
             return PhaseResult(
                 success=False,
@@ -737,7 +749,7 @@ class CoinJoinSession:
 
             # Report incompatible makers as failed so the replacement loop can
             # ignore them and pick substitutes before any PoDLE proof is revealed.
-            if len(self.maker_sessions) < self.config.minimum_makers:
+            if len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
                     f"Not enough compatible makers: {len(self.maker_sessions)} "
                     f"< {self.config.minimum_makers}. Neutrino takers require makers that "
@@ -1017,7 +1029,7 @@ class CoinJoinSession:
                 failed_makers.append(nick)
                 del self.maker_sessions[nick]
 
-        if len(self.maker_sessions) < self.config.minimum_makers:
+        if len(self.maker_sessions) < self.required_maker_count:
             logger.error(f"Not enough makers sent UTXOs: {len(self.maker_sessions)}")
             return PhaseResult(
                 success=False,
@@ -2307,7 +2319,11 @@ class CoinJoinSession:
         builder = CoinJoinTxBuilder(self.config.network.value)
 
         # Add taker's signatures
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.mark_local_signature_creation()
         taker_sigs = await self._sign_our_inputs()
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.mark_local_signatures(taker_sigs)
         signatures["taker"] = taker_sigs
 
         self.final_tx = builder.add_signatures(
@@ -2315,6 +2331,8 @@ class CoinJoinSession:
             signatures,
             self.tx_metadata,
         )
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.persist_final_transaction(self.final_tx.hex())
 
         logger.bind(sensitive=True).info("Signed tx: {} bytes", len(self.final_tx))
         return True
@@ -2618,6 +2636,14 @@ class CoinJoinSession:
 
         # Build list of broadcast candidates based on policy
         maker_nicks = list(self.maker_sessions.keys())
+
+        if self.ring_coordinator is not None:
+            delivered = await self._broadcast_to_all_makers(maker_nicks, tx_b64)
+            if delivered != len(maker_nicks):
+                logger.warning(
+                    f"Final ring transaction reached {delivered}/{len(maker_nicks)} makers; "
+                    "durable reconciliation remains active"
+                )
 
         if policy == BroadcastPolicy.SELF:
             # Always broadcast via own node

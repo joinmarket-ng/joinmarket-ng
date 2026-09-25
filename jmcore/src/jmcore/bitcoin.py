@@ -513,6 +513,18 @@ def bech32m_decode(hrp: str, addr: str) -> tuple[int | None, list[int] | None]:
     return data[0], data[1:-6]
 
 
+@validate_call
+def pubkey_to_p2tr_address(
+    output_xonly_pubkey: bytes | str, network: str | NetworkType = "mainnet"
+) -> str:
+    """Encode a 32-byte tweaked Taproot output key as a BIP350 address."""
+    if isinstance(output_xonly_pubkey, str):
+        output_xonly_pubkey = bytes.fromhex(output_xonly_pubkey)
+    if len(output_xonly_pubkey) != 32:
+        raise ValueError(f"output_xonly_pubkey must be 32 bytes, got {len(output_xonly_pubkey)}")
+    return bech32m_encode(get_hrp(network), 1, output_xonly_pubkey)
+
+
 def create_p2tr_scriptpubkey(output_xonly_pubkey: bytes) -> bytes:
     """
     Create a witness-v1 (P2TR) scriptPubKey from a 32-byte x-only output key.

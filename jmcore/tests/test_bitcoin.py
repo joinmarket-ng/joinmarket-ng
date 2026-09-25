@@ -35,6 +35,7 @@ from jmcore.bitcoin import (
     parse_derivation_path,
     parse_transaction,
     psbt_to_base64,
+    pubkey_to_p2tr_address,
     pubkey_to_p2wpkh_address,
     pubkey_to_p2wpkh_script,
     sats_to_btc,
@@ -1021,6 +1022,22 @@ class TestPubkeyToP2wpkhAddress:
         pubkey = b"\x02" + b"\xbb" * 32
         addr = pubkey_to_p2wpkh_address(pubkey, "mainnet")
         assert addr.startswith("bc1q")
+
+
+class TestPubkeyToP2trAddress:
+    def test_output_key_roundtrip(self) -> None:
+        output_key = bytes.fromhex(
+            "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cd9e71a4bceaa7c10c05df779a"
+        )
+
+        address = pubkey_to_p2tr_address(output_key, "regtest")
+
+        assert address.startswith("bcrt1p")
+        assert address_to_scriptpubkey(address) == b"\x51\x20" + output_key
+
+    def test_rejects_non_xonly_key(self) -> None:
+        with pytest.raises(ValueError, match="(must be 32 bytes|x-only pubkey length)"):
+            pubkey_to_p2tr_address(b"\x02" + b"\x00" * 32)
 
 
 class TestAddressToScriptpubkey:

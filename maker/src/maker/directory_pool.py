@@ -53,11 +53,13 @@ class MakerDirectoryPool(DirectoryClientPool):
         neutrino_compat: bool,
         onion_host: str | None = None,
         onion_serving_port: int | None = None,
+        cofunded_channel_ring_v1: bool = False,
     ):
         self._config = config
         self._neutrino_compat = neutrino_compat
         self._onion_host = onion_host
         self._onion_serving_port = onion_serving_port
+        self._cofunded_channel_ring_v1 = cofunded_channel_ring_v1
         self._dir_creds: tuple[str | None, str | None]
         super().__init__(
             directory_servers=list(config.directory_servers),
@@ -87,6 +89,7 @@ class MakerDirectoryPool(DirectoryClientPool):
         kwargs["location"] = location
         kwargs["neutrino_compat"] = self._neutrino_compat
         kwargs["allow_clearnet_connections"] = self._config.allow_clearnet_connections
+        kwargs["cofunded_channel_ring_v1"] = self._cofunded_channel_ring_v1
         return kwargs
 
     def refresh_neutrino_compat(self, neutrino_compat: bool) -> None:
@@ -98,3 +101,7 @@ class MakerDirectoryPool(DirectoryClientPool):
         :meth:`reconnect_disconnected` call.
         """
         self._neutrino_compat = neutrino_compat
+
+    def enable_cofunded_channel_ring_v1(self) -> None:
+        """Advertise the feature on future connections after backend validation."""
+        self._cofunded_channel_ring_v1 = True

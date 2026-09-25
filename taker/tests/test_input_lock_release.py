@@ -12,11 +12,21 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, Mock
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from _taker_test_helpers import make_taker_config, make_utxo
+from jmcore.channel_ring_store import (
+    Outpoint,
+    RingParticipantRecord,
+    RingParticipantRole,
+    RingParticipantStore,
+)
 from jmcore.models import Offer, OfferType
+from jmwallet.wallet.service import WalletService
+from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
 
 from taker.taker import Taker, TakerState
 
@@ -206,3 +216,164 @@ async def test_new_round_does_not_release_prior_post_sign_lease() -> None:
     wallet.release_coinjoin_inputs.assert_not_called()
     wallet.renew_coinjoin_inputs.assert_not_called()
     assert taker._session.reserved_inputs == set()
+
+
+def test_active_ring_lock_is_retained_when_round_cleanup_runs() -> None:
+    wallet = _make_wallet([])
+    taker = Taker(wallet, _backend(), make_taker_config())
+    reserved = {("c" * 64, 2)}
+    taker._session.reserved_inputs = set(reserved)
+    taker._session.ring_coordinator = SimpleNamespace(_record=lambda: SimpleNamespace(active=True))
+
+    taker.release_input_locks()
+
+    wallet.release_coinjoin_inputs.assert_not_called()
+    assert taker._session.reserved_inputs == reserved
+
+
+def test_new_round_detaches_active_ring_lock_and_rotates_owner() -> None:
+    wallet = _make_wallet([])
+    taker = Taker(wallet, _backend(), make_taker_config())
+    previous_owner = taker._session.input_lock_owner
+    taker._session.reserved_inputs = {("d" * 64, 3)}
+    taker._session.ring_coordinator = SimpleNamespace(_record=lambda: SimpleNamespace(active=True))
+
+    taker._begin_input_lock_round()
+
+    wallet.release_coinjoin_inputs.assert_not_called()
+    assert taker._session.reserved_inputs == set()
+    assert taker._session.input_lock_owner != previous_owner
+    assert taker._session.ring_coordinator is None
+
+
+@pytest.mark.parametrize("lease_exists", [True, False])
+def test_restart_renews_active_ring_lock_with_persisted_owner(lease_exists: bool) -> None:
+    wallet = _make_wallet([])
+    wallet.renew_coinjoin_inputs.return_value = lease_exists
+    taker = Taker(wallet, _backend(), make_taker_config())
+    outpoint = SimpleNamespace(txid="e" * 64, vout=4)
+    taker._channel_ring_store = SimpleNamespace(
+        load_all=lambda: SimpleNamespace(
+            records=(
+                SimpleNamespace(
+                    active=True,
+                    local_input_outpoints=(outpoint,),
+                    input_lock_owner="taker:persisted-owner",
+                ),
+            ),
+            corruptions=(),
+        )
+    )
+
+    assert taker._renew_channel_ring_input_locks()
+    wallet.renew_coinjoin_inputs.assert_called_once_with(
+        {(outpoint.txid, outpoint.vout)},
+        ttl=taker._session.input_lock_ttl_sec(),
+        owner="taker:persisted-owner",
+    )
+    if lease_exists:
+        wallet.reserve_coinjoin_inputs.assert_not_called()
+    else:
+        wallet.reserve_coinjoin_inputs.assert_called_once_with(
+            {(outpoint.txid, outpoint.vout)},
+            ttl=taker._session.input_lock_ttl_sec(),
+            owner="taker:persisted-owner",
+        )
+
+
+@pytest.mark.parametrize(
+    ("lease_state", "expected"),
+    [
+        ("owned", True),
+        ("missing", True),
+        ("expired", True),
+        ("foreign", False),
+        ("ownerless", False),
+        ("frozen", False),
+        ("no_metadata", False),
+        ("partial", False),
+    ],
+)
+def test_ring_reconciliation_preserves_wallet_lock_ownership(
+    tmp_path: Path, lease_state: str, expected: bool
+) -> None:
+    outpoint = Outpoint(txid="12" * 32, vout=0)
+    outpoints = (
+        (outpoint, Outpoint(txid="56" * 32, vout=1)) if lease_state == "partial" else (outpoint,)
+    )
+    owner = "taker:durable-owner"
+    ring_store = RingParticipantStore(
+        tmp_path / "rings", max_active_sessions=4, max_verified_sessions=2
+    )
+    ring_store.save(
+        RingParticipantRecord.fresh(
+            round_nonce="34" * 32,
+            revision=0,
+            taker_session_identity="taker:round",
+            local_role=RingParticipantRole.TAKER,
+            local_position=0,
+            local_input_outpoints=outpoints,
+            input_lock_owner=None if lease_state == "ownerless" else owner,
+        )
+    )
+    metadata = UTXOMetadataStore(path=tmp_path / "metadata.jsonl")
+    wallet = WalletService.__new__(WalletService)
+    wallet.metadata_store = metadata if lease_state != "no_metadata" else None
+    points = {(outpoint.txid, outpoint.vout)}
+    if lease_state in {"owned", "foreign", "expired", "partial"}:
+        lock_owner = "taker:another-round" if lease_state == "foreign" else owner
+        # An old clock creates an expired lease without sleeping or rewriting metadata.
+        with patch(
+            "jmwallet.wallet.utxo_metadata.time.time",
+            return_value=1.0 if lease_state == "expired" else time.time(),
+        ):
+            assert wallet.reserve_coinjoin_inputs(points, ttl=60, owner=lock_owner)
+    if lease_state == "frozen":
+        metadata.freeze(str(outpoint))
+    before = metadata.path.read_bytes() if metadata.path.exists() else None
+    taker = Taker.__new__(Taker)
+    taker.wallet = wallet
+    taker._channel_ring_store = ring_store
+    taker._session = SimpleNamespace(input_lock_ttl_sec=lambda: 600)  # type: ignore[assignment]
+
+    assert taker._renew_channel_ring_input_locks() is expected
+
+    if expected:
+        metadata.load()
+        lease = metadata.records[str(outpoint)]
+        assert lease.lock_owner == owner
+        assert lease.lock_until is not None and lease.lock_until > time.time() + 500
+        assert not wallet.reserve_coinjoin_inputs(points, owner="taker:another-round")
+    else:
+        after = metadata.path.read_bytes() if metadata.path.exists() else None
+        assert after == before
+
+
+@pytest.mark.asyncio
+async def test_fee_growth_reserves_extra_inputs_with_round_owner() -> None:
+    initial = make_utxo(txid_char="f", value=1_000)
+    extra = make_utxo(txid_char="0", value=1_000, vout=1)
+    wallet = _make_wallet([initial, extra])
+    wallet.select_utxos = Mock(return_value=[initial, extra])
+    wallet.get_change_address = Mock(return_value="bcrt1qchange")
+    wallet.get_next_address_index = Mock(return_value=0)
+    backend = _backend()
+    # HEAD builds an anti-fee-sniping locktime, so a real height is required.
+    backend.get_block_height = AsyncMock(return_value=500)
+    taker = Taker(wallet, backend, make_taker_config())
+    session = taker._session
+    session.cj_amount = 1_500
+    session.preselected_utxos = [initial]
+    session.reserved_inputs = {(initial.txid, initial.vout)}
+    session._fee_rate = 1.0
+    session._randomized_fee_rate = 1.0
+    session._estimate_tx_fee = Mock(return_value=100)  # type: ignore[method-assign]
+
+    with patch("taker.coinjoin_session.build_coinjoin_tx", return_value=(b"\x00", {})):
+        assert await session._phase_build_tx("bcrt1qdestination", 0)
+
+    wallet.reserve_coinjoin_inputs.assert_called_once_with(
+        {(extra.txid, extra.vout)},
+        ttl=session.input_lock_ttl_sec(),
+        owner=session.input_lock_owner,
+    )

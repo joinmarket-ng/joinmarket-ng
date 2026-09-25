@@ -541,7 +541,7 @@ class TestHiddenServiceListener:
             # At this point, the connection should be tracked
             connection_was_tracked = taker_nick in bot.direct_connections
             assert taker_nick == taker_identity.nick
-            assert "fill" in msg
+            assert msg == f"fill {signed_fill}"
             assert source == "direct"  # Should be called with source="direct"
             assert generation_id == 0
 
@@ -919,6 +919,71 @@ class TestHiddenServiceListener:
             await bot._handle_message(fill_message("cd" * 32), source="dir:second")
 
         assert handler.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_on_direct_connection_ring_command(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        """Authenticated direct ring envelopes reach the ring dispatcher."""
+        bot = MakerBot(
+            wallet=mock_wallet,
+            backend=mock_backend,
+            config=config_with_onion,
+        )
+        bot.running = True
+        received: list[tuple[str, str, str, int | None]] = []
+
+        async def mock_handle_ring(
+            taker_nick: str,
+            msg: str,
+            source: str = "unknown",
+            generation_id: int | None = None,
+        ) -> None:
+            received.append((taker_nick, msg, source, generation_id))
+
+        bot._handle_ring = mock_handle_ring
+        taker_identity = NickIdentity(JM_VERSION)
+        handshake = create_handshake_request(
+            nick=taker_identity.nick,
+            location="NOT-SERVING-ONION",
+            network=NetworkType.REGTEST.value,
+            directory=False,
+        )
+        handshake_msg = json.dumps(
+            {"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)}
+        ).encode()
+        ciphertext = "ciphertext"
+        signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
+        ring_msg = json.dumps(
+            {
+                "type": MessageType.PRIVMSG.value,
+                "line": f"{taker_identity.nick}!{bot.nick}!ring {signed}",
+            }
+        ).encode()
+        received_messages = iter((handshake_msg, ring_msg))
+
+        async def mock_receive() -> bytes:
+            return next(received_messages)
+
+        async def mock_close() -> None:
+            pass
+
+        mock_conn = MagicMock(spec=TCPConnection)
+        mock_conn.is_connected.side_effect = [True, True, False]
+        mock_conn.receive = mock_receive
+        mock_conn.send = AsyncMock(return_value=True)
+        mock_conn.close = mock_close
+
+        await bot._on_direct_connection(mock_conn, "127.0.0.1:12345")
+
+        assert received == [
+            (
+                taker_identity.nick,
+                f"ring {signed}",
+                "direct",
+                0,
+            )
+        ]
 
     @pytest.mark.asyncio
     async def test_on_direct_connection_clean_eof_not_logged_as_error(

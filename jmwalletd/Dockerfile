@@ -68,6 +68,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 # while keeping the image layer small (the cache lives on the host, not in the image).
 COPY jmcore/requirements.txt /build/requirements-jmcore.txt
 COPY jmwallet/requirements.txt /build/requirements-jmwallet.txt
+COPY jmswap/requirements.txt /build/requirements-jmswap.txt
 COPY maker/requirements.txt /build/requirements-maker.txt
 COPY taker/requirements.txt /build/requirements-taker.txt
 COPY orderbook_watcher/requirements.txt /build/requirements-obwatcher.txt
@@ -78,6 +79,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
     pip install \
         -r /build/requirements-jmcore.txt \
         -r /build/requirements-jmwallet.txt \
+        -r /build/requirements-jmswap.txt \
         -r /build/requirements-maker.txt \
         -r /build/requirements-taker.txt \
         -r /build/requirements-obwatcher.txt \
@@ -89,6 +91,8 @@ COPY jmcore/pyproject.toml /build/jmcore/
 COPY jmcore/setup.py /build/jmcore/
 COPY jmwallet/src /build/jmwallet/src
 COPY jmwallet/pyproject.toml /build/jmwallet/
+COPY jmswap/src /build/jmswap/src
+COPY jmswap/pyproject.toml /build/jmswap/
 COPY maker/src /build/maker/src
 COPY maker/pyproject.toml /build/maker/
 COPY taker/src /build/taker/src
@@ -107,7 +111,7 @@ COPY completions/*.bash completions/jm-completions-loader.sh /build/completions/
 
 # Normalize file timestamps so local working-copy mtimes don't differ from CI clone
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
-        find /build/jmcore /build/jmwallet /build/maker /build/taker \
+        find /build/jmcore /build/jmwallet /build/jmswap /build/maker /build/taker \
              /build/orderbook_watcher /build/jmwalletd /build/tumbler \
              /build/completions \
              -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
@@ -117,6 +121,7 @@ RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_E
     pip install --no-cache-dir --no-deps --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/jmwallet \
+        /build/jmswap \
         /build/maker \
         /build/taker \
         /build/orderbook_watcher \
