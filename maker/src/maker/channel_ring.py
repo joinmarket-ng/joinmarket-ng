@@ -89,6 +89,7 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from jmswap.channel_ring_nodes import BoundChannelRingNode, ChannelRingNodePool
+    from jmswap.lnd import LndBackend
     from jmwallet.backends.base import BlockchainBackend
 
     from maker.maker_session import MakerSession
@@ -209,7 +210,17 @@ class MakerRingParticipant:
         retained locks expire on their own TTL.
         """
         try:
-            return self._record().active
+            record = self._record()
+            if record.active:
+                return True
+            # A duplicate cancellation must not release an input now retained by
+            # a newer revision, even when that revision shares the session owner.
+            report = self.store.load_all()
+            return bool(report.corruptions) or any(
+                item.active
+                and set(record.local_input_outpoints).intersection(item.local_input_outpoints)
+                for item in report.records
+            )
         except Exception:
             return True
 
@@ -963,7 +974,7 @@ class MakerRingParticipant:
 
     def prepare_coinjoin_signing(self, tx_hex: str) -> None:
         record = self._record()
-        if record.state is not RingLifecycleState.SIGNING:
+        if record.state is not RingLifecycleState.SIGNING or record.unsigned_retirement_pending:
             raise MakerRingError("ring CoinJoin signature was not authorized")
         if record.unsigned_tx != tx_hex or record.manifest is None:
             raise MakerRingError("!tx differs from the exact verified ring transaction")
@@ -1009,70 +1020,16 @@ class MakerRingParticipant:
             updates={"final_tx": tx_hex},
         )
 
-    async def _prove_absent(self, record: RingParticipantRecord) -> RingChainStatus:
-        if record.manifest is None:
-            raise MakerRingError("verified ring record has no manifest")
-        if not self.chain_backend.has_mempool_access() or not (
-            self.chain_backend.can_get_confirmations_by_txid()
-        ):
-            raise MakerRingError("backend cannot prove exact transaction absence")
-        transaction = await self.chain_backend.get_transaction(record.manifest.unsigned_txid)
-        if transaction is not None:
-            raise MakerRingError("ring transaction is present in mempool or chain")
-        for outpoint in record.local_input_outpoints:
-            if await self.chain_backend.get_utxo(outpoint.txid, outpoint.vout) is None:
-                raise MakerRingError(
-                    "backend cannot prove transaction absence because a local input is spent"
-                )
-        return RingChainStatus(
-            exact_txid=record.manifest.unsigned_txid,
-            mempool=StoreTransactionPresence.ABSENT,
-            chain=StoreTransactionPresence.ABSENT,
-            checked_at=time.time(),
-        )
-
-    async def _retire_verified(self, record: RingParticipantRecord) -> None:
-        if record.manifest is None or record.unsigned_psbt is None:
-            raise MakerRingError("verified retirement lacks exact funding data")
-        manifest = record.manifest
-        unsigned_psbt = record.unsigned_psbt
-        status = await self._prove_absent(record)
-        record = self.store.transition(
-            record.key,
-            RingLifecycleState.RETIRING,
-            updates={"chain_status": status},
-        )
-        for edge in manifest.edges:
-            if edge.pending_channel_id not in record.pending_channel_ids:
-                continue
-            verified = VerifiedFunding(
-                pending_channel_id=bytes.fromhex(edge.pending_channel_id),
-                funding_txid=manifest.unsigned_txid,
-                funding_vout=edge.output_index,
-                unsigned_psbt=bytes.fromhex(unsigned_psbt),
-            )
-            authorization = VerifiedChannelRetirementAuthorization(
-                verified_funding=verified,
-                channel_point=verified.channel_point,
-                unsigned_txid=verified.funding_txid,
-                chain_status=FundingTransactionChainStatus(
-                    unsigned_txid=verified.funding_txid,
-                    mempool=LndTransactionPresence.ABSENT,
-                    chain=LndTransactionPresence.ABSENT,
-                ),
-                local_coinjoin_input_signature_created=False,
-                local_coinjoin_input_signature_sent=False,
-                funding_transaction_broadcast=False,
-                final_transaction_observed=False,
-            )
-            await self.lnd.retire_verified_external_channel(authorization)
-        self.store.transition(record.key, RingLifecycleState.RETIRED)
-
     async def _cancel(
         self, payload: RingCancelPayload, record: RingParticipantRecord
     ) -> list[RingPayloadType]:
-        if record.state is RingLifecycleState.SIGNING or record.local_input_signature_created:
-            raise MakerRingError("ring cancellation is forbidden after signing authorization")
+        if (
+            record.local_input_signature_created
+            or record.local_input_signature_sent
+            or record.local_signatures
+            or record.final_tx is not None
+        ):
+            raise MakerRingError("ring cancellation is forbidden after signing has begun")
         if payload.canceled_pending_ids and not set(record.pending_channel_ids).issubset(
             payload.canceled_pending_ids
         ):
@@ -1095,12 +1052,19 @@ class MakerRingParticipant:
                     )
                     canceled.append(pending_id)
                 record = self.store.transition(record.key, RingLifecycleState.RETIRED)
-            elif action is RingRetirementAction.ABANDON_VERIFIED or record.state in {
-                RingLifecycleState.PSBT_VERIFIED,
-                RingLifecycleState.READY,
-            }:
-                await self._retire_verified(record)
-                record = self._record()
+            elif (
+                record.unsigned_retirement_pending
+                or action is RingRetirementAction.ABANDON_VERIFIED
+                or record.state
+                in {
+                    RingLifecycleState.PSBT_VERIFIED,
+                    RingLifecycleState.READY,
+                    RingLifecycleState.SIGNING,
+                }
+            ):
+                record = await _retire_unsigned_record(
+                    self.store, self.lnd, self.chain_backend, record
+                )
                 canceled.extend(record.pending_channel_ids)
             else:
                 raise MakerRingError("ring revision cannot be safely canceled")
@@ -1132,6 +1096,116 @@ class MakerRingParticipant:
         updates = self._cache_updates(retired, payload, [response])
         self.store.transition(retired.key, RingLifecycleState.RETIRED, updates=updates)
         return [response]
+
+
+def _incoming_expectation(plan: RingPlanPayload) -> InboundChannelExpectation:
+    return InboundChannelExpectation(
+        scid_alias=True,
+        pending_channel_id=bytes.fromhex(plan.incoming_edge.pending_channel_id),
+        opener_node_id=plan.predecessor.node_id,
+        chain_hash=_chain_hash(plan.network),
+        capacity_sat=plan.incoming_edge.capacity,
+        push_msat=plan.incoming_edge.push_amount * 1000,
+        opener_reserve_sat=plan.incoming_edge.policy.opener_reserve,
+        fundee_reserve_sat=plan.incoming_edge.policy.fundee_reserve,
+        opener_csv_delay=plan.incoming_edge.policy.opener_csv_delay,
+        fundee_csv_delay=plan.incoming_edge.policy.fundee_csv_delay,
+        min_depth=plan.incoming_edge.policy.min_depth,
+    )
+
+
+def _resume_verified_channels(record: RingParticipantRecord, lnd: LndBackend) -> None:
+    """Restore locally observed funding points, including before retirement retries."""
+    if record.plan is None:
+        raise MakerRingError("verified ring record has no plan")
+    outgoing = _retained_verified_funding(record, record.outgoing_edge)
+    lnd.resume_inbound_channel(
+        _incoming_expectation(record.plan),
+        observed_channel_point=_retained_observed_point(
+            record.incoming_pending_state,
+            _retained_verified_funding(record, record.incoming_edge),
+            EndpointRole.FUNDEE,
+        ),
+    )
+    lnd.resume_external_channel(
+        _funding_negotiation(record),
+        verified=outgoing,
+        observed_channel_point=_retained_observed_point(
+            record.outgoing_pending_state, outgoing, EndpointRole.OPENER
+        ),
+    )
+
+
+async def _retire_unsigned_record(
+    store: RingParticipantStore,
+    lnd: LndBackend,
+    chain_backend: BlockchainBackend,
+    record: RingParticipantRecord,
+) -> RingParticipantRecord:
+    """Persist unsigned retirement intent and finish it idempotently after restart.
+
+    The store reloads and validates the signing evidence before claiming intent.
+    Intent forbids subsequent signing, even while chain/LND checks yield control.
+    It survives failures and remains set until the bot releases the wallet leases.
+    """
+    record = store.transition(
+        record.key, record.state, updates={"unsigned_retirement_pending": True}
+    )
+    if record.state is RingLifecycleState.RETIRED:
+        return record
+    assert record.manifest is not None and record.unsigned_psbt is not None
+    manifest = record.manifest
+    unsigned_psbt = record.unsigned_psbt
+    if not chain_backend.has_mempool_access() or not (
+        chain_backend.can_get_confirmations_by_txid()
+    ):
+        raise MakerRingError("backend cannot prove exact transaction absence")
+    if await chain_backend.get_transaction(manifest.unsigned_txid) is not None:
+        raise MakerRingError("ring transaction is present in mempool or chain")
+    for outpoint in record.local_input_outpoints:
+        if await chain_backend.get_utxo(outpoint.txid, outpoint.vout) is None:
+            raise MakerRingError(
+                "backend cannot prove transaction absence because a local input is spent"
+            )
+    record = store.transition(
+        record.key,
+        RingLifecycleState.RETIRING,
+        updates={
+            "chain_status": RingChainStatus(
+                exact_txid=manifest.unsigned_txid,
+                mempool=StoreTransactionPresence.ABSENT,
+                chain=StoreTransactionPresence.ABSENT,
+                checked_at=time.time(),
+            )
+        },
+    )
+    _resume_verified_channels(record, lnd)
+    for edge in manifest.edges:
+        if edge.pending_channel_id not in record.pending_channel_ids:
+            continue
+        verified = VerifiedFunding(
+            pending_channel_id=bytes.fromhex(edge.pending_channel_id),
+            funding_txid=manifest.unsigned_txid,
+            funding_vout=edge.output_index,
+            unsigned_psbt=bytes.fromhex(unsigned_psbt),
+        )
+        await lnd.retire_verified_external_channel(
+            VerifiedChannelRetirementAuthorization(
+                verified_funding=verified,
+                channel_point=verified.channel_point,
+                unsigned_txid=verified.funding_txid,
+                chain_status=FundingTransactionChainStatus(
+                    unsigned_txid=verified.funding_txid,
+                    mempool=LndTransactionPresence.ABSENT,
+                    chain=LndTransactionPresence.ABSENT,
+                ),
+                local_coinjoin_input_signature_created=record.local_input_signature_created,
+                local_coinjoin_input_signature_sent=record.local_input_signature_sent,
+                funding_transaction_broadcast=False,
+                final_transaction_observed=record.final_tx is not None,
+            )
+        )
+    return store.transition(record.key, RingLifecycleState.RETIRED)
 
 
 _T = TypeVar("_T")
@@ -1168,16 +1242,19 @@ async def reconcile_ring_records(
     Records whose taker session is still live in this process are resumed but never
     escalated: escalation targets restart-orphaned state, not in-flight rounds.
 
-    Returns invitations retired because their session is gone. An ``INVITED``
-    maker has sent only a signed hello: no plan, LND operation, or signature
-    exists, so the caller may release that owner's input leases.
+    Returns retired invitations and completed unsigned retirements whose owner-
+    qualified leases may be released. Pending retired records are returned again
+    after restart so a crash between retirement and lease release is recoverable.
     """
 
     report = store.load_all()
     if report.corruptions:
         return ()
-    expired_invites: list[RingParticipantRecord] = []
+    retired_records: list[RingParticipantRecord] = []
     for record in report.records:
+        if record.state is RingLifecycleState.RETIRED and record.unsigned_retirement_pending:
+            retired_records.append(record)
+            continue
         if not record.active:
             continue
         # Ownership failures must not rewrite evidence or use the current mapping.
@@ -1190,9 +1267,22 @@ async def reconcile_ring_records(
             # Without a live session the taker cannot deliver a plan, and the
             # grace period covers a session registered just after the invite.
             retiring = store.transition(record.key, RingLifecycleState.RETIRING)
-            expired_invites.append(store.transition(retiring.key, RingLifecycleState.RETIRED))
+            retired_records.append(store.transition(retiring.key, RingLifecycleState.RETIRED))
             continue
         try:
+            if record.taker_session_identity not in active_session_identities and (
+                record.unsigned_retirement_pending
+                or (
+                    record.state is RingLifecycleState.SIGNING
+                    and record.has_unsigned_funding_evidence
+                )
+            ):
+                retired_records.append(
+                    await _retire_unsigned_record(
+                        store, initialized_backend.backend, chain_backend, record
+                    )
+                )
+                continue
             if record.plan is not None and record.state in {
                 RingLifecycleState.ACCEPTOR_ARMED,
                 RingLifecycleState.PREPARED_NOT_VERIFIED,
@@ -1200,27 +1290,13 @@ async def reconcile_ring_records(
                 RingLifecycleState.READY,
                 RingLifecycleState.SIGNING,
             }:
-                plan = record.plan
-                incoming = InboundChannelExpectation(
-                    scid_alias=True,
-                    pending_channel_id=bytes.fromhex(plan.incoming_edge.pending_channel_id),
-                    opener_node_id=plan.predecessor.node_id,
-                    chain_hash=_chain_hash(plan.network),
-                    capacity_sat=plan.incoming_edge.capacity,
-                    push_msat=plan.incoming_edge.push_amount * 1000,
-                    opener_reserve_sat=plan.incoming_edge.policy.opener_reserve,
-                    fundee_reserve_sat=plan.incoming_edge.policy.fundee_reserve,
-                    opener_csv_delay=plan.incoming_edge.policy.opener_csv_delay,
-                    fundee_csv_delay=plan.incoming_edge.policy.fundee_csv_delay,
-                    min_depth=plan.incoming_edge.policy.min_depth,
-                )
                 if record.state is RingLifecycleState.ACCEPTOR_ARMED:
                     task_key = record.key.filename
                     existing_task = None if acceptor_tasks is None else acceptor_tasks.get(task_key)
                     if existing_task is None or existing_task.done():
                         task = asyncio.create_task(
                             initialized_backend.backend.run_channel_acceptor(
-                                incoming,
+                                _incoming_expectation(record.plan),
                                 AcceptorBounds(),
                                 timeout_seconds=acceptor_timeout_seconds,
                             )
@@ -1228,24 +1304,7 @@ async def reconcile_ring_records(
                         if acceptor_tasks is not None:
                             acceptor_tasks[task_key] = task
                 else:
-                    outgoing_verified = _retained_verified_funding(record, record.outgoing_edge)
-                    initialized_backend.backend.resume_inbound_channel(
-                        incoming,
-                        observed_channel_point=_retained_observed_point(
-                            record.incoming_pending_state,
-                            _retained_verified_funding(record, record.incoming_edge),
-                            EndpointRole.FUNDEE,
-                        ),
-                    )
-                    initialized_backend.backend.resume_external_channel(
-                        _funding_negotiation(record),
-                        verified=outgoing_verified,
-                        observed_channel_point=_retained_observed_point(
-                            record.outgoing_pending_state,
-                            outgoing_verified,
-                            EndpointRole.OPENER,
-                        ),
-                    )
+                    _resume_verified_channels(record, initialized_backend.backend)
             if record.state in {RingLifecycleState.SIGNED, RingLifecycleState.BROADCAST}:
                 transaction = None
                 if record.manifest is not None:
@@ -1341,4 +1400,4 @@ async def reconcile_ring_records(
                         "retry": current.retry.model_copy(update={"last_error": str(exc)[:2000]})
                     },
                 )
-    return tuple(expired_invites)
+    return tuple(retired_records)

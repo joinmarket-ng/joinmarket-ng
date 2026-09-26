@@ -122,6 +122,7 @@ ALLOWED = {
     },
     RingLifecycleState.SIGNING: {
         RingLifecycleState.SIGNED,
+        RingLifecycleState.RETIRING,
         RingLifecycleState.RECOVERY_REQUIRED,
     },
     RingLifecycleState.SIGNED: {
@@ -317,6 +318,50 @@ def test_permissions_atomic_persistence_and_restart_state(tmp_path: Path) -> Non
         store.directory, max_active_sessions=4, max_verified_sessions=2
     )
     assert restarted.load(durable.key) == durable
+
+
+def test_previous_complete_journal_loads_without_retirement_intent(tmp_path: Path) -> None:
+    store = RingParticipantStore(tmp_path, max_active_sessions=4, max_verified_sessions=2)
+    previous = record(state=RingLifecycleState.SIGNING)
+    payload = previous.model_dump(mode="json")
+    del payload["unsigned_retirement_pending"]
+    path = tmp_path / previous.key.filename
+    path.write_text(json.dumps(payload), encoding="ascii")
+    path.chmod(0o600)
+    original = path.read_bytes()
+
+    loaded = store.load(previous.key)
+
+    assert loaded == previous
+    assert loaded is not None and not loaded.unsigned_retirement_pending
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "state",
+        "local_input_signature_created",
+        "local_input_signature_sent",
+        "local_signatures",
+        "final_tx",
+    ],
+)
+def test_previous_partial_journal_is_not_upgraded(tmp_path: Path, missing: str) -> None:
+    store = RingParticipantStore(tmp_path, max_active_sessions=4, max_verified_sessions=2)
+    previous = record(state=RingLifecycleState.SIGNING)
+    payload = previous.model_dump(mode="json")
+    del payload["unsigned_retirement_pending"]
+    del payload[missing]
+    path = tmp_path / previous.key.filename
+    path.write_text(json.dumps(payload), encoding="ascii")
+    path.chmod(0o600)
+    original = path.read_bytes()
+
+    assert store.load_all().corruptions
+    with pytest.raises(RingStoreError):
+        store.transition(previous.key, RingLifecycleState.RETIRING)
+    assert path.read_bytes() == original
 
 
 def test_atomic_replace_failure_preserves_previous_record(
