@@ -1077,6 +1077,58 @@ async def test_reconcile_escalation_skips_live_sessions(harness: Harness) -> Non
     assert harness.record().state is RingLifecycleState.RECOVERY_REQUIRED
 
 
+@pytest.mark.parametrize("signatures_persisted", [False, True])
+async def test_fresh_maker_restart_retains_uncertain_or_signed_inputs(
+    tmp_path: Path, signatures_persisted: bool
+) -> None:
+    original = Harness(tmp_path)
+    await original.through_open()
+    unsigned = await original.unsigned()
+    await original.machine.handle(unsigned)
+    await original.machine.handle(original.ready_set(unsigned.manifest))
+    await original.machine.handle(
+        original.signed(
+            RingSignPayload(
+                round_nonce="aa" * 32,
+                revision=0,
+                signer_key=original.taker_key,
+                manifest_hash=manifest_hash(unsigned.manifest).hex(),
+                unsigned_tx_hash=unsigned.manifest.unsigned_tx_hash,
+            )
+        )
+    )
+    original.machine.prepare_coinjoin_signing(unsigned.unsigned_tx)
+    if signatures_persisted:
+        original.machine.mark_signatures_sent(["signature"])
+    before = original.record()
+    assert before.local_input_signature_created
+    assert before.final_tx is None
+    # Discard session/backend memory. Only the journal directory crosses restart.
+    restarted = Harness(tmp_path)
+    assert restarted.store is not original.store
+    assert restarted.store.load(before.key) == before
+    retired_invites = await reconcile_ring_records(
+        restarted.store,
+        restarted.nodes,
+        restarted.chain,
+        {},  # type: ignore[arg-type]
+    )
+    after = restarted.store.load(before.key)
+    assert after is not None
+    assert after.state is (
+        RingLifecycleState.SIGNED if signatures_persisted else RingLifecycleState.RECOVERY_REQUIRED
+    )
+    assert after.local_input_signature_created
+    assert after.local_signatures == before.local_signatures
+    assert after.local_input_outpoints == before.local_input_outpoints
+    assert after.input_lock_owner == before.input_lock_owner
+    assert after.retirement_action() is RingRetirementAction.BLOCKED
+    assert after.active
+    assert retired_invites == ()
+    assert restarted.lnd.canceled == restarted.lnd.retired == []
+    assert restarted.chain.broadcasts == []
+
+
 async def test_reconcile_rearms_acceptor_with_configured_timeout(harness: Harness) -> None:
     await harness.machine.handle(harness.invite())
     await harness.machine.handle(harness.plan())
