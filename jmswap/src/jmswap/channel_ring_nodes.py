@@ -405,7 +405,13 @@ async def initialize_channel_ring_nodes(
                 "ring journals are malformed or lack ownership provenance; preserved for operator review"
             )
         retained = [record.node_binding for record in report.records if record.active]
-        for binding in retained:
+        for record in report.records:
+            # Completed channel retirement can still owe wallet lease release.
+            # Validate that wallet before acknowledging the pending operation,
+            # without requiring an already-retired LND node to remain available.
+            if not (record.active or record.unsigned_retirement_pending):
+                continue
+            binding = record.node_binding
             if (
                 binding.network != network
                 or binding.wallet_identity != wallet_identity

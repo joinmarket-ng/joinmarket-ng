@@ -22,11 +22,15 @@ from jmcore.bitcoin import (
 from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig, RingNodeBinding
 from jmcore.channel_ring_store import (
     Outpoint,
+    RingAntiGriefError,
+    RingChainStatus,
     RingLifecycleState,
     RingParticipantRecord,
     RingParticipantRole,
     RingParticipantStore,
     RingRetirementAction,
+    RingTransitionError,
+    TransactionPresence,
 )
 from jmcore.cofunded_ring import (
     BackendLimits,
@@ -60,7 +64,11 @@ from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.models import Offer, OfferType
 from jmcore.network import ONION_HOSTID
 from jmcore.protocol import parse_jm_message
-from jmswap.channel_ring_nodes import BoundChannelRingNode
+from jmswap.channel_ring_nodes import (
+    BoundChannelRingNode,
+    ChannelRingNodeClaimConflictError,
+    initialize_channel_ring_nodes,
+)
 from jmswap.lnd import (
     AcceptorObservation,
     FundingNegotiation,
@@ -84,6 +92,7 @@ from maker.channel_ring import (
     MakerRingError,
     MakerRingParticipant,
     _chain_hash,
+    _retire_unsigned_record,
     reconcile_ring_records,
 )
 from maker.coinjoin import CoinJoinState
@@ -920,6 +929,8 @@ async def test_cancel_before_verify_after_verify_and_after_sign_boundaries(tmp_p
             )
         )
     )
+    # Authorization alone is now cancelable; a durable signing attempt is not.
+    signed.machine.prepare_coinjoin_signing(unsigned.unsigned_tx)
     with pytest.raises(MakerRingError, match="forbidden"):
         await signed.machine.handle(
             signed.signed(
@@ -931,6 +942,568 @@ async def test_cancel_before_verify_after_verify_and_after_sign_boundaries(tmp_p
                 )
             )
         )
+
+
+async def _authorize_ring_without_tx(harness: Harness) -> RingUnsignedPayload:
+    await harness.through_open()
+    unsigned = await harness.unsigned()
+    await harness.machine.handle(unsigned)
+    await harness.machine.handle(harness.ready_set(unsigned.manifest))
+    await harness.machine.handle(
+        harness.signed(
+            RingSignPayload(
+                round_nonce="aa" * 32,
+                revision=0,
+                signer_key=harness.taker_key,
+                manifest_hash=manifest_hash(unsigned.manifest).hex(),
+                unsigned_tx_hash=unsigned.manifest.unsigned_tx_hash,
+            )
+        )
+    )
+    assert harness.record().state is RingLifecycleState.SIGNING
+    assert not harness.record().local_input_signature_created
+    return unsigned
+
+
+async def test_cancel_after_authorization_retires_unsigned_funding(harness: Harness) -> None:
+    await _authorize_ring_without_tx(harness)
+    cancel = harness.signed(
+        RingCancelPayload(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            reason_code="authorized_but_unsigned",
+        )
+    )
+    response = await harness.machine.handle(cancel)
+    assert harness.record().state is RingLifecycleState.RETIRED
+    assert harness.record().unsigned_retirement_pending
+    assert len(harness.lnd.retired) == 2
+    assert await harness.machine.handle(cancel) == response
+    assert len(harness.lnd.retired) == 2
+
+
+async def test_explicit_cancel_preserves_unsigned_conflict_retirement(harness: Harness) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    harness.store.transition(record.key, RingLifecycleState.RECOVERY_REQUIRED)
+    harness.store.transition(
+        record.key,
+        RingLifecycleState.CONFLICTED,
+        updates={
+            "chain_status": RingChainStatus(
+                exact_txid=record.manifest.unsigned_txid,
+                confirmed_conflict_txid="87" * 32,
+                conflict_confirmations=1,
+            )
+        },
+    )
+    await harness.machine.handle(
+        harness.signed(
+            RingCancelPayload(
+                round_nonce="aa" * 32,
+                revision=0,
+                signer_key=harness.taker_key,
+                reason_code="conflicted_unsigned_funding",
+            )
+        )
+    )
+    assert harness.record().state is RingLifecycleState.RETIRED
+    assert len(harness.lnd.retired) == 2
+
+
+@pytest.mark.parametrize("previous_format", [False, True])
+async def test_orphaned_authorization_restart_frees_capacity_and_leases(
+    tmp_path: Path, previous_format: bool
+) -> None:
+    original = Harness(tmp_path / "original")
+    await _authorize_ring_without_tx(original)
+    record = original.record()
+    bot = _ring_lock_bot(tmp_path / "bot", (record,))
+    assert bot._channel_ring_store is not None
+    directory = bot._channel_ring_store.directory
+    if previous_format:
+        path = directory / record.key.filename
+        payload = json.loads(path.read_text())
+        del payload["unsigned_retirement_pending"]
+        path.write_text(json.dumps(payload))
+    # Reopen the on-disk journal and use a fresh LND backend with no observations.
+    restarted = Harness(tmp_path / "restarted")
+    bot._channel_ring_store = RingParticipantStore(
+        directory, max_active_sessions=4, max_verified_sessions=1
+    )
+    assert bot._renew_channel_ring_input_locks()
+    outpoint = record.local_input_outpoints[0]
+    assert _lock_state(bot, outpoint)[0] == record.input_lock_owner
+    candidate = _ring_record(
+        outpoint=Outpoint(txid="09" * 32, vout=0), owner="other", nonce_byte="25"
+    ).model_copy(update={"state": RingLifecycleState.PSBT_VERIFIED})
+    with pytest.raises(RingAntiGriefError, match="maximum verified"):
+        bot._channel_ring_store.save(candidate)
+
+    retired = await reconcile_ring_records(
+        bot._channel_ring_store,
+        restarted.nodes,
+        restarted.chain,  # type: ignore[arg-type]
+    )
+    assert [item.key for item in retired] == [record.key]
+    assert retired[0].state is RingLifecycleState.RETIRED
+    assert len(restarted.lnd.retired) == 2
+    assert all(restarted.lnd.resumed_incoming_points)
+    assert all(point for _, point in restarted.lnd.resumed_verified)
+    assert not retired[0].active and not retired[0].verified_unresolved
+    # A crash here must leave release work discoverable without repeating LND calls.
+    again = await reconcile_ring_records(
+        bot._channel_ring_store,
+        restarted.nodes,
+        restarted.chain,  # type: ignore[arg-type]
+    )
+    assert again == retired
+    assert len(restarted.lnd.retired) == 2
+    bot._release_retired_ring_inputs(again)
+    assert _lock_state(bot, outpoint)[0] is None
+    assert bot._renew_channel_ring_input_locks()
+    assert _lock_state(bot, outpoint)[0] is None
+    assert (
+        await reconcile_ring_records(
+            bot._channel_ring_store,
+            restarted.nodes,
+            restarted.chain,  # type: ignore[arg-type]
+        )
+        == ()
+    )
+    bot._channel_ring_store.save(candidate)
+
+
+@pytest.mark.parametrize("fail_at", [1, 2])
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_unsigned_retirement_resumes_partial_lnd_failure(
+    tmp_path: Path, fail_at: int, interrupted: bool
+) -> None:
+    original = Harness(tmp_path)
+    await _authorize_ring_without_tx(original)
+    record = original.record()
+    attempts = 0
+    successful_retirement = original.lnd.retire_verified_external_channel
+
+    async def fail_once(authorization: Any) -> VerifiedChannelRetirementOutcome:
+        nonlocal attempts
+        attempts += 1
+        if attempts == fail_at:
+            if interrupted:
+                raise asyncio.CancelledError
+            raise RuntimeError("LND unavailable")
+        return await successful_retirement(authorization)
+
+    original.lnd.retire_verified_external_channel = fail_once  # type: ignore[method-assign]
+    if interrupted:
+        with pytest.raises(asyncio.CancelledError):
+            await reconcile_ring_records(original.store, original.nodes, original.chain)  # type: ignore[arg-type]
+    else:
+        assert await reconcile_ring_records(original.store, original.nodes, original.chain) == ()  # type: ignore[arg-type]
+    pending = original.record()
+    assert pending.state is (
+        RingLifecycleState.RETIRING if interrupted else RingLifecycleState.RECOVERY_REQUIRED
+    )
+    assert pending.unsigned_retirement_pending and pending.active
+    assert len(original.lnd.retired) == fail_at - 1
+
+    restarted = Harness(tmp_path)
+    retired = await reconcile_ring_records(restarted.store, restarted.nodes, restarted.chain)  # type: ignore[arg-type]
+    assert retired[0].key == record.key
+    assert retired[0].state is RingLifecycleState.RETIRED
+    assert len(restarted.lnd.retired) == 2
+    assert all(restarted.lnd.resumed_incoming_points)
+    assert all(point for _, point in restarted.lnd.resumed_verified)
+
+
+@pytest.mark.parametrize("failure", ["present", "spent", "unsupported", "unavailable"])
+async def test_unsigned_retirement_requires_fresh_absence_and_retries(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    unsigned = await _authorize_ring_without_tx(harness)
+    with monkeypatch.context() as patch:
+        if failure == "present":
+            patch.setattr(harness.chain, "get_transaction", AsyncMock(return_value=object()))
+        elif failure == "spent":
+            patch.setattr(harness.chain, "get_utxo", AsyncMock(return_value=None))
+        elif failure == "unsupported":
+            patch.setattr(harness.chain, "has_mempool_access", lambda: False)
+        else:
+            patch.setattr(
+                harness.chain, "get_transaction", AsyncMock(side_effect=OSError("offline"))
+            )
+        assert await reconcile_ring_records(harness.store, harness.nodes, harness.chain) == ()  # type: ignore[arg-type]
+    record = harness.record()
+    assert record.state is RingLifecycleState.RECOVERY_REQUIRED
+    assert record.unsigned_retirement_pending
+    assert harness.lnd.retired == []
+    assert record.manifest.unsigned_txid == unsigned.manifest.unsigned_txid
+    assert len(await reconcile_ring_records(harness.store, harness.nodes, harness.chain)) == 1  # type: ignore[arg-type]
+
+
+async def test_live_unsigned_authorization_is_not_retired(harness: Harness) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    assert (
+        await reconcile_ring_records(
+            harness.store,
+            harness.nodes,
+            harness.chain,  # type: ignore[arg-type]
+            active_session_identities=frozenset({record.taker_session_identity}),
+        )
+        == ()
+    )
+    assert harness.record().state is RingLifecycleState.SIGNING
+    assert not harness.record().unsigned_retirement_pending
+    assert harness.lnd.retired == []
+
+
+async def test_reconciliation_does_not_overlap_live_retirement(harness: Harness) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    harness.store.transition(
+        record.key, record.state, updates={"unsigned_retirement_pending": True}
+    )
+    assert (
+        await reconcile_ring_records(
+            harness.store,
+            harness.nodes,
+            harness.chain,  # type: ignore[arg-type]
+            active_session_identities=frozenset({record.taker_session_identity}),
+        )
+        == ()
+    )
+    assert harness.record().unsigned_retirement_pending
+    assert harness.lnd.retired == []
+
+
+async def test_explicit_cancel_retries_failed_absence_check(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    cancel = harness.signed(
+        RingCancelPayload(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            reason_code="retry_cleanup",
+        )
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(harness.chain, "get_transaction", AsyncMock(side_effect=OSError("offline")))
+        with pytest.raises(OSError, match="offline"):
+            await harness.machine.handle(cancel)
+    assert harness.record().state is RingLifecycleState.RECOVERY_REQUIRED
+    assert harness.record().unsigned_retirement_pending
+    await harness.machine.handle(cancel)
+    assert harness.record().state is RingLifecycleState.RETIRED
+    assert len(harness.lnd.retired) == 2
+
+
+async def test_retirement_intent_excludes_signing_during_absence_check(harness: Harness) -> None:
+    unsigned = await _authorize_ring_without_tx(harness)
+    checking = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def blocked_check(txid: str) -> None:
+        assert txid == unsigned.manifest.unsigned_txid
+        checking.set()
+        await proceed.wait()
+
+    harness.chain.get_transaction = blocked_check  # type: ignore[method-assign]
+    task = asyncio.create_task(reconcile_ring_records(harness.store, harness.nodes, harness.chain))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(checking.wait(), timeout=5)
+        record = harness.record()
+        assert record.unsigned_retirement_pending
+        with pytest.raises(MakerRingError, match="not authorized"):
+            harness.machine.prepare_coinjoin_signing(unsigned.unsigned_tx)
+        with pytest.raises(ValueError, match="unsigned retirement intent"):
+            harness.store.transition(
+                record.key, record.state, updates={"local_input_signature_created": True}
+            )
+    finally:
+        proceed.set()
+        await task
+    assert harness.record().state is RingLifecycleState.RETIRED
+
+
+async def test_retirement_reloads_signing_evidence_before_claiming_intent(harness: Harness) -> None:
+    unsigned = await _authorize_ring_without_tx(harness)
+    stale = harness.record()
+    harness.machine.prepare_coinjoin_signing(unsigned.unsigned_tx)
+    with pytest.raises(ValueError, match="unsigned retirement intent"):
+        await _retire_unsigned_record(harness.store, harness.lnd, harness.chain, stale)  # type: ignore[arg-type]
+    assert harness.record().local_input_signature_created
+    assert not harness.record().unsigned_retirement_pending
+    assert harness.lnd.retired == []
+
+
+@pytest.mark.parametrize(
+    "state", [RingLifecycleState.RETIRING, RingLifecycleState.RECOVERY_REQUIRED]
+)
+async def test_unmarked_recovery_is_not_automatically_abandoned(
+    harness: Harness, state: RingLifecycleState
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    status = RingChainStatus(
+        exact_txid=record.manifest.unsigned_txid,
+        mempool=TransactionPresence.ABSENT,
+        chain=TransactionPresence.ABSENT,
+    )
+    harness.store.transition(record.key, state, updates={"chain_status": status})
+    assert await reconcile_ring_records(harness.store, harness.nodes, harness.chain) == ()  # type: ignore[arg-type]
+    assert harness.record().state is state
+    assert harness.lnd.retired == []
+
+
+async def test_pending_same_state_retirement_checks_current_evidence(harness: Harness) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    status = RingChainStatus(
+        exact_txid=record.manifest.unsigned_txid,
+        mempool=TransactionPresence.ABSENT,
+        chain=TransactionPresence.ABSENT,
+    )
+    harness.store.transition(
+        record.key,
+        RingLifecycleState.RETIRING,
+        updates={"chain_status": status, "unsigned_retirement_pending": True},
+    )
+    with pytest.raises(RingTransitionError, match="absent funding evidence"):
+        harness.store.transition(
+            record.key,
+            RingLifecycleState.RETIRING,
+            updates={
+                "chain_status": status.model_copy(update={"chain": TransactionPresence.UNKNOWN})
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"local_input_signature_created": True},
+        {"local_input_signature_created": True, "local_input_signature_sent": True},
+        {"local_signatures": ("signature",)},
+        {"final_tx": "00"},
+    ],
+)
+async def test_signing_evidence_blocks_unsigned_retirement(
+    harness: Harness, evidence: dict[str, object]
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    status = RingChainStatus(
+        exact_txid=record.manifest.unsigned_txid,
+        mempool=TransactionPresence.ABSENT,
+        chain=TransactionPresence.ABSENT,
+    )
+    harness.store.transition(record.key, record.state, updates=evidence)
+    with pytest.raises(RingTransitionError, match="unsigned retirement"):
+        harness.store.transition(
+            record.key, RingLifecycleState.RETIRING, updates={"chain_status": status}
+        )
+    assert await reconcile_ring_records(harness.store, harness.nodes, harness.chain) == ()  # type: ignore[arg-type]
+    assert harness.record().active
+    assert harness.lnd.retired == []
+
+
+async def test_timeout_reconciliation_retires_unsigned_signing_ring(tmp_path: Path) -> None:
+    harness = Harness(tmp_path / "ring")
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    bot = _ring_lock_bot(tmp_path / "bot", (record,))
+    bot._channel_ring_store = harness.store
+    assert bot._renew_channel_ring_input_locks()
+    harness.session.wallet = bot.wallet
+    harness.session.input_lock_owner = record.input_lock_owner
+    harness.session.state = CoinJoinState.IOAUTH_SENT
+    harness.session.signing_boundary_crossed = False
+    harness.session.session_timeout_sec = SESSION_TIMEOUT_SEC
+    session = MakerSession(harness.session)
+    session.ring_participant = harness.machine
+    session.deadline = time.monotonic() - 1
+    bot.active_sessions = {(0, session.taker_nick): session}
+    bot._reserved_commitments = {session.commitment.hex()}
+    bot._active_podle_outpoints = {}
+    bot._broadcast_commitment = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    bot._prune_pending_signed_rounds = AsyncMock()  # type: ignore[method-assign]
+    bot._direct_connection_rate_limiter = Mock()
+
+    await bot._cleanup_timed_out_sessions()
+
+    assert bot.active_sessions == {}
+    assert session.expired and session.detached
+    outpoint = record.local_input_outpoints[0]
+    # Session cleanup must still retain locks until both LND retirements succeed.
+    assert _lock_state(bot, outpoint)[0] == record.input_lock_owner
+    assert harness.record().state is RingLifecycleState.SIGNING
+    retired = await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    bot._release_retired_ring_inputs(retired)
+    assert harness.record().state is RingLifecycleState.RETIRED
+    assert not harness.record().unsigned_retirement_pending
+    assert _lock_state(bot, outpoint)[0] is None
+
+
+async def test_retired_input_release_failure_is_retryable(
+    harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    bot = _ring_lock_bot(tmp_path / "bot", (record,))
+    bot._channel_ring_store = harness.store
+    assert bot._renew_channel_ring_input_locks()
+    retired = await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    with monkeypatch.context() as patch:
+        patch.setattr(bot.wallet, "release_coinjoin_inputs", Mock(side_effect=OSError("disk full")))
+        with pytest.raises(OSError, match="disk full"):
+            bot._release_retired_ring_inputs(retired)
+    assert harness.record().unsigned_retirement_pending
+    assert _lock_state(bot, record.local_input_outpoints[0])[0] == record.input_lock_owner
+    again = await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    bot._release_retired_ring_inputs(again)
+    assert len(harness.lnd.retired) == 2
+    assert not harness.record().unsigned_retirement_pending
+    assert _lock_state(bot, record.local_input_outpoints[0])[0] is None
+
+
+@pytest.mark.parametrize("same_owner", [False, True])
+async def test_retired_input_release_protects_reused_active_inputs(
+    harness: Harness, tmp_path: Path, same_owner: bool
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    bot = _ring_lock_bot(tmp_path / "bot", (record,))
+    bot._channel_ring_store = harness.store
+    assert bot._renew_channel_ring_input_locks()
+    retired = await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    outpoint = record.local_input_outpoints[0]
+    owner = record.input_lock_owner if same_owner else "maker:new-owner"
+    active = RingParticipantRecord.fresh(
+        node_binding=record.node_binding,
+        round_nonce=record.round_nonce,
+        revision=record.revision + 1,
+        taker_session_identity=record.taker_session_identity,
+        local_role=RingParticipantRole.MAKER,
+        local_position=record.local_position,
+        local_input_outpoints=(outpoint,),
+        input_lock_owner=owner,
+    ).model_copy(update={"state": RingLifecycleState.PSBT_VERIFIED})
+    harness.store.save(active)
+    bot.wallet.release_coinjoin_inputs({(outpoint.txid, outpoint.vout)}, record.input_lock_owner)
+    assert bot._renew_channel_ring_input_locks()
+
+    bot._release_retired_ring_inputs(retired)
+
+    assert _lock_state(bot, outpoint)[0] == owner
+    assert not harness.record().unsigned_retirement_pending
+    # The direct/session cancellation cleanup path has the same protection.
+    harness.session.wallet = bot.wallet
+    harness.session.input_lock_owner = record.input_lock_owner
+    harness.session.session_timeout_sec = SESSION_TIMEOUT_SEC
+    session = MakerSession(harness.session)
+    session.ring_participant = harness.machine
+    assert harness.machine.holds_active_record()
+    session.release_input_locks()
+    assert _lock_state(bot, outpoint)[0] == owner
+
+
+async def test_corrupt_journal_prevents_retired_input_release(
+    harness: Harness, tmp_path: Path
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    bot = _ring_lock_bot(tmp_path / "bot", (record,))
+    bot._channel_ring_store = harness.store
+    assert bot._renew_channel_ring_input_locks()
+    retired = await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    corruption = harness.store.directory / "corrupt.json"
+    corruption.write_text("{")
+    corruption.chmod(0o600)
+    with pytest.raises(RuntimeError, match="corrupt records"):
+        bot._release_retired_ring_inputs(retired)
+    assert _lock_state(bot, record.local_input_outpoints[0])[0] == record.input_lock_owner
+    assert harness.record().unsigned_retirement_pending
+
+
+async def test_retired_record_without_owner_never_releases_inputs(
+    harness: Harness, tmp_path: Path
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    harness.store.transition(record.key, record.state, updates={"input_lock_owner": None})
+    retired = await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    bot = _ring_lock_bot(tmp_path / "bot", ())
+    bot._channel_ring_store = harness.store
+    bot.wallet.release_coinjoin_inputs = Mock()  # type: ignore[method-assign]
+    bot._release_retired_ring_inputs(retired)
+    bot.wallet.release_coinjoin_inputs.assert_not_called()
+    assert harness.record().unsigned_retirement_pending
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("mismatch", ["wallet", "network", "mixdepth"])
+async def test_terminal_release_recovery_validates_wallet_provenance(
+    harness: Harness, tmp_path: Path, pending: bool, mismatch: str
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    retired = await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    record = retired[0]
+    if not pending:
+        harness.store.transition(
+            record.key, record.state, updates={"unsigned_retirement_pending": False}
+        )
+    path = harness.store.directory / record.key.filename
+    before = path.read_bytes()
+    config = harness.config.model_copy(update={"enabled": False, "nodes": {}, "mixdepth_nodes": {}})
+    kwargs = {
+        "network": "signet" if mismatch == "network" else "regtest",
+        "offer_type": "tr0absoffer",
+        "wallet_identity": "ff" * 32
+        if mismatch == "wallet"
+        else record.node_binding.wallet_identity,
+        "mixdepth_count": 0 if mismatch == "mixdepth" else 5,
+        "data_directory": tmp_path,
+    }
+    if pending:
+        with pytest.raises(ChannelRingNodeClaimConflictError, match="different wallet"):
+            await initialize_channel_ring_nodes(config, **kwargs)  # type: ignore[arg-type]
+    else:
+        # Completed release has no remaining ownership/recovery obligations.
+        pool = await initialize_channel_ring_nodes(config, **kwargs)  # type: ignore[arg-type]
+        await pool.close()
+    assert path.read_bytes() == before
+
+
+async def test_terminal_release_recovery_needs_no_retired_lnd_node(
+    harness: Harness, tmp_path: Path
+) -> None:
+    await _authorize_ring_without_tx(harness)
+    record = harness.record()
+    bot = _ring_lock_bot(tmp_path / "bot", (record,))
+    bot._channel_ring_store = harness.store
+    assert bot._renew_channel_ring_input_locks()
+    await reconcile_ring_records(harness.store, harness.nodes, harness.chain)  # type: ignore[arg-type]
+    config = harness.config.model_copy(update={"enabled": False, "nodes": {}, "mixdepth_nodes": {}})
+    pool = await initialize_channel_ring_nodes(
+        config,
+        network=record.node_binding.network,
+        offer_type="tr0absoffer",
+        wallet_identity=record.node_binding.wallet_identity,
+        mixdepth_count=5,
+        data_directory=tmp_path,
+    )
+    try:
+        bot._channel_ring_store = pool.store
+        retired = await reconcile_ring_records(pool.store, pool, harness.chain)  # type: ignore[arg-type]
+        bot._release_retired_ring_inputs(retired)
+        assert _lock_state(bot, record.local_input_outpoints[0])[0] is None
+        assert not harness.record().unsigned_retirement_pending
+    finally:
+        await pool.close()
 
 
 async def test_partial_psbt_verification_requires_verified_retirement(harness: Harness) -> None:
@@ -1511,7 +2084,7 @@ async def _expire_invites(
         active_session_identities=active,
     )
     assert bot._renew_channel_ring_input_locks()
-    bot._release_expired_invite_inputs(expired)
+    bot._release_retired_ring_inputs(expired)
     return expired
 
 
@@ -1566,7 +2139,7 @@ async def test_expired_invite_never_releases_another_owners_lease(tmp_path: Path
         acceptor_timeout_seconds=60,
     )
 
-    bot._release_expired_invite_inputs(expired)
+    bot._release_retired_ring_inputs(expired)
 
     assert len(expired) == 1
     assert _lock_state(bot, outpoint)[0] == "maker:other"
