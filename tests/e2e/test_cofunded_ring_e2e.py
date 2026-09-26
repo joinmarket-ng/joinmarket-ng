@@ -143,7 +143,7 @@ async def bitcoin_rpc(method: str, params: list[Any] | None = None) -> Any:
 
 
 def compose(
-    *args: str, environment: dict[str, str] | None = None
+    *args: str, environment: dict[str, str] | None = None, timeout: float = 180
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     if environment:
@@ -167,11 +167,11 @@ def compose(
         check=True,
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=timeout,
     )
 
 
-def lncli(service: str, *args: str) -> dict[str, Any]:
+def lncli(service: str, *args: str, timeout: float = 180) -> dict[str, Any]:
     result = compose(
         "exec",
         "-T",
@@ -181,6 +181,7 @@ def lncli(service: str, *args: str) -> dict[str, Any]:
         "--tlscertpath=/root/.lnd/tls.cert",
         "--macaroonpath=/root/.lnd/admin.macaroon",
         *args,
+        timeout=timeout,
     )
     return json.loads(result.stdout)
 
@@ -1754,9 +1755,14 @@ async def ensure_peer_connected(
     peer_state_observed = False
     while loop.time() < deadline:
         try:
-            peers = (await asyncio.to_thread(lncli, service, "listpeers")).get(
-                "peers"
-            ) or []
+            peers = (
+                await asyncio.to_thread(
+                    lncli,
+                    service,
+                    "listpeers",
+                    timeout=min(30.0, deadline - loop.time()),
+                )
+            ).get("peers") or []
         except subprocess.CalledProcessError as exc:
             last_exception = f"{type(exc).__name__}(exit_status={exc.returncode})"
         except (subprocess.SubprocessError, json.JSONDecodeError) as exc:
@@ -1770,7 +1776,16 @@ async def ensure_peer_connected(
             break
         attempts += 1
         try:
-            await asyncio.to_thread(lncli, service, "connect", f"{node_id}@{endpoint}")
+            remaining = deadline - loop.time()
+            await asyncio.to_thread(
+                lncli,
+                service,
+                "connect",
+                "--timeout",
+                f"{max(1, int(min(125.0, remaining)))}s",
+                f"{node_id}@{endpoint}",
+                timeout=remaining,
+            )
         except subprocess.CalledProcessError as exc:
             last_exception = f"{type(exc).__name__}(exit_status={exc.returncode})"
         except (subprocess.SubprocessError, json.JSONDecodeError) as exc:

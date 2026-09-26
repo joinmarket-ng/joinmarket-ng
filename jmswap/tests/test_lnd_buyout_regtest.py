@@ -491,8 +491,8 @@ def _open_channel_rpc(stack: BuyoutRegtest, opener: str, peer: str, *args: str) 
     """Open a channel, reconnecting a peer that an idle channel timer disconnected.
 
     Earlier tests on the shared stack leave quiescent channels whose timers can
-    drop the peer link; a funding negotiation that fails on a disconnected peer
-    broadcasts nothing, so reconnecting and retrying is safe.
+    drop the peer link. Retry only LND's exact pre-broadcast peer errors, not
+    ambiguous RPC/stream failures that might follow funding publication.
     """
     node_id = stack.node_ids[peer]
     for attempt in range(3):
@@ -506,7 +506,17 @@ def _open_channel_rpc(stack: BuyoutRegtest, opener: str, peer: str, *args: str) 
         try:
             return stack.lncli(opener, "openchannel", "--node_key", node_id, *args)
         except RegtestError as exc:
-            transient = "disconnected" in str(exc) or "not connected" in str(exc)
+            detail = str(exc).removeprefix(
+                "compose exec failed: [lncli] rpc error: code = Unknown desc = "
+            )
+            # LND v0.21.3: server.OpenChannel rejects an offline peer before
+            # InitFundingWorkflow. CancelPeerReservations reports the bare error
+            # only for active reservations, removed before PublishTransaction.
+            transient = detail in {
+                "peer disconnected",
+                f"peer {node_id} disconnected",
+                f"peer {node_id} is not online",
+            }
             if not transient or attempt == 2:
                 raise
             time.sleep(1.0)
