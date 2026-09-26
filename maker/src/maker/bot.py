@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING
 
 from jmcore import experimental
 from jmcore.channel_ring import ChannelRingConfig
-from jmcore.channel_ring_store import RingParticipantRecord, RingParticipantStore
+from jmcore.channel_ring_store import (
+    RingLifecycleState,
+    RingParticipantRecord,
+    RingParticipantStore,
+)
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
@@ -1416,7 +1420,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 self._channel_ring_store = self._channel_ring_nodes.store
                 from maker.channel_ring import reconcile_ring_records
 
-                expired_invites = await reconcile_ring_records(
+                retired_records = await reconcile_ring_records(
                     self._channel_ring_store,
                     self._channel_ring_nodes,
                     self.backend,
@@ -1426,7 +1430,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 report = self._channel_ring_store.load_all()
                 if not self._renew_channel_ring_input_locks():
                     raise RuntimeError("could not restore an active channel-ring input reservation")
-                self._release_expired_invite_inputs(expired_invites)
+                self._release_retired_ring_inputs(retired_records)
                 if self.config.channel_ring.enabled:
                     await self._channel_ring_nodes.enable_funding()
                 active = sum(record.active for record in report.records)
@@ -1686,7 +1690,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     f"{session.taker_nick}:{session.commitment.hex()}"
                     for session in self.active_sessions.values()
                 )
-                expired_invites = await reconcile_ring_records(
+                retired_records = await reconcile_ring_records(
                     self._channel_ring_store,
                     self._channel_ring_nodes,
                     self.backend,
@@ -1696,7 +1700,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 )
                 if not self._renew_channel_ring_input_locks():
                     raise RuntimeError("channel-ring input reservation renewal failed")
-                self._release_expired_invite_inputs(expired_invites)
+                self._release_retired_ring_inputs(retired_records)
             except Exception as exc:
                 self.channel_ring_capability_validated = False
                 logger.error("Stopping maker: channel-ring input safety check failed")
@@ -1709,21 +1713,46 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 return
             await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
 
-    def _release_expired_invite_inputs(
-        self, expired_invites: tuple[RingParticipantRecord, ...]
+    def _release_retired_ring_inputs(
+        self, retired_records: tuple[RingParticipantRecord, ...]
     ) -> None:
-        """Release owner-qualified leases of invitations retired before planning.
+        """Release retired owners' leases, then acknowledge completed retirement.
 
-        The ring store refuses two active records sharing an input, and an
-        owner-qualified release never touches a lease another session holds.
+        No await separates the journal check, wallet release, and acknowledgment.
+        Active revisions take responsibility for any inputs they reused. A crash
+        before acknowledgment simply retries the owner-qualified release.
         """
-        for record in expired_invites:
+        if not retired_records:
+            return
+        assert self._channel_ring_store is not None
+        report = self._channel_ring_store.load_all()
+        if report.corruptions:
+            raise RuntimeError("cannot release ring inputs while corrupt records exist")
+        protected = {
+            outpoint
+            for item in report.records
+            if item.active
+            for outpoint in item.local_input_outpoints
+        }
+        current_records = {item.key: item for item in report.records}
+        for retired in retired_records:
+            record = current_records.get(retired.key)
+            if record is None or record.state is not RingLifecycleState.RETIRED:
+                continue
             if record.input_lock_owner is None or not record.local_input_outpoints:
                 continue
-            self.wallet.release_coinjoin_inputs(
-                {(item.txid, item.vout) for item in record.local_input_outpoints},
-                owner=record.input_lock_owner,
-            )
+            releasable = set(record.local_input_outpoints) - protected
+            if releasable:
+                self.wallet.release_coinjoin_inputs(
+                    {(item.txid, item.vout) for item in releasable},
+                    owner=record.input_lock_owner,
+                )
+            if record.unsigned_retirement_pending:
+                self._channel_ring_store.transition(
+                    record.key,
+                    RingLifecycleState.RETIRED,
+                    updates={"unsigned_retirement_pending": False},
+                )
 
     def _renew_channel_ring_input_locks(self) -> bool:
         """Keep the wallet leases of active durable ring records alive.
