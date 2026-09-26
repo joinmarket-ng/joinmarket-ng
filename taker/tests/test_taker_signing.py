@@ -4,6 +4,7 @@ Tests for taker transaction signing functionality.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from pathlib import Path
 from typing import Any
@@ -1107,6 +1108,174 @@ class TestPhaseCollectSignaturesCompleteness:
             "doesn't respond. The old minimum_makers check would have "
             "incorrectly allowed this."
         )
+
+    @pytest.mark.parametrize("blocked_relay_write", [False, True])
+    async def test_lost_direct_tx_recovers_with_real_encryption_and_signatures(
+        self,
+        two_maker_tx_data: CoinJoinTxData,
+        test_master_key: HDKey,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        blocked_relay_write: bool,
+    ) -> None:
+        from _taker_test_helpers import make_crypto_pair, make_directory_client, make_utxo
+        from bitcointx.core import CTransaction
+        from bitcointx.core.key import CKey
+        from jmcore.crypto import NickIdentity
+        from jmcore.models import Offer, OfferType
+        from jmcore.network import ONION_HOSTID
+        from jmcore.protocol import MessageType
+        from jmwallet.wallet.signer import WalletSigningMixin
+        from jmwallet.wallet.signing import create_p2wpkh_script_code, sign_p2wpkh_input
+
+        identities = [NickIdentity(5), NickIdentity(5)]
+        lost, healthy = [identity.nick for identity in identities]
+        names = {"maker1": lost, "maker2": healthy}
+        # The healthy maker has two inputs. One signature precedes the fallback,
+        # and the other arrives during it, exercising partial-set preservation.
+        two_maker_tx_data.maker_inputs["maker2"] = [
+            TxInput.from_hex(txid=char * 64, vout=0, value=600_000) for char in ("c", "d")
+        ]
+        for field in ("maker_inputs", "maker_cj_outputs", "maker_change_outputs"):
+            setattr(
+                two_maker_tx_data,
+                field,
+                {names[name]: value for name, value in getattr(two_maker_tx_data, field).items()},
+            )
+        keys = {nick: CKey(bytes([i + 1]) * 32) for i, nick in enumerate((lost, healthy))}
+        crypto_pairs = {nick: make_crypto_pair() for nick in (lost, healthy)}
+        sessions = {}
+        for nick, inputs in two_maker_tx_data.maker_inputs.items():
+            offer = Offer(
+                counterparty=nick,
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=100_000,
+                maxsize=10_000_000,
+                txfee=0,
+                cjfee="0.001",
+            )
+            utxos = [
+                {
+                    "txid": item.txid_le[::-1].hex(),
+                    "vout": item.vout,
+                    "value": item.value,
+                    "scriptpubkey": pubkey_to_p2wpkh_script(bytes(keys[nick].pub)).hex(),
+                }
+                for item in inputs
+            ]
+            session = self._make_maker_session(nick, offer, utxos)
+            session.crypto = crypto_pairs[nick][0]
+            session.comm_channel = "direct"
+            sessions[nick] = session
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=sessions)
+        taker.config.data_dir = tmp_path
+        taker.config.maker_timeout_sec = 3
+        monkeypatch.setattr("taker.coinjoin_session._DIRECT_TX_FALLBACK_SEC", 0.05)
+        key = test_master_key.derive("m/84'/1'/0'/0/0")
+        taker._session.selected_utxos = [
+            make_utxo(
+                value=2_000_000,
+                address=key.get_address("regtest"),
+                scriptpubkey=pubkey_to_p2wpkh_script(
+                    key.get_public_key_bytes(compressed=True)
+                ).hex(),
+            )
+        ]
+        taker.wallet.get_key_for_address.return_value = key
+        taker.wallet.sign_input = lambda *args, **kwargs: WalletSigningMixin.sign_input(
+            taker.wallet, *args, **kwargs
+        )
+        client = make_directory_client(prefer_direct_connections=True)
+        taker.directory_client = client
+        responses: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        signed_messages: dict[str, list[dict[str, Any]]] = {}
+        tx = deserialize_transaction(taker._session.unsigned_tx)
+        for identity in identities:
+            nick = identity.nick
+            payloads = []
+            values = {(u["txid"], u["vout"]): u["value"] for u in sessions[nick].utxos}
+            for index, item in enumerate(tx.inputs):
+                value = values.get((item.txid_le[::-1].hex(), item.vout))
+                if value is None:
+                    continue
+                pub = bytes(keys[nick].pub)
+                sig = sign_p2wpkh_input(
+                    tx, index, create_p2wpkh_script_code(pub), value, keys[nick]
+                )
+                encoded = base64.b64encode(
+                    bytes([len(sig)]) + sig + bytes([len(pub)]) + pub
+                ).decode()
+                encrypted = crypto_pairs[nick][1].encrypt(encoded)
+                payloads.append(
+                    {
+                        "type": MessageType.PRIVMSG.value,
+                        "line": f"{nick}!{client.nick}!sig "
+                        + identity.sign_message(encrypted, ONION_HOSTID),
+                    }
+                )
+            signed_messages[nick] = payloads
+
+        direct_writes: dict[str, str] = {}
+        peers = {}
+        for nick in (lost, healthy):
+
+            async def direct_send(
+                our_nick: str, command: str, data: str, *, nick: str = nick
+            ) -> bool:
+                assert command == "tx"
+                assert (
+                    base64.b64decode(crypto_pairs[nick][1].decrypt(data))
+                    == taker._session.unsigned_tx
+                )
+                direct_writes[nick] = data
+                if nick == healthy:
+                    responses.put_nowait(signed_messages[nick][0])
+                # Lost maker: a successful local write without remote delivery.
+                return True
+
+            peers[nick] = MagicMock(send_privmsg=AsyncMock(side_effect=direct_send))
+        monkeypatch.setattr(client, "_get_connected_peer", lambda nick: peers[nick])
+        monkeypatch.setattr(client, "_get_peer_location", lambda nick: None)
+        relay_canceled = asyncio.Event()
+
+        async def relay_send(nick: str, command: str, data: str) -> None:
+            assert nick == lost  # Never resend to a maker with partial signatures.
+            assert command == "tx"
+            assert data == direct_writes[nick]
+            assert (
+                base64.b64decode(crypto_pairs[nick][1].decrypt(data)) == taker._session.unsigned_tx
+            )
+            # Includes a duplicate of the first healthy signature.
+            for message in [*signed_messages[lost], *signed_messages[healthy]]:
+                responses.put_nowait(message)
+            if blocked_relay_write:
+                try:
+                    await asyncio.Future[None]()
+                finally:
+                    relay_canceled.set()
+
+        async def listen(duration: float) -> list[dict[str, Any]]:
+            try:
+                messages = [await asyncio.wait_for(responses.get(), duration)]
+            except TimeoutError:
+                return []
+            while not responses.empty():
+                messages.append(responses.get_nowait())
+            return messages
+
+        relay = MagicMock(host="relay", port=5222)
+        relay.send_private_message = AsyncMock(side_effect=relay_send)
+        relay.listen_for_messages = AsyncMock(side_effect=listen)
+        client.clients = {"relay:5222": relay}
+        assert await asyncio.wait_for(taker._session._phase_collect_signatures(), 5)
+        relay.send_private_message.assert_awaited_once()
+        assert relay_canceled.is_set() is blocked_relay_write
+        assert all(session.responded_sig for session in sessions.values())
+        assert not taker._session.failed_signer_nicks
+        final = CTransaction.deserialize(taker._session.final_tx)
+        assert len(final.wit.vtxinwit) == 4
+        assert all(len(witness.scriptWitness.stack) == 2 for witness in final.wit.vtxinwit)
 
     def _maker1_sig_response(self, tx_bytes: bytes, privkey: Any) -> str:
         """Build a valid base64 !sig payload for maker1's input signed by ``privkey``."""
