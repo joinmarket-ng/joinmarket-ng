@@ -12,7 +12,7 @@ import pytest
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import scriptpubkey_to_address
 from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig, RingNodeBinding
-from jmcore.channel_ring_store import RingLifecycleState, RingParticipantStore
+from jmcore.channel_ring_store import RingLifecycleState, RingParticipantStore, RingRetirementAction
 from jmcore.cofunded_ring import (
     BackendLimits,
     EndpointRole,
@@ -1090,3 +1090,38 @@ async def test_restart_rebroadcasts_and_confirms_exact_final_transaction(tmp_pat
     )
     assert coordinator._record().state is RingLifecycleState.CONFIRMED_OPEN
     assert chain.broadcasts == [unsigned]
+
+
+@pytest.mark.parametrize("signatures_persisted", [False, True])
+async def test_fresh_taker_restart_does_not_cancel_or_publish_incomplete_signing(
+    tmp_path: Path, signatures_persisted: bool
+) -> None:
+    original = _harness(tmp_path)
+    assert await original.prepare(_address(300), 0)
+    original.mark_local_signature_creation()
+    if signatures_persisted:
+        original.mark_local_signatures([{"txid": "01" * 32, "vout": 0, "witness": ["11" * 64]}])
+    before = original._record()
+    assert before.local_input_signature_created
+    assert before.final_tx is None
+    restarted = _harness(tmp_path)
+    assert restarted.store is not original.store
+    assert restarted.store.load(before.key) == before
+    chain = cast(FakeChain, restarted.chain_backend)
+    lnd = cast(FakeLnd, restarted.lnd)
+    await reconcile_taker_ring_records(
+        restarted.store, FakeNodePool(restarted.initialized_backend), cast(Any, chain)
+    )
+    after = restarted.store.load(before.key)
+    assert after is not None
+    assert after.state is (
+        RingLifecycleState.SIGNED if signatures_persisted else RingLifecycleState.RECOVERY_REQUIRED
+    )
+    assert after.local_input_signature_created
+    assert after.local_signatures == before.local_signatures
+    assert after.local_input_outpoints == before.local_input_outpoints
+    assert after.input_lock_owner == before.input_lock_owner
+    assert after.retirement_action() is RingRetirementAction.BLOCKED
+    assert after.active
+    assert lnd.canceled == lnd.retired == []
+    assert chain.broadcasts == []
