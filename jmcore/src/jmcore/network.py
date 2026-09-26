@@ -668,7 +668,7 @@ class OnionPeer:
                 self._status = PeerStatus.CONNECTED
 
             # Perform handshake
-            await self._handshake(our_nick, our_location, network)
+            first_message = await self._handshake(our_nick, our_location, network)
 
             async with self._lock:
                 self._status = PeerStatus.HANDSHAKED
@@ -677,7 +677,7 @@ class OnionPeer:
             logger.bind(sensitive=True).debug(f"Connected and handshaked with peer {self.nick}")
 
             # Start receive loop
-            self._receive_task = asyncio.create_task(self._receive_loop())
+            self._receive_task = asyncio.create_task(self._receive_loop(first_message))
 
             if self.on_handshake_complete:
                 await self.on_handshake_complete(self.nick)
@@ -694,8 +694,8 @@ class OnionPeer:
                 self._connection = None
             return False
 
-    async def _handshake(self, our_nick: str, our_location: str, network: str) -> None:
-        """Perform handshake with peer (same protocol as directory)."""
+    async def _handshake(self, our_nick: str, our_location: str, network: str) -> bytes | None:
+        """Send our handshake, preserving an application frame received instead of a reply."""
         if not self._connection:
             raise OnionPeerConnectionError("Not connected")
 
@@ -727,9 +727,15 @@ class OnionPeer:
             )
         except TimeoutError:
             self.peer_features = {}
-            return
+            return None
         response = json.loads(response_data.decode("utf-8"))
+        if isinstance(response, dict) and response.get("type") == MessageType.PRIVMSG.value:
+            # Legacy peers need not reply with a handshake. Do not lose their
+            # first application frame during the optional reciprocal-read window.
+            # The normal receiver still performs application authentication.
+            return response_data
         self._accept_peer_handshake(response, network)
+        return None
 
     def _accept_peer_handshake(self, response: dict[str, Any], network: str) -> None:
         """Validate reciprocal handshakes, including replies arriving after 2s."""
@@ -778,7 +784,7 @@ class OnionPeer:
 
         logger.bind(sensitive=True).debug(f"Handshake with peer {self.nick} successful")
 
-    async def _receive_loop(self) -> None:
+    async def _receive_loop(self, first_message: bytes | None = None) -> None:
         """Background task to receive messages from peer."""
         if not self._connection:
             return
@@ -799,7 +805,10 @@ class OnionPeer:
                 and connection.is_connected()
             ):
                 try:
-                    data = await connection.receive()
+                    if first_message is not None:
+                        data, first_message = first_message, None
+                    else:
+                        data = await connection.receive()
                     if self._connection is not connection:
                         break
                     try:

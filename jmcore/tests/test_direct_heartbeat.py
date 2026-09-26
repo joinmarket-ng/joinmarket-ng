@@ -207,6 +207,57 @@ async def test_late_reciprocal_handshake_can_enable_keepalives(transport: Transp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("late_handshake", [False, True])
+async def test_application_frame_during_optional_handshake_is_delivered_in_order(
+    transport: Transport, late_handshake: bool
+) -> None:
+    connection, incoming, _closed = transport
+    first = json.dumps({"type": MessageType.PRIVMSG.value, "line": "first"}).encode()
+    second = json.dumps({"type": MessageType.PRIVMSG.value, "line": "second"}).encode()
+    incoming.put_nowait(first)
+    if late_handshake:
+        incoming.put_nowait(handshake({FEATURE_DIRECT_PING_V1: True}))
+    incoming.put_nowait(second)
+    delivered: list[bytes] = []
+    received = asyncio.Event()
+
+    async def on_message(nick: str, data: bytes) -> None:
+        assert nick == "maker"
+        delivered.append(data)
+        if len(delivered) == 2:
+            received.set()
+
+    peer = OnionPeer("maker", "127.0.0.1:5222", on_message=on_message)
+    try:
+        assert await peer.connect("taker", "NOT-SERVING-ONION", "regtest")
+        await asyncio.wait_for(received.wait(), 1)
+        assert delivered == [first, second]
+        assert peer.peer_features == ({FEATURE_DIRECT_PING_V1: True} if late_handshake else {})
+        assert peer.is_connected()
+    finally:
+        await peer.disconnect()
+    connection.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_invalid_reciprocal_handshake_is_not_delivered_as_application_data(
+    transport: Transport,
+) -> None:
+    _connection, incoming, closed = transport
+    payload = json.loads(handshake({FEATURE_DIRECT_PING_V1: True}))
+    fields = json.loads(payload["line"])
+    fields["network"] = "signet"
+    payload["line"] = json.dumps(fields)
+    incoming.put_nowait(json.dumps(payload).encode())
+    delivered = AsyncMock()
+    peer = OnionPeer("maker", "127.0.0.1:5222", on_message=delivered)
+    assert not await peer.connect("taker", "NOT-SERVING-ONION", "regtest")
+    assert closed.is_set()
+    delivered.assert_not_awaited()
+    assert peer.peer_features == {}
+
+
+@pytest.mark.asyncio
 async def test_old_heartbeat_closes_only_its_original_socket(transport: Transport) -> None:
     connection, incoming, closed = transport
     incoming.put_nowait(handshake({FEATURE_DIRECT_PING_V1: True}))
