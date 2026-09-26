@@ -410,6 +410,33 @@ def test_unsafe_file_mode_and_symlink_are_rejected(tmp_path: Path) -> None:
         RingParticipantStore(link, max_active_sessions=1, max_verified_sessions=1)
 
 
+@pytest.mark.parametrize(
+    "missing_field", ["state", "local_input_signature_created", "local_input_signature_sent"]
+)
+def test_missing_durable_signing_state_is_not_defaulted_to_unsigned(
+    tmp_path: Path, missing_field: str
+) -> None:
+    store = RingParticipantStore(tmp_path / "rings", max_active_sessions=4, max_verified_sessions=2)
+    durable = record(state=RingLifecycleState.RECOVERY_REQUIRED)
+    store.save(durable)
+    path = store.directory / durable.key.filename
+    payload = json.loads(path.read_text())
+    del payload[missing_field]
+    source = json.dumps(payload)
+    path.write_text(source)
+
+    reopened = RingParticipantStore(store.directory, max_active_sessions=4, max_verified_sessions=2)
+    with pytest.raises(RingStoreError, match="strict validation"):
+        reopened.load(durable.key)
+    report = reopened.load_all()
+    assert report.records == ()
+    assert len(report.corruptions) == 1
+    assert path.read_text() == source
+    with pytest.raises(RingStoreError, match="corrupt records"):
+        reopened.save(record(revision=1))
+    assert path.read_text() == source
+
+
 def test_secret_is_persisted_only_in_private_record_and_redacted_from_repr(tmp_path: Path) -> None:
     store = RingParticipantStore(tmp_path / "rings", max_active_sessions=4, max_verified_sessions=2)
     durable = record()

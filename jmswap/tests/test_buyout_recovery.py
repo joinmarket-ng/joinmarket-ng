@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -9,6 +10,7 @@ from test_buyout_signing import BUYER_KEY, COUNTERPARTY_KEY, POINT, Runtime, Set
 
 from jmswap.buyout_chain import BuyoutChain, ChainTransaction
 from jmswap.buyout_recovery import BuyoutRecovery
+from jmswap.buyout_store import BuyoutStore
 from jmswap.lnd_peer import InvoiceState, InvoiceStatus, LndPeerError
 
 runtime = signing_tests.runtime
@@ -163,6 +165,76 @@ async def test_uncertain_force_close_requires_explicit_retry_after_restart(
     assert len(recovery.store.get(h.sid).data["force_close_attempts"]) == 2
     assert await restarted.poll(h.sid)
     assert recovery.peer.close_channel.await_count == 2
+
+
+async def test_crash_after_force_close_intent_survives_database_reopen(
+    settlement: SettlementRuntime, tmp_path: Path
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    h = settlement
+    original = _recovery(h)
+    del h.transactions[h.parent.txid]
+
+    async def crash_during_close(*args: Any, **kwargs: Any) -> None:
+        saved = original.store.get(h.sid)
+        assert saved.state == "FORCE_CLOSE_REQUESTED"
+        assert saved.data["force_close_attempts"][-1]["status"] == "started"
+        raise SimulatedCrash
+
+    original.peer.close_channel.side_effect = crash_during_close
+    with pytest.raises(SimulatedCrash):
+        await original.poll(h.sid)
+    saved = original.store.get(h.sid)
+    original.store.close()
+    # A new DB connection and a new recovery object must not treat a lost reply
+    # as proof the force-close never happened, even across repeated restarts.
+    for _ in range(2):
+        with BuyoutStore(tmp_path / "buyer" / "sessions.sqlite") as reopened:
+            restarted = BuyoutRecovery(
+                reopened,
+                original.escrow,
+                original.peer,
+                original.chain,
+                runtime_binding=original.binding,
+            )
+            assert await restarted.poll(h.sid)
+            current = reopened.get(h.sid)
+            assert current.state == "FORCE_CLOSE_RECOVERY_REQUIRED"
+            assert current.parent_signing_started
+            assert current.data["force_close_attempts"] == saved.data["force_close_attempts"]
+    original.peer.close_channel.assert_awaited_once()
+    original.escrow.cancel.assert_not_awaited()
+
+
+@pytest.mark.parametrize("authorization", [None, False, "true", "absent"])
+async def test_reopened_legacy_session_cannot_infer_force_close_authorization(
+    settlement: SettlementRuntime, tmp_path: Path, authorization: Any
+) -> None:
+    h = settlement
+    original = _recovery(h)
+    del h.transactions[h.parent.txid]
+    record = original.store.get(h.sid)
+    data = {**record.data, "force_close_requested": True}
+    if authorization == "absent":
+        del data["force_close_authorized"]
+    else:
+        data["force_close_authorized"] = authorization
+    saved = original.store.update(record, state=record.state, data=data)
+    original.store.close()
+    with BuyoutStore(tmp_path / "buyer" / "sessions.sqlite") as reopened:
+        restarted = BuyoutRecovery(
+            reopened,
+            original.escrow,
+            original.peer,
+            original.chain,
+            runtime_binding=original.binding,
+        )
+        assert not await restarted.poll(h.sid)
+        assert reopened.get(h.sid) == saved
+    original.peer.close_channel.assert_not_awaited()
+    original.escrow.cancel.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
