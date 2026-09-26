@@ -112,6 +112,25 @@ as JSON, without secrets and without contacting LND or the chain. Records whose
 action is `blocked` must keep their inputs unspent until the exact funding
 transaction or a confirmed conflict settles them.
 
+An orphaned maker `signing` record can be retired automatically if authorization
+was received but local input signing never began. Recovery checks that the exact
+funding transaction is absent and every local input is unspent, retires both LND
+channel attempts, and then releases only that record's wallet leases. Retirement
+intent is saved before external checks, so failures and restarts resume cleanup
+without allowing signing or releasing inputs early.
+After durable channel retirement, release-only recovery still validates wallet
+ownership but does not require the retired LND node to be available.
+
+On upgrade, complete previous-format journals retain their explicit signing
+evidence and unsigned orphans are eligible for this recovery. Missing signing
+fields remain an error. Existing `retiring` or `recovery_required` records without
+the new retirement intent are not automatically abandoned. Once signing might
+have begun, empty signature storage or transaction absence alone does not permit
+retirement. Never delete journals or manually unlock their inputs to bypass this
+protection.
+Older binaries reject journals written with the new retirement-intent field;
+do not remove that field to force a downgrade.
+
 ### Node rotation and on-chain reserve
 
 Once a node has no open ring channels left, it is a good time to give its

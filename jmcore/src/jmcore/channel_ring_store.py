@@ -252,6 +252,7 @@ _ALLOWED_TRANSITIONS: Mapping[RingLifecycleState, frozenset[RingLifecycleState]]
     RingLifecycleState.SIGNING: frozenset(
         {
             RingLifecycleState.SIGNED,
+            RingLifecycleState.RETIRING,
             RingLifecycleState.RECOVERY_REQUIRED,
         }
     ),
@@ -337,6 +338,8 @@ class RingParticipantRecord(StrictStoreModel):
     local_input_signature_created: bool = False
     local_input_signature_sent: bool = False
     final_tx: str | None = None
+    # Durable unsigned retirement intent, retained until wallet leases are released.
+    unsigned_retirement_pending: bool = False
     chain_status: RingChainStatus = Field(default_factory=RingChainStatus)
     created_at: float = Field(ge=0)
     updated_at: float = Field(ge=0)
@@ -394,9 +397,38 @@ class RingParticipantRecord(StrictStoreModel):
     def can_transition_to(self, state: RingLifecycleState) -> bool:
         return state == self.state or state in _ALLOWED_TRANSITIONS[self.state]
 
+    @property
+    def has_unsigned_funding_evidence(self) -> bool:
+        """Whether this maker's exact funding transaction cannot have its signature.
+
+        Persisted signing flags are mandatory when loading a journal. In particular,
+        ``created`` means signing may have begun, even without a saved signature.
+        Chain absence must still be checked separately before retiring channels.
+        """
+        return (
+            self.local_role is RingParticipantRole.MAKER
+            and not self.local_input_signature_created
+            and not self.local_input_signature_sent
+            and not self.local_signatures
+            and self.final_tx is None
+            and self.manifest is not None
+            and self.unsigned_tx is not None
+            and self.unsigned_psbt is not None
+            and bool(self.local_input_outpoints)
+            and self.chain_status.exact_txid == self.manifest.unsigned_txid
+        )
+
     def retirement_action(self) -> RingRetirementAction:
         if self.state in _PRE_VERIFIED_STATES:
             return RingRetirementAction.SHIM_CANCEL
+        if self.state is RingLifecycleState.SIGNING or self.unsigned_retirement_pending:
+            if (
+                self.has_unsigned_funding_evidence
+                and self.chain_status.mempool is TransactionPresence.ABSENT
+                and self.chain_status.chain is TransactionPresence.ABSENT
+            ):
+                return RingRetirementAction.ABANDON_VERIFIED
+            return RingRetirementAction.BLOCKED
         if self.state in {
             RingLifecycleState.PSBT_VERIFIED,
             RingLifecycleState.READY,
@@ -586,6 +618,20 @@ class RingParticipantRecord(StrictStoreModel):
             raise ValueError("verification intent requires exact unsigned funding evidence")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at cannot precede created_at")
+        if self.unsigned_retirement_pending and (
+            not self.has_unsigned_funding_evidence
+            or self.state
+            not in {
+                RingLifecycleState.PSBT_VERIFIED,
+                RingLifecycleState.READY,
+                RingLifecycleState.SIGNING,
+                RingLifecycleState.RETIRING,
+                RingLifecycleState.RETIRED,
+                RingLifecycleState.CONFLICTED,
+                RingLifecycleState.RECOVERY_REQUIRED,
+            }
+        ):
+            raise ValueError("unsigned retirement intent requires exact unsigned maker funding")
         return self
 
     def transition(
@@ -619,7 +665,17 @@ class RingParticipantRecord(StrictStoreModel):
         values["state"] = state
         values["updated_at"] = time.time() if now is None else now
         candidate = RingParticipantRecord(**values)
-        if state is RingLifecycleState.RETIRING and state != self.state:
+        if (
+            self.unsigned_retirement_pending
+            and not candidate.unsigned_retirement_pending
+            and candidate.state is not RingLifecycleState.RETIRED
+        ):
+            raise RingTransitionError(
+                "unsigned retirement intent cannot be cleared before retirement"
+            )
+        if state is RingLifecycleState.RETIRING and (
+            state != self.state or candidate.unsigned_retirement_pending
+        ):
             self._validate_retirement(candidate)
         if (
             state is RingLifecycleState.CONFLICTED
@@ -629,6 +685,16 @@ class RingParticipantRecord(StrictStoreModel):
         return candidate
 
     def _validate_retirement(self, candidate: RingParticipantRecord) -> None:
+        if self.state is RingLifecycleState.SIGNING or candidate.unsigned_retirement_pending:
+            if (
+                not candidate.has_unsigned_funding_evidence
+                or candidate.chain_status.mempool is not TransactionPresence.ABSENT
+                or candidate.chain_status.chain is not TransactionPresence.ABSENT
+            ):
+                raise RingTransitionError(
+                    "unsigned retirement requires exact absent funding evidence"
+                )
+            return
         if self.state in _PRE_VERIFIED_STATES or self.state is RingLifecycleState.CONFIRMED_OPEN:
             return
         if self.state is RingLifecycleState.CONFLICTED:
@@ -732,7 +798,10 @@ class RingParticipantStore:
             if not isinstance(payload, dict):
                 raise ValueError("participant record must be a JSON object")
             expected_keys = set(RingParticipantRecord.model_fields)
-            if set(payload) != expected_keys:
+            # The previous complete format lacks only the retirement-intent marker.
+            # Its absence means no requested cleanup, never permission to abandon.
+            # All old signing fields remain mandatory, including explicit false flags.
+            if set(payload) not in (expected_keys, expected_keys - {"unsigned_retirement_pending"}):
                 raise ValueError("participant record JSON fields differ from the current journal")
             if payload["journal_kind"] != "private_channel_ring":
                 raise ValueError("participant record has an unknown journal kind")
@@ -843,7 +912,9 @@ class RingParticipantStore:
             shared_inputs = set(record.local_input_outpoints).intersection(
                 candidate.local_input_outpoints
             )
-            if shared_inputs:
+            # Updating a retired record's release acknowledgment does not claim
+            # inputs now owned by an active revision.
+            if candidate.active and shared_inputs:
                 raise RingAntiGriefError("input outpoint already belongs to an active session")
         for record in existing:
             same_round_participant = (
@@ -851,7 +922,7 @@ class RingParticipantStore:
                 and record.taker_session_identity == candidate.taker_session_identity
                 and record.revision != candidate.revision
             )
-            if same_round_participant and record.verified_unresolved:
+            if candidate.active and same_round_participant and record.verified_unresolved:
                 raise RingAntiGriefError(
                     "cannot create another revision while verified state is unresolved"
                 )
