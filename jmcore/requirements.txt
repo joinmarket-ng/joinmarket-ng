@@ -382,9 +382,9 @@ httpx-socks==0.13.1 \
     --hash=sha256:771b4f3dbc8f62515a6f8a64f3e1dea9a7826a2521032351d3bd5cc008486bb6 \
     --hash=sha256:9114898471eb0b2c1f67749f1d2b1c9d35c9f6c450d2f5c338033fc2d0af2d20
     # via jmcore (pyproject.toml)
-idna==3.19 \
-    --hash=sha256:5e0811a4383b21dc5838069f801c4fb62113b7447663d2530d2bd6e77b49bf15 \
-    --hash=sha256:815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4
+idna==3.20 \
+    --hash=sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44 \
+    --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
     # via
     #   anyio
     #   httpx
@@ -393,9 +393,9 @@ loguru==0.7.3 \
     --hash=sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6 \
     --hash=sha256:31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c
     # via jmcore (pyproject.toml)
-markdown==3.10.3 \
-    --hash=sha256:3589362618f743188b4d955b874402bc814f4f83f544dc207719f4baa7d9c45f \
-    --hash=sha256:fa6c92a00a4a3c98b22728c64a935ae1928250ae65058a6ded814d2cc29a4cea
+markdown==3.11 \
+    --hash=sha256:180224db6aed87ba9ce1f2781ebcd5826253de8ff637112090e24b84502bbf9f \
+    --hash=sha256:cd6c89e7eb308c8b332ed673215a52d208a43f8bacc030b1419376129408719e
     # via apprise
 mnemonic==0.21 \
     --hash=sha256:1fe496356820984f45559b1540c80ff10de448368929b9c60a2b55744cc88acf \
@@ -573,8 +573,8 @@ pysocks==1.7.1 \
     --hash=sha256:2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5 \
     --hash=sha256:3f8804571ebe159c380ac6de37643bb4685970655d3bba243530d6558b799aa0
     # via jmcore (pyproject.toml)
-python-bitcointx @ https://github.com/m0wer/python-bitcointx/releases/download/python-bitcointx-v2.1.1/python_bitcointx-2.1.1-py3-none-any.whl#sha256=2f82999aa557da5f501bf10ca51dd830bcf16aba27ed8d976065c798454c11c6 \
-    --hash=sha256:2f82999aa557da5f501bf10ca51dd830bcf16aba27ed8d976065c798454c11c6
+python-bitcointx @ https://github.com/m0wer/python-bitcointx/releases/download/python-bitcointx-v2.2.0/python_bitcointx-2.2.0-py3-none-any.whl#sha256=c14297225f11ded3bb6220d520e74a3c144ca28a25455e621aa21b5db31fe36b \
+    --hash=sha256:c14297225f11ded3bb6220d520e74a3c144ca28a25455e621aa21b5db31fe36b
     # via jmcore (pyproject.toml)
 python-dotenv==1.2.3 \
     --hash=sha256:904552145e8bfed22162c09dab1c2b9b54fefa7b23ba780f4f26ca0316b0f0d9 \
@@ -699,7 +699,7 @@ typing-inspection==0.4.4 \
     # via
     #   pydantic
     #   pydantic-settings
-urllib3==2.7.0 \
-    --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
-    --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
+    --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
     # via requests

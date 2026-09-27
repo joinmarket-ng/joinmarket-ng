@@ -29,9 +29,9 @@ PRODUCTION_LOCKS = {
     "tumbler/requirements.txt",
 }
 BITCOINTX_PACKAGES = {"jmcore", "jmwallet", "jmwalletd"}
-BITCOINTX_VERSION = "2.1.1"
+BITCOINTX_VERSION = "2.2.0"
 BITCOINTX_WHEEL_SHA256 = (
-    "2f82999aa557da5f501bf10ca51dd830bcf16aba27ed8d976065c798454c11c6"
+    "c14297225f11ded3bb6220d520e74a3c144ca28a25455e621aa21b5db31fe36b"
 )
 RUNTIME_IMAGE_STAGES = {
     "directory_server/Dockerfile": {"production", "debug"},

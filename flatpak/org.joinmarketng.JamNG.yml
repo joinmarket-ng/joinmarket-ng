@@ -68,8 +68,8 @@ modules:
     buildsystem: autotools
     sources:
       - type: archive
-        url: https://dist.torproject.org/tor-0.4.9.12.tar.gz
-        sha256: c0d307c9dcdaee4848a8ca53e9d6c4ec92823e4f30be12790b0fbddfc6515f5b
+        url: https://dist.torproject.org/tor-0.4.9.13.tar.gz
+        sha256: 5e748d3272cdf44a7d7741173f371c8def3d96eecb77e93c89c50663ce9cc792
 
   # =========================================================================
   # Module 3: libsodium
@@ -153,7 +153,7 @@ modules:
     sources:
       - type: git
         url: https://github.com/joinmarket-webui/jam.git
-        commit: dfed3f85158a7ca6991e3563aaa9ecd35f7b3306
+        commit: 88be5a49b1cf7532f05c1a4cb33046ab5af99e35
 
   # =========================================================================
   # Module 7: Python application
