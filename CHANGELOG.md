@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-09-27
+
+### Added
+
+- Enable CLI tab completion inside the maker, taker and jmwalletd Docker images ([4605f891](../../commit/4605f891d1eb871c97e1386b35e1274fc9e13087))
+- BIP-329 wallet metadata now labels addresses as CoinJoin output, CoinJoin change, deposit, or non-CoinJoin change instead of a bare jm:used marker ([1997c6e6](../../commit/1997c6e6289a0a8717f2a03422ce9df50d65bb67))
+- Add a --show-utxos flag to jm-wallet info that lists UTXOs grouped by type plus fidelity bonds ([fbf2f56e](../../commit/fbf2f56eff265e622b897e030d142f404a4402ac))
+- taker/coinjoin now exposes a status endpoint reporting phase, txid and error ([6adeca78](../../commit/6adeca7886e70fb5b5f869685260985a6c8bda5a))
+
+### Fixed
+
+- Keep installer updates working while new releases await trusted signatures ([e37e5a27](../../commit/e37e5a278251dc245e02df5d743b8c189d16eced))
+- Keep makers available when optional miner-fee prevout lookups fail while logging absent inputs for diagnosis ([950d4b7d](../../commit/950d4b7d64f9b351d7e824bed51de951c4dfdeed))
+- Keep TUI update output available in a scrollable log before returning to the menu ([2625586b](../../commit/2625586b8efb0084ea8aadfec524048eb09b6779))
+- Preserve working Tor configurations when cookie-authenticated control access is already available during installation or updates ([7e8c45a8](../../commit/7e8c45a8943636933e9736e54201aa90401109fc))
+- Fix stale maker offers not being re-announced after a CoinJoin reduced the available balance ([c87a731f](../../commit/c87a731fde4a70783dd52c44527e494e9d60f822))
+- Apply maker offer privacy delays to private orderbook responses and retry failed offer announcements and withdrawals ([2ae87a59](../../commit/2ae87a59188e88876bb8228c26e7b796a92f11cf))
+- Sort UTXOs numerically by derivation path so indices >= 10 order correctly ([44642121](../../commit/44642121b90ea33543d6a4761759d43493be9941))
+- Fix jm-wallet info --show-utxos crashing on a wallet with no UTXOs ([c25968bc](../../commit/c25968bc3bc4371f9de4aa0cf8893d1241a930a6))
+- Support PSBT v2 signing and transactions with unrelated P2WSH inputs ([b6b08368](../../commit/b6b0836834ef3711e7585233d3e1e7d989b2ea96))
+- Omitted Tor control hosts now follow the SOCKS host. Explicit hosts remain unchanged; set control_host = "127.0.0.1" to retain local control with a remote SOCKS proxy. ([24fe2838](../../commit/24fe2838725ddd2fff7cbd238a79c330f2cbb75e))
+- Unknown config entries now warn, including ignored [tor_control] sections. Existing config files are not rewritten. ([24fe2838](../../commit/24fe2838725ddd2fff7cbd238a79c330f2cbb75e))
+- The legacy wallet.background_full_scan setting now blocks startup. Rename it to background_full_rescan (WALLET__BACKGROUND_FULL_RESCAN for environment variables), preserving its value. ([24fe2838](../../commit/24fe2838725ddd2fff7cbd238a79c330f2cbb75e))
+- Keep orderbook nicknames on one line while allowing reachability badges to wrap below them. ([7e28b1db](../../commit/7e28b1dbb43a0522c317291ddfee09f9c4adef1d))
+- Prioritize zero-fee and feature-advertising makers in direct probes and increase scan coverage without increasing concurrency ([783f5ecd](../../commit/783f5ecd88c676c1c89a93f93df5b234efb89388))
+- The fee picked for a single send in JAM (txfee on direct-send and coinjoin requests) is now used instead of being replaced by the global fee setting ([a999aafa](../../commit/a999aafa06aca847bf3f601efdabbcfd61653bac))
+- Apply size_factor only to maximum offer sizes so common minimum sizes remain stable ([8143a16f](../../commit/8143a16f9cf8581c5e5cf695febd9b8bd284a79a))
+- Reduce repeated missing-transaction maker logs to hourly INFO messages ([a100b213](../../commit/a100b213ea65d175658dcfae59d86417a10b9a06))
+- Install jmwalletd in fresh complete profiles and support opt-in updates ([7aa994e4](../../commit/7aa994e4e13b9142b84f0cd4a1c5b6f44ad05fdf))
+- Report the identity rotation quiet period as rotation progress instead of a directory disconnection warning, and stop logging the hidden service listener shutdown twice ([be6ac40c](../../commit/be6ac40c33c9b425cde454d8fe3f1d866c17aa78))
+- Makers now detect when Tor drops their onion service (for example after a Tor restart) and renew their identity instead of advertising an unreachable onion for up to a day ([f421cb29](../../commit/f421cb296cf523d9333de73b5571af0ccdedbcf3))
+- Default the BIP39 wallet confirmation prompt to Yes so Enter continues ([f5f980db](../../commit/f5f980db2cf2c0427735441d424d86aa1ea3be0e))
+- Remove the plaintext all-interface wallet daemon recipe and warn when starting with a non-loopback plaintext listener ([cd55dfb3](../../commit/cd55dfb3da49a0b1cc15f60114eec85b48f26934))
+- Bound direct maker scans and keep peerlist refresh independent of slow probes ([02f254ce](../../commit/02f254ce2402adc990ab51506abbf05b002432f3))
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.39.2)
++++ config.toml.template (0.40.0)
+@@ -6,6 +6,7 @@ top level
+ # section and key, then join them with a double underscore. For example:
+ # [wallet] background_full_rescan -> WALLET__BACKGROUND_FULL_RESCAN
+ # Environment variables take precedence over values in this file.
++# Unknown sections and keys warn at startup and are ignored.
+
+ # ============================================================================
+ # Core Settings
+@@ -37,6 +38,9 @@ [tor]
+ # connection_timeout = 120.0
+
+ # Control port settings (for hidden services)
++# Keep SOCKS and control settings together in [tor], not [tor_control].
++# When control_host is omitted, it follows the effective socks_host (including
++# environment/CLI overrides). Set it explicitly for a separate control endpoint.
+ # control_enabled = true
+ # control_host = "127.0.0.1"  # Defaults to socks_host if not set
+ # control_port = 9051
+@@ -360,8 +364,9 @@ [maker]
+ # Minimum CoinJoin amount (in satoshis) that this maker will offer.
+ #
+ # Lower min_size lets you serve takers requesting smaller mixes at the cost of
+-# producing smaller UTXOs. Note: the *advertised* minsize is randomized on each
+-# offer announcement (see size_factor below) and clamped to the dust threshold.
++# producing smaller UTXOs. The advertised minsize is not randomized. It remains
++# subject to the dust threshold, relative-fee profitability floor, and dual-offer
++# fee intersection described below.
+ #
+ # Default: 100000 (matches the upstream JoinMarket reference; using a different
+ # value may make jm-ng makers fingerprintable).
+@@ -403,9 +408,11 @@ [maker]
+ # cj_fee_absolute = 500        # Absolute fee in satoshis (for sw0absoffer)
+ # tx_fee_contribution = 0      # Mining fee contribution in satoshis
+
+-# Offer randomization factors. Each advertised offer is sampled uniformly from
+-# [value*(1-factor), value*(1+factor)] (size is sampled downward only) on every
+-# announcement so observers cannot correlate balance changes with exact values.
++# Offer randomization factors. Fees are sampled uniformly from
++# [value*(1-factor), value*(1+factor)] on every announcement.
++# size_factor applies only to maxsize, sampled from
++# [available*(1-size_factor), available] to obscure exact fillable liquidity.
++# The minimum is not randomized, and dual-offer intersection boundaries stay pinned.
+ # Set any factor to 0 to disable randomization for that field.
+ # cjfee_factor defaults to 0 (no fee randomization) so a default maker stays
+ # exactly on its quantization quantum. Randomized and other off-grid offers can
+````
+
 ## [0.39.2] - 2026-09-10
 
 Bug fixes! And more security hardening, privacy improvements, and usability enhancements. And a new maker diagnostic tool for checking reachability, offer(s), fidelity bond, and nick authentication.
@@ -4188,7 +4277,8 @@ This release did not change the bundled `config.toml.template`.
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.39.2...HEAD
+[Unreleased]: ../../compare/0.40.0...HEAD
+[0.40.0]: ../../compare/0.39.2...0.40.0
 [0.39.2]: ../../compare/0.39.1...0.39.2
 [0.39.1]: ../../compare/0.39.0...0.39.1
 [0.39.0]: ../../compare/0.38.0...0.39.0

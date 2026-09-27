@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 
 # The project version - update this when releasing
 # Format: MAJOR.MINOR.PATCH (Semantic Versioning)
-__version__ = "0.39.2"
+__version__ = "0.40.0"
 
 # Alias for convenience
 VERSION = __version__
