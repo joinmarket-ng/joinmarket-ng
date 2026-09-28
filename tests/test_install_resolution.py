@@ -85,6 +85,7 @@ get_latest_version() {{ echo "v9.9.9"; }}
 resolve_to_commit_hash() {{ echo "$1"; }}
 verify_release_signature() {{ echo "VERIFY: $1 $2"; return 0; }}
 verify_update_imports() {{ return 0; }}
+read_release_file() {{ cat "{REPO_ROOT}/$1"; }}
 python3() {{ return 0; }}
 pip() {{
     [[ "$1" == "show" ]] && return 1
