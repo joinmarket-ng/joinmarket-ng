@@ -38,6 +38,10 @@ verify_update_imports() {{ return 0; }}
 prepare_verified_source() {{ return 0; }}
 RELEASE_LOG=$(mktemp)
 read_release_file() {{
+    if [[ "$1" == */pyproject.toml ]]; then
+        cat "{INSTALL_SH.parent}/$1"
+        return
+    fi
     echo "LOCK: $1" >> "$RELEASE_LOG"
     if [[ "$1" == jmwalletd/requirements.txt && "{str(missing_lock).lower()}" == true ]]; then
         return 1
@@ -147,7 +151,7 @@ def test_existing_daemon_updates_even_when_minimal_role_selected() -> None:
     )
     assert all(
         f"LOCK: {pkg}/requirements.txt" in result.stdout
-        for pkg in ("maker", "taker", "tumbler", "jmwalletd")
+        for pkg in ("jmswap", "maker", "taker", "tumbler", "jmwalletd")
     )
 
 

@@ -23,6 +23,7 @@ PLATFORMS = {"linux/amd64", "linux/arm64", "linux/arm/v7"}
 PRODUCTION_LOCKS = {
     "directory_server/requirements.txt",
     "jmcore/requirements.txt",
+    "jmswap/requirements.txt",
     "jmwallet/requirements.txt",
     "jmwalletd/requirements.txt",
     "maker/requirements.txt",
@@ -115,6 +116,7 @@ def test_python_security_workflow_audits_locks_and_fresh_resolution() -> None:
     fresh_commands = "\n".join(step.get("run", "") for step in fresh_steps)
     assert '--path "$target_site_packages" --skip-editable' in fresh_commands
     assert "requirements-security.txt" in fresh_commands
+    assert "-e ./jmswap" in fresh_commands
 
 
 def test_codeql_uses_extended_queries_for_supported_sources() -> None:
