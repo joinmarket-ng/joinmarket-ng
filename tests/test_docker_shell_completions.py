@@ -26,7 +26,8 @@ COMPLETION_IMAGES = {
 }
 
 BUILDER_STAGE_COPY = (
-    "COPY completions/*.bash completions/jm-completions-loader.sh /build/completions/"
+    "COPY --chmod=0644 completions/*.bash completions/jm-completions-loader.sh "
+    "/build/completions/"
 )
 RUNTIME_STAGE_COPY = "COPY --from=builder /build/completions /etc/bash_completion.d"
 BASHRC_LINE = (
@@ -89,3 +90,18 @@ def test_staged_completions_are_timestamp_normalized(image: str) -> None:
         f"{image} builder does not normalize /build/completions timestamps"
     )
     assert content.index(BUILDER_STAGE_COPY) < content.index(RUNTIME_STAGE_COPY)
+
+
+@pytest.mark.parametrize("image", sorted(COMPLETION_IMAGES))
+def test_staged_completions_have_fixed_modes(image: str) -> None:
+    """COPY keeps source file modes, which follow the umask of the local checkout."""
+    copies = [
+        line
+        for line in COMPLETION_IMAGES[image].read_text().splitlines()
+        if line.startswith("COPY ") and "completions/" in line and "--from=" not in line
+    ]
+
+    assert copies
+    assert all("--chmod=0644" in line.split() for line in copies), (
+        f"{image} stages completions with checkout dependent file modes"
+    )
