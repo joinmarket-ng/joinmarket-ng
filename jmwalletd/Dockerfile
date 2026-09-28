@@ -98,7 +98,8 @@ COPY tumbler/src /build/tumbler/src
 COPY tumbler/pyproject.toml /build/tumbler/
 
 # Static bash completions shipped in the runtime image (normalized below too).
-COPY completions/*.bash completions/jm-completions-loader.sh /build/completions/
+# --chmod fixes the modes a checkout takes from the local umask.
+COPY --chmod=0644 completions/*.bash completions/jm-completions-loader.sh /build/completions/
 
 # Normalize file timestamps so local working-copy mtimes don't differ from CI clone
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \

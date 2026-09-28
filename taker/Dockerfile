@@ -90,8 +90,8 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
 
 # Static bash completions shipped in the runtime image. Staged here so the
 # timestamp normalization below covers them and the production COPY layer stays
-# reproducible.
-COPY completions/*.bash completions/jm-completions-loader.sh /build/completions/
+# reproducible. --chmod fixes the modes a checkout takes from the local umask.
+COPY --chmod=0644 completions/*.bash completions/jm-completions-loader.sh /build/completions/
 
 # Normalize installed Python environment mtimes for reproducible COPY layer digests
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
