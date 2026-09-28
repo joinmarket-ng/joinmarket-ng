@@ -442,7 +442,7 @@ jobs:
           python -m pip install --upgrade pip
           # Install from source in editable mode mirrors the documented
           # Windows quick start.
-          pip install ./jmcore ./taker ./jmwallet
+          pip install ./jmcore ./jmwallet ./jmswap ./taker
           python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig'
       - name: Install Tor, start it, and fetch the signet orderbook
         shell: pwsh

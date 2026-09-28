@@ -50,8 +50,25 @@ runs:
           DEV_FLAG="[dev]"
         fi
 
+        # Maker/taker declare jmswap as an unpublished local dependency. Install
+        # it first even if the caller lists it last (or omits it entirely).
+        swap_installed=false
         for component in "${COMPONENTS[@]}"; do
           component=$(echo "$component" | xargs)  # trim whitespace
+          case "$component" in
+            maker|taker|tumbler|jmwalletd)
+              if [ "$swap_installed" = false ]; then
+                pip install -e "jmswap${DEV_FLAG}"
+                swap_installed=true
+              fi
+              ;;
+            jmswap)
+              if [ "$swap_installed" = true ]; then
+                continue
+              fi
+              swap_installed=true
+              ;;
+          esac
           echo "Installing $component..."
           pip install -e "${component}${DEV_FLAG}"
         done
