@@ -1945,31 +1945,41 @@ jobs:
             sleep 2
           done
 
-          echo "Waiting for JAM makers..."
-          for i in {1..30}; do
-            if docker compose exec -T jam-maker1 sh -c "timeout 5 bash -c '</dev/tcp/127.0.0.1/80'" 2>/dev/null; then
-              echo "JAM maker1 ready"
-              break
+          echo "Waiting for both JAM makers..."
+          for maker in jam-maker1 jam-maker2; do
+            maker_ready=0
+            for i in {1..30}; do
+              if docker compose exec -T "$maker" sh -c "timeout 5 bash -c '</dev/tcp/127.0.0.1/80'" 2>/dev/null; then
+                echo "$maker ready"
+                maker_ready=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "$maker_ready" -ne 1 ]; then
+              echo "$maker never became ready"
+              exit 1
             fi
-            sleep 5
           done
 
-          echo "Verifying the directory onion is reachable from jam-maker1..."
           ONION=$(docker compose exec -T tor sh -c "tr -d '[:space:]' < /var/lib/tor/directory/hostname")
-          onion_ready=0
-          for i in {1..60}; do
-            if docker compose exec -T jam-maker1 check-directory-onion "$ONION" --timeout 20; then
-              echo "Directory onion reachable: $ONION"
-              onion_ready=1
-              break
+          for maker in jam-maker1 jam-maker2; do
+            echo "Verifying the directory onion is reachable from $maker..."
+            onion_ready=0
+            for i in {1..60}; do
+              if docker compose exec -T "$maker" check-directory-onion "$ONION" --timeout 20; then
+                echo "Directory onion reachable from $maker: $ONION"
+                onion_ready=1
+                break
+              fi
+              echo "Attempt $i/60: onion not reachable from $maker yet..."
+              sleep 5
+            done
+            if [ "$onion_ready" -ne 1 ]; then
+              echo "Directory onion never became reachable from $maker"
+              exit 1
             fi
-            echo "Attempt $i/60: onion $ONION not reachable yet..."
-            sleep 5
           done
-          if [ "$onion_ready" -ne 1 ]; then
-            echo "Directory onion $ONION never became reachable from jam-maker1"
-            exit 1
-          fi
 
           echo "Waiting for reference makers to connect..."
           sleep 30
