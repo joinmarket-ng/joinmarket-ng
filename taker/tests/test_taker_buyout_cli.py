@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 from bitcointx.core.key import CKey
+from click.utils import strip_ansi
 from jmcore.bitcoin import scriptpubkey_to_address
 from jmcore.models import NetworkType, OfferType
 from jmswap import buyout_config as buyout_config_module
@@ -190,8 +191,9 @@ def test_coinjoin_help_documents_the_opt_in_pair() -> None:
     result = runner.invoke(app, ["coinjoin", "--help"], prog_name="jm-taker")
 
     assert result.exit_code == 0
-    assert "--buyout-config" in result.stdout
-    assert "--buyout-session" in result.stdout
+    help_text = strip_ansi(result.stdout)
+    assert "--buyout-config" in help_text
+    assert "--buyout-session" in help_text
 
 
 async def test_ordinary_coinjoin_never_loads_or_opens_a_buyout(taker: MagicMock) -> None:
