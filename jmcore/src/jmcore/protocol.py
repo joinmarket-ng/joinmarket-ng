@@ -15,6 +15,8 @@ Available Features:
   light client verification. Required for Neutrino backend takers.
 - push_encrypted: Encrypted !push command with session binding. Prevents
   abuse of makers as unauthenticated broadcast bots.
+- private_channel_ring: Backend-validated support for private
+  Taproot channel rings. This has no legacy fallback.
 
 Feature Dependencies:
 - neutrino_compat: No dependencies
@@ -53,6 +55,7 @@ import binascii
 import ipaddress
 import json
 import re
+from collections.abc import Iterator
 from enum import IntEnum, StrEnum
 from typing import Any
 
@@ -81,16 +84,20 @@ _FEATURE_IDENTIFIER_DELIMITERS = _PEERLIST_FIELD_DELIMITERS | {"+"}
 # Feature flag constants
 FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
 FEATURE_PUSH_ENCRYPTED = "push_encrypted"
+FEATURE_PRIVATE_CHANNEL_RING = "private_channel_ring"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
+FEATURE_DIRECT_PING_V1 = "direct_ping_v1"  # Verified direct sockets echo a 16-byte hex nonce
 FEATURE_NICK_AUTH = "nick_auth"
 
 # Feature dependencies: feature -> list of required features
 FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_NEUTRINO_COMPAT: [],
     FEATURE_PUSH_ENCRYPTED: [],  # Requires NaCl session, but that's implicit
+    FEATURE_PRIVATE_CHANNEL_RING: [],
     FEATURE_PEERLIST_FEATURES: [],  # No dependencies
     FEATURE_PING: [],  # No dependencies
+    FEATURE_DIRECT_PING_V1: [],
     FEATURE_NICK_AUTH: [],  # No dependencies
 }
 
@@ -98,8 +105,10 @@ FEATURE_DEPENDENCIES: dict[str, list[str]] = {
 ALL_FEATURES = {
     FEATURE_NEUTRINO_COMPAT,
     FEATURE_PUSH_ENCRYPTED,
+    FEATURE_PRIVATE_CHANNEL_RING,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
+    FEATURE_DIRECT_PING_V1,
     FEATURE_NICK_AUTH,
 }
 
@@ -243,7 +252,7 @@ class FeatureSet:
     def __contains__(self, feature: str) -> bool:
         return feature in self.features
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         return iter(self.features)
 
     def __len__(self) -> int:
@@ -578,7 +587,7 @@ def peer_supports_neutrino_compat(handshake_data: dict[str, Any]) -> bool:
         True if peer advertises neutrino_compat feature
     """
     features = handshake_data.get("features", {})
-    return features.get(FEATURE_NEUTRINO_COMPAT, False)
+    return features.get(FEATURE_NEUTRINO_COMPAT) is True
 
 
 def parse_peer_location(location: str) -> tuple[str, int]:

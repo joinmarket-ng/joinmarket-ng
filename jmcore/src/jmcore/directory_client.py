@@ -16,6 +16,7 @@ import contextlib
 import json
 import struct
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -24,7 +25,13 @@ from typing import Any
 from loguru import logger
 
 from jmcore.btc_script import mk_freeze_script, redeem_script_to_p2wsh_script
-from jmcore.crypto import NickIdentity, verify_fidelity_bond_proof
+from jmcore.credential_market import (
+    MAX_MARKET_LISTING_BYTES,
+    MarketError,
+    canonical,
+    decode_document,
+)
+from jmcore.crypto import NickIdentity, verify_fidelity_bond_proof, verify_signed_privmsg
 from jmcore.models import FidelityBond, Offer, OfferType
 from jmcore.network import (
     ONION_HOSTID,
@@ -50,6 +57,7 @@ from jmcore.protocol import (
     FEATURE_NICK_AUTH,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
+    FEATURE_PRIVATE_CHANNEL_RING,
     JM_VERSION,
     NICK_PEERLOCATOR_SEPARATOR,
     FeatureSet,
@@ -109,6 +117,20 @@ _NICK_AUTH_MESSAGE_TYPES = frozenset(
         MessageType.NICK_AUTH_PROOF.value,
         MessageType.NICK_AUTH_RESULT.value,
     }
+)
+
+_MAX_MARKET_PROOF_BYTES = 16 * 1024
+_MAX_MARKET_PROOF_BASE64_BYTES = 22 * 1024
+_MAX_MARKET_FAULTS = 64
+_MAX_MARKET_LISTINGS = 256
+_MAX_MARKET_LISTING_BASE64_BYTES = 4 * ((MAX_MARKET_LISTING_BYTES + 2) // 3)
+_MAX_MARKET_LISTING_WIRE_BYTES = (
+    len("moffer ")
+    + _MAX_MARKET_LISTING_BASE64_BYTES
+    + 1
+    + 66  # Compressed public key hex.
+    + 1
+    + 96  # DER signature base64.
 )
 
 
@@ -250,6 +272,7 @@ class DirectoryClient:
         max_message_size: int = 2097152,
         on_disconnect: Callable[[], None] | None = None,
         neutrino_compat: bool = False,
+        private_channel_ring: bool = False,
         peerlist_timeout: float = 60.0,
         socks_username: str | None = None,
         socks_password: str | None = None,
@@ -323,6 +346,7 @@ class DirectoryClient:
         if self.nick_auth_directory_id is None:
             with contextlib.suppress(ValueError):
                 self.nick_auth_directory_id = directory_id_for_endpoint(self.host, self.port)
+        self.private_channel_ring = private_channel_ring
 
         # Version negotiation state (set after handshake)
         self.negotiated_version: int | None = None
@@ -361,6 +385,12 @@ class DirectoryClient:
             maxsize=MAX_BUFFERED_MESSAGES
         )
         self._message_buffer_bytes = 0
+        # Fault proofs remain opaque here. Takers drain and verify them after
+        # their ordinary batch bond verification has completed.
+        self._market_faults: deque[bytes] = deque()
+        # Listings are authenticated only when a caller explicitly drains this
+        # bounded public-message buffer. They never enter CoinJoin offer state.
+        self._market_listings: deque[tuple[str, str]] = deque(maxlen=_MAX_MARKET_LISTINGS)
 
         # In-flight GETPEERLIST sink. When non-None, the listen() receive loop
         # redirects PEERLIST payloads into this queue instead of handling them
@@ -518,6 +548,95 @@ class DirectoryClient:
         if isinstance(error, _DirectoryClientLimitError):
             await self._abort_for_resource_limit(error)
 
+    def drain_market_faults(self) -> list[bytes]:
+        """Return and clear bounded, public ``mproof`` payloads without verification."""
+        faults = list(self._market_faults)
+        self._market_faults.clear()
+        return faults
+
+    def drain_market_listings(self) -> list[tuple[str, bytes]]:
+        """Return and clear authenticated, canonical public ``moffer`` documents."""
+        listings: list[tuple[str, bytes]] = []
+        while self._market_listings:
+            sender, rest = self._market_listings.popleft()
+            authenticated, command, encoded = verify_signed_privmsg(sender, rest, ONION_HOSTID)
+            if not authenticated or command != "moffer":
+                continue
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+                if (
+                    len(raw) > MAX_MARKET_LISTING_BYTES
+                    or base64.b64encode(raw).decode("ascii") != encoded
+                    or canonical(decode_document(raw)) != raw
+                ):
+                    continue
+            except (binascii.Error, MarketError, ValueError):
+                continue
+            listings.append((sender, raw))
+        return listings
+
+    def _capture_market_fault(self, message: dict[str, Any]) -> None:
+        """Capture only the exact public fault-proof wire form before crypto work."""
+        if message.get("type") != MessageType.PUBMSG.value:
+            return
+        line = message.get("line")
+        if not isinstance(line, str) or not line.isascii():
+            return
+        parts = line.split(COMMAND_PREFIX, 2)
+        if len(parts) != 3 or not parts[0] or parts[1] != "PUBLIC":
+            return
+        command, separator, encoded = parts[2].partition(" ")
+        if (
+            command != "mproof"
+            or not separator
+            or not encoded
+            or " " in encoded
+            or len(encoded) > _MAX_MARKET_PROOF_BASE64_BYTES
+        ):
+            return
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return
+        if len(raw) > _MAX_MARKET_PROOF_BYTES or base64.b64encode(raw).decode("ascii") != encoded:
+            return
+        # Keep the oldest unverified proofs: a flood of newcomers must not evict
+        # evidence already captured, and repeats do not take extra slots.
+        if len(self._market_faults) >= _MAX_MARKET_FAULTS or raw in self._market_faults:
+            return
+        self._market_faults.append(raw)
+
+    def _capture_market_listing(self, message: dict[str, Any]) -> None:
+        """Capture bounded public ``moffer`` envelopes before signature verification."""
+        # Preserve this batch until authentication. An unverified newcomer must
+        # not evict an older valid envelope through deque's maxlen behavior.
+        if len(self._market_listings) >= _MAX_MARKET_LISTINGS:
+            return
+        if message.get("type") != MessageType.PUBMSG.value:
+            return
+        line = message.get("line")
+        if not isinstance(line, str) or not line.isascii():
+            return
+        parts = line.split(COMMAND_PREFIX, 2)
+        if len(parts) != 3 or not is_valid_nick(parts[0]) or parts[1] != "PUBLIC":
+            return
+        rest = parts[2]
+        if len(rest) > _MAX_MARKET_LISTING_WIRE_BYTES:
+            return
+        tokens = rest.split(" ")
+        if len(tokens) != 4 or tokens[0] != "moffer" or not all(tokens):
+            return
+        encoded = tokens[1]
+        if len(encoded) > _MAX_MARKET_LISTING_BASE64_BYTES:
+            return
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return
+        if len(raw) > MAX_MARKET_LISTING_BYTES or base64.b64encode(raw).decode("ascii") != encoded:
+            return
+        self._market_listings.append((parts[0], rest))
+
     async def connect(self) -> None:
         """Connect to the directory server and perform handshake."""
         self._disconnect_notified = False
@@ -602,6 +721,8 @@ class DirectoryClient:
             and self.nick_auth_directory_id is not None
         ):
             our_features.add(FEATURE_NICK_AUTH)
+        if self.private_channel_ring:
+            our_features.add(FEATURE_PRIVATE_CHANNEL_RING)
         feature_set = FeatureSet(features=our_features)
 
         # Send our handshake with current version and features
@@ -1232,6 +1353,8 @@ class DirectoryClient:
                 buffered_msg = self._message_buffer.get_nowait()
                 self._discard_buffered_message(buffered_msg)
                 await self._reject_out_of_order_nick_auth(buffered_msg.get("type"))
+                self._capture_market_fault(buffered_msg)
+                self._capture_market_listing(buffered_msg)
                 logger.bind(sensitive=True).trace(
                     f"Processing buffered message type {buffered_msg.get('type')}: "
                     f"{buffered_msg.get('line', '')[:80]}..."
@@ -1273,6 +1396,8 @@ class DirectoryClient:
                 total_message_bytes = self._append_collected_message(
                     messages, response, total_message_bytes, "listen"
                 )
+                self._capture_market_fault(response)
+                self._capture_market_listing(response)
                 consecutive_errors = 0
 
             except TimeoutError:
@@ -1380,7 +1505,7 @@ class DirectoryClient:
 
         # Offer type prefixes for lightweight detection during listening.
         # Full parsing happens after collection -- this is just for counting.
-        offer_prefixes = ("sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer")
+        offer_prefixes = tuple(t.value for t in OfferType)
 
         messages: list[dict[str, Any]] = []
         total_message_bytes = 0
@@ -1752,6 +1877,8 @@ class DirectoryClient:
                 msg_type = message.get("type")
                 await self._reject_out_of_order_nick_auth(msg_type)
                 line = message.get("line", "")
+                self._capture_market_fault(message)
+                self._capture_market_listing(message)
 
                 # Handle PEERLIST responses (from periodic or automatic requests)
                 if msg_type == MessageType.PEERLIST.value:
@@ -1926,7 +2053,8 @@ class DirectoryClient:
         """
         Parse an offer from a message's content part.
 
-        Handles all offer types (sw0reloffer, sw0absoffer, swreloffer, swabsoffer),
+        Handles all offer types (sw0reloffer, sw0absoffer, swreloffer, swabsoffer,
+        tr0reloffer, tr0absoffer),
         optional fidelity bond proof, and the deprecated !neutrino flag.
 
         Args:
@@ -1944,7 +2072,7 @@ class DirectoryClient:
             logger.debug("Dropping offer from invalid JoinMarket nick")
             return None
 
-        offer_types = ["sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer"]
+        offer_types = [t.value for t in OfferType]
         for offer_type in offer_types:
             if not rest.startswith(offer_type):
                 continue
@@ -1997,7 +2125,7 @@ class DirectoryClient:
                 txfee = int(offer_parts[4])
                 cjfee_str = offer_parts[5]
 
-                if offer_type in ["sw0absoffer", "swabsoffer"]:
+                if offer_type in ["sw0absoffer", "swabsoffer", "tr0absoffer"]:
                     cjfee = str(int(cjfee_str))
                 else:
                     cjfee = normalize_relative_cjfee(cjfee_str)

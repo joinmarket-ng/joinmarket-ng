@@ -31,6 +31,7 @@ from jmcore.bitcoin import (
     sha256,
 )
 from jmcore.btc_script import BondAddressInfo, derive_bond_address
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingSettings
 from jmcore.commitment_blacklist import (
     COMMITMENT_HEX_LENGTH,
     CommitmentBlacklist,
@@ -76,6 +77,9 @@ from jmcore.models import (
     PeerInfo,
     calculate_cj_fee,
     get_default_directory_nodes,
+    is_taproot_offer_type,
+    offer_output_script_type,
+    offer_types_for_family,
 )
 from jmcore.nick_tracker import NickTracker
 from jmcore.notifications import (
@@ -108,6 +112,7 @@ from jmcore.podle import (
 )
 from jmcore.protocol import (
     FEATURE_NEUTRINO_COMPAT,
+    FEATURE_PRIVATE_CHANNEL_RING,
     FEATURE_PUSH_ENCRYPTED,
     JM_VERSION,
     JM_VERSION_MIN,
@@ -238,6 +243,9 @@ __all__ = [
     "MessageEnvelope",
     "PeerInfo",
     "calculate_cj_fee",
+    "is_taproot_offer_type",
+    "offer_output_script_type",
+    "offer_types_for_family",
     # Nick tracking
     "NickTracker",
     # Notifications
@@ -266,6 +274,7 @@ __all__ = [
     "serialize_revelation",
     "verify_podle",
     # Protocol
+    "FEATURE_PRIVATE_CHANNEL_RING",
     "FEATURE_NEUTRINO_COMPAT",
     "FEATURE_PUSH_ENCRYPTED",
     "FeatureSet",
@@ -279,6 +288,9 @@ __all__ = [
     "get_nick_version",
     "parse_utxo_list",
     "peer_supports_neutrino_compat",
+    # Channel ring
+    "ChannelRingConfig",
+    "ChannelRingSettings",
     # Rate limiting
     "RateLimiter",
     "TokenBucket",

@@ -113,20 +113,32 @@ class TestConfigTemplate:
         derived_env_names: set[str] = set()
         expected_env_names: set[str] = set()
 
-        for section in JoinMarketSettings.model_fields:
-            nested_settings = getattr(settings, section, None)
+        pending = [
+            (section, getattr(settings, section, None))
+            for section in JoinMarketSettings.model_fields
+        ]
+        while pending:
+            section, nested_settings = pending.pop()
             if not isinstance(nested_settings, BaseModel):
                 continue
-
+            child_models = {
+                name: value
+                for name in type(nested_settings).model_fields
+                if isinstance((value := getattr(nested_settings, name)), BaseModel)
+            }
             canonical_keys = template_keys.get(section)
             assert canonical_keys is not None, f"Missing [{section}] in config.toml.template"
-            expected_keys = set(type(nested_settings).model_fields) - excluded_fields.get(
-                section, set()
+            expected_keys = (
+                set(type(nested_settings).model_fields)
+                - set(child_models)
+                - excluded_fields.get(section, set())
             )
             assert canonical_keys == expected_keys
 
-            derived_env_names.update(f"{section}__{key}".upper() for key in canonical_keys)
-            expected_env_names.update(f"{section}__{key}".upper() for key in expected_keys)
+            env_section = section.replace(".", "__")
+            derived_env_names.update(f"{env_section}__{key}".upper() for key in canonical_keys)
+            expected_env_names.update(f"{env_section}__{key}".upper() for key in expected_keys)
+            pending.extend((f"{section}.{name}", value) for name, value in child_models.items())
 
         assert JoinMarketSettings.model_config["env_nested_delimiter"] == "__"
         assert derived_env_names == expected_env_names
@@ -348,6 +360,7 @@ class TestSettingsDefaults:
         assert settings.taker.bondless_require_zero_fee is True
         assert settings.taker.initial_confirmation_timeout_sec == 300
         assert settings.taker.tx_broadcast == "random-peer"
+        assert settings.taker.external_podle_mode == "disabled"
 
 
 class TestSettingsFromEnv:
@@ -842,10 +855,16 @@ class TestTakerSettingsPodleFields:
             taker_utxo_age=10,
             taker_utxo_retries=7,
             taker_utxo_amtpercent=50,
+            external_podle_mode="only",
         )
         assert settings.taker_utxo_age == 10
         assert settings.taker_utxo_retries == 7
         assert settings.taker_utxo_amtpercent == 50
+        assert settings.external_podle_mode == "only"
+
+    def test_external_podle_mode_rejects_unsupported_values(self) -> None:
+        with pytest.raises(ValueError):
+            TakerSettings(external_podle_mode="fallback")  # type: ignore[arg-type]
 
     def test_taker_utxo_age_rejects_zero(self) -> None:
         """``taker_utxo_age`` must be >= 1; PoDLE commitments require

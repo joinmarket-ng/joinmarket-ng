@@ -7,8 +7,14 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
+from jmcore.channel_ring import ChannelRingConfig
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
-from jmcore.models import OfferType
+from jmcore.models import (
+    OfferType,
+    is_absolute_offer_type,
+    is_taproot_offer_type,
+    offer_output_script_type,
+)
 from jmcore.tor_control import HiddenServiceDoSConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -146,13 +152,13 @@ class OfferConfig(BaseModel):
             raise ValueError(
                 "Wrapped SegWit maker offers are not supported by the P2WPKH wallet signer"
             )
-        if self.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+        if not is_absolute_offer_type(self.offer_type):
             validate_relative_cj_fee(self.cj_fee_relative, self.cjfee_factor)
         return self
 
     def get_cjfee(self) -> str | int:
         """Get the appropriate cjfee value based on offer type."""
-        if self.offer_type in (OfferType.SW0_ABSOLUTE, OfferType.SWA_ABSOLUTE):
+        if is_absolute_offer_type(self.offer_type):
             return self.cj_fee_absolute
         return self.cj_fee_relative
 
@@ -259,6 +265,7 @@ class MakerConfig(WalletConfig):
             "Allows running multiple offers (e.g., relative + absolute) simultaneously."
         ),
     )
+    channel_ring: ChannelRingConfig = Field(default_factory=ChannelRingConfig)
 
     # Single offer configuration (legacy, used when offer_configs is empty)
     offer_type: OfferType = Field(
@@ -539,8 +546,36 @@ class MakerConfig(WalletConfig):
                     "Wrapped SegWit maker offers are not supported by the P2WPKH wallet signer"
                 )
             # Validate cj_fee_relative for relative offer types
-            if self.offer_type in (OfferType.SW0_RELATIVE, OfferType.SWA_RELATIVE):
+            if not is_absolute_offer_type(self.offer_type):
                 validate_relative_cj_fee(self.cj_fee_relative, self.cjfee_factor)
+
+        # A co-funded ring is Taproot only, so report that requirement before
+        # the generic pit check: an operator who enabled the ring needs to know
+        # which feature constrains the wallet and offer family.
+        if self.channel_ring.enabled:
+            if not self.channel_ring.mixdepth_nodes:
+                raise ValueError("enabled maker channel ring requires local mixdepth_nodes")
+            if self.channel_ring.taker_participates is not None:
+                raise ValueError("taker_participates is a taker-only channel-ring setting")
+            if self.address_type != "p2tr":
+                raise ValueError("enabled channel ring requires a p2tr wallet")
+            if any(
+                not is_taproot_offer_type(offer.offer_type)
+                for offer in self.get_effective_offer_configs()
+            ):
+                raise ValueError("enabled channel ring requires only tr0 maker offers")
+
+        # A CoinJoin pit is rigid (JMP-0010): every offer this maker advertises
+        # must produce the output script type its wallet can sign for, so an
+        # incompatible family fails here instead of at !fill time.
+        for offer in self.get_effective_offer_configs():
+            expected_address_type = offer_output_script_type(offer.offer_type)
+            if expected_address_type != self.address_type:
+                raise ValueError(
+                    f"offer_type {offer.offer_type.value!r} requires a "
+                    f"{expected_address_type!r} wallet, but address_type is "
+                    f"{self.address_type!r}"
+                )
 
         return self
 

@@ -98,6 +98,8 @@ async def test_bond_sent_only_in_privmsg_response():
     mock_backend = Mock()
     mock_config = Mock()
     mock_config.data_dir = "/tmp/test"
+    # MakerBot derives the CoinJoin pit (and peer nick filename) from this.
+    mock_config.address_type = "p2wpkh"
     # Add rate limiter config to prevent validation errors
     mock_config.message_rate_limit = 10
     mock_config.message_burst_limit = 100

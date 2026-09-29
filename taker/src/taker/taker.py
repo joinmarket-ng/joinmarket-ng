@@ -17,20 +17,27 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import secrets
 import time
-from collections.abc import Awaitable, Callable
-from typing import Any, cast
+from collections.abc import Awaitable, Callable, Iterable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
+from jmcore import experimental
 from jmcore.bitcoin import calculate_tx_vsize, get_address_type
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
+from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.commitment_blacklist import set_blacklist_path
+from jmcore.credential_market import BondReference
 from jmcore.crypto import NickIdentity
+from jmcore.experimental import warn_experimental
 from jmcore.fee_policy import fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
-from jmcore.models import Offer
+from jmcore.market_faults import MarketFaultCache
+from jmcore.models import Offer, offer_output_script_type, offer_types_for_family
 from jmcore.notifications import get_notifier
-from jmcore.paths import read_nick_state
+from jmcore.paths import get_default_data_dir, get_nick_state_component, read_nick_state
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, JM_VERSION
 from jmcore.tasks import spawn_task
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
@@ -45,6 +52,7 @@ from jmwallet.wallet.signing import (
 from jmwallet.wallet.spend import resolve_input_utxos
 from loguru import logger
 
+from taker.channel_ring_coordinator_store import CoordinatorStore
 from taker.coinjoin_session import CoinJoinSession
 from taker.config import Schedule, TakerConfig, resolve_counterparty_count
 from taker.eligibility import (
@@ -59,8 +67,13 @@ from taker.orderbook import (
     OrderbookManager,
     calculate_cj_fee,
     maker_selection_keys,
+    offer_supports_private_channel_ring,
 )
-from taker.podle_manager import PoDLEManager
+from taker.podle import ExtendedPoDLECommitment
+from taker.podle_manager import BondKey, ExternalPoDLEPreview, PoDLEManager
+
+if TYPE_CHECKING:
+    from taker.buyout import ChannelBuyout
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
 __all__ = [
@@ -71,6 +84,13 @@ __all__ = [
     "Taker",
     "warn_if_destination_script_mismatch",
 ]
+
+
+# A channel ring spends every participant residual into shared channel outputs,
+# while a buyout needs its own escrow change output from the same round. One
+# round cannot satisfy both accountings, so the combination is rejected before
+# any maker selection, input reservation or signing happens.
+RING_BUYOUT_CONFLICT = "Channel-ring mode cannot fund a private channel buyout in the same round"
 
 
 # JM-NG wallets are uniformly wpkh descriptors, so any non-p2wpkh destination
@@ -164,6 +184,140 @@ def warn_if_destination_script_mismatch(destination: str) -> str | None:
     return dest_type
 
 
+def verified_bond_key(offer: Offer, network: str) -> BondKey | None:
+    """Return the complete bond identity an offer independently proved, if any.
+
+    Only a bond that passed normal backend verification and carries the whole
+    tuple (outpoint, public key, locktime) yields a key. An unverified bond, a
+    different key on the same outpoint, or incomplete proof data yields
+    ``None``, so nothing is ever matched on partial evidence.
+    """
+    if offer.fidelity_bond_verified is not True:
+        return None
+    data = offer.fidelity_bond_data
+    if not isinstance(data, dict):
+        return None
+    txid = data.get("utxo_txid")
+    vout = data.get("utxo_vout")
+    pubkey = data.get("utxo_pub")
+    locktime = data.get("locktime")
+    if (
+        not isinstance(txid, str)
+        or type(vout) is not int
+        or not isinstance(pubkey, str)
+        or type(locktime) is not int
+    ):
+        return None
+    return (network, txid, vout, pubkey, locktime)
+
+
+def bond_reference_key(bond: BondReference) -> BondKey:
+    """Return the same identity tuple for a signed market bond reference."""
+    return (bond.network, bond.outpoint.txid, bond.outpoint.vout, bond.pubkey, bond.locktime)
+
+
+def nicks_proving_bonds(offers: Iterable[Offer], bond_keys: set[BondKey], network: str) -> set[str]:
+    """Return the nicks currently proving one of these exact bond identities."""
+    if not bond_keys:
+        return set()
+    return {
+        offer.counterparty
+        for offer in offers
+        if verified_bond_key(offer, network) in bond_keys  # None never matches a key
+    }
+
+
+class _RoundSellerSeparation:
+    """Keep every credential seller used in a round out of that round's makers.
+
+    Both directions are permanent for the round and nick-independent, because
+    knowledge cannot be taken back and a nick is not an identity:
+
+    * every maker bond the round selected or contacted (including makers that
+      later failed, were replaced, or stopped advertising) blocks any
+      credential sold by that bond, and
+    * every seller bond the round committed to blocks any maker nick currently
+      proving that bond, recomputed on each selection pass so a nick that only
+      starts advertising the bond later is still excluded.
+    """
+
+    def __init__(self, taker: Taker) -> None:
+        self._taker = taker
+
+    @property
+    def _network(self) -> str:
+        configured = self._taker.config.bitcoin_network or self._taker.config.network
+        return str(configured.value)
+
+    def _seller_key(self, seller_bond: BondReference) -> BondKey | None:
+        """Return the seller identity, or ``None`` when it is off this network."""
+        key = bond_reference_key(seller_bond)
+        return key if key[0] == self._network else None
+
+    def record_offered_makers(self, offers: Iterable[Offer]) -> None:
+        """Remember the bond identity of makers this round selected or contacted.
+
+        Candidates are recorded before they are contacted, so a credential can
+        never be revealed to a maker the round is about to fill.
+        """
+        keys = {
+            key
+            for key in (verified_bond_key(offer, self._network) for offer in offers)
+            if key is not None
+        }
+        self._taker._session.round_maker_bond_keys |= keys
+
+    def _round_maker_keys(self) -> set[BondKey]:
+        """Return every maker identity this round recorded or is still holding."""
+        session = self._taker._session
+        live = (maker.offer for maker in session.maker_sessions.values())
+        return session.round_maker_bond_keys | {
+            key
+            for key in (verified_bond_key(offer, self._network) for offer in live)
+            if key is not None
+        }
+
+    def allows(self, seller_bond: BondReference | None) -> bool:
+        """Reject a credential sold by any maker identity seen in this round."""
+        if seller_bond is None:
+            # No verified provenance: this pool makes no seller claim, and the
+            # pre-existing external credential contract is unchanged.
+            return True
+        key = self._seller_key(seller_bond)
+        if key is None:
+            logger.warning(
+                "Rejecting an external PoDLE credential whose seller bond is on another network"
+            )
+            return False
+        if key in self._round_maker_keys():
+            logger.warning(
+                "Rejecting an external PoDLE credential: its seller bond belongs to a maker "
+                "selected or contacted in this CoinJoin round"
+            )
+            return False
+        return True
+
+    def record_claim(self, seller_bond: BondReference | None) -> None:
+        """Retain the seller identity for every later selection pass of the round."""
+        if seller_bond is None:
+            return
+        if seller_bond not in self._taker._session.podle_seller_bonds:
+            self._taker._session.podle_seller_bonds.append(seller_bond)
+            logger.info(
+                "Excluding the fidelity bond of an external PoDLE credential seller from "
+                "maker selection for the rest of this CoinJoin round"
+            )
+
+    def excluded_nicks(self) -> set[str]:
+        """Return the nicks currently proving a seller bond used in this round."""
+        keys = {
+            key
+            for key in (self._seller_key(bond) for bond in self._taker._session.podle_seller_bonds)
+            if key is not None
+        }
+        return nicks_proving_bonds(self._taker.orderbook_manager.offers, keys, self._network)
+
+
 class Taker(TakerMonitoringMixin):
     """
     Main Taker class for executing CoinJoin transactions.
@@ -185,10 +339,30 @@ class Taker(TakerMonitoringMixin):
             config: Taker configuration
             confirmation_callback: Optional callback for user confirmation before proceeding
         """
+        podle_data_dir = config.data_dir
+        wallet_data_dir = getattr(wallet, "data_dir", None)
+        if isinstance(wallet_data_dir, Path):
+            podle_data_dir = (
+                get_default_data_dir() if podle_data_dir is None else podle_data_dir
+            ).resolve()
+            # Bind before activation too: this wallet may activate while the taker is running.
+            if wallet_data_dir.resolve() != podle_data_dir:
+                raise ValueError("Wallet and taker must use the same data directory")
+
         self.wallet = wallet
         self.backend = backend
         self.config = config
         self.confirmation_callback = confirmation_callback
+
+        pit_script_type = offer_output_script_type(config.preferred_offer_type)
+        wallet_type = getattr(wallet, "address_type", None)
+        if wallet_type in ("p2wpkh", "p2tr") and pit_script_type != wallet_type:
+            raise ValueError(
+                f"preferred_offer_type {config.preferred_offer_type.value!r} implies a "
+                f"{pit_script_type!r} pit but the wallet is {wallet_type!r}; a rigid "
+                f"JMP-0010 pit requires them to match (use a {pit_script_type!r} wallet or a "
+                f"matching offer family)."
+            )
 
         self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
@@ -220,8 +394,10 @@ class Taker(TakerMonitoringMixin):
 
         # Orderbook manager
         # Read maker nick from state file to exclude from peer selection (self-CoinJoin protection)
+        # Only the maker trading in the same pit can meet us in a CoinJoin.
+        self._maker_nick_component = get_nick_state_component("maker", config.address_type)
         own_wallet_nicks: set[str] = set()
-        maker_nick = read_nick_state(config.data_dir, "maker")
+        maker_nick = read_nick_state(config.data_dir, self._maker_nick_component)
         if maker_nick:
             own_wallet_nicks.add(maker_nick)
             logger.info(f"Self-CoinJoin protection: excluding maker nick {maker_nick}")
@@ -235,10 +411,19 @@ class Taker(TakerMonitoringMixin):
             require_quantized_cj_fees=config.require_quantized_cj_fees,
             round_up_cj_fees=config.round_up_cj_fees,
             equalize_cj_fees=config.equalize_cj_fees,
+            allowed_types=offer_types_for_family(config.preferred_offer_type),
+        )
+        # Do not load or rewrite a previous run's fault evidence unless the
+        # operator enabled the experimental maker-selection policy explicitly.
+        self.market_fault_cache = MarketFaultCache(
+            config.data_dir if config.market_fault_exclusion else None
         )
 
         # PoDLE manager for commitment tracking
-        self.podle_manager = PoDLEManager(config.data_dir)
+        wallet_id = getattr(wallet, "market_wallet_id", None)
+        self.podle_manager = PoDLEManager(
+            podle_data_dir, wallet_id=wallet_id if isinstance(wallet_id, str) else None
+        )
 
         # Per-CoinJoin state and protocol phases live in a dedicated
         # ``CoinJoinSession``. ``Taker`` owns persistent infrastructure
@@ -256,6 +441,17 @@ class Taker(TakerMonitoringMixin):
         # Background task tracking
         self.running = False
         self._background_tasks: list[asyncio.Task[None]] = []
+        self._channel_ring_nodes: Any | None = None
+        self._channel_ring_store: RingParticipantStore | None = None
+        self._channel_ring_coordinator_store: CoordinatorStore | None = None
+        self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
+        if config.channel_ring.enabled:
+            data_directory = Path(config.data_dir or get_default_data_dir())
+            self._channel_ring_store = RingParticipantStore(
+                config.channel_ring.persistence_path(data_directory),
+                max_active_sessions=config.channel_ring.max_active_sessions,
+                max_verified_sessions=config.channel_ring.max_verified_sessions,
+            )
 
     async def _request_confirmation(
         self,
@@ -378,6 +574,92 @@ class Taker(TakerMonitoringMixin):
 
         This should be called after sync_wallet() and any fund validation.
         """
+        self.warn_experimental_features()
+        if self.config.channel_ring.enabled or self.config.channel_ring.nodes:
+            if not self.backend.has_mempool_access() or not (
+                self.backend.can_get_confirmations_by_txid()
+            ):
+                raise RuntimeError(
+                    "Channel-ring taker requires a full backend that can prove mempool "
+                    "and chain absence"
+                )
+            from jmswap.channel_ring_nodes import (
+                channel_ring_wallet_identity,
+                initialize_channel_ring_nodes,
+            )
+
+            wallet_identity = channel_ring_wallet_identity(
+                self.wallet.master_key.get_public_key_bytes()
+            )
+            data_directory = Path(self.config.data_dir or get_default_data_dir())
+            # Preflight strict coordinator state before inspecting a local LND
+            # node. Reload under the runtime lease after node initialization.
+            from taker.channel_ring_coordinator_store import CoordinatorStore
+
+            preflight = CoordinatorStore(
+                self.config.channel_ring.persistence_path(data_directory),
+                network=cast(Any, self.config.network.value),
+                wallet_identity=wallet_identity,
+                max_active_sessions=self.config.channel_ring.max_active_sessions,
+                max_verified_sessions=self.config.channel_ring.max_verified_sessions,
+            )
+            preflight.load_all()
+
+            self._channel_ring_nodes = await initialize_channel_ring_nodes(
+                self.config.channel_ring,
+                network=self.config.network.value,
+                offer_type=self.config.preferred_offer_type.value,
+                wallet_identity=wallet_identity,
+                mixdepth_count=self.wallet.mixdepth_count,
+                data_directory=data_directory,
+            )
+            self._channel_ring_store = self._channel_ring_nodes.store
+            self._channel_ring_coordinator_store = CoordinatorStore(
+                self._channel_ring_store.directory,
+                network=cast(Any, self.config.network.value),
+                wallet_identity=wallet_identity,
+                participant_store=self._channel_ring_store,
+                max_active_sessions=self.config.channel_ring.max_active_sessions,
+                max_verified_sessions=self.config.channel_ring.max_verified_sessions,
+            )
+            # Validate ownership and all field states before any LND recovery or
+            # funding action. Unknown coordinator evidence is never ignored.
+            coordinator_records = self._channel_ring_coordinator_store.load_all()
+            from taker.channel_ring import reconcile_taker_ring_records
+
+            await reconcile_taker_ring_records(
+                self._channel_ring_store,
+                self._channel_ring_nodes,
+                self.backend,
+                self._channel_ring_recovery_tasks,
+                acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+            )
+            if not self._renew_channel_ring_input_locks():
+                raise RuntimeError("could not restore an active channel-ring input reservation")
+            from taker.channel_ring_maker_only import reconcile_maker_only_ring_records
+
+            await reconcile_maker_only_ring_records(
+                self._channel_ring_coordinator_store, self.backend
+            )
+            report = self._channel_ring_store.load_all()
+            coordinator_records = self._channel_ring_coordinator_store.load_all()
+            active = sum(record.active for record in report.records) + sum(
+                record.active for record in coordinator_records
+            )
+            verified = sum(record.verified_unresolved for record in report.records) + sum(
+                record.verified_unresolved for record in coordinator_records
+            )
+            if (
+                report.corruptions
+                or active >= self.config.channel_ring.max_active_sessions
+                or verified >= self.config.channel_ring.max_verified_sessions
+            ):
+                raise RuntimeError(
+                    "Channel-ring durable capacity is exhausted or contains corrupt records"
+                )
+            if self.config.channel_ring.enabled and self.config.channel_ring.taker_joins:
+                await self._channel_ring_nodes.enable_funding()
+
         # Connect to directory servers
         logger.info("Connecting to directory servers...")
         connected = await self.directory_client.connect_all()
@@ -412,6 +694,25 @@ class Taker(TakerMonitoringMixin):
         # Start periodic directory connection status logging task
         conn_status_task = asyncio.create_task(self._periodic_directory_connection_status())
         self._background_tasks.append(conn_status_task)
+        if self._channel_ring_nodes is not None:
+            ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
+            self._background_tasks.append(ring_task)
+
+    def warn_experimental_features(self) -> None:
+        """Warn once about every experimental feature this taker has enabled."""
+        warn_experimental(
+            [
+                *([experimental.TAPROOT_PIT] if self.config.address_type == "p2tr" else []),
+                *([experimental.CHANNEL_RING] if self.config.channel_ring.enabled else []),
+                *(
+                    [experimental.CREDENTIAL_MARKET]
+                    if self.config.external_podle_mode == "only"
+                    or self.config.market_fault_exclusion
+                    else []
+                ),
+            ],
+            str(self.config.bitcoin_network or self.config.network),
+        )
 
     async def start(self) -> None:
         """
@@ -435,6 +736,14 @@ class Taker(TakerMonitoringMixin):
             return
         if self._session and self._session.reserved_inputs:
             try:
+                coordinator = self._session.ring_coordinator
+                if (
+                    coordinator is not None
+                    and getattr(coordinator, "has_durable_record", True)
+                    and coordinator._record().active
+                ):
+                    logger.warning("Retaining taker input locks for an active channel-ring record")
+                    return
                 self.wallet.release_coinjoin_inputs(
                     self._session.reserved_inputs,
                     owner=self._session.input_lock_owner,
@@ -443,6 +752,13 @@ class Taker(TakerMonitoringMixin):
                 logger.bind(sensitive=True).debug("Failed to release taker input locks: {}", e)
             else:
                 self._session.reserved_inputs = set()
+
+    def _begin_input_lock_round(self) -> None:
+        """Detach any prior reservation and create a unique owner for this round."""
+        self.release_input_locks()
+        self._session.reserved_inputs = set()
+        self._session.input_lock_owner = f"taker:{secrets.token_hex(32)}"
+        self._session.ring_coordinator = None
 
     @property
     def last_failure_reason(self) -> str | None:
@@ -500,11 +816,26 @@ class Taker(TakerMonitoringMixin):
         """Resolved minimum miner fee rate for the current round."""
         return self._session._minimum_fee_rate_sat_vb
 
+    def _wallet_funding_required(
+        self,
+        total_required: int,
+        buyout: ChannelBuyout | None = None,
+    ) -> int:
+        """Wallet-only funding requirement, for a prepared or attached buyout.
+
+        Preflight runs before a round exists, so the caller may pass the adapter
+        it is about to use; otherwise the current round's adapter (or none) decides.
+        """
+        if buyout is None:
+            return self._session.wallet_funding_required(total_required)
+        return buyout.wallet_funding_required(total_required)
+
     async def _resolve_explicit_input_utxos(
         self,
         input_utxos: list[str],
         mixdepth: int,
         amount: int,
+        buyout: ChannelBuyout | None = None,
     ) -> list[UTXOInfo]:
         """Resolve and validate a strict set of taker CoinJoin inputs."""
         selected, _locktime_cutoff = await resolve_input_utxos(
@@ -531,17 +862,23 @@ class Taker(TakerMonitoringMixin):
 
         if amount > 0:
             total = sum(utxo.value for utxo in selected)
-            if total < amount:
+            required = self._wallet_funding_required(amount, buyout)
+            if total < required:
                 msg = (
                     f"Insufficient funds in explicit input UTXOs: have {total:,} sats, "
-                    f"need at least {amount:,} sats before fees"
+                    f"need at least {required:,} sats before fees"
                 )
                 raise ValueError(msg)
-            if not podle_threshold_met(
-                selected,
-                amount,
-                self.config.taker_utxo_age,
-                self.config.taker_utxo_amtpercent,
+            # The PoDLE commitment covers the CoinJoin amount itself, so channel
+            # value never lowers the wallet UTXO size this requires.
+            if (
+                not podle_threshold_met(
+                    selected,
+                    amount,
+                    self.config.taker_utxo_age,
+                    self.config.taker_utxo_amtpercent,
+                )
+                and self.config.external_podle_mode != "only"
             ):
                 min_value = int(amount * self.config.taker_utxo_amtpercent / 100)
                 msg = (
@@ -558,6 +895,7 @@ class Taker(TakerMonitoringMixin):
         amount: int,
         mixdepth: int | None,
         input_utxos: list[str] | None = None,
+        buyout: ChannelBuyout | None = None,
     ) -> str | None:
         """Validate that ``mixdepth`` can fund a CoinJoin of ``amount``.
 
@@ -575,12 +913,27 @@ class Taker(TakerMonitoringMixin):
                 otherwise it falls back to mixdepth 0.
             input_utxos: Optional exact ``txid:vout`` set to validate instead
                 of automatic or interactive selection.
+            buyout: Prepared channel buyout this round will use, when it was
+                not attached to a session yet. Channel value lowers the
+                *funding* the wallet must supply; it never lowers the PoDLE
+                commitment requirement, which follows the CoinJoin amount.
 
         Returns:
             ``None`` when a CoinJoin can proceed, otherwise a human-readable
             reason describing why it cannot.
         """
         min_conf = self.config.taker_utxo_age
+
+        source_mixdepth = (
+            mixdepth if mixdepth is not None else (None if self.config.select_utxos else 0)
+        )
+        if (
+            self.config.channel_ring.enabled
+            and self.config.channel_ring.taker_joins
+            and source_mixdepth is not None
+            and source_mixdepth not in self.config.channel_ring.mixdepth_nodes
+        ):
+            return "Source mixdepth has no configured channel-ring node"
 
         if input_utxos is not None:
             if self.config.select_utxos:
@@ -591,6 +944,7 @@ class Taker(TakerMonitoringMixin):
                     input_utxos,
                     resolved_mixdepth,
                     amount,
+                    buyout,
                 )
             except ValueError as exc:
                 return str(exc)
@@ -605,6 +959,12 @@ class Taker(TakerMonitoringMixin):
             )
             utxos = []
             for md in mixdepths:
+                if (
+                    self.config.channel_ring.enabled
+                    and self.config.channel_ring.taker_joins
+                    and md not in self.config.channel_ring.mixdepth_nodes
+                ):
+                    continue
                 utxos.extend(await self.wallet.get_utxos(md))
             reserved = self.wallet.get_locked_input_outpoints()
             if not selectable_for_interactive(utxos, min_conf, excluded_outpoints=reserved):
@@ -636,8 +996,11 @@ class Taker(TakerMonitoringMixin):
         # PoDLE necessary condition: a commitment needs a UTXO worth at least
         # ``taker_utxo_amtpercent`` of the amount. Without one the round always
         # fails at commitment generation, so reject early with a clear message.
-        if not podle_threshold_met(
-            breakdown.eligible, amount, min_conf, self.config.taker_utxo_amtpercent
+        if (
+            not podle_threshold_met(
+                breakdown.eligible, amount, min_conf, self.config.taker_utxo_amtpercent
+            )
+            and self.config.external_podle_mode != "only"
         ):
             min_value = int(amount * self.config.taker_utxo_amtpercent / 100)
             return (
@@ -652,7 +1015,7 @@ class Taker(TakerMonitoringMixin):
         try:
             self.wallet.select_utxos(
                 mixdepth,
-                amount,
+                self._wallet_funding_required(amount, buyout),
                 min_conf,
                 exclude=reserved,
             )
@@ -709,6 +1072,17 @@ class Taker(TakerMonitoringMixin):
         else:
             resolved_mixdepth = mixdepth if mixdepth is not None else 0
 
+        if (
+            self.config.channel_ring.enabled
+            and self.config.channel_ring.taker_joins
+            and resolved_mixdepth not in self.config.channel_ring.mixdepth_nodes
+        ):
+            self._session.last_failure_reason = (
+                "Source mixdepth has no configured channel-ring node"
+            )
+            self.state = TakerState.FAILED
+            return None
+
         if explicitly_selected is None:
             eligibility_reason = await self.check_utxo_eligibility(amount, resolved_mixdepth)
             if eligibility_reason is not None:
@@ -727,7 +1101,14 @@ class Taker(TakerMonitoringMixin):
         private_key_getter: Callable[[str], bytes | None],
         excluded_outpoints: set[tuple[str, int]],
     ) -> list[UTXOInfo]:
-        """Select funding inputs containing at least one fresh PoDLE UTXO."""
+        """Select funding inputs containing a usable local PoDLE UTXO when enabled."""
+        if self.config.external_podle_mode == "only":
+            return self.wallet.select_utxos(
+                mixdepth,
+                target_amount,
+                self.config.taker_utxo_age,
+                exclude=excluded_outpoints,
+            )
         available = self.wallet.get_all_utxos(
             mixdepth,
             self.config.taker_utxo_age,
@@ -780,6 +1161,103 @@ class Taker(TakerMonitoringMixin):
             raise selection_error
         raise ValueError(f"Unable to select a PoDLE-capable UTXO in mixdepth {mixdepth}")
 
+    async def _allocate_podle_commitment(
+        self,
+        wallet_utxos: list[UTXOInfo],
+        get_private_key: Callable[[str], bytes | None],
+    ) -> ExtendedPoDLECommitment | None:
+        """Allocate exactly the configured PoDLE source without changing funding inputs."""
+        if self.config.external_podle_mode == "only":
+            preview = self._session.external_podle_preview
+            if preview is not None:
+                # The round already excluded this seller from maker selection,
+                # so it must burn this exact record or none at all.
+                self._session.external_podle_preview = None
+                return self._claim_previewed_external(preview)
+            return await self.podle_manager.consume_external(
+                backend=self.backend,
+                network=(self.config.bitcoin_network or self.config.network).value,
+                cj_amount=self._session.cj_amount,
+                min_confirmations=self.config.taker_utxo_age,
+                min_percent=self.config.taker_utxo_amtpercent,
+                max_retries=self.config.taker_utxo_retries,
+                seller_policy=self._seller_separation,
+            )
+        return self.podle_manager.generate_fresh_commitment(
+            wallet_utxos=wallet_utxos,
+            cj_amount=self._session.cj_amount,
+            private_key_getter=get_private_key,
+            min_confirmations=self.config.taker_utxo_age,
+            min_percent=self.config.taker_utxo_amtpercent,
+            max_retries=self.config.taker_utxo_retries,
+        )
+
+    @property
+    def _seller_separation(self) -> _RoundSellerSeparation:
+        """Return the seller separation view of the current round.
+
+        It owns no state of its own: the round's maker identities and seller
+        bonds live in the session, so a fresh view is always consistent with
+        the round that is running.
+        """
+        return _RoundSellerSeparation(self)
+
+    async def _prepare_external_podle(self, cj_amount_bound: int) -> None:
+        """Pick the external credential this round will use, before selecting makers.
+
+        Nothing is consumed here: a cancelled or failed round leaves the
+        credential usable. The preview exists so the seller's own fidelity bond
+        can be hard-excluded from maker selection before any maker is contacted.
+
+        ``cj_amount_bound`` is the CoinJoin amount for normal rounds. A sweep
+        does not know its amount until makers are chosen, so it passes the
+        total input value, an upper bound: a credential whose backing UTXO is
+        only just large enough for the eventual CoinJoin amount can be rejected
+        here even though it would have been eligible.
+
+        Finding no usable credential is not decided here. The round continues
+        and fails at commitment allocation, exactly as it did before previews
+        existed; any credential allocated there is still filtered by the same
+        seller separation policy.
+        """
+        if self.config.external_podle_mode != "only":
+            return
+        preview = await self.podle_manager.preview_external(
+            backend=self.backend,
+            network=(self.config.bitcoin_network or self.config.network).value,
+            cj_amount=cj_amount_bound,
+            min_confirmations=self.config.taker_utxo_age,
+            min_percent=self.config.taker_utxo_amtpercent,
+            max_retries=self.config.taker_utxo_retries,
+            seller_policy=self._seller_separation,
+        )
+        if preview is None:
+            logger.warning(
+                "No usable external PoDLE credential is available yet for this CoinJoin "
+                "(external_podle_mode=only)"
+            )
+            return
+        self._session.external_podle_preview = preview
+        # Exclude the seller before selection, not after: makers chosen now
+        # would otherwise learn a commitment their own bond authorized.
+        self._seller_separation.record_claim(preview.seller_bond)
+
+    def _claim_previewed_external(
+        self, preview: ExternalPoDLEPreview
+    ) -> ExtendedPoDLECommitment | None:
+        """Burn exactly the previewed credential, never a different seller's."""
+        if not self._seller_separation.allows(preview.seller_bond):
+            return None
+        commitment = self.podle_manager.claim_previewed_external(
+            preview, seller_policy=self._seller_separation
+        )
+        if commitment is None:
+            logger.error(
+                "The selected external PoDLE credential is no longer available; not "
+                "substituting a different seller after makers were selected"
+            )
+        return commitment
+
     async def stop(self, *, close_wallet: bool = True) -> None:
         """Stop the taker and close connections.
 
@@ -797,17 +1275,106 @@ class Taker(TakerMonitoringMixin):
         # Cancel all background tasks
         for task in self._background_tasks:
             task.cancel()
+        recovery_tasks = getattr(self, "_channel_ring_recovery_tasks", {})
+        for task in recovery_tasks.values():
+            task.cancel()
 
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+        if recovery_tasks:
+            await asyncio.gather(*recovery_tasks.values(), return_exceptions=True)
+            recovery_tasks.clear()
 
+        self.podle_manager.close()
         await self.directory_client.close_all()
+        if self._channel_ring_nodes is not None:
+            # The foreground round is also a journal writer. Do not release
+            # its process lease merely because background tasks have stopped.
+            async with self._round_lock:
+                coordinator = self._session.ring_coordinator
+                if coordinator is not None and coordinator.acceptor_task is not None:
+                    coordinator.acceptor_task.cancel()
+                    await asyncio.gather(coordinator.acceptor_task, return_exceptions=True)
+                await self._channel_ring_nodes.close()
+                self._channel_ring_nodes = None
         if close_wallet:
             await self.wallet.close()
         logger.info("Taker stopped")
 
-    async def _update_offers_with_bond_values(self, offers: list[Offer]) -> None:
+    async def _periodic_channel_ring_reconciliation(self) -> None:
+        from taker.channel_ring import reconcile_taker_ring_records
+
+        while self.running:
+            assert self._channel_ring_store is not None
+            assert self._channel_ring_nodes is not None
+            await reconcile_taker_ring_records(
+                self._channel_ring_store,
+                self._channel_ring_nodes,
+                self.backend,
+                self._channel_ring_recovery_tasks,
+                acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                active_session_identities=self._active_ring_session_identities(),
+            )
+            if not self._renew_channel_ring_input_locks():
+                logger.error(
+                    "Stopped channel-ring reconciliation because an active input "
+                    "reservation could not be renewed"
+                )
+                return
+            if self._channel_ring_coordinator_store is not None:
+                from taker.channel_ring_maker_only import reconcile_maker_only_ring_records
+
+                await reconcile_maker_only_ring_records(
+                    self._channel_ring_coordinator_store,
+                    self.backend,
+                    active_session_identities=self._active_ring_session_identities(),
+                )
+            await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
+
+    def _active_ring_session_identities(self) -> frozenset[str]:
+        """Identify the ring round this process is still driving, if any.
+
+        Reconciliation must never escalate a record that a live round still owns.
+        """
+        session = getattr(self, "_session", None)
+        coordinator = None if session is None else session.ring_coordinator
+        if coordinator is None:
+            return frozenset()
+        return frozenset({coordinator.session_identity})
+
+    def _renew_channel_ring_input_locks(self) -> bool:
+        if self._channel_ring_store is None:
+            return True
+        report = self._channel_ring_store.load_all()
+        if report.corruptions:
+            return False
+        ttl = self._session.input_lock_ttl_sec()
+        active_records = [
+            (record.input_lock_owner, record.local_input_outpoints)
+            for record in report.records
+            if record.active and record.local_input_outpoints
+        ]
+        coordinator_store = getattr(self, "_channel_ring_coordinator_store", None)
+        if coordinator_store is not None:
+            active_records.extend(
+                (record.input_lock_owner, record.input_outpoints)
+                for record in coordinator_store.load_all()
+                if record.active
+            )
+        for owner, inputs in active_records:
+            if owner is None:
+                return False
+            outpoints = {(item.txid, item.vout) for item in inputs}
+            # Renew live leases before restoring missing ones from the durable
+            # record. Acquisition deliberately rejects even our own live lease.
+            if self.wallet.renew_coinjoin_inputs(outpoints, ttl=ttl, owner=owner):
+                continue
+            if not self.wallet.reserve_coinjoin_inputs(outpoints, ttl=ttl, owner=owner):
+                return False
+        return True
+
+    async def _update_offers_with_bond_values(self, offers: list[Offer]) -> int | None:
         """
         Verify fidelity bonds and calculate their values.
 
@@ -820,23 +1387,24 @@ class Taker(TakerMonitoringMixin):
         """
         for offer in offers:
             offer.fidelity_bond_value = 0
+            offer.fidelity_bond_verified = None
 
         bonded_offers = [offer for offer in offers if offer.fidelity_bond_data]
         if not bonded_offers:
-            return
+            return None
 
         try:
             current_block_height = await self.backend.get_block_height()
         except Exception as e:
             logger.warning("Cannot verify fidelity bond certificate expiry")
             logger.bind(sensitive=True).warning("Fidelity bond expiry detail: {}", e)
-            return
+            return None
         if type(current_block_height) is not int or current_block_height < 0:
             logger.warning(
                 f"Cannot verify fidelity bond certificate expiry: backend returned "
                 f"invalid block height {current_block_height!r}"
             )
-            return
+            return None
 
         # Deduplicate identical claims while verifying conflicting script claims
         # independently. A claim is the outpoint plus its proof-derived script.
@@ -852,11 +1420,13 @@ class Taker(TakerMonitoringMixin):
             cert_expiry_height = bond_data.get("cert_expiry")
 
             if not isinstance(cert_expiry_height, int):
+                offer.fidelity_bond_verified = False
                 logger.bind(sensitive=True).debug(
                     "Bond {}:{} missing certificate expiry, skipping", txid, vout
                 )
                 continue
             if current_block_height > cert_expiry_height:
+                offer.fidelity_bond_verified = False
                 logger.debug(
                     f"Bond {txid}:{vout} certificate expired at block "
                     f"{cert_expiry_height} (current block {current_block_height})"
@@ -867,6 +1437,7 @@ class Taker(TakerMonitoringMixin):
             utxo_pub = bond_data.get("utxo_pub")
 
             if not utxo_pub:
+                offer.fidelity_bond_verified = False
                 logger.bind(sensitive=True).debug(
                     "Bond {}:{} missing utxo_pub, skipping", txid, vout
                 )
@@ -874,8 +1445,13 @@ class Taker(TakerMonitoringMixin):
 
             try:
                 utxo_pub_bytes = bytes.fromhex(utxo_pub) if isinstance(utxo_pub, str) else utxo_pub
-                bond_addr = derive_bond_address(utxo_pub_bytes, locktime, self.config.network)
+                bond_addr = derive_bond_address(
+                    utxo_pub_bytes,
+                    locktime,
+                    self.config.bitcoin_network or self.config.network,
+                )
             except Exception as e:
+                offer.fidelity_bond_verified = False
                 logger.debug("Failed to derive bond address")
                 logger.bind(sensitive=True).debug(
                     "Bond address derivation detail for {}:{}: {}", txid, vout, e
@@ -899,7 +1475,7 @@ class Taker(TakerMonitoringMixin):
             claim_to_offers[claim_key] = [offer]
 
         if not claim_to_request:
-            return
+            return current_block_height
 
         logger.info(f"Verifying {len(claim_to_request)} fidelity bonds...")
 
@@ -910,12 +1486,12 @@ class Taker(TakerMonitoringMixin):
         except Exception as e:
             logger.warning("Bond verification failed")
             logger.bind(sensitive=True).warning("Bond verification detail: {}", e)
-            return
+            return None
         if len(results) != len(requests):
             logger.warning(
                 f"Bond verification returned {len(results)} results for {len(requests)} requests"
             )
-            return
+            return None
 
         current_time = int(time.time())
         claim_values: dict[tuple[str, int, str], int] = {}
@@ -928,10 +1504,17 @@ class Taker(TakerMonitoringMixin):
                 )
                 continue
             if not result.valid:
+                claim_key = (request.txid, request.vout, request.scriptpubkey)
+                for offer in claim_to_offers[claim_key]:
+                    offer.fidelity_bond_verified = False
                 logger.bind(sensitive=True).debug(
                     "Bond {}:{} invalid: {}", result.txid, result.vout, result.error
                 )
                 continue
+
+            claim_key = (request.txid, request.vout, request.scriptpubkey)
+            for offer in claim_to_offers[claim_key]:
+                offer.fidelity_bond_verified = True
 
             bond_value = calculate_timelocked_fidelity_bond_value(
                 utxo_value=result.value,
@@ -941,7 +1524,6 @@ class Taker(TakerMonitoringMixin):
             )
 
             if bond_value > 0:
-                claim_key = (request.txid, request.vout, request.scriptpubkey)
                 claim_values[claim_key] = bond_value
 
         # Update only offers whose certificate and proof data were eligible.
@@ -952,6 +1534,31 @@ class Taker(TakerMonitoringMixin):
                 updated_count += 1
 
         logger.info(f"Updated {updated_count} offers with verified fidelity bond values")
+        return current_block_height
+
+    def _drain_and_apply_market_faults(
+        self, offers: list[Offer], current_block_height: int | None
+    ) -> list[Offer]:
+        """Ingest directory evidence and hard-remove only exact verified bond matches."""
+        if not self.config.market_fault_exclusion:
+            return offers
+        for client in self.directory_client.clients.values():
+            for proof in client.drain_market_faults():
+                self.market_fault_cache.ingest(proof)
+        if current_block_height is None:
+            return offers
+        excluded_nicks = self.market_fault_cache.excluded_nicks(
+            offers,
+            network=(self.config.bitcoin_network or self.config.network).value,
+            height=current_block_height,
+        )
+        if not excluded_nicks:
+            return offers
+        logger.warning(
+            "Hard-excluding {} maker nick(s) with verified market fault evidence",
+            len(excluded_nicks),
+        )
+        return [offer for offer in offers if offer.counterparty not in excluded_nicks]
 
     def _log_initial_maker_fee_plan(self, fee_plan: dict[str, int]) -> None:
         """Explain the opt-in fee equalization policy before makers are contacted."""
@@ -977,6 +1584,219 @@ class Taker(TakerMonitoringMixin):
             f"{bumped_count}/{len(fee_plan)} maker payments increased"
         )
 
+    def _ring_request_error(
+        self, amount: int, maker_count: int, buyout: ChannelBuyout | None
+    ) -> str | None:
+        if not self.config.channel_ring.enabled:
+            return None
+        self._session.strict_maker_count = maker_count
+        minimum = max(self.config.minimum_makers, self._ring_maker_floor())
+        if buyout is not None:
+            return RING_BUYOUT_CONFLICT
+        if amount == 0:
+            return "Channel-ring mode rejects sweep/no-change CoinJoins"
+        if maker_count < minimum:
+            return f"Channel-ring mode requires at least {minimum} selected makers"
+        return None
+
+    def _enforce_ring_request(
+        self, amount: int, maker_count: int, buyout: ChannelBuyout | None = None
+    ) -> None:
+        error = self._ring_request_error(amount, maker_count, buyout)
+        if error is None:
+            return
+        self._session.last_failure_reason = error
+        raise ValueError(error)
+
+    def _ring_maker_floor(self) -> int:
+        """Keep at least three channel endpoints without guessing maker roles."""
+        return max(
+            self.config.channel_ring.minimum_makers,
+            2 if self.config.channel_ring.taker_joins else 3,
+        )
+
+    def _select_channel_ring_makers(
+        self,
+        offers: list[Offer],
+        maker_count: int,
+        required_features: set[str] | None,
+        *,
+        ring_slots: int | None = None,
+        hard_exclude_nicks: set[str] | None = None,
+        exclude_nicks: set[str] | None = None,
+        penalized_maker_keys: set[str] | None = None,
+    ) -> tuple[dict[str, Offer], int]:
+        """Reserve ring and ordinary slots using the normal orderbook chooser.
+
+        Select as many eligible non-ignored ring makers as fit the requested
+        total. Only relax soft exclusions to reach the ring minimum; do not
+        prefer an ignored ring maker over a usable ordinary maker. Then fill
+        remaining slots from the combined orderbook.
+        """
+        if self.config.channel_ring.enabled is True and (
+            self._session.ring_maker_sessions or self._session.ordinary_maker_sessions
+        ):
+            raise ValueError(
+                "Channel-ring maker roles are frozen; replacements are no longer allowed"
+            )
+        if self.config.channel_ring.enabled is not True:
+            return self.orderbook_manager.select_makers(
+                cj_amount=self._session.cj_amount,
+                n=maker_count,
+                required_features=required_features,
+                hard_exclude_nicks=hard_exclude_nicks,
+                exclude_nicks=exclude_nicks,
+                penalized_maker_keys=penalized_maker_keys,
+            )
+        ring_slots = self._ring_maker_floor() if ring_slots is None else ring_slots
+        remaining_slots = maker_count - ring_slots
+        if remaining_slots < 0:
+            raise ValueError("Channel-ring request has fewer makers than required ring slots")
+        base_hard_exclude = set(hard_exclude_nicks or ())
+        ring_pool = [
+            offer
+            for offer in offers
+            if offer_supports_private_channel_ring(offer)
+            and offer.ordertype is self.config.preferred_offer_type
+        ]
+
+        def select_from(
+            pool: list[Offer], count: int, hard: set[str]
+        ) -> tuple[dict[str, Offer], int]:
+            original = self.orderbook_manager.offers
+            self.orderbook_manager.offers = pool
+            try:
+                return self.orderbook_manager.select_makers(
+                    cj_amount=self._session.cj_amount,
+                    n=count,
+                    required_features=required_features,
+                    hard_exclude_nicks=hard,
+                    exclude_nicks=exclude_nicks,
+                    penalized_maker_keys=penalized_maker_keys,
+                )
+            finally:
+                self.orderbook_manager.offers = original
+
+        soft_exclude = self.orderbook_manager.ignored_makers | set(exclude_nicks or ())
+        preferred_ring_pool = [
+            offer for offer in ring_pool if offer.counterparty not in soft_exclude
+        ]
+        ring, ring_fee = select_from(preferred_ring_pool, maker_count, base_hard_exclude)
+        if len(ring) < ring_slots:
+            ring, ring_fee = select_from(ring_pool, ring_slots, base_hard_exclude)
+        if len(ring) < ring_slots:
+            raise ValueError("Not enough private_channel_ring makers for reserved ring slots")
+        remaining_slots = maker_count - len(ring)
+        network = (self.config.bitcoin_network or self.config.network).value
+        ring_bonds = {
+            bond
+            for bond in (verified_bond_key(offer, network) for offer in ring.values())
+            if bond is not None
+        }
+        remaining_pool = [
+            offer
+            for offer in offers
+            if offer.ordertype is self.config.preferred_offer_type
+            and offer.counterparty not in ring
+            and verified_bond_key(offer, network) not in ring_bonds
+        ]
+        remaining, remaining_fee = select_from(
+            remaining_pool, remaining_slots, base_hard_exclude | set(ring)
+        )
+        if len(remaining) != remaining_slots:
+            raise ValueError("Not enough makers for the remaining channel-ring slots")
+        return {**ring, **remaining}, ring_fee + remaining_fee
+
+    def _ring_replacement_slots(self, needed: int) -> int:
+        """Return how many pending replacement slots must remain ring-capable."""
+        if self.config.channel_ring.enabled is not True:
+            return 0
+        active_ring = set(self._session.maker_sessions) & self._session.ring_candidate_nicks
+        missing_ring = self._ring_maker_floor() - len(active_ring)
+        return min(needed, max(0, missing_ring))
+
+    def _drop_capability_flipped_ring_candidates(self) -> set[str]:
+        """Discard stale ring candidates before roles are frozen."""
+        if self.config.channel_ring.enabled is not True:
+            return set()
+        dropped = {
+            nick
+            for nick in self._session.ring_candidate_nicks & set(self._session.maker_sessions)
+            if not offer_supports_private_channel_ring(self._session.maker_sessions[nick].offer)
+        }
+        for nick in dropped:
+            self._session.remove_maker_session(nick)
+        return dropped
+
+    async def _prepare_channel_ring(self, destination: str, mixdepth: int) -> bool:
+        if self._channel_ring_nodes is None or self._channel_ring_store is None:
+            self._session.last_failure_reason = "Channel-ring backend was not safely initialized"
+            logger.error(self._session.last_failure_reason)
+            return False
+        self.state = TakerState.RING_INVITING
+        assert self._session.podle_commitment is not None
+        session_identity = f"{self.nick}:{self._session.podle_commitment.to_commitment_str()}"
+        if self.config.channel_ring.taker_joins:
+            from taker.channel_ring import TakerRingCoordinator
+
+            coordinator = TakerRingCoordinator(
+                self._session,
+                config=self.config.channel_ring,
+                store=self._channel_ring_store,
+                initialized_backend=self._channel_ring_nodes.for_mixdepth(mixdepth),
+                chain_backend=self.backend,
+                session_identity=session_identity,
+            )
+        else:
+            from taker.channel_ring_maker_only import MakerOnlyRingCoordinator
+
+            if self._channel_ring_coordinator_store is None:
+                raise RuntimeError("Maker-only ring coordinator journal was not initialized")
+            coordinator = MakerOnlyRingCoordinator(
+                self._session,
+                config=self.config.channel_ring,
+                store=self._channel_ring_coordinator_store,
+                chain_backend=self.backend,
+                session_identity=session_identity,
+            )
+        self._session.ring_coordinator = coordinator
+        if await coordinator.prepare(destination, mixdepth):
+            return True
+        self._session.last_failure_reason = "Strict channel-ring negotiation aborted"
+        return False
+
+    def _initial_maker_details(self, fee_plan: dict[str, int]) -> list[dict[str, Any]]:
+        """Snapshot the offer and directory details shown at initial confirmation."""
+        details: list[dict[str, Any]] = []
+        for nick, session in self._session.maker_sessions.items():
+            # Preserve the directory's original first-serving-peer ordering.
+            # If none serve, the last observed location is shown as before.
+            location = None
+            for client in self.directory_client.clients.values():
+                location = client._active_peers.get(nick)
+                if not location or location == "NOT-SERVING-ONION":
+                    continue
+                break
+            details.append(
+                {
+                    "nick": nick,
+                    "fee": fee_plan[nick],
+                    "advertised_fee": calculate_cj_fee(
+                        session.offer, self._session.cj_amount, False
+                    ),
+                    "bond_value": session.offer.fidelity_bond_value,
+                    "location": location,
+                }
+            )
+        return details
+
+    async def _build_transaction_phase(self, destination: str, mixdepth: int) -> bool:
+        if self.config.channel_ring.enabled:
+            return await self._prepare_channel_ring(destination, mixdepth)
+        self.state = TakerState.BUILDING_TX
+        logger.debug("Phase 3: Building transaction...")
+        return await self._session._phase_build_tx(destination=destination, mixdepth=mixdepth)
+
     async def do_coinjoin(
         self,
         amount: int,
@@ -986,6 +1806,7 @@ class Taker(TakerMonitoringMixin):
         exclude_nicks: set[str] | None = None,
         input_utxos: list[str] | None = None,
         penalized_maker_keys: set[str] | None = None,
+        buyout: ChannelBuyout | None = None,
     ) -> str | None:
         """Run one CoinJoin with fresh, non-reusable per-round state."""
         if self._round_lock.locked():
@@ -995,6 +1816,20 @@ class Taker(TakerMonitoringMixin):
         async with self._round_lock:
             session = CoinJoinSession()
             session.attach(self)
+            if buyout is not None:
+                if self.config.channel_ring.enabled:
+                    raise ValueError(RING_BUYOUT_CONFLICT)
+                if (
+                    amount <= 0
+                    or offer_output_script_type(self.config.preferred_offer_type) != "p2tr"
+                ):
+                    raise ValueError("A channel buyout requires a non-sweep Taproot CoinJoin")
+                if (
+                    buyout.terms.proposal.network
+                    != (self.config.bitcoin_network or self.config.network).value
+                ):
+                    raise ValueError("Buyout and CoinJoin Bitcoin networks differ")
+                session.buyout = buyout
             self._session = session
             self.state = TakerState.IDLE
             return await self._do_coinjoin(
@@ -1041,6 +1876,7 @@ class Taker(TakerMonitoringMixin):
             Transaction ID if successful, None otherwise
         """
         try:
+            self._begin_input_lock_round()
             # Reset per-call state so callers reading ``last_used_nicks`` after
             # a failure don't pick up nicks from a previous successful round.
             self._session.last_used_nicks = set()
@@ -1055,7 +1891,7 @@ class Taker(TakerMonitoringMixin):
             # in tumbler runs), so the nick read at __init__ time would be
             # stale.  Refreshing here ensures the hard exclusion is always
             # current regardless of startup order.
-            current_maker_nick = read_nick_state(self.config.data_dir, "maker")
+            current_maker_nick = read_nick_state(self.config.data_dir, self._maker_nick_component)
             if current_maker_nick:
                 if current_maker_nick not in self.orderbook_manager.own_wallet_nicks:
                     logger.bind(sensitive=True).info(
@@ -1071,6 +1907,7 @@ class Taker(TakerMonitoringMixin):
             )
             n_makers = resolve_counterparty_count(requested)
             self._session.maker_target_count = n_makers
+            self._enforce_ring_request(amount, n_makers, self._session.buyout)
 
             # Resolve explicit or interactive input requests before orderbook
             # and bond work, then fail fast if the requested source cannot fund
@@ -1083,6 +1920,30 @@ class Taker(TakerMonitoringMixin):
             if requested_inputs is None:
                 return None
             explicitly_selected_utxos, manually_selected_utxos, mixdepth = requested_inputs
+            if self._session.buyout is not None:
+                binding = self._session.buyout.buyer.runtime_binding
+                binding_mixdepth = binding.get("mixdepth")
+                if type(binding_mixdepth) is not int or binding_mixdepth != mixdepth:
+                    self._session.last_failure_reason = (
+                        "Buyout LND binding does not match the wallet source mixdepth"
+                    )
+                    logger.error(self._session.last_failure_reason)
+                    return None
+                fingerprint = binding.get("wallet_fingerprint")
+                if (
+                    not isinstance(fingerprint, str)
+                    or not fingerprint
+                    or fingerprint != self.wallet.wallet_fingerprint
+                ):
+                    self._session.last_failure_reason = (
+                        "Buyout LND binding does not match the wallet identity"
+                    )
+                    logger.error(self._session.last_failure_reason)
+                    return None
+                # Input selection (including interactive selection) is complete.
+                # Refuse a cross-mixdepth buyout before reserving its journal or
+                # revealing a PoDLE commitment to the makers.
+                self._session.buyout.begin_round()
 
             # Determine destination address
             if destination == "INTERNAL":
@@ -1140,7 +2001,7 @@ class Taker(TakerMonitoringMixin):
             # Offers with empty features dicts (unknown status) are NOT rejected here --
             # they pass through and will be verified during _phase_auth(). Only offers
             # where we KNOW the maker lacks the feature are filtered out.
-            if required_features:
+            if self.backend.requires_neutrino_metadata():
                 known_compatible = sum(
                     1
                     for o in offers
@@ -1183,8 +2044,10 @@ class Taker(TakerMonitoringMixin):
                         f"support peerlist_features."
                     )
 
-            # Verify and calculate fidelity bond values
-            await self._update_offers_with_bond_values(offers)
+            # Verify bonds once, then apply any independently matching fault
+            # proof before this offer set can enter selection or replacements.
+            current_block_height = await self._update_offers_with_bond_values(offers)
+            offers = self._drain_and_apply_market_faults(offers, current_block_height)
 
             self.orderbook_manager.update_offers(offers)
 
@@ -1195,7 +2058,7 @@ class Taker(TakerMonitoringMixin):
                 self.state = TakerState.FAILED
                 return None
 
-            if required_features:
+            if self.backend.requires_neutrino_metadata():
                 logger.info(
                     "Neutrino backend: requiring neutrino_compat in offer filtering, "
                     "will also negotiate during handshake"
@@ -1284,6 +2147,10 @@ class Taker(TakerMonitoringMixin):
                 # so we MUST use this same value at build time to avoid residual fees.
                 self._session._sweep_tx_fee_budget = estimated_tx_fee
 
+                # The sweep amount is only known after selection, so the
+                # credential is validated against the total input value.
+                await self._prepare_external_podle(total_input_value)
+
                 # Use sweep order selection - this calculates exact cj_amount for zero change
                 selected_offers, self._session.cj_amount, total_fee = (
                     self.orderbook_manager.select_makers_for_sweep(
@@ -1292,9 +2159,11 @@ class Taker(TakerMonitoringMixin):
                         n=n_makers,
                         required_features=required_features,
                         exclude_nicks=exclude_nicks,
+                        hard_exclude_nicks=self._seller_separation.excluded_nicks(),
                         penalized_maker_keys=penalized_maker_keys,
                     )
                 )
+                self._seller_separation.record_offered_makers(selected_offers.values())
 
                 if len(selected_offers) < self.config.minimum_makers:
                     reason = f"Not enough makers for sweep: {len(selected_offers)}"
@@ -1313,13 +2182,17 @@ class Taker(TakerMonitoringMixin):
                     "Selecting {} makers for {:,} sats...", n_makers, self._session.cj_amount
                 )
 
-                selected_offers, total_fee = self.orderbook_manager.select_makers(
-                    cj_amount=self._session.cj_amount,
-                    n=n_makers,
-                    required_features=required_features,
+                await self._prepare_external_podle(self._session.cj_amount)
+
+                selected_offers, total_fee = self._select_channel_ring_makers(
+                    offers,
+                    n_makers,
+                    required_features,
                     exclude_nicks=exclude_nicks,
+                    hard_exclude_nicks=self._seller_separation.excluded_nicks(),
                     penalized_maker_keys=penalized_maker_keys,
                 )
+                self._seller_separation.record_offered_makers(selected_offers.values())
 
                 if len(selected_offers) < self.config.minimum_makers:
                     reason = f"Not enough makers selected: {len(selected_offers)}"
@@ -1327,6 +2200,10 @@ class Taker(TakerMonitoringMixin):
                     self._session.last_failure_reason = reason
                     self.state = TakerState.FAILED
                     return None
+                if self.config.channel_ring.enabled and len(selected_offers) != n_makers:
+                    raise ValueError(
+                        "Channel-ring selection did not return the exact requested maker set"
+                    )
 
                 # Pre-select UTXOs for CoinJoin, then generate PoDLE from one of them
                 # This ensures the PoDLE UTXO is one we'll actually use in the transaction
@@ -1349,11 +2226,13 @@ class Taker(TakerMonitoringMixin):
                     # Estimate required amount (conservative estimate for UTXO pre-selection)
                     # We'll refine this in _phase_build_tx once we have exact maker UTXOs
                     estimated_inputs = 2 + len(selected_offers) * 2  # Rough estimate
+                    estimated_inputs += self._session.buyout_input_count
                     estimated_outputs = 2 + len(selected_offers) * 2
                     estimated_tx_fee = self._session._estimate_tx_fee(
                         estimated_inputs, estimated_outputs
                     )
                     estimated_required = self._session.cj_amount + total_fee + estimated_tx_fee
+                    estimated_required = self._session.wallet_funding_required(estimated_required)
 
                     # Pre-select UTXOs for the CoinJoin, skipping any inputs
                     # locked by another in-flight round (this or another process
@@ -1408,6 +2287,11 @@ class Taker(TakerMonitoringMixin):
                 nick: MakerSession(nick=nick, offer=offer, supports_neutrino_compat=False)
                 for nick, offer in selected_offers.items()
             }
+            self._session.ring_candidate_nicks = {
+                nick
+                for nick, offer in selected_offers.items()
+                if offer_supports_private_channel_ring(offer)
+            }
             initial_fee_plan = self._session.maker_fee_plan()
             total_fee = sum(initial_fee_plan.values())
 
@@ -1440,31 +2324,7 @@ class Taker(TakerMonitoringMixin):
             # Prompt for confirmation after maker selection
             if hasattr(self, "confirmation_callback") and self.confirmation_callback:
                 try:
-                    # Build maker details for confirmation
-                    maker_details = []
-                    for nick, session in self._session.maker_sessions.items():
-                        fee = initial_fee_plan[nick]
-                        advertised_fee = calculate_cj_fee(
-                            session.offer,
-                            self._session.cj_amount,
-                            False,
-                        )
-                        bond_value = session.offer.fidelity_bond_value
-                        # Get maker's location from any connected directory
-                        location = None
-                        for client in self.directory_client.clients.values():
-                            location = client._active_peers.get(nick)
-                            if location and location != "NOT-SERVING-ONION":
-                                break
-                        maker_details.append(
-                            {
-                                "nick": nick,
-                                "fee": fee,
-                                "advertised_fee": advertised_fee,
-                                "bond_value": bond_value,
-                                "location": location,
-                            }
-                        )
+                    maker_details = self._initial_maker_details(initial_fee_plan)
 
                     confirmation_timeout = float(self.config.initial_confirmation_timeout_sec)
                     confirmed = await self._request_confirmation(
@@ -1497,15 +2357,9 @@ class Taker(TakerMonitoringMixin):
                     self.state = TakerState.FAILED
                     return None
 
-            # Generate PoDLE from pre-selected UTXOs only
-            # This ensures the commitment is from a UTXO that will be in the transaction
-            self._session.podle_commitment = self.podle_manager.generate_fresh_commitment(
-                wallet_utxos=self._session.preselected_utxos,  # Only from pre-selected UTXOs!
-                cj_amount=self._session.cj_amount,
-                private_key_getter=get_private_key,
-                min_confirmations=self.config.taker_utxo_age,
-                min_percent=self.config.taker_utxo_amtpercent,
-                max_retries=self.config.taker_utxo_retries,
+            self._session.podle_commitment = await self._allocate_podle_commitment(
+                self._session.preselected_utxos,
+                get_private_key,
             )
 
             if not self._session.podle_commitment:
@@ -1537,15 +2391,8 @@ class Taker(TakerMonitoringMixin):
                 return None
 
             # Phase 3: Build transaction
-            self.state = TakerState.BUILDING_TX
-            logger.debug("Phase 3: Building transaction...")
-
-            tx_success = await self._session._phase_build_tx(
-                destination=destination,
-                mixdepth=mixdepth,
-            )
-            if not tx_success:
-                logger.error("Transaction build failed")
+            if not await self._build_transaction_phase(destination, mixdepth):
+                logger.error("Transaction build or channel-ring preparation failed")
                 self.state = TakerState.FAILED
                 return None
 
@@ -1641,6 +2488,12 @@ class Taker(TakerMonitoringMixin):
                 else [u for u in available_utxos if u.mixdepth == mixdepth]
             )
             locked_inputs = self.wallet.get_locked_input_outpoints()
+            if self.config.channel_ring.enabled and self.config.channel_ring.taker_joins:
+                locked_inputs = locked_inputs | {
+                    (utxo.txid, utxo.vout)
+                    for utxo in available_utxos
+                    if utxo.mixdepth not in self.config.channel_ring.mixdepth_nodes
+                }
             if not selectable_for_interactive(
                 candidates, min_age, excluded_outpoints=locked_inputs
             ):
@@ -1684,7 +2537,7 @@ class Taker(TakerMonitoringMixin):
             )
 
             # Validate selected UTXOs have sufficient funds (for non-sweep)
-            if amount > 0 and total_selected < amount:
+            if amount > 0 and total_selected < self._session.wallet_funding_required(amount):
                 logger.error("Selected UTXOs have insufficient funds")
                 logger.bind(sensitive=True).error(
                     "Selected UTXO funding detail: have {:,} sats, need at least {:,} sats",
@@ -1718,6 +2571,10 @@ class Taker(TakerMonitoringMixin):
         target_makers = max(self._session.maker_target_count, self.config.minimum_makers)
         while True:
             auth_result = await self._session._phase_auth()
+
+            flipped = self._drop_capability_flipped_ring_candidates()
+            if flipped:
+                auth_result.failed_makers.extend(sorted(flipped))
 
             current_makers = len(self._session.maker_sessions)
             if auth_result.success and current_makers >= target_makers:
@@ -1758,16 +2615,25 @@ class Taker(TakerMonitoringMixin):
                 )
 
                 current_session_nicks = set(self._session.maker_sessions.keys())
-                replacement_offers, _ = self.orderbook_manager.select_makers(
-                    cj_amount=self._session.cj_amount,
-                    n=needed,
-                    hard_exclude_nicks=current_session_nicks | failed_nicks,
-                    required_features=required_features,
+                replacement_offers, _ = self._select_channel_ring_makers(
+                    self.orderbook_manager.offers,
+                    needed,
+                    required_features,
+                    ring_slots=self._ring_replacement_slots(needed),
+                    hard_exclude_nicks=(
+                        current_session_nicks
+                        | failed_nicks
+                        | self._seller_separation.excluded_nicks()
+                    ),
                     penalized_maker_keys=penalized_maker_keys,
                 )
 
                 if not replacement_offers:
                     break
+
+                # These candidates are about to be contacted, so a commitment
+                # rotated below must not come from any of their bonds.
+                self._seller_separation.record_offered_makers(replacement_offers.values())
 
                 if len(replacement_offers) < needed:
                     logger.info(
@@ -1776,7 +2642,7 @@ class Taker(TakerMonitoringMixin):
                     )
 
                 if not replacement_commitment_ready:
-                    if not self._rotate_commitment_for_auth_replacement(get_private_key):
+                    if not await self._rotate_commitment_for_auth_replacement(get_private_key):
                         break
                     replacement_commitment_ready = True
 
@@ -1795,24 +2661,24 @@ class Taker(TakerMonitoringMixin):
             if added_replacements:
                 continue
 
-            if auth_result.success and current_makers >= self.config.minimum_makers:
+            if auth_result.success and current_makers >= self._session.required_maker_count:
                 logger.warning(
                     f"Auth replacement attempts exhausted or no candidates remain; proceeding "
                     f"with {current_makers}/{target_makers} makers "
-                    f"(minimum {self.config.minimum_makers})"
+                    f"(minimum {self._session.required_maker_count})"
                 )
                 return True
 
             reason = (
                 f"Auth phase failed: only {current_makers} authenticated makers remain, "
-                f"below minimum {self.config.minimum_makers}"
+                f"below minimum {self._session.required_maker_count}"
             )
             logger.error(reason)
             self._session.last_failure_reason = reason
             self.state = TakerState.FAILED
             return False
 
-    def _rotate_commitment_for_auth_replacement(self, get_private_key: Any) -> bool:
+    async def _rotate_commitment_for_auth_replacement(self, get_private_key: Any) -> bool:
         """Prepare a fresh PoDLE proof after an auth-stage commitment disclosure."""
         if any(
             not maker_session.responded_auth
@@ -1821,13 +2687,9 @@ class Taker(TakerMonitoringMixin):
             logger.error("Cannot rotate PoDLE while an unauthenticated maker session remains")
             return False
 
-        new_commitment = self.podle_manager.generate_fresh_commitment(
-            wallet_utxos=self._session.preselected_utxos,
-            cj_amount=self._session.cj_amount,
-            private_key_getter=get_private_key,
-            min_confirmations=self.config.taker_utxo_age,
-            min_percent=self.config.taker_utxo_amtpercent,
-            max_retries=self.config.taker_utxo_retries,
+        new_commitment = await self._allocate_podle_commitment(
+            self._session.preselected_utxos,
+            get_private_key,
         )
         if new_commitment is None:
             logger.warning("No fresh PoDLE commitment remains for auth-stage maker replacement")
@@ -1862,6 +2724,8 @@ class Taker(TakerMonitoringMixin):
             self._session.maker_sessions[nick] = MakerSession(
                 nick=nick, offer=offer, supports_neutrino_compat=False
             )
+            if offer_supports_private_channel_ring(offer):
+                self._session.ring_candidate_nicks.add(nick)
             logger.debug(f"Added replacement maker for auth: {nick}")
         logger.debug("Running fill phase for replacement makers...")
         new_maker_nicks = list(replacement_offers.keys())
@@ -1916,7 +2780,7 @@ class Taker(TakerMonitoringMixin):
             else:
                 logger.warning(f"Replacement maker {nick} didn't respond to !fill")
             if not ready:
-                self._session.maker_sessions.pop(nick, None)
+                self._session.remove_maker_session(nick)
                 failed_nicks.add(nick)
                 self.orderbook_manager.add_ignored_maker(nick)
         return True
@@ -2017,15 +2881,11 @@ class Taker(TakerMonitoringMixin):
                         f"(attempt {podle_retry + 2}/{max_podle_retries})..."
                     )
                     podle_retry += 1
-                    new_commitment = self.podle_manager.generate_fresh_commitment(
-                        wallet_utxos=self._session.preselected_utxos,
-                        cj_amount=self._session.cj_amount,
-                        private_key_getter=get_private_key,
-                        min_confirmations=self.config.taker_utxo_age,
-                        min_percent=self.config.taker_utxo_amtpercent,
-                        max_retries=self.config.taker_utxo_retries,
+                    new_commitment = await self._allocate_podle_commitment(
+                        self._session.preselected_utxos,
+                        get_private_key,
                     )
-                    if new_commitment is None:
+                    if new_commitment is None and self.config.external_podle_mode != "only":
                         added = self._session._expand_preselected_utxos_same_mixdepth(mixdepth)
                         if added > 0:
                             logger.info(
@@ -2033,13 +2893,9 @@ class Taker(TakerMonitoringMixin):
                                 f"additional UTXO(s) from mixdepth {mixdepth}, which will "
                                 "also be spent in the CoinJoin."
                             )
-                            new_commitment = self.podle_manager.generate_fresh_commitment(
-                                wallet_utxos=self._session.preselected_utxos,
-                                cj_amount=self._session.cj_amount,
-                                private_key_getter=get_private_key,
-                                min_confirmations=self.config.taker_utxo_age,
-                                min_percent=self.config.taker_utxo_amtpercent,
-                                max_retries=self.config.taker_utxo_retries,
+                            new_commitment = await self._allocate_podle_commitment(
+                                self._session.preselected_utxos,
+                                get_private_key,
                             )
                     if new_commitment is None:
                         if self._session.strict_input_selection:
@@ -2065,6 +2921,12 @@ class Taker(TakerMonitoringMixin):
                         if nick not in self.orderbook_manager.ignored_makers
                         and nick not in failed_nicks
                     }
+                    self._session.ring_candidate_nicks = {
+                        nick
+                        for nick, offer in selected_offers.items()
+                        if nick in self._session.maker_sessions
+                        and offer_supports_private_channel_ring(offer)
+                    }
                     continue
 
                 logger.error(
@@ -2086,15 +2948,15 @@ class Taker(TakerMonitoringMixin):
 
             needed = target_makers - current_makers
             if replacement_attempt >= max_replacement_attempts:
-                if fill_result.success and current_makers >= self.config.minimum_makers:
+                if fill_result.success and current_makers >= self._session.required_maker_count:
                     logger.warning(
                         f"Fill replacement attempts exhausted; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self.config.minimum_makers})"
+                        f"{target_makers} makers (minimum {self._session.required_maker_count})"
                     )
                     return True
                 reason = (
                     f"Fill phase failed: only {current_makers} responding makers remain, "
-                    f"below minimum {self.config.minimum_makers}"
+                    f"below minimum {self._session.required_maker_count}"
                 )
                 logger.error(reason)
                 self._session.last_failure_reason = reason
@@ -2108,24 +2970,28 @@ class Taker(TakerMonitoringMixin):
             )
 
             current_session_nicks = set(self._session.maker_sessions.keys())
-            replacement_offers, _ = self.orderbook_manager.select_makers(
-                cj_amount=self._session.cj_amount,
-                n=needed,
-                hard_exclude_nicks=current_session_nicks | failed_nicks,
-                required_features=required_features,
+            replacement_offers, _ = self._select_channel_ring_makers(
+                self.orderbook_manager.offers,
+                needed,
+                required_features,
+                ring_slots=self._ring_replacement_slots(needed),
+                hard_exclude_nicks=(
+                    current_session_nicks | failed_nicks | self._seller_separation.excluded_nicks()
+                ),
                 penalized_maker_keys=penalized_maker_keys,
             )
+            self._seller_separation.record_offered_makers(replacement_offers.values())
 
             if not replacement_offers:
-                if fill_result.success and current_makers >= self.config.minimum_makers:
+                if fill_result.success and current_makers >= self._session.required_maker_count:
                     logger.warning(
                         f"No fill replacements available; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self.config.minimum_makers})"
+                        f"{target_makers} makers (minimum {self._session.required_maker_count})"
                     )
                     return True
                 reason = (
                     f"Fill phase failed: no replacements available and only {current_makers} "
-                    f"makers remain (minimum {self.config.minimum_makers})"
+                    f"makers remain (minimum {self._session.required_maker_count})"
                 )
                 logger.error(reason)
                 self._session.last_failure_reason = reason
@@ -2142,12 +3008,14 @@ class Taker(TakerMonitoringMixin):
                 self._session.maker_sessions[nick] = MakerSession(
                     nick=nick, offer=offer, supports_neutrino_compat=False
                 )
+                if offer_supports_private_channel_ring(offer):
+                    self._session.ring_candidate_nicks.add(nick)
                 logger.info(f"Added replacement maker: {nick}")
             selected_offers.update(replacement_offers)
 
     async def _finalize_and_broadcast(self, destination: str) -> str | None:
         # Final confirmation before broadcast
-        num_taker_inputs = len(self._session.selected_utxos)
+        num_taker_inputs = len(self._session.selected_utxos) + self._session.buyout_input_count
         num_maker_inputs = sum(len(s.utxos) for s in self._session.maker_sessions.values())
         total_inputs = num_taker_inputs + num_maker_inputs
 
@@ -2156,6 +3024,8 @@ class Taker(TakerMonitoringMixin):
         total_output_value = sum(out.value for out in tx.outputs)
 
         taker_input_value = sum(utxo.value for utxo in self._session.selected_utxos)
+        if self._session.buyout is not None:
+            taker_input_value += self._session.buyout.total_value
         maker_input_value = sum(
             utxo["value"]
             for session in self._session.maker_sessions.values()
@@ -2285,7 +3155,7 @@ class Taker(TakerMonitoringMixin):
         try:
             updated = update_taker_awaiting_transaction_broadcast(
                 destination_address=self._session.cj_destination,
-                change_address=self._session.taker_change_address,  # Empty string if no change
+                change_address=self._session.wallet_change_address,
                 txid=self._session.txid,
                 mining_fee=actual_mining_fee,
                 broadcast_method=self._session.broadcast_method,

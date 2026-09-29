@@ -21,6 +21,7 @@ PLATFORMS = {"linux/amd64", "linux/arm64", "linux/arm/v7"}
 PRODUCTION_LOCKS = {
     "directory_server/requirements.txt",
     "jmcore/requirements.txt",
+    "jmswap/requirements.txt",
     "jmwallet/requirements.txt",
     "jmwalletd/requirements.txt",
     "maker/requirements.txt",
@@ -97,6 +98,7 @@ def test_python_security_workflow_audits_locks_and_fresh_resolution() -> None:
     fresh_commands = "\n".join(step.get("run", "") for step in fresh_steps)
     assert '--path "$target_site_packages" --skip-editable' in fresh_commands
     assert "requirements-security.txt" in fresh_commands
+    assert "-e ./jmswap" in fresh_commands
 
 
 def test_codeql_uses_extended_queries_for_supported_sources() -> None:
@@ -186,6 +188,31 @@ def test_bitcointx_dependency_is_pinned_to_release_wheel() -> None:
             assert "coincurve" not in lock
             assert expected_url in lock
             assert BITCOINTX_WHEEL_SHA256 in lock
+
+
+def test_bitcointx_standalone_scripts_document_the_same_pin() -> None:
+    """The standalone bond scripts install python-bitcointx outside the locks."""
+    expected_pin = (
+        "https://github.com/m0wer/python-bitcointx/releases/download/"
+        f"python-bitcointx-v{BITCOINTX_VERSION}/"
+        f"python_bitcointx-{BITCOINTX_VERSION}-py3-none-any.whl"
+        f"#sha256={BITCOINTX_WHEEL_SHA256}"
+    )
+    for script_name in (
+        "derive_bond_pubkey.py",
+        "sign_bond_cert_reference.py",
+        "sign_bond_mnemonic.py",
+    ):
+        script = (REPO_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+        assert expected_pin in script
+
+
+def test_components_do_not_depend_on_coincurve() -> None:
+    for production_lock in PRODUCTION_LOCKS:
+        component = (REPO_ROOT / production_lock).parent
+        for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt"):
+            path = component / name
+            assert "coincurve" not in path.read_text(encoding="utf-8").lower(), path
 
 
 def test_main_and_release_promotions_depend_on_image_scans() -> None:

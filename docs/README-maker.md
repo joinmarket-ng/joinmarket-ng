@@ -50,6 +50,9 @@ expiry and publicly links the bond to the maker. It is optional, not a startup
 requirement. Read [fidelity bond operations](fidelity-bond-operations.md) before
 locking funds; external-signing bonds require separate recovery material.
 
+For the experimental Taproot pit, channel rings, buyouts, and rented fidelity
+bonds, see [Experimental Ring Market](experimental-ring-market.md).
+
 ## Migration From JoinMarket Reference
 
 The network protocol is compatible; wallet files and configuration are not

@@ -166,6 +166,78 @@ class TestMakerConfigMultiOffer:
         assert abs_cfg.get_cjfee() == 500
 
 
+class TestOfferManagerWalletPitValidation:
+    """MakerConfig rejects an offer family outside the configured pit, and
+    OfferManager still rejects a wallet that disagrees with that config at
+    announce time (maker startup) instead of discovering the mismatch later
+    at !fill time via CoinJoinSession.__init__ (which wastes a round-trip and
+    looks like a flaky maker to the taker)."""
+
+    def _wallet(self, address_type: str) -> MagicMock:
+        wallet = MagicMock()
+        wallet.address_type = address_type
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        return wallet
+
+    def test_rejects_tr0_offer_on_p2wpkh_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            address_type="p2tr",
+            offer_type=OfferType.TR0_RELATIVE,
+        )
+        with pytest.raises(ValueError, match="rigid JMP-0010 pit"):
+            OfferManager(self._wallet("p2wpkh"), config, "J5TestMaker")
+
+    def test_rejects_sw0_offer_on_p2tr_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.SW0_ABSOLUTE,
+            cj_fee_absolute=1000,
+        )
+        with pytest.raises(ValueError, match="rigid JMP-0010 pit"):
+            OfferManager(self._wallet("p2tr"), config, "J5TestMaker")
+
+    def test_rejects_mismatched_offer_in_dual_offer_configs(self) -> None:
+        """Even one offer_config among several dual-offer entries mismatching
+        the configured pit must be rejected, not just the first/legacy one."""
+        with pytest.raises(ValueError, match="requires a 'p2tr' wallet"):
+            MakerConfig(
+                mnemonic="test " * 12,
+                directory_servers=["localhost:5222"],
+                network=NetworkType.REGTEST,
+                offer_configs=[
+                    OfferConfig(offer_type=OfferType.SW0_RELATIVE, cj_fee_relative="0.001"),
+                    OfferConfig(offer_type=OfferType.TR0_ABSOLUTE, cj_fee_absolute=500),
+                ],
+            )
+
+    def test_accepts_matching_sw0_offer_on_p2wpkh_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.SW0_RELATIVE,
+        )
+        # Must not raise.
+        OfferManager(self._wallet("p2wpkh"), config, "J5TestMaker")
+
+    def test_accepts_matching_tr0_offer_on_p2tr_wallet(self) -> None:
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            address_type="p2tr",
+            offer_type=OfferType.TR0_RELATIVE,
+        )
+        # Must not raise.
+        OfferManager(self._wallet("p2tr"), config, "J5TestMaker")
+
+
 class TestOfferManagerMultiOffer:
     """Tests for OfferManager multi-offer creation."""
 
@@ -566,6 +638,68 @@ class TestMakerBotMultiOfferFill:
         ]
         return bot
 
+    @pytest.mark.parametrize("ring", [False, True])
+    @pytest.mark.parametrize("overlap", [False, True])
+    async def test_duplicate_tx_across_routes_signs_only_once(
+        self, maker_bot, ring: bool, overlap: bool
+    ) -> None:
+        session = self._session("taker", "ab" * 32, state=CoinJoinState.IOAUTH_SENT)
+        session.inner.crypto.is_encrypted = True
+        session.inner.crypto.decrypt.return_value = "AA=="
+        session.inner.offer = maker_bot.current_offers[0]
+        session.inner.amount = 100_000
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def sign(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return (
+                ["signature"] if ring else (True, {"signatures": ["signature"], "txid": "cd" * 32})
+            )
+
+        signer = AsyncMock(side_effect=sign)
+        if ring:
+            session.ring_participant = MagicMock()
+            session.inner._sign_transaction = signer
+        else:
+            session.inner.handle_tx = signer
+        session.send_response = AsyncMock()
+        maker_bot._register_pending_signed_round = AsyncMock(return_value=True)
+        maker_bot._deferred_wallet_resync = AsyncMock()
+        maker_bot.active_sessions[_session_key("taker")] = session
+        tasks = []
+        with (
+            patch("maker.maker_session.get_txid", return_value="cd" * 32),
+            patch("maker.maker_session.update_awaiting_transaction_signed", return_value=True),
+            patch("maker.maker_session.get_notifier", return_value=AsyncMock()),
+        ):
+            try:
+                first = asyncio.create_task(
+                    maker_bot._handle_tx("taker", "tx ciphertext", source="direct:peer")
+                )
+                tasks.append(first)
+                await asyncio.wait_for(started.wait(), 2)
+                if not overlap:
+                    release.set()
+                    await asyncio.wait_for(first, 2)
+                second = asyncio.create_task(
+                    maker_bot._handle_tx("taker", "tx ciphertext", source="directory:server")
+                )
+                tasks.append(second)
+                await asyncio.sleep(0)
+                assert signer.await_count == 1
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 2)
+            finally:
+                release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        signer.assert_awaited_once()
+        session.send_response.assert_awaited_once_with(maker_bot, "sig", {"signature": "signature"})
+        maker_bot._register_pending_signed_round.assert_awaited_once()
+        assert session.state is CoinJoinState.COMPLETE
+
     @pytest.mark.asyncio
     async def test_fill_relative_offer(self, maker_bot, mock_backend):
         """Test !fill for relative fee offer (oid=0)."""
@@ -953,6 +1087,7 @@ class TestMakerBotMultiOfferFill:
                 "cj_addr": "coinjoin-address",
                 "change_addr": "change-address",
                 "btc_sig": "signature",
+                "hold_seconds": "180",
             },
         )
 
@@ -1013,6 +1148,7 @@ class TestMakerBotMultiOfferFill:
                     "cj_addr": "coinjoin-address",
                     "change_addr": "change-address",
                     "btc_sig": "signature",
+                    "hold_seconds": "180",
                 },
             )
 
@@ -1063,6 +1199,7 @@ class TestMakerBotMultiOfferFill:
                 "cj_addr": "coinjoin-address",
                 "change_addr": "change-address",
                 "btc_sig": "signature",
+                "hold_seconds": "180",
             },
         )
 

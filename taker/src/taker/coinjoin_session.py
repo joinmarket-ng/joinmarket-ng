@@ -18,21 +18,31 @@ keeps ``Taker`` focused on lifecycle (start/stop/sync_wallet/run_schedule).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import secrets
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import get_txid, pubkey_to_p2wpkh_script
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    estimate_vsize,
+    get_address_type,
+    get_txid,
+    pubkey_to_p2wpkh_script,
+    taproot_tweak_pubkey,
+)
 from jmcore.constants import BITCOIN_DUST_THRESHOLD, DUST_THRESHOLD
+from jmcore.credential_market import BondReference
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     MinimumFeeRateExceedsCapError,
-    estimate_p2wpkh_vsize,
     fee_rate_meets_minimum,
     parse_low_fee_error,
     resolve_min_fee_rate,
 )
+from jmcore.models import offer_output_script_type
 from jmcore.protocol import FEATURE_NEUTRINO_COMPAT, MakerError, UTXOMetadata, parse_utxo_list
 from jmcore.randomness import secure_random
 from jmwallet.history import (
@@ -45,6 +55,7 @@ from jmwallet.wallet.signing import (
     TransactionSigningError,
     create_p2wpkh_script_code,
     deserialize_transaction,
+    verify_p2tr_signature,
     verify_p2wpkh_signature,
 )
 from jmwallet.wallet.spend import enforce_fee_rate_cap
@@ -54,6 +65,7 @@ from taker.config import BroadcastPolicy
 from taker.models import MakerSession, PhaseResult
 from taker.orderbook import calculate_cj_fee, calculate_cj_fee_plan
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
+from taker.podle_manager import BondKey, ExternalPoDLEPreview
 from taker.tx_builder import CoinJoinTxBuilder, build_coinjoin_tx, compute_tx_locktime
 
 if TYPE_CHECKING:
@@ -61,9 +73,32 @@ if TYPE_CHECKING:
     from jmwallet.wallet.models import UTXOInfo
     from jmwallet.wallet.service import WalletService
 
+    from taker.buyout import ChannelBuyout
+    from taker.channel_ring import TakerRingCoordinator
+    from taker.channel_ring_maker_only import MakerOnlyRingCoordinator
     from taker.config import TakerConfig
     from taker.multi_directory import MultiDirectoryClient
     from taker.taker import Taker
+
+
+MAX_IOAUTH_HOLD_SECONDS = 3_600
+# Resend !tx through a directory to a direct-routed maker still silent after this.
+_DIRECT_TX_FALLBACK_SEC = 30.0
+
+
+def _ioauth_hold_seconds(fields: list[str], *, ring_enabled: bool) -> int:
+    """Accept legacy no-hold auth only when channel setup cannot follow."""
+    if len(fields) == 5 and not ring_enabled:
+        return 0
+    if len(fields) != 6:
+        raise ValueError(f"expected 6 parts, got {len(fields)}")
+    value = fields[5]
+    if not value or not value.isdigit() or (len(value) > 1 and value.startswith("0")):
+        raise ValueError("invalid hold")
+    seconds = int(value)
+    if seconds > MAX_IOAUTH_HOLD_SECONDS:
+        raise ValueError("invalid hold")
+    return seconds
 
 
 @dataclass(frozen=True)
@@ -119,9 +154,27 @@ class CoinJoinSession:
         # Requested maker count for this round. Replacement runners use this
         # target before falling back to the configured minimum floor.
         self.maker_target_count: int = 0
+        # Roles are selected before !fill and retained through replacements.
+        # The coordinator freezes the corresponding authenticated sessions before
+        # any private ring message or LND action.
+        self.ring_candidate_nicks: set[str] = set()
+        self.ring_maker_sessions: dict[str, MakerSession] = {}
+        self.ordinary_maker_sessions: dict[str, MakerSession] = {}
 
         # PoDLE commitment used for this CoinJoin. Rotated on majority-blacklist.
         self.podle_commitment: ExtendedPoDLECommitment | None = None
+
+        # External credential chosen before maker selection and user
+        # confirmation, and claimed (burned) only once the round commits to it.
+        self.external_podle_preview: ExternalPoDLEPreview | None = None
+        # Fidelity bond identities of every maker this round selected or
+        # contacted, retained even after a maker fails, is replaced, or stops
+        # advertising: a credential sold by one of them can never be revealed.
+        self.round_maker_bond_keys: set[BondKey] = set()
+        # Seller bonds of every credential this round committed to using. Kept
+        # as full bond references (not nicks) so each selection pass can
+        # re-derive the exclusion from the offers advertised at that moment.
+        self.podle_seller_bonds: list[BondReference] = []
 
         # Transaction bytes at successive phases:
         # ``unsigned_tx`` is the constructed-but-unsigned PSBT-equivalent;
@@ -175,6 +228,7 @@ class CoinJoinSession:
         # Addresses recorded for broadcast verification and history reconciliation.
         self.cj_destination: str = ""
         self.taker_change_address: str = ""
+        self.buyout: ChannelBuyout | None = None
 
         # Sweep-only: the tx-fee budget reserved at order-selection time. At
         # build time we re-use this exact number to keep the actual fee in line
@@ -190,6 +244,14 @@ class CoinJoinSession:
         self._fee_rate: float | None = None
         self._randomized_fee_rate: float | None = None
         self._minimum_fee_rate_sat_vb: float | None = None
+        # Co-funded channel ring state for this round. ``strict_maker_count``
+        # pins the exact counterparty count a ring requires.
+        self.ring_coordinator: TakerRingCoordinator | MakerOnlyRingCoordinator | None = None
+        self.strict_maker_count: int | None = None
+        # A channel-ring round freezes paid maker fees after every selected maker
+        # has authenticated. The signed ring plan and post-broadcast history must
+        # retain these exact amounts rather than re-evaluating relative offers.
+        self._frozen_maker_fee_plan: dict[str, int] | None = None
 
     def attach(self, taker: Taker) -> None:
         """Wire the owning ``Taker`` so the session can read persistent deps.
@@ -203,12 +265,41 @@ class CoinJoinSession:
 
     def maker_fee_plan(self) -> dict[str, int]:
         """Return the paid fee plan for the current participating makers."""
-        return calculate_cj_fee_plan(
+        if self._frozen_maker_fee_plan is not None:
+            if set(self._frozen_maker_fee_plan) != set(self.maker_sessions):
+                raise RuntimeError("frozen maker fee plan does not match participating makers")
+            return dict(self._frozen_maker_fee_plan)
+        advertised_plan = calculate_cj_fee_plan(
             (session.offer for session in self.maker_sessions.values()),
             self.cj_amount,
             round_up_cj_fees=self.config.round_up_cj_fees,
             equalize_cj_fees=self.config.equalize_cj_fees,
         )
+        return {
+            nick: advertised_plan[session.offer.counterparty]
+            for nick, session in self.maker_sessions.items()
+        }
+
+    def freeze_maker_fee_plan(self) -> dict[str, int]:
+        """Freeze paid maker fees once authenticated counterparties are final."""
+        if self._frozen_maker_fee_plan is None:
+            self._frozen_maker_fee_plan = self.maker_fee_plan()
+        return dict(self._frozen_maker_fee_plan)
+
+    def wallet_funding_required(self, total_required: int) -> int:
+        """Keep the mandatory escrow reserve outside spendable wallet funding."""
+        if self.buyout is None:
+            return total_required
+        return max(1, total_required + self.buyout.minimum_change - self.buyout.total_value)
+
+    @property
+    def wallet_change_address(self) -> str:
+        """Escrow change belongs in the buyout journal, not wallet address history."""
+        return self.taker_change_address if self.buyout is None else ""
+
+    @property
+    def buyout_input_count(self) -> int:
+        return len(self.buyout.inputs) if self.buyout is not None else 0
 
     def reset(self) -> None:
         """Reset transient session state to a fresh state."""
@@ -218,7 +309,14 @@ class CoinJoinSession:
         self.is_sweep = False
         self.maker_sessions = {}
         self.maker_target_count = 0
+        self.ring_candidate_nicks = set()
+        self.ring_maker_sessions = {}
+        self.ordinary_maker_sessions = {}
+        self._frozen_maker_fee_plan = None
         self.podle_commitment = None
+        self.external_podle_preview = None
+        self.podle_seller_bonds = []
+        self.round_maker_bond_keys = set()
         self.unsigned_tx = b""
         self.tx_metadata = {}
         self.final_tx = b""
@@ -239,11 +337,25 @@ class CoinJoinSession:
         self.declined_signer_nicks = set()
         self.cj_destination = ""
         self.taker_change_address = ""
+        self.buyout = None
         self._sweep_tx_fee_budget = 0
         self.crypto_session = None
         self._fee_rate = None
         self._randomized_fee_rate = None
         self._minimum_fee_rate_sat_vb = None
+        self.ring_coordinator = None
+        self.strict_maker_count = None
+
+    def remove_maker_session(self, nick: str) -> None:
+        """Drop one session and its mutable pre-freeze role slot together."""
+        self.maker_sessions.pop(nick, None)
+        if not self.ring_maker_sessions and not self.ordinary_maker_sessions:
+            self.ring_candidate_nicks.discard(nick)
+
+    @property
+    def required_maker_count(self) -> int:
+        """Rings need every invited participant, ordinary rounds need the minimum."""
+        return self.strict_maker_count or self.config.minimum_makers
 
     def input_lock_ttl_sec(self) -> float:
         """Cover the remaining protocol plus the pending-broadcast window."""
@@ -366,7 +478,7 @@ class CoinJoinSession:
                 f"Dropping maker {nick} before !fill: peer handshake reports "
                 f"no neutrino_compat support (taker requires it)."
             )
-            del self.maker_sessions[nick]
+            self.remove_maker_session(nick)
         return dropped
 
     def process_pubkey_response(self, nick: str, response_data: str) -> bool:
@@ -494,7 +606,7 @@ class CoinJoinSession:
         # in _phase_auth will catch them later.
         if self.backend.requires_neutrino_metadata():
             incompatible = self._drop_neutrino_incompatible_sessions(pending_nicks)
-            if incompatible and len(self.maker_sessions) < self.config.minimum_makers:
+            if incompatible and len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
                     f"After filtering {len(incompatible)} neutrino-incompatible maker(s), "
                     f"only {len(self.maker_sessions)} remain (need "
@@ -577,26 +689,26 @@ class CoinJoinSession:
                             f"Commitment was blacklisted by {nick} - may need retry with new index"
                         )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
                     continue
 
                 try:
                     response_data = responses[nick]["data"].strip()
                     if not self.process_pubkey_response(nick, response_data):
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                 except Exception as e:
                     logger.warning("Invalid !pubkey response from maker")
                     logger.bind(sensitive=True).warning(
                         "Invalid !pubkey response from {}: {}", nick, e
                     )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
             else:
                 logger.warning(f"No !pubkey response from {nick}")
                 failed_makers.append(nick)
                 silent_makers.append(nick)
-                del self.maker_sessions[nick]
+                self.remove_maker_session(nick)
 
         # If at least one maker explicitly rejected the commitment as
         # blacklisted, treat the silent makers (timeouts) as also-blacklisted.
@@ -633,9 +745,9 @@ class CoinJoinSession:
                         f"advertised features (taker requires extended UTXO metadata)."
                     )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
 
-        if len(self.maker_sessions) < self.config.minimum_makers:
+        if len(self.maker_sessions) < self.required_maker_count:
             logger.error(f"Not enough makers responded: {len(self.maker_sessions)}")
             return PhaseResult(
                 success=False,
@@ -703,13 +815,13 @@ class CoinJoinSession:
                     f"without extended metadata (scriptpubkey + blockheight)."
                 )
                 incompatible_makers.append(nick)
-                del self.maker_sessions[nick]
+                self.remove_maker_session(nick)
 
             pending_nicks = [nick for nick in pending_nicks if nick in self.maker_sessions]
 
             # Report incompatible makers as failed so the replacement loop can
             # ignore them and pick substitutes before any PoDLE proof is revealed.
-            if len(self.maker_sessions) < self.config.minimum_makers:
+            if len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
                     f"Not enough compatible makers: {len(self.maker_sessions)} "
                     f"< {self.config.minimum_makers}. Neutrino takers require makers that "
@@ -782,8 +894,8 @@ class CoinJoinSession:
         unavailable_makers: list[str] = []
 
         # Process responses
-        # Maker sends !ioauth as ENCRYPTED space-separated:
-        # <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
+        # Maker sends !ioauth as ENCRYPTED ASCII space-separated:
+        # <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig> <hold_seconds>
         # where utxo_list can be:
         # - Legacy format: txid:vout,txid:vout,...
         # - Extended format (neutrino_compat): txid:vout:scriptpubkey:blockheight,...
@@ -807,7 +919,7 @@ class CoinJoinSession:
                     # A remote maker controls this error token, so it cannot be
                     # trusted to bypass the persistent failed-maker policy.
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
                     continue
 
                 try:
@@ -815,7 +927,7 @@ class CoinJoinSession:
                     if session.crypto is None:
                         logger.warning(f"No encryption session for {nick}")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Extract encrypted data (first part of response)
@@ -824,24 +936,32 @@ class CoinJoinSession:
                     if not parts:
                         logger.warning(f"Empty !ioauth response from {nick}")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     encrypted_data = parts[0]
 
                     # Decrypt the ioauth message
                     decrypted = session.crypto.decrypt(encrypted_data)
-                    logger.debug(f"Decrypted !ioauth from {nick}: {decrypted[:50]}...")
+                    logger.debug(f"Received encrypted !ioauth from {nick}")
 
-                    # Parse: <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
-                    ioauth_parts = decrypted.split()
-                    if len(ioauth_parts) < 5:
-                        logger.warning(
-                            f"Invalid !ioauth format from {nick}: expected 5 parts, "
-                            f"got {len(ioauth_parts)}"
-                        )
+                    # Ring setup requires an explicit maker input hold. Legacy
+                    # makers omit the sixth field, which is only safe for an
+                    # ordinary CoinJoin without channel-ring negotiation.
+                    if not decrypted.isascii():
+                        logger.warning(f"Invalid !ioauth format from {nick}")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
+                        continue
+                    ioauth_parts = decrypted.split()
+                    try:
+                        hold_seconds = _ioauth_hold_seconds(
+                            ioauth_parts, ring_enabled=self.config.channel_ring.enabled
+                        )
+                    except ValueError as exc:
+                        logger.warning(f"Invalid !ioauth from {nick}: {exc}")
+                        failed_makers.append(nick)
+                        self.remove_maker_session(nick)
                         continue
 
                     utxo_list_str = ioauth_parts[0]
@@ -854,12 +974,13 @@ class CoinJoinSession:
                     # malicious directory substitute the maker's encryption key and
                     # MITM the channel, so a failing btc_sig is fatal.
                     btc_sig = ioauth_parts[4]
+                    hold_received_at = time.monotonic()
                     from jmcore.crypto import ecdsa_verify
 
                     if not ecdsa_verify(session.pubkey, btc_sig, bytes.fromhex(auth_pub)):
                         logger.warning(f"btc_sig verification failed from {nick}, dropping")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Parse utxo_list using protocol helper
@@ -881,7 +1002,7 @@ class CoinJoinSession:
                             "mining fee for every input, so this would inflate our fee."
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Track if maker sent extended format
@@ -897,7 +1018,7 @@ class CoinJoinSession:
                             unavailable_makers.append(nick)
                         else:
                             failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Every outpoint in the transaction must be unique across ALL
@@ -920,7 +1041,7 @@ class CoinJoinSession:
                             "already used by another participant in this round"
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Reference-taker parity: the maker must fund its CoinJoin
@@ -942,29 +1063,40 @@ class CoinJoinSession:
                             f"the maker change threshold ({DUST_THRESHOLD})"
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
-                    # Tie the authenticated session to on-chain ownership: the auth
-                    # pubkey must own one of the maker's declared UTXOs. Compare
+                    pit_mismatch = self._maker_pit_mismatch(session, cj_addr, change_addr)
+                    if pit_mismatch is not None:
+                        logger.warning(f"Dropping maker {nick}: {pit_mismatch}")
+                        failed_makers.append(nick)
+                        self.remove_maker_session(nick)
+                        continue
+
+                    # Tie the authenticated session to on-chain ownership: the
+                    # auth pubkey must own one of the maker's declared UTXOs. The
+                    # expected scriptPubKey depends on the pit type (JMP-0010):
+                    # P2WPKH for sw0, and the BIP341 taproot output key (tweaked
+                    # from the internal auth pubkey) for tr0. Compare
                     # case-insensitively: for neutrino peers the scriptPubKey is
                     # peer-supplied hex whose case is not normalized (matching the
                     # case-insensitive signing-phase check via bytes.fromhex).
-                    auth_spk = pubkey_to_p2wpkh_script(bytes.fromhex(auth_pub)).hex()
-                    if not any(
-                        u.get("scriptpubkey", "").lower() == auth_spk for u in session.utxos
-                    ):
+                    if not self._auth_pubkey_owns_utxo(auth_pub, session):
                         logger.warning("Maker authentication key matches no declared UTXO")
                         logger.bind(sensitive=True).warning(
                             "Authentication key for {} matches no declared UTXO", nick
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     session.cj_address = cj_addr
                     session.change_address = change_addr
                     session.auth_pubkey = auth_pub  # Store for later verification
+                    session.record_hold(
+                        hold_seconds=hold_seconds,
+                        received_at=hold_received_at,
+                    )
                     session.responded_auth = True
                     logger.bind(sensitive=True).debug(
                         f"Processed !ioauth from {nick}: {len(session.utxos)} UTXOs, "
@@ -976,13 +1108,13 @@ class CoinJoinSession:
                         "Invalid !ioauth response from {}: {}", nick, e
                     )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
             else:
                 logger.warning(f"No !ioauth response from {nick}")
                 failed_makers.append(nick)
-                del self.maker_sessions[nick]
+                self.remove_maker_session(nick)
 
-        if len(self.maker_sessions) < self.config.minimum_makers:
+        if len(self.maker_sessions) < self.required_maker_count:
             logger.error(f"Not enough makers sent UTXOs: {len(self.maker_sessions)}")
             return PhaseResult(
                 success=False,
@@ -1156,7 +1288,7 @@ class CoinJoinSession:
                     )
 
             # Estimate tx fee with actual input counts
-            num_taker_inputs = len(self.preselected_utxos)
+            num_taker_inputs = len(self.preselected_utxos) + self.buyout_input_count
             num_maker_inputs = sum(len(s.utxos) for s in self.maker_sessions.values())
             num_inputs = num_taker_inputs + num_maker_inputs
 
@@ -1170,8 +1302,22 @@ class CoinJoinSession:
                 # Normal mode: include taker change
                 num_outputs = 1 + len(self.maker_sessions) + 1 + len(self.maker_sessions)
 
-            # Calculate actual tx fee based on real transaction size
-            actual_tx_fee = self._estimate_tx_fee(num_inputs, num_outputs)
+            # Classify the actual inputs so a legacy bond input in a taproot
+            # round cannot make the fee estimate too small.
+            est_input_types, est_output_types = self._build_script_type_lists(
+                self.preselected_utxos, num_outputs
+            )
+            fee_type_overrides: dict[str, Any] = {}
+            if any(script_type != "p2wpkh" for script_type in est_input_types + est_output_types):
+                fee_type_overrides = {
+                    "input_types": est_input_types,
+                    "output_types": est_output_types,
+                }
+            actual_tx_fee = self._estimate_tx_fee(
+                num_inputs,
+                num_outputs,
+                **fee_type_overrides,
+            )
 
             preselected_total = sum(u.value for u in self.preselected_utxos)
 
@@ -1206,7 +1352,7 @@ class CoinJoinSession:
                 # taker's approved total outflow.
                 #
                 # Calculate actual vsize for fee rate logging
-                actual_tx_vsize = estimate_p2wpkh_vsize(num_inputs, num_outputs)
+                actual_tx_vsize = estimate_vsize(est_input_types, est_output_types)
 
                 # Use the budget as the tx_fee
                 tx_fee = self._sweep_tx_fee_budget
@@ -1282,7 +1428,10 @@ class CoinJoinSession:
 
                     tolerance = self.config.max_sweep_fee_change
                     actual_base_fee = self._estimate_tx_fee(
-                        num_inputs, num_outputs, use_base_rate=True
+                        num_inputs,
+                        num_outputs,
+                        use_base_rate=True,
+                        **fee_type_overrides,
                     )
                     fee_ratio = actual_base_fee / tx_fee
                     if fee_ratio > 1 + tolerance:
@@ -1317,7 +1466,7 @@ class CoinJoinSession:
                 # NORMAL MODE: Use pre-selected UTXOs, add more if needed
                 # For normal mode, we use the actual tx_fee estimate
                 tx_fee = actual_tx_fee
-                required = self.cj_amount + total_maker_fee + tx_fee
+                required = self.wallet_funding_required(self.cj_amount + total_maker_fee + tx_fee)
 
                 # Use pre-selected UTXOs (which include the PoDLE UTXO)
                 # These were selected during PoDLE generation to ensure the commitment
@@ -1385,6 +1534,15 @@ class CoinJoinSession:
             self.selected_utxos = selected_utxos
 
             taker_total = sum(u.value for u in selected_utxos)
+            if self.buyout is not None:
+                if self.is_sweep or not all(u.is_p2tr for u in selected_utxos):
+                    raise ValueError(
+                        "Buyout requires ordinary Taproot wallet inputs and escrow change"
+                    )
+                channel_points = {(u["txid"], u["vout"]) for u in self.buyout.inputs}
+                if channel_points.intersection((u.txid, u.vout) for u in selected_utxos):
+                    raise ValueError("Channel funding inputs cannot be wallet-owned inputs")
+                taker_total += self.buyout.total_value
 
             # Calculate expected change to determine if we need a change address
             # Change = total_input - cj_amount - maker_fees - tx_fee
@@ -1392,7 +1550,12 @@ class CoinJoinSession:
 
             # Only generate change address if we'll actually have a change output
             # This avoids recording unused addresses in history
-            if expected_change > BITCOIN_DUST_THRESHOLD:
+            if self.buyout is not None:
+                if expected_change < self.buyout.minimum_change:
+                    raise ValueError("Buyout escrow reserve is insufficient")
+                taker_change_address = self.buyout.change_address
+                self.taker_change_address = taker_change_address
+            elif expected_change > BITCOIN_DUST_THRESHOLD:
                 taker_change_address = self.wallet.get_new_internal_address(mixdepth)
                 self.taker_change_address = taker_change_address
                 logger.bind(sensitive=True).debug(
@@ -1440,7 +1603,8 @@ class CoinJoinSession:
                         "scriptpubkey": u.scriptpubkey,
                     }
                     for u in selected_utxos
-                ],
+                ]
+                + (self.buyout.inputs if self.buyout is not None else []),
                 taker_cj_address=destination,
                 taker_change_address=taker_change_address,
                 taker_total_input=taker_total,
@@ -1450,6 +1614,8 @@ class CoinJoinSession:
                 network=network,
                 locktime=locktime,
             )
+            if self.buyout is not None:
+                self.buyout.validate(self.unsigned_tx, self._build_prevout_map(), current_height)
 
             logger.bind(sensitive=True).debug("Built unsigned tx: {} bytes", len(self.unsigned_tx))
             logger.bind(sensitive=True).debug(
@@ -1487,8 +1653,110 @@ class CoinJoinSession:
             logger.bind(sensitive=True).error("Transaction build error detail: {}", e)
             return False
 
+    @staticmethod
+    def _classify_scriptpubkey(scriptpubkey: str, default: str) -> str:
+        """Map a scriptPubKey to a coarse type for vsize estimation."""
+        spk = (scriptpubkey or "").lower()
+        if spk.startswith("0014") and len(spk) == 44:
+            return "p2wpkh"
+        if spk.startswith("5120") and len(spk) == 68:
+            return "p2tr"
+        if spk.startswith("0020") and len(spk) == 68:
+            return "p2wsh"
+        if spk.startswith("76a914") and len(spk) == 50:
+            return "p2pkh"
+        if spk.startswith("a914") and len(spk) == 46:
+            return "p2sh"
+        return default
+
+    def _auth_pubkey_owns_utxo(self, auth_pub: str, session: MakerSession) -> bool:
+        """Return whether the pit-specific auth key owns a declared maker UTXO."""
+        pit_type = offer_output_script_type(self.config.preferred_offer_type)
+        auth_bytes = bytes.fromhex(auth_pub)
+        if pit_type == "p2tr":
+            _parity, output_xonly = taproot_tweak_pubkey(auth_bytes[1:])
+            expected_spk = "5120" + output_xonly.hex()
+        else:
+            expected_spk = pubkey_to_p2wpkh_script(auth_bytes).hex()
+        return any(
+            utxo.get("scriptpubkey", "").lower() == expected_spk.lower() for utxo in session.utxos
+        )
+
+    def _maker_pit_mismatch(
+        self, session: MakerSession, cj_addr: str, change_addr: str
+    ) -> str | None:
+        """Return why a maker violates the configured rigid pit, if it does."""
+        expected = offer_output_script_type(self.config.preferred_offer_type)
+        try:
+            cj_type = get_address_type(cj_addr)
+        except ValueError:
+            cj_type = ""
+        if cj_type != expected:
+            return f"cj_addr type {cj_type!r} does not match pit type {expected!r}"
+
+        if change_addr:
+            try:
+                change_type = get_address_type(change_addr)
+            except ValueError:
+                change_type = ""
+            if change_type != expected:
+                return f"change type {change_type!r} does not match pit type {expected!r}"
+
+        if not self._maker_inputs_match_pit(session, expected):
+            return f"one or more inputs are not {expected} (rigid pit, JMP-0010)"
+        return None
+
+    def _maker_inputs_match_pit(self, session: MakerSession, pit_type: str) -> bool:
+        """Return whether every verified maker input matches the pit type."""
+        for utxo in session.utxos:
+            scriptpubkey = utxo.get("scriptpubkey") or ""
+            if not scriptpubkey or self._classify_scriptpubkey(scriptpubkey, "") != pit_type:
+                return False
+        return True
+
+    def _build_script_type_lists(
+        self, selected_utxos: list[Any], num_outputs: int
+    ) -> tuple[list[str], list[str]]:
+        """Derive concrete input and output types for fee estimation."""
+        cj_type = offer_output_script_type(self.config.preferred_offer_type)
+        input_types = [
+            self._classify_scriptpubkey(getattr(utxo, "scriptpubkey", "") or "", cj_type)
+            for utxo in selected_utxos
+        ]
+        input_types.extend(["p2tr"] * self.buyout_input_count)
+        for session in self.maker_sessions.values():
+            input_types.extend(
+                self._classify_scriptpubkey(utxo.get("scriptpubkey", "") or "", cj_type)
+                for utxo in session.utxos
+            )
+
+        output_types = [cj_type] * (1 + len(self.maker_sessions))
+        change_addresses: list[str] = []
+        if not self.is_sweep and self.taker_change_address:
+            change_addresses.append(self.taker_change_address)
+        change_addresses.extend(
+            session.change_address
+            for session in self.maker_sessions.values()
+            if session.change_address
+        )
+        for address in change_addresses:
+            try:
+                output_types.append(get_address_type(address))
+            except ValueError:
+                output_types.append(cj_type)
+
+        if len(output_types) != num_outputs:
+            output_types = [cj_type] * num_outputs
+        return input_types, output_types
+
     def _estimate_tx_fee(
-        self, num_inputs: int, num_outputs: int, *, use_base_rate: bool = False
+        self,
+        num_inputs: int,
+        num_outputs: int,
+        *,
+        use_base_rate: bool = False,
+        input_types: list[str] | None = None,
+        output_types: list[str] | None = None,
     ) -> int:
         """Estimate transaction fee.
 
@@ -1509,8 +1777,10 @@ class CoinJoinSession:
         """
         import math
 
-        # P2WPKH: ~68 vbytes per input, 31 vbytes per output, ~11 overhead
-        vsize = estimate_p2wpkh_vsize(num_inputs, num_outputs)
+        script_type = offer_output_script_type(self.config.preferred_offer_type)
+        in_types = input_types if input_types is not None else [script_type] * num_inputs
+        out_types = output_types if output_types is not None else [script_type] * num_outputs
+        vsize = estimate_vsize(in_types, out_types)
 
         # Use base rate for deterministic calculations (sweeps),
         # otherwise use the session's randomized rate for privacy
@@ -1643,8 +1913,13 @@ class CoinJoinSession:
         total_input = sum(utxo.value for utxo in self.selected_utxos) + sum(
             utxo["value"] for session in self.maker_sessions.values() for utxo in session.utxos
         )
+        if self.buyout is not None:
+            total_input += self.buyout.total_value
         fee = total_input - sum(output.value for output in tx.outputs)
-        vsize = estimate_p2wpkh_vsize(len(tx.inputs), len(tx.outputs))
+        input_types, output_types = self._build_script_type_lists(
+            self.selected_utxos, len(tx.outputs)
+        )
+        vsize = estimate_vsize(input_types, output_types)
         if fee < 0:
             return "CoinJoin has a negative miner fee"
         if not fee_rate_meets_minimum(fee, vsize, self._minimum_fee_rate_sat_vb):
@@ -1778,6 +2053,89 @@ class CoinJoinSession:
             )
         return failure_reason
 
+    @staticmethod
+    def _decode_maker_signature_payload(encoded_payload: str) -> tuple[bytes, bytes]:
+        """Decode one length-delimited maker signature payload."""
+        padding_needed = (4 - len(encoded_payload) % 4) % 4
+        try:
+            payload = base64.b64decode(encoded_payload + "=" * padding_needed, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("maker signature payload is not valid base64") from exc
+
+        if len(payload) < 2:
+            raise ValueError("maker signature payload is truncated")
+        signature_length = payload[0]
+        public_key_length_offset = 1 + signature_length
+        if public_key_length_offset >= len(payload):
+            raise ValueError("maker signature payload is truncated")
+        public_key_length = payload[public_key_length_offset]
+        expected_length = 2 + signature_length + public_key_length
+        if len(payload) != expected_length:
+            raise ValueError(
+                f"maker signature payload length is {len(payload)}, expected {expected_length}"
+            )
+
+        signature = payload[1:public_key_length_offset]
+        public_key = payload[public_key_length_offset + 1 :]
+        if public_key_length == 32 and signature_length != 64:
+            raise ValueError(
+                "Taproot maker signature payload must be 0x40 || signature[64] || "
+                "0x20 || output_key[32]"
+            )
+        return signature, public_key
+
+    @staticmethod
+    def _match_maker_input_signature(
+        *,
+        maker_input_indices: list[int],
+        matched_indices: set[int],
+        input_map: dict[int, tuple[str, int]],
+        maker_utxo_map: dict[tuple[str, int], dict[str, Any]],
+        all_prevout_scripts: list[bytes],
+        all_prevout_values: list[int],
+        tx: Any,
+        signature: bytes,
+        pubkey: bytes,
+    ) -> tuple[int | None, bool]:
+        """Return the maker input matched by a script-bound signature."""
+        for idx in maker_input_indices:
+            if idx in matched_indices:
+                continue
+            txid, vout = input_map[idx]
+            utxo = maker_utxo_map[(txid, vout)]
+            script_hex = utxo.get("scriptpubkey", "")
+            if not script_hex:
+                continue
+            script = bytes.fromhex(script_hex)
+            is_taproot = bool(all_prevout_scripts) and script.startswith(b"\x51\x20")
+            if is_taproot:
+                if script != b"\x51\x20" + pubkey:
+                    continue
+                if verify_p2tr_signature(
+                    tx,
+                    idx,
+                    all_prevout_values,
+                    all_prevout_scripts,
+                    signature,
+                    pubkey,
+                ):
+                    return idx, True
+                continue
+
+            if script != pubkey_to_p2wpkh_script(pubkey):
+                continue
+            script_code = create_p2wpkh_script_code(pubkey)
+            if verify_p2wpkh_signature(
+                tx,
+                idx,
+                script_code,
+                utxo["value"],
+                signature,
+                pubkey,
+            ):
+                return idx, False
+        return None, False
+
     async def _phase_collect_signatures(self) -> bool:
         """Send !tx and collect !sig responses from makers.
 
@@ -1794,8 +2152,6 @@ class CoinJoinSession:
                 return False
 
         # Encode transaction as base64 (expected by maker after decryption)
-        import base64
-
         tx_b64 = base64.b64encode(self.unsigned_tx).decode("ascii")
 
         # Record history BEFORE sending !tx to makers.
@@ -1812,7 +2168,7 @@ class CoinJoinSession:
                 total_maker_fees=total_maker_fees,
                 mining_fee=0,  # Will be updated after signing
                 destination=self.cj_destination,
-                change_address=self.taker_change_address,  # Empty string if no change needed
+                change_address=self.wallet_change_address,
                 source_mixdepth=self.tx_metadata.get("source_mixdepth", 0),
                 selected_utxos=[(utxo.txid, utxo.vout) for utxo in self.selected_utxos],
                 txid="",  # Will be updated after broadcast
@@ -1836,6 +2192,7 @@ class CoinJoinSession:
             return False
 
         # Send ENCRYPTED !tx to each maker
+        encrypted_txs: dict[str, str] = {}
         for nick, session in self.maker_sessions.items():
             if session.crypto is None:
                 logger.error(f"No encryption session for {nick}")
@@ -1848,6 +2205,7 @@ class CoinJoinSession:
             )
 
             encrypted_tx = session.crypto.encrypt(tx_b64)
+            encrypted_txs[nick] = encrypted_tx
             # Verify ownership immediately before every delivery. Maker-only
             # signatures cannot spend taker inputs, so they do not cross the
             # local signing boundary.
@@ -1867,12 +2225,43 @@ class CoinJoinSession:
         expected_nicks = list(self.maker_sessions.keys())
         signatures: dict[str, list[dict[str, Any]]] = {}
 
+        lock_renewal_failed = False
+
+        async def resend_stalled_direct_tx(stalled: set[str]) -> None:
+            # A direct Tor stream can stall silently after !auth; the heartbeat
+            # only notices after minutes. Resend the same !tx once through a
+            # directory. Our makers ignore a !tx after signing; reference makers
+            # may return signatures again, which response collection deduplicates.
+            nonlocal lock_renewal_failed
+            for nick in sorted(stalled):
+                session = self.maker_sessions.get(nick)
+                if session is None or session.comm_channel != "direct":
+                    continue
+                if nick not in encrypted_txs:
+                    continue
+                if not self.renew_input_locks(f"resend !tx to maker {nick}"):
+                    lock_renewal_failed = True
+                    return
+                logger.warning(
+                    f"No !sig from {nick} over direct connection, resending via directory"
+                )
+                try:
+                    session.comm_channel = await self.directory_client.send_privmsg(
+                        nick, "tx", encrypted_txs[nick], log_routing=True, force_channel="directory"
+                    )
+                except Exception as e:
+                    logger.warning("Directory fallback for !tx failed ({})", type(e).__name__)
+                    logger.bind(sensitive=True).debug("Fallback to {} failed: {}", nick, e)
+
         responses = await self.directory_client.wait_for_responses(
             expected_nicks=expected_nicks,
             expected_command="!sig",
             timeout=timeout,
             expected_counts=expected_counts,
+            on_stalled=(min(_DIRECT_TX_FALLBACK_SEC, timeout / 2), resend_stalled_direct_tx),
         )
+        if lock_renewal_failed:
+            return False
 
         # Deserialize transaction for signature verification
         # We use verification-based matching: verify each signature against inputs
@@ -1889,6 +2278,14 @@ class CoinJoinSession:
         for idx, tx_input in enumerate(tx.inputs):
             txid_hex = tx_input.txid_le[::-1].hex()
             input_map[idx] = (txid_hex, tx_input.vout)
+
+        try:
+            all_prevout_values, all_prevout_scripts = self._assemble_prevouts(
+                tx, self._build_prevout_map()
+            )
+        except TransactionSigningError as exc:
+            logger.debug(f"Could not assemble full prevout set: {exc}")
+            all_prevout_values, all_prevout_scripts = [], []
 
         # Process responses
         low_fee_decline: tuple[float, float] | None = None
@@ -1946,49 +2343,28 @@ class CoinJoinSession:
                         encrypted_data = parts[0]
                         decrypted_sig = session.crypto.decrypt(encrypted_data)
 
-                        # Parse signature (same as before)
-                        padding_needed = (4 - len(decrypted_sig) % 4) % 4
-                        padded_sig = decrypted_sig + "=" * padding_needed
-                        sig_bytes = base64.b64decode(padded_sig)
-                        sig_len = sig_bytes[0]
-                        signature = sig_bytes[1 : 1 + sig_len]
-                        pub_len = sig_bytes[1 + sig_len]
-                        pubkey = sig_bytes[2 + sig_len : 2 + sig_len + pub_len]
+                        signature, pubkey = self._decode_maker_signature_payload(decrypted_sig)
 
-                        # Try to verify against each of maker's inputs
-                        matched_input_idx = None
-
-                        for idx in maker_input_indices:
-                            if idx in matched_indices:
-                                continue
-
-                            txid, vout = input_map[idx]
-                            utxo = maker_utxo_map[(txid, vout)]
-                            value = utxo["value"]
-
-                            # Bind the maker-supplied pubkey to this UTXO's own
-                            # scriptPubKey. Without this a signature by any key
-                            # verifies for a UTXO the maker does not control,
-                            # yielding a consensus-invalid coinjoin.
-                            utxo_spk = utxo.get("scriptpubkey", "")
-                            if not utxo_spk or bytes.fromhex(utxo_spk) != pubkey_to_p2wpkh_script(
-                                pubkey
-                            ):
-                                continue
-
-                            # Create scriptCode for verification
-                            script_code = create_p2wpkh_script_code(pubkey)
-
-                            if verify_p2wpkh_signature(
-                                tx, idx, script_code, value, signature, pubkey
-                            ):
-                                matched_input_idx = idx
-                                break
+                        matched_input_idx, matched_is_taproot = self._match_maker_input_signature(
+                            maker_input_indices=maker_input_indices,
+                            matched_indices=matched_indices,
+                            input_map=input_map,
+                            maker_utxo_map=maker_utxo_map,
+                            all_prevout_scripts=all_prevout_scripts,
+                            all_prevout_values=all_prevout_values,
+                            tx=tx,
+                            signature=signature,
+                            pubkey=pubkey,
+                        )
 
                         if matched_input_idx is not None:
                             matched_indices.add(matched_input_idx)
                             txid, vout = input_map[matched_input_idx]
-                            witness = [signature.hex(), pubkey.hex()]
+                            witness = (
+                                [signature.hex()]
+                                if matched_is_taproot
+                                else [signature.hex(), pubkey.hex()]
+                            )
 
                             sig_infos.append({"txid": txid, "vout": vout, "witness": witness})
                             logger.bind(sensitive=True).debug(
@@ -2061,7 +2437,11 @@ class CoinJoinSession:
         builder = CoinJoinTxBuilder(self.config.network.value)
 
         # Add taker's signatures
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.mark_local_signature_creation()
         taker_sigs = await self._sign_our_inputs()
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.mark_local_signatures(taker_sigs)
         signatures["taker"] = taker_sigs
 
         self.final_tx = builder.add_signatures(
@@ -2069,9 +2449,56 @@ class CoinJoinSession:
             signatures,
             self.tx_metadata,
         )
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.persist_final_transaction(self.final_tx.hex())
 
         logger.bind(sensitive=True).info("Signed tx: {} bytes", len(self.final_tx))
         return True
+
+    def _build_prevout_map(self) -> dict[tuple[str, int], tuple[int, bytes]]:
+        """Map every CoinJoin input to the data committed by BIP341."""
+        prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
+        if self.buyout is not None:
+            for item in self.buyout.inputs:
+                prevouts[(item["txid"], item["vout"])] = (
+                    item["value"],
+                    bytes.fromhex(item["scriptpubkey"]),
+                )
+        for utxo in self.selected_utxos:
+            prevouts[(utxo.txid, utxo.vout)] = (
+                utxo.value,
+                bytes.fromhex(utxo.scriptpubkey),
+            )
+        for session in self.maker_sessions.values():
+            for utxo in session.utxos:
+                script_hex = utxo.get("scriptpubkey") or ""
+                if script_hex:
+                    script = bytes.fromhex(script_hex)
+                elif utxo.get("address"):
+                    script = address_to_scriptpubkey(utxo["address"])
+                else:
+                    continue
+                prevouts[(utxo["txid"], utxo["vout"])] = (utxo["value"], script)
+        return prevouts
+
+    @staticmethod
+    def _assemble_prevouts(
+        tx: Any,
+        prevout_map: dict[tuple[str, int], tuple[int, bytes]],
+    ) -> tuple[list[int], list[bytes]]:
+        """Return ordered values and scripts for every transaction input."""
+        values: list[int] = []
+        scripts: list[bytes] = []
+        for tx_input in tx.inputs:
+            txid_hex = tx_input.txid_le[::-1].hex()
+            entry = prevout_map.get((txid_hex, tx_input.vout))
+            if entry is None:
+                raise TransactionSigningError(
+                    f"Missing prevout for {txid_hex}:{tx_input.vout} (required for taproot sighash)"
+                )
+            values.append(entry[0])
+            scripts.append(entry[1])
+        return values, scripts
 
     async def _sign_our_inputs(self) -> list[dict[str, Any]]:
         """
@@ -2108,6 +2535,22 @@ class CoinJoinSession:
             if not self.renew_input_locks("sign taker inputs"):
                 return []
 
+            need_prevouts = any(utxo.is_p2tr for utxo in self.selected_utxos)
+            prevout_values: list[int] = []
+            prevout_scripts: list[bytes] = []
+            if need_prevouts:
+                prevout_values, prevout_scripts = self._assemble_prevouts(
+                    tx, self._build_prevout_map()
+                )
+
+            if self.buyout is not None:
+                if not all(utxo.is_p2tr for utxo in self.selected_utxos):
+                    raise TransactionSigningError("Buyout requires ordinary Taproot wallet inputs")
+                self.signing_boundary_crossed = True
+                signatures_info.extend(
+                    await self.buyout.sign(self.unsigned_tx, self._build_prevout_map())
+                )
+
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:
                 # Find the input index in the transaction
@@ -2133,7 +2576,16 @@ class CoinJoinSession:
                 # This is the local signing boundary. Maker signatures alone
                 # cannot spend taker inputs.
                 self.signing_boundary_crossed = True
-                signed = self.wallet.sign_input(tx, input_index, utxo)
+                if need_prevouts:
+                    signed = self.wallet.sign_input(
+                        tx,
+                        input_index,
+                        utxo,
+                        prevout_values=prevout_values,
+                        prevout_scripts=prevout_scripts,
+                    )
+                else:
+                    signed = self.wallet.sign_input(tx, input_index, utxo)
 
                 signatures_info.append(
                     {
@@ -2181,7 +2633,7 @@ class CoinJoinSession:
                 total_maker_fees=total_maker_fees,
                 mining_fee=mining_fee,
                 destination=destination,
-                change_address=self.taker_change_address,  # May be empty string if no change
+                change_address=self.wallet_change_address,
                 source_mixdepth=self.tx_metadata.get("source_mixdepth", 0),
                 selected_utxos=[(utxo.txid, utxo.vout) for utxo in self.selected_utxos],
                 txid=txid,
@@ -2302,6 +2754,14 @@ class CoinJoinSession:
 
         # Build list of broadcast candidates based on policy
         maker_nicks = list(self.maker_sessions.keys())
+
+        if self.ring_coordinator is not None:
+            delivered = await self._broadcast_to_all_makers(maker_nicks, tx_b64)
+            if delivered != len(maker_nicks):
+                logger.warning(
+                    f"Final ring transaction reached {delivered}/{len(maker_nicks)} makers; "
+                    "durable reconciliation remains active"
+                )
 
         if policy == BroadcastPolicy.SELF:
             # Always broadcast via own node

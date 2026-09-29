@@ -24,6 +24,12 @@ class TakerState(StrEnum):
     SELECTING_MAKERS = "selecting_makers"
     FILLING = "filling"
     AUTHENTICATING = "authenticating"
+    RING_INVITING = "ring_inviting"
+    RING_PLANNING = "ring_planning"
+    RING_OPENING = "ring_opening"
+    RING_VERIFYING = "ring_verifying"
+    RING_READINESS = "ring_readiness"
+    RING_AUTHORIZING_SIGNATURES = "ring_authorizing_signatures"
     BUILDING_TX = "building_tx"
     COLLECTING_SIGNATURES = "collecting_signatures"
     BROADCASTING = "broadcasting"
@@ -49,10 +55,20 @@ class MakerSession:
     responded_auth: bool = False
     responded_sig: bool = False
     supports_neutrino_compat: bool = False  # Supports extended UTXO metadata for Neutrino
+    hold_seconds: int | None = None
+    hold_deadline: float | None = None
     # Communication channel used for this session (must be consistent throughout)
     # "direct" = peer-to-peer onion connection
     # "directory:<host>:<port>" = relayed through specific directory
     comm_channel: str = ""
+
+    def record_hold(self, *, hold_seconds: int, received_at: float) -> None:
+        """Record the first authenticated pre-sign hold without renewing it."""
+        # A replay must not give a maker a new local deadline.
+        if self.hold_seconds is not None or self.hold_deadline is not None:
+            return
+        self.hold_seconds = hold_seconds
+        self.hold_deadline = received_at + hold_seconds
 
 
 @dataclass

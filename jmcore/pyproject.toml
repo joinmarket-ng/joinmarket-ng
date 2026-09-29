@@ -14,6 +14,7 @@ authors = [
 license = {text = "GPL-3.0"}
 dependencies = [
     "pydantic>=2.5.0",
+    "typing-extensions>=4.6.1",
     "pydantic-settings>=2.1.0",
     "tomli>=2.0.0;python_version<'3.11'",
     "loguru>=0.7.2",
@@ -69,6 +70,11 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# musig2.py uses BIP327/BIP340 single-letter point names (P, Q, R) verbatim so
+# the implementation stays readable against the spec.
+"src/jmcore/musig2.py" = ["N806"]
 
 [tool.mypy]
 python_version = "3.11"

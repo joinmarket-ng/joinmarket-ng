@@ -4,6 +4,7 @@ Tests for taker transaction signing functionality.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from pathlib import Path
 from typing import Any
@@ -200,8 +201,8 @@ class TestTakerSigning:
         # key lookup so tests exercise WalletService.sign_input behavior.
         from jmwallet.wallet.signer import WalletSigningMixin
 
-        wallet.sign_input = lambda tx, idx, utxo: WalletSigningMixin.sign_input(
-            wallet, tx, idx, utxo
+        wallet.sign_input = lambda tx, idx, utxo, prevout_values=None, prevout_scripts=None: (
+            WalletSigningMixin.sign_input(wallet, tx, idx, utxo, prevout_values, prevout_scripts)
         )
         wallet.renew_coinjoin_inputs = MagicMock(return_value=True)
         return wallet
@@ -266,9 +267,22 @@ class TestTakerSigning:
 
             real_signer = mock_wallet.sign_input
 
-            def assert_local_signing_boundary(tx: Any, input_index: int, utxo: UTXOInfo) -> Any:
+            def assert_local_signing_boundary(
+                tx: Any,
+                input_index: int,
+                utxo: UTXOInfo,
+                *,
+                prevout_values: list[int] | None = None,
+                prevout_scripts: list[bytes] | None = None,
+            ) -> Any:
                 assert taker._session.signing_boundary_crossed is True
-                return real_signer(tx, input_index, utxo)
+                return real_signer(
+                    tx,
+                    input_index,
+                    utxo,
+                    prevout_values=prevout_values,
+                    prevout_scripts=prevout_scripts,
+                )
 
             mock_wallet.sign_input = MagicMock(side_effect=assert_local_signing_boundary)
 
@@ -558,8 +572,8 @@ class TestEdgeCases:
         wallet.wallet_fingerprint = "deadbeef"
         from jmwallet.wallet.signer import WalletSigningMixin
 
-        wallet.sign_input = lambda tx, idx, utxo: WalletSigningMixin.sign_input(
-            wallet, tx, idx, utxo
+        wallet.sign_input = lambda tx, idx, utxo, prevout_values=None, prevout_scripts=None: (
+            WalletSigningMixin.sign_input(wallet, tx, idx, utxo, prevout_values, prevout_scripts)
         )
 
         utxos = [
@@ -645,6 +659,46 @@ class TestEdgeCases:
             signatures = await taker._session._sign_our_inputs()
 
             assert signatures == []
+
+
+class TestMakerSignaturePayload:
+    """Tests for strict maker signature wire framing."""
+
+    @staticmethod
+    def _encode(signature: bytes, public_key: bytes, trailing: bytes = b"") -> str:
+        payload = (
+            bytes([len(signature)]) + signature + bytes([len(public_key)]) + public_key + trailing
+        )
+        return base64.b64encode(payload).decode("ascii")
+
+    def test_accepts_canonical_taproot_payload(self) -> None:
+        signature = b"\x11" * 64
+        output_key = b"\x22" * 32
+
+        assert CoinJoinSession._decode_maker_signature_payload(
+            self._encode(signature, output_key)
+        ) == (signature, output_key)
+
+    @pytest.mark.parametrize("sighash_byte", [0x00, 0x01, 0x81])
+    def test_rejects_65_byte_taproot_signature(self, sighash_byte: int) -> None:
+        payload = self._encode(b"\x11" * 64 + bytes([sighash_byte]), b"\x22" * 32)
+
+        with pytest.raises(ValueError, match="Taproot maker signature payload"):
+            CoinJoinSession._decode_maker_signature_payload(payload)
+
+    def test_rejects_trailing_bytes(self) -> None:
+        payload = self._encode(b"\x11" * 64, b"\x22" * 32, trailing=b"\x50")
+
+        with pytest.raises(ValueError, match="payload length"):
+            CoinJoinSession._decode_maker_signature_payload(payload)
+
+    def test_preserves_legacy_signature_framing(self) -> None:
+        signature = b"\x30" + b"\x11" * 70
+        public_key = b"\x02" + b"\x22" * 32
+
+        assert CoinJoinSession._decode_maker_signature_payload(
+            self._encode(signature, public_key)
+        ) == (signature, public_key)
 
 
 class TestPhaseCollectSignaturesCompleteness:
@@ -830,6 +884,89 @@ class TestPhaseCollectSignaturesCompleteness:
         assert taker._session.reserved_inputs == set()
 
     @pytest.mark.asyncio
+    async def test_stalled_direct_maker_gets_tx_resent_via_directory(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        """A direct Tor stream can stall after !auth; !tx is resent once via a directory."""
+        from jmcore.models import Offer, OfferType
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            nick: self._make_maker_session(nick, offer, [{"txid": c * 64, "vout": 0}])
+            for nick, c in (("maker1", "b"), ("maker2", "c"))
+        }
+        direct_session = maker_sessions["maker1"]
+        direct_session.comm_channel = "direct"
+        maker_sessions["maker2"].comm_channel = "directory:dir1"
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        taker.directory_client.upgrade_channel_prefer_direct = MagicMock(
+            side_effect=lambda nick, channel: channel
+        )
+        taker.directory_client.send_privmsg = AsyncMock(return_value="directory:dir2")
+        delays: list[float] = []
+
+        async def wait_for_responses(**kwargs: Any) -> dict[str, Any]:
+            delay, callback = kwargs["on_stalled"]
+            delays.append(delay)
+            await callback({"maker1", "maker2"})
+            return {}
+
+        taker.directory_client.wait_for_responses = wait_for_responses
+
+        assert await taker._session._phase_collect_signatures() is False
+        assert delays == [2.5]  # half of maker_timeout_sec=5, capped at 30s
+        calls = taker.directory_client.send_privmsg.await_args_list
+        assert [(c.args[0], c.kwargs["force_channel"]) for c in calls] == [
+            ("maker1", "direct"),
+            ("maker2", "directory:dir1"),
+            ("maker1", "directory"),
+        ]
+        assert calls[2].args[1:3] == ("tx", "encrypted")
+        assert direct_session.comm_channel == "directory:dir2"
+
+    @pytest.mark.asyncio
+    async def test_stalled_resend_rechecks_input_ownership(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        from jmcore.models import Offer, OfferType
+
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        session = self._make_maker_session("maker1", offer, [{"txid": "b" * 64, "vout": 0}])
+        session.comm_channel = "direct"
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions={"maker1": session})
+        taker.directory_client.upgrade_channel_prefer_direct = MagicMock(
+            side_effect=lambda nick, channel: channel
+        )
+
+        async def wait_for_responses(**kwargs: Any) -> dict[str, Any]:
+            taker.wallet.renew_coinjoin_inputs.return_value = False
+            await kwargs["on_stalled"][1]({"maker1"})
+            return {"maker1": {"data": ["sig"]}}
+
+        taker.directory_client.wait_for_responses = wait_for_responses
+
+        assert await taker._session._phase_collect_signatures() is False
+        assert taker.directory_client.send_privmsg.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_owner_loss_before_tx_prevents_signature_requests(
         self, two_maker_tx_data: CoinJoinTxData
     ) -> None:
@@ -971,6 +1108,174 @@ class TestPhaseCollectSignaturesCompleteness:
             "doesn't respond. The old minimum_makers check would have "
             "incorrectly allowed this."
         )
+
+    @pytest.mark.parametrize("blocked_relay_write", [False, True])
+    async def test_lost_direct_tx_recovers_with_real_encryption_and_signatures(
+        self,
+        two_maker_tx_data: CoinJoinTxData,
+        test_master_key: HDKey,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        blocked_relay_write: bool,
+    ) -> None:
+        from _taker_test_helpers import make_crypto_pair, make_directory_client, make_utxo
+        from bitcointx.core import CTransaction
+        from bitcointx.core.key import CKey
+        from jmcore.crypto import NickIdentity
+        from jmcore.models import Offer, OfferType
+        from jmcore.network import ONION_HOSTID
+        from jmcore.protocol import MessageType
+        from jmwallet.wallet.signer import WalletSigningMixin
+        from jmwallet.wallet.signing import create_p2wpkh_script_code, sign_p2wpkh_input
+
+        identities = [NickIdentity(5), NickIdentity(5)]
+        lost, healthy = [identity.nick for identity in identities]
+        names = {"maker1": lost, "maker2": healthy}
+        # The healthy maker has two inputs. One signature precedes the fallback,
+        # and the other arrives during it, exercising partial-set preservation.
+        two_maker_tx_data.maker_inputs["maker2"] = [
+            TxInput.from_hex(txid=char * 64, vout=0, value=600_000) for char in ("c", "d")
+        ]
+        for field in ("maker_inputs", "maker_cj_outputs", "maker_change_outputs"):
+            setattr(
+                two_maker_tx_data,
+                field,
+                {names[name]: value for name, value in getattr(two_maker_tx_data, field).items()},
+            )
+        keys = {nick: CKey(bytes([i + 1]) * 32) for i, nick in enumerate((lost, healthy))}
+        crypto_pairs = {nick: make_crypto_pair() for nick in (lost, healthy)}
+        sessions = {}
+        for nick, inputs in two_maker_tx_data.maker_inputs.items():
+            offer = Offer(
+                counterparty=nick,
+                oid=0,
+                ordertype=OfferType.SW0_RELATIVE,
+                minsize=100_000,
+                maxsize=10_000_000,
+                txfee=0,
+                cjfee="0.001",
+            )
+            utxos = [
+                {
+                    "txid": item.txid_le[::-1].hex(),
+                    "vout": item.vout,
+                    "value": item.value,
+                    "scriptpubkey": pubkey_to_p2wpkh_script(bytes(keys[nick].pub)).hex(),
+                }
+                for item in inputs
+            ]
+            session = self._make_maker_session(nick, offer, utxos)
+            session.crypto = crypto_pairs[nick][0]
+            session.comm_channel = "direct"
+            sessions[nick] = session
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=sessions)
+        taker.config.data_dir = tmp_path
+        taker.config.maker_timeout_sec = 3
+        monkeypatch.setattr("taker.coinjoin_session._DIRECT_TX_FALLBACK_SEC", 0.05)
+        key = test_master_key.derive("m/84'/1'/0'/0/0")
+        taker._session.selected_utxos = [
+            make_utxo(
+                value=2_000_000,
+                address=key.get_address("regtest"),
+                scriptpubkey=pubkey_to_p2wpkh_script(
+                    key.get_public_key_bytes(compressed=True)
+                ).hex(),
+            )
+        ]
+        taker.wallet.get_key_for_address.return_value = key
+        taker.wallet.sign_input = lambda *args, **kwargs: WalletSigningMixin.sign_input(
+            taker.wallet, *args, **kwargs
+        )
+        client = make_directory_client(prefer_direct_connections=True)
+        taker.directory_client = client
+        responses: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        signed_messages: dict[str, list[dict[str, Any]]] = {}
+        tx = deserialize_transaction(taker._session.unsigned_tx)
+        for identity in identities:
+            nick = identity.nick
+            payloads = []
+            values = {(u["txid"], u["vout"]): u["value"] for u in sessions[nick].utxos}
+            for index, item in enumerate(tx.inputs):
+                value = values.get((item.txid_le[::-1].hex(), item.vout))
+                if value is None:
+                    continue
+                pub = bytes(keys[nick].pub)
+                sig = sign_p2wpkh_input(
+                    tx, index, create_p2wpkh_script_code(pub), value, keys[nick]
+                )
+                encoded = base64.b64encode(
+                    bytes([len(sig)]) + sig + bytes([len(pub)]) + pub
+                ).decode()
+                encrypted = crypto_pairs[nick][1].encrypt(encoded)
+                payloads.append(
+                    {
+                        "type": MessageType.PRIVMSG.value,
+                        "line": f"{nick}!{client.nick}!sig "
+                        + identity.sign_message(encrypted, ONION_HOSTID),
+                    }
+                )
+            signed_messages[nick] = payloads
+
+        direct_writes: dict[str, str] = {}
+        peers = {}
+        for nick in (lost, healthy):
+
+            async def direct_send(
+                our_nick: str, command: str, data: str, *, nick: str = nick
+            ) -> bool:
+                assert command == "tx"
+                assert (
+                    base64.b64decode(crypto_pairs[nick][1].decrypt(data))
+                    == taker._session.unsigned_tx
+                )
+                direct_writes[nick] = data
+                if nick == healthy:
+                    responses.put_nowait(signed_messages[nick][0])
+                # Lost maker: a successful local write without remote delivery.
+                return True
+
+            peers[nick] = MagicMock(send_privmsg=AsyncMock(side_effect=direct_send))
+        monkeypatch.setattr(client, "_get_connected_peer", lambda nick: peers[nick])
+        monkeypatch.setattr(client, "_get_peer_location", lambda nick: None)
+        relay_canceled = asyncio.Event()
+
+        async def relay_send(nick: str, command: str, data: str) -> None:
+            assert nick == lost  # Never resend to a maker with partial signatures.
+            assert command == "tx"
+            assert data == direct_writes[nick]
+            assert (
+                base64.b64decode(crypto_pairs[nick][1].decrypt(data)) == taker._session.unsigned_tx
+            )
+            # Includes a duplicate of the first healthy signature.
+            for message in [*signed_messages[lost], *signed_messages[healthy]]:
+                responses.put_nowait(message)
+            if blocked_relay_write:
+                try:
+                    await asyncio.Future[None]()
+                finally:
+                    relay_canceled.set()
+
+        async def listen(duration: float) -> list[dict[str, Any]]:
+            try:
+                messages = [await asyncio.wait_for(responses.get(), duration)]
+            except TimeoutError:
+                return []
+            while not responses.empty():
+                messages.append(responses.get_nowait())
+            return messages
+
+        relay = MagicMock(host="relay", port=5222)
+        relay.send_private_message = AsyncMock(side_effect=relay_send)
+        relay.listen_for_messages = AsyncMock(side_effect=listen)
+        client.clients = {"relay:5222": relay}
+        assert await asyncio.wait_for(taker._session._phase_collect_signatures(), 5)
+        relay.send_private_message.assert_awaited_once()
+        assert relay_canceled.is_set() is blocked_relay_write
+        assert all(session.responded_sig for session in sessions.values())
+        assert not taker._session.failed_signer_nicks
+        final = CTransaction.deserialize(taker._session.final_tx)
+        assert len(final.wit.vtxinwit) == 4
+        assert all(len(witness.scriptWitness.stack) == 2 for witness in final.wit.vtxinwit)
 
     def _maker1_sig_response(self, tx_bytes: bytes, privkey: Any) -> str:
         """Build a valid base64 !sig payload for maker1's input signed by ``privkey``."""
@@ -1290,6 +1595,127 @@ class TestPhaseCollectSignaturesCompleteness:
         taker.wallet.sign_input.assert_not_called()
         assert "Could not finalize declined CoinJoin history entry" in normal_logs
         assert "disk full" not in "\n".join(normal_logs)
+
+    def _collect_with_taproot_maker1(
+        self,
+        two_maker_tx_data: CoinJoinTxData,
+        *,
+        append_sighash_byte: bool,
+    ) -> tuple[Any, bytes]:
+        from bitcointx.core.key import CKey
+        from jmcore.models import Offer, OfferType
+        from jmwallet.wallet.signing import sign_p2tr_input
+
+        maker_key = CKey.from_secret_bytes((1).to_bytes(32, "big"))
+        output_key = bytes(maker_key.xonly_pub)
+        maker1_script = (b"\x51\x20" + output_key).hex()
+        fallback_pubkey = bytes(CKey.from_secret_bytes((2).to_bytes(32, "big")).pub)
+        fallback_script = pubkey_to_p2wpkh_script(fallback_pubkey).hex()
+        offer = Offer(
+            counterparty="maker1",
+            oid=0,
+            ordertype=OfferType.TR0_RELATIVE,
+            minsize=100_000,
+            maxsize=10_000_000,
+            txfee=0,
+            cjfee="0.001",
+            fidelity_bond_value=0,
+        )
+        maker_sessions = {
+            "maker1": self._make_maker_session(
+                "maker1",
+                offer,
+                [
+                    {
+                        "txid": "b" * 64,
+                        "vout": 0,
+                        "value": 1_500_000,
+                        "scriptpubkey": maker1_script,
+                    }
+                ],
+            ),
+            "maker2": self._make_maker_session(
+                "maker2",
+                offer,
+                [
+                    {
+                        "txid": "c" * 64,
+                        "vout": 0,
+                        "value": 1_200_000,
+                        "scriptpubkey": fallback_script,
+                    }
+                ],
+            ),
+        }
+        taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
+        taker._session.selected_utxos = [
+            UTXOInfo(
+                txid="a" * 64,
+                vout=0,
+                value=2_000_000,
+                address="bcrt1qtaker",
+                confirmations=10,
+                scriptpubkey=fallback_script,
+                path="m/84'/1'/0'/0/0",
+                mixdepth=0,
+            )
+        ]
+        tx = deserialize_transaction(taker._session.unsigned_tx)
+        prevout_values, prevout_scripts = taker._session._assemble_prevouts(
+            tx,
+            taker._session._build_prevout_map(),
+        )
+        input_index = next(
+            index
+            for index, tx_input in enumerate(tx.inputs)
+            if (tx_input.txid_le[::-1].hex(), tx_input.vout) == ("b" * 64, 0)
+        )
+        signature = sign_p2tr_input(
+            tx,
+            input_index,
+            prevout_values,
+            prevout_scripts,
+            maker_key,
+        )
+        wire_signature = signature + b"\x00" if append_sighash_byte else signature
+        payload = TestMakerSignaturePayload._encode(wire_signature, output_key)
+        maker_sessions["maker1"].crypto.decrypt = MagicMock(return_value=payload)
+        taker.directory_client.wait_for_responses = AsyncMock(
+            return_value={"maker1": {"data": [payload]}}
+        )
+        return taker, signature
+
+    @pytest.mark.asyncio
+    async def test_accepts_canonical_taproot_signature_through_collection(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        taker, signature = self._collect_with_taproot_maker1(
+            two_maker_tx_data,
+            append_sighash_byte=False,
+        )
+
+        result = await taker._session._phase_collect_signatures()
+
+        assert result is False  # maker2 stayed silent
+        maker1 = taker._session.maker_sessions["maker1"]
+        assert maker1.responded_sig is True
+        assert maker1.signature == {
+            "signatures": [{"txid": "b" * 64, "vout": 0, "witness": [signature.hex()]}]
+        }
+
+    @pytest.mark.asyncio
+    async def test_rejects_65_byte_taproot_signature_through_collection(
+        self, two_maker_tx_data: CoinJoinTxData
+    ) -> None:
+        taker, _signature = self._collect_with_taproot_maker1(
+            two_maker_tx_data,
+            append_sighash_byte=True,
+        )
+
+        result = await taker._session._phase_collect_signatures()
+
+        assert result is False
+        assert "maker1" not in taker._session.maker_sessions
 
 
 # Re-export fixtures for use in conftest

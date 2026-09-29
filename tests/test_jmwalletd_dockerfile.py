@@ -69,6 +69,9 @@ def test_playwright_uses_jam_docker_standalone_ng() -> None:
     dockerfile = PLAYWRIGHT_DOCKERFILE.read_text()
     assert dockerfile.startswith("FROM jam_ng_base\n")
     assert "COPY jmwalletd /build/jmwalletd" in dockerfile
+    assert "COPY jmswap /build/jmswap" in dockerfile
+    assert "--require-hashes -r /build/jmswap/requirements.txt" in dockerfile
+    assert "/build/jmswap" in dockerfile.split("--no-deps --force-reinstall", 1)[1]
     assert "/build/jmwalletd" in dockerfile
     assert service["ports"] == ["29183:80"]
     assert service["environment"] == [

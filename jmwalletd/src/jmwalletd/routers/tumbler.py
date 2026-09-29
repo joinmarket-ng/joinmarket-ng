@@ -52,7 +52,7 @@ from tumbler.plan import (
 )
 from tumbler.runner import RunnerContext, TumbleRunner
 
-from jmcore.paths import write_nick_state
+from jmcore.paths import get_nick_state_component, write_nick_state
 from jmcore.settings import get_settings
 from jmcore.tasks import spawn_task
 from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
@@ -461,14 +461,16 @@ async def start_plan(
             wallet_service=ws,
         )
         config = build_daemon_maker_config(jm_settings, state.wallet_mnemonic, state.data_dir)
-        # Tumbler maker sessions must run as 0-fee sw0absoffer with no
+        # Tumbler maker sessions must run as zero-fee absolute offers with no
         # fidelity bond. See ``tumbler.maker_policy`` for the rationale.
         from tumbler.maker_policy import apply_tumbler_maker_policy
 
         apply_tumbler_maker_policy(config)
 
         def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
-            write_nick_state(state.data_dir, "maker", new_nick)
+            write_nick_state(
+                state.data_dir, get_nick_state_component("maker", config.address_type), new_nick
+            )
 
         return MakerBot(
             wallet=ws,

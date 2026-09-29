@@ -62,6 +62,7 @@ set +e
 get_latest_version() {{ echo "v9.9.9"; }}
 resolve_to_commit_hash() {{ echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"; }}
 verify_release_signature() {{ return 0; }}
+read_release_file() {{ cat "{REPO_ROOT}/$1"; }}
 
 # Quiet, deterministic logging helpers.
 print_header() {{ :; }}
@@ -245,6 +246,7 @@ def _run_update_with_pinning(
     pinned_deps: bool = True,
     fetch_ok: bool = True,
     hash_install_ok: bool = True,
+    installed_roles: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Run ``update_packages`` with dependency pinning enabled.
 
@@ -291,12 +293,19 @@ print_error() {{ echo "ERR: $1"; }}
 RELEASE_FILE_LOG="$(mktemp)"
 prepare_verified_source() {{ return 0; }}
 read_release_file() {{
+    if [[ "$1" == */pyproject.toml ]]; then
+        cat "{REPO_ROOT}/$1"
+        return
+    fi
     printf '%s\n' "$1" >> "$RELEASE_FILE_LOG"
     {read_file_body}
 }}
 
 pip() {{
-    [[ "$1" == "show" ]] && return 1
+    if [[ "$1" == "show" ]]; then
+        [[ ",{",".join(installed_roles)}," == *",$2,"* ]]
+        return
+    fi
     {pip_body}
 }}
 python3() {{ return 0; }}
@@ -356,6 +365,42 @@ def test_update_default_hash_checks_dependencies() -> None:
         "jmcore/requirements.txt",
         "jmwallet/requirements.txt",
     ]
+
+
+@pytest.mark.parametrize("role", ["jm-maker", "jm-taker", "jmwalletd"])
+def test_upgrade_old_install_backfills_required_swap_without_new_roles(
+    role: str,
+) -> None:
+    result = _run_update_with_pinning(installed_roles=(role,))
+    assert "EXIT:0" in result.stdout, result.stdout + result.stderr
+    paths = _release_file_paths(result.stdout)
+    assert "jmswap/requirements.txt" in paths
+    assert f"{role.removeprefix('jm-')}/requirements.txt" in paths
+    pip_calls = _pip_lines(result.stdout)
+    swap_index = next(
+        i
+        for i, call in enumerate(pip_calls)
+        if "--force-reinstall --no-deps" in call and "subdirectory=jmswap" in call
+    )
+    role_index = next(
+        i
+        for i, call in enumerate(pip_calls)
+        if "--force-reinstall --no-deps" in call
+        and f"subdirectory={role.removeprefix('jm-')}" in call
+    )
+    assert swap_index < role_index
+    assert any(
+        "subdirectory=jmswap" in call
+        and f"subdirectory={role.removeprefix('jm-')}" in call
+        for call in pip_calls
+    )
+    if role != "jmwalletd":
+        other_role = "taker" if role == "jm-maker" else "maker"
+        assert not any(
+            f"subdirectory={component}" in call
+            for call in pip_calls
+            for component in (other_role, "tumbler", "jmwalletd")
+        )
 
 
 def test_update_no_hash_deps_pins_versions_only() -> None:

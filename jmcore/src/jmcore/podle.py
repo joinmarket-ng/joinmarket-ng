@@ -34,7 +34,7 @@ from loguru import logger
 from pydantic import ValidationError
 from pydantic.dataclasses import dataclass
 
-from jmcore.bitcoin import hash160
+from jmcore.bitcoin import hash160, taproot_tweak_privkey
 from jmcore.constants import SECP256K1_N
 from jmcore.protocol import UTXOMetadata
 
@@ -321,6 +321,8 @@ def generate_podle(
     private_key_bytes: bytes,
     utxo_str: str,
     index: int = 0,
+    *,
+    p2tr: bool = False,
 ) -> PoDLECommitment:
     """
     Generate a PoDLE commitment for a UTXO.
@@ -333,6 +335,7 @@ def generate_podle(
         private_key_bytes: 32-byte private key
         utxo_str: UTXO reference as "txid:vout"
         index: NUMS point index (0-255)
+        p2tr: Derive the parity-normalized BIP86 output key before proving ownership
 
     Returns:
         PoDLECommitment with all proof data
@@ -347,6 +350,16 @@ def generate_podle(
         private_key = CKey(private_key_bytes)
     except ValueError as exc:
         raise PoDLEError("Invalid private key value") from exc
+
+    if p2tr:
+        try:
+            tweaked_key = taproot_tweak_privkey(private_key_bytes)
+            private_key = CKey(tweaked_key)
+            if bytes(private_key.pub)[0] == 0x03:
+                private_key = private_key.negated()
+            private_key_bytes = private_key.secret_bytes
+        except ValueError as exc:
+            raise PoDLEError("Failed to derive BIP86 PoDLE key") from exc
 
     # Calculate P = k*G (standard public key)
     p_point = private_key.pub
@@ -459,6 +472,20 @@ def verify_podle_binding(p: bytes, scriptpubkey: bytes | str) -> tuple[bool, str
 
     if len(p) != 33:
         return False, f"Invalid P length: {len(p)}, expected 33 (compressed)"
+
+    # BIP86 P2TR: P is the even-Y, parity-normalized output key.
+    if len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+        try:
+            pubkey = CPubKey(p)
+            if not pubkey.is_fullyvalid():
+                raise ValueError("invalid public key")
+        except ValueError:
+            return False, "P is not a valid compressed secp256k1 public key"
+        if p[0] != 0x02:
+            return False, "P is not the even-Y BIP86 P2TR output key"
+        if spk[2:] == p[1:]:
+            return True, ""
+        return False, "P does not match BIP86 P2TR scriptpubkey"
 
     h160 = hash160(p)
 

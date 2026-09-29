@@ -43,7 +43,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 from loguru import logger
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
@@ -54,12 +54,14 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from jmcore.channel_ring import ChannelRingSettings, TakerChannelRingSettings
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import (
     DIRECTORY_NODES_MAINNET,
     DIRECTORY_NODES_SIGNET,
     DIRECTORY_NODES_TESTNET,
     NetworkType,
+    OfferType,
 )
 from jmcore.nick_auth import NickAuthMode, validate_directory_endpoint, validate_directory_id
 from jmcore.paths import get_default_data_dir
@@ -412,6 +414,14 @@ class WalletSettings(BaseModel):
             )
         return value
 
+    address_type: Literal["p2wpkh", "p2tr"] = Field(
+        default="p2wpkh",
+        description=(
+            "Wallet address type: 'p2wpkh' (BIP84 native segwit, the default) or "
+            "'p2tr' (BIP86 Taproot key-path). A p2tr wallet participates in tr0 "
+            "Taproot CoinJoins (JMP-0010)."
+        ),
+    )
     mixdepth_count: int = Field(
         default=5,
         ge=1,
@@ -725,7 +735,11 @@ class MakerSettings(BaseModel):
     )
     offer_type: str = Field(
         default="sw0reloffer",
-        description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",
+        description=(
+            "Offer type: sw0reloffer/sw0absoffer serve the native-segwit (P2WPKH) pit, "
+            "tr0reloffer/tr0absoffer the Taproot (P2TR) pit (JMP-0010). The family must "
+            "match wallet.address_type; 'rel' uses cj_fee_relative, 'abs' cj_fee_absolute."
+        ),
     )
     cj_fee_relative: str = Field(
         default="0.0001",
@@ -960,6 +974,7 @@ class MakerSettings(BaseModel):
             "The CLI flag --dual-offers overrides this setting."
         ),
     )
+    channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -996,6 +1011,17 @@ class MakerSettings(BaseModel):
 
 class TakerSettings(BaseModel):
     """Taker-specific settings."""
+
+    channel_ring: TakerChannelRingSettings = Field(default_factory=TakerChannelRingSettings)
+
+    @field_validator("channel_ring", mode="before")
+    @classmethod
+    def accept_common_channel_ring_settings(cls, value: Any) -> Any:
+        if isinstance(value, ChannelRingSettings) and not isinstance(
+            value, TakerChannelRingSettings
+        ):
+            return value.model_dump()
+        return value
 
     counterparty_count: int | None = Field(
         default=None,
@@ -1057,6 +1083,20 @@ class TakerSettings(BaseModel):
         description=(
             "Minimum UTXO value as a percentage of the CoinJoin amount for "
             "PoDLE commitments (reference default: 20)."
+        ),
+    )
+    external_podle_mode: Literal["disabled", "only"] = Field(
+        default="disabled",
+        description=(
+            "Use imported external PoDLE credentials only, without selecting their backing "
+            "UTXOs as CoinJoin funding inputs."
+        ),
+    )
+    market_fault_exclusion: bool = Field(
+        default=False,
+        description=(
+            "Opt in to experimental exclusion of makers with verified credential-market "
+            "fault evidence. Independent of buying or selling credentials."
         ),
     )
     max_cj_fee_rel: str = Field(
@@ -1197,6 +1237,15 @@ class TakerSettings(BaseModel):
         description=(
             "Maximum fill/auth replacement attempts to restore counterparty_count "
             "before proceeding at minimum_makers (0 = disabled)."
+        ),
+    )
+    preferred_offer_type: OfferType = Field(
+        default=OfferType.SW0_RELATIVE,
+        description=(
+            "Preferred offer family (rigid pit, JMP-0010). 'sw0reloffer'/'sw0absoffer' "
+            "select a native-segwit (P2WPKH) pit; 'tr0reloffer'/'tr0absoffer' a Taproot "
+            "(P2TR) pit. The taker only joins makers of this family and its own outputs "
+            "use this type, so it must match wallet.address_type."
         ),
     )
     rescan_interval_sec: int = Field(
@@ -1857,7 +1906,7 @@ def _get_user_sections(user_text: str) -> set[str]:
         Set of section names found in the user config.
     """
     commented_sections = {
-        m.group(1) for m in re.finditer(r"^\s*#\s*\[(\w+)]\s*$", user_text, re.MULTILINE)
+        m.group(1) for m in re.finditer(r"^\s*#\s*\[([\w.]+)]\s*$", user_text, re.MULTILINE)
     }
 
     import tomlkit
@@ -1868,7 +1917,7 @@ def _get_user_sections(user_text: str) -> set[str]:
     except Exception:
         # If parsing fails, fall back to regex for uncommented headers.
         active_sections = {
-            m.group(1) for m in re.finditer(r"^\s*\[(\w+)]\s*$", user_text, re.MULTILINE)
+            m.group(1) for m in re.finditer(r"^\s*\[([\w.]+)]\s*$", user_text, re.MULTILINE)
         }
         return active_sections | commented_sections
 
@@ -1886,7 +1935,7 @@ def _get_template_section_keys(template_text: str) -> dict[str, set[str]]:
     Returns:
         Mapping of section name to set of key names defined in that section.
     """
-    section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    section_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     matches = list(section_re.finditer(template_text))
     result: dict[str, set[str]] = {}
     for idx, match in enumerate(matches):
@@ -1909,8 +1958,8 @@ def _get_user_section_keys(user_text: str) -> dict[str, set[str]]:
     Returns:
         Mapping of uncommented section name to set of key names found.
     """
-    boundary_re = re.compile(r"^(?:#\s*)?\[(\w+)]", re.MULTILINE)
-    uncommented_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    boundary_re = re.compile(r"^(?:#\s*)?\[([\w.]+)]", re.MULTILINE)
+    uncommented_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     all_boundaries = list(boundary_re.finditer(user_text))
     uncommented = list(uncommented_re.finditer(user_text))
 
@@ -1964,7 +2013,7 @@ def config_diff(
     user_sections = _get_user_sections(user_text)
 
     # Extract template section names.
-    template_section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    template_section_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     template_section_names = [m.group(1) for m in template_section_re.finditer(template_text)]
 
     diffs: list[str] = []
