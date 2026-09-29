@@ -326,12 +326,19 @@ that included `jam-ng` still skip its non-deterministic frontend layers during
 verification.
 
 Playwright builds pin both the JAM release and the `jam-docker` build context in
-`docker-compose.yml`. Update those pins together with the Flatpak JAM source by
-running `scripts/update-flatpak-deps.py`; do not advance them manually. The pinned
-standalone image is a build-only base. A local Playwright Dockerfile overlays the
-current JoinMarket NG working tree so local runs and CI test the same checkout,
-even when the base image's remote clone layer is cached. Set `JAM_NG_PULL_POLICY`
-explicitly only when testing a pre-built `JAM_NG_IMAGE` override.
+`docker-compose.yml`. Update those pins with `scripts/update-flatpak-deps.py`.
+The Flatpak frontend archive is pinned independently: the updater keeps its
+current commit by default, since a newer release tag does not prove that it
+contains the selected frontend behavior. After reviewing a replacement, pass
+`--jam-frontend-commit <SHA>` to download and pin its archive checksum. Do not
+edit manifest or Compose pins manually. An explicitly reviewed Flatpak frontend
+replacement must also update the exact URL and checksum expectations in
+`tests/test_flatpak_manifest.py`; the updater intentionally does not relax that
+test. The pinned standalone image is a build-only base. A local Playwright
+Dockerfile overlays the current JoinMarket NG working tree so local runs and CI
+test the same checkout, even when the base image's remote clone layer is cached.
+Set `JAM_NG_PULL_POLICY` explicitly only when testing a pre-built `JAM_NG_IMAGE`
+override.
 
 #### How reproducibility is achieved
 

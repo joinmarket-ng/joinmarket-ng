@@ -43,6 +43,22 @@ def test_manifest_builds_recovery_enabled_libsecp256k1() -> None:
     assert source["commit"] == "6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d"
 
 
+def test_frontend_uses_checksum_pinned_archive() -> None:
+    manifest = _manifest()
+    frontend = next(
+        module for module in manifest["modules"] if module["name"] == "jam-frontend"
+    )
+    source = frontend["sources"][0]
+
+    assert source["type"] == "archive"
+    assert source["archive-type"] == "tar-gzip"
+    assert source["url"].endswith("/88be5a49b1cf7532f05c1a4cb33046ab5af99e35")
+    assert (
+        source["sha256"]
+        == "01383ed2744bcff0eb8f2eb6a94631c6c48f996f29f8e7d0e2b7cc596de48026"
+    )
+
+
 def test_latest_appstream_release_matches_project_version() -> None:
     project_root = Path(__file__).resolve().parents[1]
     version_text = (
