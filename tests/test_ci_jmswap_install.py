@@ -9,8 +9,25 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_windows_install_accepts_both_main_and_pr_source_layouts() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yaml").read_text())
+    steps = workflow["jobs"]["test-install-windows"]["steps"]
+    script = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Manual pip install (Windows has no install.sh path)"
+    )
+
+    assert '$projects = @("./jmcore", "./jmwallet", "./taker")' in script
+    assert (
+        'if (Test-Path ./jmswap/pyproject.toml) { $projects += "./jmswap" }' in script
+    )
+    assert "pip install @projects" in script
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
