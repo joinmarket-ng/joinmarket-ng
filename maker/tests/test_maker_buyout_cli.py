@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bitcointx.core.key import CKey
+from click.utils import strip_ansi
 from jmcore.bitcoin import scriptpubkey_to_address
 from jmswap import buyout_config as buyout_config_module
 from jmswap import buyout_runtime as buyout_runtime_module
@@ -316,8 +317,9 @@ def test_start_help_documents_the_opt_in_pair() -> None:
     result = runner.invoke(app, ["start", "--help"], prog_name="jm-maker")
 
     assert result.exit_code == 0
-    assert "--buyout-config" in result.stdout
-    assert "--buyout-session" in result.stdout
+    help_text = strip_ansi(result.stdout)
+    assert "--buyout-config" in help_text
+    assert "--buyout-session" in help_text
 
 
 @pytest.mark.parametrize(
