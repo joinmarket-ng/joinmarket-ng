@@ -53,6 +53,15 @@ successful import followed by `info` only proves that the phrase was accepted
 and reports currently discovered data. It does not prove that all old history,
 labels, freezes, address metadata, or coverage was restored.
 
+On a pruned or assumeUTXO node, check that the blocks needed for historical
+recovery are available before requesting a scan. A snapshot supplies current
+unspent coins, not previously spent addresses. Finishing background validation
+does not reconstruct wallet history, and a fresh seed import cannot repair
+missing block data. Keep any original Core wallet database and JoinMarket NG
+metadata intact. If required blocks are unavailable, recover using a node that
+retains them and confirm the wallet scan succeeds. See
+[pruning and assumeUTXO limitations](technical/wallet-scanning.md#pruned-nodes-and-assumeutxo).
+
 ## Check Coverage Before Rescanning
 
 For a descriptor wallet, inspect Core's scan and coverage diagnostics first:

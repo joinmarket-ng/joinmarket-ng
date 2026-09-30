@@ -15,12 +15,22 @@ the node is caught up and can serve wallet RPCs before continuing:
 
 ```bash
 bitcoin-cli getblockchaininfo
+bitcoin-cli getchainstates
 bitcoin-cli listwallets
 ```
 
 `initialblockdownload` should be `false` and `listwallets` should return a JSON
-array. For an imported wallet with old transactions, confirm your node retains
-the blocks needed for recovery; a pruned node may not have them.
+array. The recommended baseline is an unpruned node with a fully validated,
+current active chain. On Bitcoin Core 30.2, `getchainstates` lists the active
+chainstate last; its `validated` field should be `true`. An assumeUTXO node can
+be at the chain tip while its active snapshot is still unvalidated, so
+`initialblockdownload=false` alone is insufficient.
+
+Pruned nodes and assumeUTXO bootstrap are experimental setups. Restoring a used
+seed requires the blocks needed for historical wallet scanning, not just a
+current UTXO set. Background validation does not reconstruct wallet history.
+Read the [pruning and assumeUTXO limitations](technical/wallet-scanning.md#pruned-nodes-and-assumeutxo)
+before importing a seed or running a maker on either setup.
 
 Choose exactly one authentication method. Cookie authentication avoids storing
 an RPC password in the JoinMarket configuration:

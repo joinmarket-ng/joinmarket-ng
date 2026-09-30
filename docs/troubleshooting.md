@@ -78,6 +78,33 @@ expensive operations, not routine startup steps. See
 Fidelity bonds have separate recovery requirements. A regular wallet scan does
 not prove all bonds were found. See [bond recovery](fidelity-bond-operations.md).
 
+## Cannot Enumerate Address History
+
+`listsinceblock failed; cannot enumerate address history` and
+`Could not fetch addresses with history` describe the same failed wallet-history
+request. Newer logs include the exception class, such as `ReadTimeout`, even
+when the exception has no message. Previously persisted used-address records
+are retained, but history enumeration is incomplete for that run. A restored
+seed may lack those records; do not treat proposed deposit addresses as verified
+unused until recovery coverage is established.
+
+On Core 30.2, this empty-blockhash `listsinceblock` call reads transactions
+already known to the wallet, not historical block data. Pruning alone does not
+explain its failure. Collect the exception class, approximate request duration,
+and nearby sanitized Core logs. A timeout is a possible cause, not a diagnosis
+from these two messages alone. Inspect `jm-wallet info --scan-status` with the
+same wallet options, and check `bitcoin-cli getblockchaininfo` and
+`bitcoin-cli getchainstates` locally. Wait for an active wallet scan instead of
+starting another. Review diagnostics before sharing; keep wallet identifiers,
+addresses, transactions, paths, and credentials private. Full exception
+tracebacks are sensitive logs.
+
+Finishing assumeUTXO background validation does not populate missing wallet
+history, and a later successful history request does not prove complete seed
+recovery. Do not delete metadata, repeatedly reimport, or bypass scans to clear
+the warning. See [pruning and assumeUTXO limitations](technical/wallet-scanning.md#pruned-nodes-and-assumeutxo)
+for the required block availability and recovery coverage.
+
 ## Insufficient Funds Or No Eligible PoDLE UTXO
 
 A displayed balance is not necessarily spendable for the proposed CoinJoin.

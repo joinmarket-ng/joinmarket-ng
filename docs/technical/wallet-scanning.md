@@ -17,7 +17,8 @@ invisible until the range is widened. This is controlled by
 index range, Core only knows about transactions in the blocks it has
 actually scanned. A fresh import scans roughly the last year (smart scan)
 and then catches up in the background. A coin in an older, unscanned block
-is invisible until those blocks are scanned.
+is invisible until those blocks are scanned. This requires the relevant block
+data to be available; see [pruning and assumeUTXO limitations](#pruned-nodes-and-assumeutxo).
 
 The address range that is actually in effect is whatever JoinMarket NG
 imported into the node's descriptor wallet, not a value re-derived on every
@@ -177,6 +178,79 @@ node and its storage performance. When `jm-wallet rescan` remains attached
 through completion, it performs a final wallet sync and reconstructs imported
 wallet history automatically. If polling was interrupted, opening CoinJoin
 History in the TUI performs the sync and reconstruction after Core finishes.
+
+### Pruned nodes and assumeUTXO
+
+Pruned Bitcoin Core nodes and assumeUTXO bootstrap are experimental setups.
+The recommended baseline is a wallet-enabled, unpruned node with a fully
+validated active chain at the current tip. Three separate conditions matter:
+
+- **Node validation:** an active snapshot can reach the tip before background
+  validation completes.
+- **Block availability:** pruning deletes historical block data. Snapshot
+  bootstrap can also leave required blocks not yet downloaded, even without
+  pruning. A validated chain or a reported prune height does not by itself
+  establish that every required block is available.
+- **Wallet coverage:** Core must successfully scan the relevant blocks against
+  sufficient address ranges. Descriptor presence, visible balance, and an idle
+  scan status do not prove that this succeeded.
+
+On Bitcoin Core 30.2, inspect node state locally:
+
+```bash
+bitcoin-cli getblockchaininfo
+bitcoin-cli getchainstates
+```
+
+`getblockchaininfo` reports `pruned` and, when applicable, `pruneheight`.
+`initialblockdownload=false` describes the active chain's sync state, not
+completion of assumeUTXO background validation. `getchainstates` lists the
+active chainstate last. During snapshot validation, that entry contains
+`snapshot_blockhash` and `validated=false`, while the background chainstate can
+report `validated=true`. A `validated=true` entry for the background chainstate
+does not establish snapshot validation completion. After successful snapshot
+validation and background-chainstate cleanup, the remaining active chainstate
+reports `validated=true`.
+
+Core does not add historical wallet transactions from background-chain block
+notifications. Finishing background validation therefore does not repair wallet
+coverage: an actual successful wallet rescan is still needed for undiscovered
+history, and blocks already pruned remain unavailable.
+
+The practical recovery boundaries are:
+
+- **Already scanned wallet:** retaining Core's wallet database and NG's wallet
+  metadata can allow continued use after pruning, provided the wallet stays
+  synchronized and required catch-up blocks remain available. This is not
+  equivalent to importing the seed into a new Core wallet.
+- **Genuinely new, unused seed:** there is no earlier wallet history to recover.
+  Required scanning can be bounded to its known creation time, accounting for
+  Core's two-hour timestamp lookback. Do not assign a new creation time to a
+  previously used seed to bypass recovery.
+- **Used-seed restore:** recovery needs successful scanning of relevant history
+  and address ranges, including addresses whose coins are now spent. If needed
+  blocks are missing, use an unpruned node or one retaining the required history.
+  Having the blocks is necessary, but is not proof the scan succeeded.
+
+`scantxoutset` can find matching current unspent outputs in the active UTXO set,
+including a snapshot. It cannot establish a complete used-address set. Likewise,
+`listsinceblock` enumerates transactions already known to Core's wallet; a
+successful response does not prove that all prior transactions were discovered.
+Do not treat a visible balance or an apparently unused deposit address as proof
+of complete seed recovery. Preserve original backups and used-address metadata.
+
+Default descriptor setup requests a smart scan followed by a background full
+rescan, floored to a recorded wallet creation height when known. These scans can
+require blocks a pruned or snapshot-bootstrapping node cannot serve. In NG 0.40.0,
+maker first-time setup does not forward the configured `smart_scan` and
+`background_full_rescan` settings, so disabling the latter in configuration is
+not a reliable maker workaround. Do not suppress history errors, silently move
+the scan start past missing history, or repeatedly reimport a used seed.
+
+These Core 30.2 behaviors are defined by its
+[wallet block notifications](https://github.com/bitcoin/bitcoin/blob/v30.2/src/wallet/wallet.cpp#L1509-L1536),
+[descriptor import](https://github.com/bitcoin/bitcoin/blob/v30.2/src/wallet/rpc/backup.cpp#L295-L450),
+and [chainstate diagnostics](https://github.com/bitcoin/bitcoin/blob/v30.2/src/rpc/blockchain.cpp#L3403-L3460).
 
 ### Wallet creation height
 
