@@ -130,6 +130,20 @@ compare successive summaries to assess sustained pressure. Admissions are work
 attempts, not confirmation of successful delivery. Persistent warnings or growing
 suppression counts warrant investigation before changing rate-limit policy.
 
+## Receiving Addresses
+
+Use `jm-wallet address --prompt-bip39-passphrase new 0` to issue and reserve a
+fresh receiving address in mixdepth 0. Omit the prompt option for wallets without
+a BIP39 passphrase. This replaces the removed `jm-maker generate-address`
+command, which always derived index 0 and could return an already used address.
+
+Put wallet options before `new`, for example
+`jm-wallet address --mnemonic-file FILE --data-dir DIR new 0`. Use `--backend`
+instead of the old command's `--backend-type`. Wallet commands use the configured
+Bitcoin network (not a separate protocol network); there is no
+`--bitcoin-network` option on `address`. The backend must be available for
+synchronization and address-history verification.
+
 <!-- AUTO-GENERATED HELP START: jm-maker -->
 
 <details>
@@ -148,9 +162,8 @@ suppression counts warrant investigation before changing rate-limit policy.
 │                               exit.                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ config-init       Initialize the config file with default settings.          │
-│ generate-address  Generate a new receive address.                            │
-│ start             Start the maker bot.                                       │
+│ config-init  Initialize the config file with default settings.               │
+│ start        Start the maker bot.                                            │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -172,47 +185,6 @@ suppression counts warrant investigation before changing rate-limit policy.
 │ --data-dir     -d      PATH  Data directory for JoinMarket files             │
 │                              [env var: JOINMARKET_DATA_DIR]                  │
 │ --help                       Show this message and exit.                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-</details>
-
-<details>
-<summary><code>jm-maker generate-address --help</code></summary>
-
-```
-
- Usage: jm-maker generate-address [OPTIONS]
-
- Generate a new receive address.
-
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --backend-type                  TEXT                  Backend type           │
-│ --bitcoin-network               [mainnet|testnet|sig  Bitcoin network for    │
-│                                 net|regtest]          address generation     │
-│                                                       (defaults to           │
-│                                                       --network)             │
-│ --config-file                   PATH                  Config file path       │
-│                                                       (decoupled from data   │
-│                                                       dir). Defaults to      │
-│                                                       <data-dir>/config.toml │
-│                                                       [env var:              │
-│                                                       JOINMARKET_CONFIG_FIL… │
-│ --data-dir                      PATH                  Data directory         │
-│                                                       (default:              │
-│                                                       ~/.joinmarket-ng or    │
-│                                                       $JOINMARKET_DATA_DIR)  │
-│                                                       [env var:              │
-│                                                       JOINMARKET_DATA_DIR]   │
-│ --help                                                Show this message and  │
-│                                                       exit.                  │
-│ --log-level             -l      TEXT                  Log level              │
-│ --mnemonic-file         -f      PATH                  Path to mnemonic file  │
-│ --network                       [mainnet|testnet|sig  Protocol network       │
-│                                 net|regtest]                                 │
-│ --prompt-bip39-passph…                                Prompt for BIP39       │
-│                                                       passphrase             │
-│                                                       interactively          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

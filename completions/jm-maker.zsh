@@ -7,7 +7,6 @@ _jm_maker() {
   local -a commands
   commands=(
     'config-init:Initialize the config file with default settings.'
-    'generate-address:Generate a new receive address.'
     'start:Start the maker bot.'
   )
 
@@ -25,18 +24,6 @@ _jm_maker() {
           _arguments \
             '--data-dir=[Data directory for JoinMarket files]:file:_files' \
             '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
-            '--help[Show this message and exit]'
-          ;;
-        generate-address)
-          _arguments \
-            '--mnemonic-file=[Path to mnemonic file]:file:_files' \
-            '--prompt-bip39-passphrase[Prompt for BIP39 passphrase interactively]' \
-            '--network=[Protocol network]:choice:(mainnet testnet signet regtest)' \
-            '--bitcoin-network=[Bitcoin network for address generation (defaults to --network)]:choice:(mainnet testnet signet regtest)' \
-            '--backend-type=[Backend type]: :' \
-            '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
-            '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
-            '--log-level=[Log level]: :' \
             '--help[Show this message and exit]'
           ;;
         start)

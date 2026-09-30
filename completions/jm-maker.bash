@@ -8,7 +8,7 @@ _jm_maker_completion() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "config-init generate-address start" -- "$cur") )
+        COMPREPLY=( $(compgen -W "config-init start" -- "$cur") )
         return 0
     fi
 
@@ -16,9 +16,6 @@ _jm_maker_completion() {
     case "$subcmd" in
       config-init)
         COMPREPLY=( $(compgen -W "--help --data-dir -d --config-file" -- "$cur") )
-        ;;
-      generate-address)
-        COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --network --bitcoin-network --backend-type --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       start)
         COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --prompt-bip39-passphrase --data-dir -d --config-file --network --bitcoin-network --backend-type --rpc-url --neutrino-url --min-size --cj-fee-relative --cj-fee-absolute --tx-fee-contribution --directory -D --tor-socks-host --tor-socks-port --tor-control-host --tor-control-port --tor-cookie-path --disable-tor-control --onion-serving-host --onion-serving-port --tor-target-host --fidelity-bond-locktime -L --fidelity-bond-index -I --fidelity-bond -B --no-fidelity-bond --merge-algorithm -M --mixdepth-selection --dual-offers --log-level -l" -- "$cur") )

@@ -15,6 +15,18 @@ and taker demand determine whether your wallet can participate.
 
 ## Quick Start
 
+Use the wallet CLI to issue a fresh receiving address:
+
+```bash
+jm-wallet address --prompt-bip39-passphrase new 0
+```
+
+Omit the passphrase prompt if your wallet has no BIP39 passphrase. The wallet
+synchronizes, verifies address history, and reserves the address before printing
+it. The old `jm-maker generate-address` command was removed because it always
+derived the first receiving address, even if that address had already been used.
+See [wallet recovery](recover-wallet.md) before funding an imported wallet.
+
 ```bash
 jm-wallet info
 jm-maker start

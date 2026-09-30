@@ -17,6 +17,19 @@ from maker.fidelity import ExpiredFidelityBondCertificateError
 runner = CliRunner()
 
 
+def test_receiving_addresses_are_wallet_cli_only() -> None:
+    """Do not expose the unsafe fixed-index maker address command (#646)."""
+    help_result = runner.invoke(app, ["--help"], prog_name="jm-maker")
+    assert help_result.exit_code == 0
+    assert "generate-address" not in click.unstyle(help_result.stdout)
+
+    with patch("maker.cli.create_wallet_service") as create_wallet:
+        result = runner.invoke(app, ["generate-address"], prog_name="jm-maker")
+    assert result.exit_code == 2
+    assert "No such command" in click.unstyle(result.output)
+    create_wallet.assert_not_called()
+
+
 def test_root_help_shows_completion_options() -> None:
     """Maker CLI should expose Typer shell completion options."""
     result = runner.invoke(app, ["--help"], prog_name="jm-maker")
