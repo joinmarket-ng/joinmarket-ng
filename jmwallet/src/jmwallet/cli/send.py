@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import typer
+from jmcore.bitcoin import address_to_scriptpubkey_for_network
 from jmcore.cli_common import (
     ResolvedBackendSettings,
     resolve_backend_settings,
@@ -360,6 +361,29 @@ def send(
             )
             raise typer.Exit(1)
 
+    # Resolve backend settings
+    backend_settings = resolve_backend_settings(
+        settings,
+        network=network,
+        backend_type=backend_type,
+        rpc_url=rpc_url,
+        neutrino_url=neutrino_url,
+        data_dir=data_dir,
+    )
+    if allow_conflicts and backend_settings.backend_type != "descriptor_wallet":
+        logger.error("--allow-conflicts is supported only with the descriptor_wallet backend")
+        raise typer.Exit(1)
+
+    # Reject invalid destinations before prompting for secrets or accessing the wallet.
+    try:
+        address_to_scriptpubkey_for_network(destination, backend_settings.network)
+    except ValueError:
+        logger.error("Invalid address (bad checksum, format, or wrong network)")
+        logger.bind(sensitive=True).error(
+            f"Invalid address (bad checksum, format, or wrong network): {destination}"
+        )
+        raise typer.Exit(1)
+
     try:
         resolved = resolve_mnemonic(
             settings,
@@ -373,19 +397,6 @@ def send(
         resolved_creation_height = resolved.creation_height
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
-        raise typer.Exit(1)
-
-    # Resolve backend settings
-    backend_settings = resolve_backend_settings(
-        settings,
-        network=network,
-        backend_type=backend_type,
-        rpc_url=rpc_url,
-        neutrino_url=neutrino_url,
-        data_dir=data_dir,
-    )
-    if allow_conflicts and backend_settings.backend_type != "descriptor_wallet":
-        logger.error("--allow-conflicts is supported only with the descriptor_wallet backend")
         raise typer.Exit(1)
 
     # Use configured default block target if not specified

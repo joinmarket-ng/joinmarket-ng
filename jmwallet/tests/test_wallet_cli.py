@@ -146,6 +146,8 @@ def _write_mixdepth_config(tmp_path: Path) -> Path:
                 "1",
                 "--fee-rate",
                 "1",
+                "--network",
+                "regtest",
             ],
             "jmwallet.cli.send._send_transaction",
         ),
@@ -686,7 +688,7 @@ def test_send_respects_config_block_target():
                     app,
                     [
                         "send",
-                        "bcrt1q...",
+                        "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
                         "--amount",
                         "1000",
                         "--network",
@@ -1104,6 +1106,82 @@ def test_send_cli_preserves_async_cancellation_exit_code(tmp_path: Path) -> None
     assert result.exit_code == 1
 
 
+@pytest.mark.parametrize(
+    ("destination", "network"),
+    [
+        ("bc1qxxx", "mainnet"),
+        ("bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7q", "regtest"),
+        ("bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m", "testnet"),
+    ],
+)
+def test_send_rejects_invalid_destination_before_mnemonic(destination: str, network: str) -> None:
+    settings = MagicMock()
+    settings.wallet.max_fee_rate_sat_vb = 1_000.0
+    backend_settings = MagicMock(network=network)
+
+    with (
+        patch("jmwallet.cli.send.setup_cli", return_value=settings),
+        patch("jmwallet.cli.send.resolve_backend_settings", return_value=backend_settings),
+        patch("jmwallet.cli.send.resolve_mnemonic") as resolve_mnemonic,
+        patch("jmwallet.cli.send._send_transaction", new_callable=AsyncMock) as send_transaction,
+        patch("jmwallet.cli.send.logger") as send_logger,
+    ):
+        result = runner.invoke(
+            app,
+            ["send", "--select-utxos", "--prompt-bip39-passphrase", destination],
+        )
+
+    assert result.exit_code == 1
+    send_logger.error.assert_called_once_with(
+        "Invalid address (bad checksum, format, or wrong network)"
+    )
+    resolve_mnemonic.assert_not_called()
+    send_transaction.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("configured_network", "cli_network"),
+    [("regtest", None), ("signet", "regtest")],
+)
+def test_send_validates_destination_with_effective_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_network: str,
+    cli_network: str | None,
+) -> None:
+    from jmcore.settings import reset_settings
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(f'[network_config]\nnetwork = "{configured_network}"\n')
+    monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config_file))
+    monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("NETWORK_CONFIG__NETWORK", raising=False)
+    command = [
+        "send",
+        "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
+        "--select-utxos",
+    ]
+    if cli_network is not None:
+        command.extend(["--network", cli_network])
+
+    reset_settings()
+    try:
+        with (
+            patch("jmwallet.cli.send.resolve_mnemonic", return_value=MagicMock()),
+            patch(
+                "jmwallet.cli.send._send_transaction", new_callable=AsyncMock
+            ) as send_transaction,
+        ):
+            result = runner.invoke(app, command)
+    finally:
+        reset_settings()
+
+    assert result.exit_code == 0, result.output
+    send_transaction.assert_awaited_once()
+    assert send_transaction.await_args is not None
+    assert send_transaction.await_args.args[6].network == "regtest"
+
+
 def test_send_select_utxos_does_not_require_amount_or_mixdepth() -> None:
     settings = MagicMock()
     settings.wallet.max_fee_rate_sat_vb = 1_000.0
@@ -1116,7 +1194,7 @@ def test_send_select_utxos_does_not_require_amount_or_mixdepth() -> None:
         bip39_passphrase="",
         creation_height=None,
     )
-    backend_settings = MagicMock()
+    backend_settings = MagicMock(network="regtest")
 
     with (
         patch("jmwallet.cli.send.setup_cli", return_value=settings),
@@ -1128,7 +1206,7 @@ def test_send_select_utxos_does_not_require_amount_or_mixdepth() -> None:
             app,
             [
                 "send",
-                "bcrt1qtestdestination000000000000000000000000000",
+                "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
                 "--select-utxos",
             ],
         )
