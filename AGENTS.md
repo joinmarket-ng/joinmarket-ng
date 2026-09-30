@@ -62,6 +62,7 @@ Tests use pytest markers to organize by Docker profile:
 ## Commit and Changelog Policy
 
 - Follow Conventional Commits for all commit titles.
+- When work addresses a known issue, include its reference in the commit body by default (for example, `Fixes #644` when resolving it or `Refs #644` for related work). Use the full issue URL for issues in another repository.
 - Use component scopes that match the code you changed (for example, `fix(jmwallet): ...`, `fix(jmwalletd): ...`, `fix(taker): ...`). Do not use sub-scopes like `jmwallet-history`.
 - Pick the commit type by intent:
   - `test:` for tests, fixtures, or changes that make tests deterministic.
