@@ -2527,7 +2527,7 @@ class WalletSyncMixin:
             # downgrade it), so subsequent ``info``/``send`` runs that
             # don't trip the same RPC failure will recover.
             logger.error(
-                f"Could not fetch addresses with history: {e}. "
+                f"Could not fetch addresses with history ({type(e).__name__}). "
                 f"Proposed deposit addresses will be checked against "
                 f"the persisted used-address store, but the in-memory "
                 f"enumeration is incomplete for this run."

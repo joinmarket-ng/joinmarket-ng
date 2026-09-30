@@ -2378,11 +2378,15 @@ class DescriptorWalletBackend(BlockchainBackend):
                 # include_removed, include_change
                 ["", 1, True, True, True],
             )
-        except Exception:
+        except Exception as e:
             # Surface the failure: callers (sync layer, scan_status_only
             # diagnostic) must distinguish "no addresses" from "RPC
             # failed" and refuse to downgrade persisted state.
-            logger.error("listsinceblock failed; cannot enumerate address history")
+            # Exception strings can be empty or contain private RPC details.
+            # Keep the class public and the full traceback sensitive.
+            logger.error(
+                f"listsinceblock failed ({type(e).__name__}); cannot enumerate address history"
+            )
             logger.bind(sensitive=True).exception(
                 "listsinceblock failed; cannot enumerate address history"
             )
