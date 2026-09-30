@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import yaml
+from packaging.version import Version
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +87,22 @@ def _dockerfile_stage(path: str, stage: str) -> str:
         len(lines),
     )
     return "\n".join(lines[start:end])
+
+
+def test_jmcore_locks_include_oauthlib_security_fix() -> None:
+    # CVE-2026-49265 is fixed in OAuthlib 4.0.0.
+    for lock_name in ("requirements.txt", "requirements-dev.txt"):
+        lock = (REPO_ROOT / "jmcore" / lock_name).read_text(encoding="utf-8")
+        version = re.search(r"^oauthlib==([^\s]+)", lock, re.MULTILINE)
+        assert version is not None
+        assert Version(version.group(1)) >= Version("4.0.0")
+
+
+def test_jmcore_requires_oauthlib_security_fix_for_unlocked_installs() -> None:
+    manifest = tomllib.loads(
+        (REPO_ROOT / "jmcore" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert "oauthlib>=4.0.0" in manifest["project"]["dependencies"]
 
 
 def test_python_security_workflow_audits_locks_and_fresh_resolution() -> None:

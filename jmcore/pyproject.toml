@@ -33,6 +33,8 @@ dependencies = [
     "base58>=2.1.0",
     "mnemonic>=0.21",
     "apprise>=1.8.0",
+    # Security floor for Apprise's transitive dependency (CVE-2026-49265).
+    "oauthlib>=4.0.0",
     "tomlkit>=0.13.0",
 ]
 

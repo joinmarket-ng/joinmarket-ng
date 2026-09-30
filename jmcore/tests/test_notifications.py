@@ -1072,6 +1072,42 @@ class TestNotifier:
         assert notifier._worker is None
 
 
+def test_apprise_twitter_oauth1_signing() -> None:
+    """Exercise real OAuth signing with synthetic credentials and mocked transport."""
+    from apprise import Apprise
+    from apprise.plugins.twitter import NotifyTwitter
+    from requests import Response  # type: ignore[import-untyped]
+    from requests.utils import parse_dict_header  # type: ignore[import-untyped]
+
+    response = Response()
+    response.status_code = 200
+    response._content = b'{"id_str":"123","user":{"screen_name":"synthetic"}}'
+
+    app = Apprise()
+    assert app.add(
+        "tweet://synthetic-consumer/synthetic-consumer-secret/"
+        "synthetic-token/synthetic-token-secret"
+    )
+
+    with patch("requests.sessions.Session.send", return_value=response) as send:
+        assert app.notify(title="Compatibility", body="Synthetic notification")
+
+    send.assert_called_once()
+    request = send.call_args.args[0]
+    assert request.method == "POST"
+    assert request.url == NotifyTwitter.twitter_tweet
+
+    header = request.headers["Authorization"]
+    if isinstance(header, bytes):
+        header = header.decode("ascii")
+    assert header.startswith("OAuth ")
+    params = parse_dict_header(header.removeprefix("OAuth "))
+    assert params["oauth_consumer_key"] == "synthetic-consumer"
+    assert params["oauth_token"] == "synthetic-token"
+    assert params["oauth_signature_method"] == "HMAC-SHA1"
+    assert params["oauth_signature"]
+
+
 class TestGlobalNotifier:
     """Tests for global notifier functions."""
 
