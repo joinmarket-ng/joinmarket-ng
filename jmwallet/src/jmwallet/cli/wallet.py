@@ -493,12 +493,15 @@ def import_mnemonic(
     else:
         typer.echo("WARNING: File is NOT encrypted")
         typer.echo("For production use, consider using a password!")
-    typer.echo("\nWallet import complete. You can now use other jm-wallet commands.")
+    typer.echo("\nSeed imported. Wallet recovery is not yet verified.")
     typer.echo(
-        "Note: an imported wallet has no recorded creation height, so the "
-        "first sync scans about one year of blockchain history (with a full "
-        "rescan continuing in the background). This can take a while on "
-        "mainnet; progress is reported while it runs."
+        "WARNING: Previously spent addresses may still appear unused. "
+        "Before receiving or spending, synchronize and compare known addresses "
+        "and balances with your original records."
+    )
+    typer.echo(
+        "A visible balance or an idle scan does not prove complete recovery. "
+        "Historical recovery requires a backend with the necessary block and history data."
     )
 
 

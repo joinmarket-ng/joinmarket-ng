@@ -1686,6 +1686,8 @@ No:  automatic coin selection from one mixdepth." 12 64
               if [ $RESULT -eq 0 ] && [ -f "$WALLET_PATH" ]; then
                   echo ""
                   echo "Wallet imported to: $WALLET_PATH"
+                  whiptail --title " Wallet Recovery " --msgbox \
+                      "Seed imported. Wallet recovery is not yet verified.\n\nPreviously spent addresses may still appear unused. Before receiving or spending, synchronize and compare known addresses and balances with your original records.\n\nA visible balance or an idle scan does not prove complete recovery. Historical recovery requires a backend with the necessary block and history data." 16 76
                   clear
                   post_wallet_create "$WALLET_PATH" "$NEW_PWD"
               else

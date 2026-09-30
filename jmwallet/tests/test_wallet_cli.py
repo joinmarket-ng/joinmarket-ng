@@ -2007,6 +2007,23 @@ def test_info_uses_default_wallet(monkeypatch):
 # ============================================================================
 
 
+def test_import_warns_recovery_is_unverified(tmp_path: Path) -> None:
+    """Saving a seed does not establish historical address coverage (#646)."""
+    result = runner.invoke(
+        app,
+        ["import", "--output", str(tmp_path / "imported.mnemonic"), "--no-prompt-password"],
+        env={"MNEMONIC": "abandon " * 11 + "about"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Wallet recovery is not yet verified" in result.stdout
+    assert "Previously spent addresses may still appear unused" in result.stdout
+    assert "compare known addresses and balances" in result.stdout
+    assert "idle scan does not prove complete recovery" in result.stdout
+    assert "You can now use" not in result.stdout
+    assert "about one year" not in result.stdout
+
+
 def test_import_with_mnemonic_argument():
     """Test importing a mnemonic passed via MNEMONIC environment variable."""
     mnemonic = (

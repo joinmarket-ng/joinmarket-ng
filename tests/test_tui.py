@@ -21,6 +21,36 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "jmcore" / "src" / "jmcore" / "data" / "menu.joinmarket-ng.sh"
 
 
+def test_import_recovery_warning_precedes_activation(tmp_path: Path) -> None:
+    """Successful import acknowledges recovery limits before clearing the notice."""
+    content = SCRIPT_PATH.read_text()
+    import_flow = content.split('MNEMONIC_PASSWORD="$NEW_PWD" jm-wallet import', 1)[1]
+    success = import_flow.split(
+        'if [ $RESULT -eq 0 ] && [ -f "$WALLET_PATH" ]; then', 1
+    )[1]
+    success = success.split("else", 1)[0]
+    script = (
+        """
+whiptail() { printf 'dialog:%s\\n' "$*"; }
+clear() { echo cleared; }
+post_wallet_create() { echo activated; }
+WALLET_PATH=imported.mnemonic
+NEW_PWD=test-password
+"""
+        + success
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True, check=True
+    )
+
+    assert "--msgbox" in result.stdout
+    assert "Wallet recovery is not yet verified" in result.stdout
+    assert "Previously spent addresses may still appear unused" in result.stdout
+    assert "idle scan does not prove complete recovery" in result.stdout
+    assert result.stdout.index("dialog:") < result.stdout.index("cleared")
+    assert result.stdout.index("cleared") < result.stdout.index("activated")
+
+
 # ---------------------------------------------------------------------------
 # Shell script tests
 # ---------------------------------------------------------------------------
