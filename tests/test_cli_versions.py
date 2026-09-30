@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from click import unstyle
+from typer import rich_utils
 from typer.testing import CliRunner
 
 from jmcore.version import get_version
@@ -18,9 +20,17 @@ from jmcore.version import get_version
     ("module_name", "entrypoint", "startup_symbols"),
     [
         ("jmcore.tui", "main", ["shutil.which", "_find_menu_script", "os.execvp"]),
-        ("directory_server.main", "main", ["run_server", "asyncio.run", "get_settings"]),
+        (
+            "directory_server.main",
+            "main",
+            ["run_server", "asyncio.run", "get_settings"],
+        ),
         ("directory_server.cli", "main", ["get_settings", "setup_logging", "urlopen"]),
-        ("orderbook_watcher.main", "main", ["run_watcher", "asyncio.run", "get_settings"]),
+        (
+            "orderbook_watcher.main",
+            "main",
+            ["run_watcher", "asyncio.run", "get_settings"],
+        ),
         (
             "orderbook_watcher.main",
             "main_deprecated",
@@ -53,9 +63,14 @@ def test_version_bypasses_startup(
 
 
 @pytest.mark.parametrize(
-    "module_name", ["jmwallet.cli", "maker.cli", "taker.cli", "tumbler.cli", "jmwalletd.cli"]
+    "module_name",
+    ["jmwallet.cli", "maker.cli", "taker.cli", "tumbler.cli", "jmwalletd.cli"],
 )
-def test_typer_version_option(module_name: str) -> None:
+@pytest.mark.parametrize("force_terminal", [False, True], ids=["plain", "colored"])
+def test_typer_version_option(
+    module_name: str, force_terminal: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_terminal)
     app = importlib.import_module(module_name).app
     result = CliRunner().invoke(app, ["--version"])
     assert result.exit_code == 0, result.output
@@ -63,7 +78,7 @@ def test_typer_version_option(module_name: str) -> None:
 
     help_result = CliRunner().invoke(app, ["--help"])
     assert help_result.exit_code == 0, help_result.output
-    assert "--version" in help_result.stdout
+    assert "--version" in unstyle(help_result.stdout)
 
 
 @pytest.mark.parametrize(
