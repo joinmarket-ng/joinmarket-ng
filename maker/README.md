@@ -144,6 +144,8 @@ suppression counts warrant investigation before changing rate-limit policy.
 │ --install-completion          Install completion for the current shell.      │
 │ --show-completion             Show completion for the current shell, to copy │
 │                               it or customize the installation.              │
+│ --version                     Show the installed JoinMarket NG version and   │
+│                               exit.                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
 │ config-init       Initialize the config file with default settings.          │

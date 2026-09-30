@@ -25,6 +25,8 @@ import sys
 from importlib import resources
 from pathlib import Path
 
+from jmcore.version import exit_if_version_requested
+
 
 def _find_menu_script() -> Path | None:
     """Locate the TUI shell script."""
@@ -67,6 +69,8 @@ def _find_menu_script() -> Path | None:
 
 def main() -> None:
     """Launch the JoinMarket-NG TUI menu."""
+    exit_if_version_requested(sys.argv[1:])
+
     # Pre-flight: whiptail is required
     if not shutil.which("whiptail"):
         print(

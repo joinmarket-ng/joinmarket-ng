@@ -23,7 +23,7 @@ For full documentation, see [directory_server Documentation](https://joinmarket-
 
 ```
 usage: jm-directory-ctl [-h] [--host HOST] [--log-level LOG_LEVEL]
-                        [--port PORT]
+                        [--port PORT] [--version]
                         {health,status} ...
 
 JoinMarket Directory Server CLI
@@ -39,6 +39,7 @@ options:
   --log-level, -l LOG_LEVEL
                         Log level (default: INFO)
   --port PORT           Health check server port (default: 8080)
+  --version             Show the installed JoinMarket NG version and exit.
 ```
 
 </details>

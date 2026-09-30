@@ -12,7 +12,7 @@ from typing import Annotated
 
 import typer
 
-from jmcore.cli_help import SortedTyper
+from jmcore.cli_help import SortedTyper, version_callback
 from jmcore.secure_files import atomic_write_private, ensure_private_directory, ensure_private_file
 
 app = SortedTyper(
@@ -43,6 +43,15 @@ def serve(
     ] = None,
     no_tls: Annotated[
         bool, typer.Option(envvar="JMWALLETD_NO_TLS", help="Disable TLS (plain HTTP)")
+    ] = False,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=version_callback,
+            is_eager=True,
+            help="Show the installed JoinMarket NG version and exit.",
+        ),
     ] = False,
 ) -> None:
     """Start the wallet daemon HTTP/WebSocket server."""

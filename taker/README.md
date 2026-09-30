@@ -31,6 +31,8 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │ --install-completion          Install completion for the current shell.      │
 │ --show-completion             Show completion for the current shell, to copy │
 │                               it or customize the installation.              │
+│ --version                     Show the installed JoinMarket NG version and   │
+│                               exit.                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
 │ clear-ignored-makers  Clear the list of ignored makers.                      │

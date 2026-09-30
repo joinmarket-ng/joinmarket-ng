@@ -8,12 +8,13 @@ decorators that reference the ``app`` Typer instance defined here.
 
 from __future__ import annotations
 
-from jmcore.cli_help import SortedTyper
+from jmcore.cli_help import SortedTyper, version_options
 
 app = SortedTyper(
     name="jm-wallet",
     help="JoinMarket Wallet Management",
     no_args_is_help=True,
+    callback=version_options,
 )
 
 

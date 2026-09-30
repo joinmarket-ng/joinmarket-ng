@@ -10,6 +10,7 @@ from urllib.request import urlopen
 
 from jmcore.cli_common import SortedHelpFormatter, setup_logging
 from jmcore.settings import get_settings
+from jmcore.version import exit_if_version_requested, get_version
 
 
 def format_status_output(stats: dict) -> str:
@@ -154,6 +155,8 @@ def health_command(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    exit_if_version_requested(sys.argv[1:])
+
     from jmcore.process_hardening import harden_current_process
 
     # Disable core dumps and ptrace before loading directory-node keys.
@@ -165,6 +168,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="JoinMarket Directory Server CLI",
         formatter_class=SortedHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"JoinMarket NG {get_version()}",
+        help="Show the installed JoinMarket NG version and exit.",
     )
     parser.add_argument(
         "--host",

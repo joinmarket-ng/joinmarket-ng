@@ -19,6 +19,7 @@ from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.process_hardening import harden_current_process
 from jmcore.protocol import JM_VERSION
 from jmcore.settings import get_settings
+from jmcore.version import exit_if_version_requested, get_version
 from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.backends.neutrino import NeutrinoBackend
 from loguru import logger
@@ -209,12 +210,20 @@ async def run_watcher(log_level: str | None = None) -> None:
 
 
 def main() -> None:
+    exit_if_version_requested(sys.argv[1:])
+
     # Disable core dumps and ptrace; the watcher holds NaCl session keys.
     harden_current_process()
 
     parser = argparse.ArgumentParser(
         description="JoinMarket Orderbook Watcher",
         formatter_class=SortedHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"JoinMarket NG {get_version()}",
+        help="Show the installed JoinMarket NG version and exit.",
     )
     parser.add_argument(
         "--log-level",

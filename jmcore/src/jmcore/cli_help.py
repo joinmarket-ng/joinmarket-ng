@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING, Any
 import typer
 from typer.core import TyperCommand, TyperGroup
 
+from jmcore.version import get_version
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -43,7 +45,29 @@ __all__ = [
     "SortedTyper",
     "find_unsorted_help",
     "sort_params_for_help",
+    "version_callback",
+    "version_options",
 ]
+
+
+def version_callback(value: bool) -> None:
+    """Print the installed project version and exit before command execution."""
+    if value:
+        typer.echo(f"JoinMarket NG {get_version()}")
+        raise typer.Exit()
+
+
+# Typer invokes the option's eager callback before this no-op root callback.
+def version_options(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=version_callback,
+        is_eager=True,
+        help="Show the installed JoinMarket NG version and exit.",
+    ),
+) -> None:
+    pass
 
 
 def _is_option(param: Any) -> bool:

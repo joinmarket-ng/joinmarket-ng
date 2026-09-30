@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
@@ -30,6 +31,20 @@ GITHUB_RELEASE_TAG_PATH = "/joinmarket-ng/joinmarket-ng/releases/tag/"
 def get_version() -> str:
     """Return the current version string."""
     return __version__
+
+
+def exit_if_version_requested(args: Sequence[str]) -> None:
+    """Handle an eager version request without loading CLI configuration.
+
+    Stop at the option separator so positional values are not interpreted
+    as flags. Other arguments retain their existing entry-point behavior.
+    """
+    for arg in args:
+        if arg == "--":
+            break
+        if arg == "--version":
+            print(f"JoinMarket NG {get_version()}")
+            raise SystemExit(0)
 
 
 def _get_build_info_module() -> object | None:

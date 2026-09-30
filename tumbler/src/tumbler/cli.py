@@ -21,7 +21,7 @@ from typing import Annotated, Any, NamedTuple
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
-from jmcore.cli_help import SortedTyper
+from jmcore.cli_help import SortedTyper, version_options
 from jmcore.models import NetworkType
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import ensure_config_file
@@ -48,6 +48,7 @@ app = SortedTyper(
     name="jm-tumbler",
     help="JoinMarket tumbler - role-mixed CoinJoin schedules with YAML-persisted state",
     no_args_is_help=True,
+    callback=version_options,
 )
 
 

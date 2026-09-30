@@ -105,6 +105,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --install-completion          Install completion for the current shell.      │
 │ --show-completion             Show completion for the current shell, to copy │
 │                               it or customize the installation.              │
+│ --version                     Show the installed JoinMarket NG version and   │
+│                               exit.                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
 │ address                      Manage deposit addresses: reserve, label,       │

@@ -16,7 +16,7 @@ from typing import Annotated, Any
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
-from jmcore.cli_help import SortedTyper
+from jmcore.cli_help import SortedTyper, version_options
 from jmcore.config import build_tor_control_config
 from jmcore.models import NetworkType, OfferType
 from jmcore.notifications import get_notifier
@@ -34,7 +34,7 @@ from maker.config import MakerConfig, MergeAlgorithm, OfferConfig
 from maker.fidelity import ExpiredFidelityBondCertificateError
 from maker.mixdepth_selection import MixdepthSelectionPolicy
 
-app = SortedTyper(no_args_is_help=True)
+app = SortedTyper(no_args_is_help=True, callback=version_options)
 
 
 def run_async(coro: Any) -> Any:

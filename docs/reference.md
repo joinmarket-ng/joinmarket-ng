@@ -5,6 +5,10 @@ question. For everyday tasks, start with the [wallet guide](README-jmwallet.md).
 
 ## Commands And Settings
 
+All installed JoinMarket NG commands support `--version` to print the installed
+project version and exit without loading configuration or starting services.
+For example, run `jm-ng --version` or `jm-wallet --version`.
+
 Run a command with `--help` for the options supported by your installed version,
 for example `jm-wallet send --help` or `jm-maker start --help`.
 The component READMEs contain generated help for the current source checkout:

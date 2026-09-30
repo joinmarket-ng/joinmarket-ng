@@ -12,6 +12,7 @@ from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import get_settings
 from jmcore.tasks import spawn_task
+from jmcore.version import exit_if_version_requested
 from loguru import logger
 
 from directory_server.server import DirectoryServer
@@ -90,6 +91,7 @@ async def run_server() -> None:
 
 
 def main() -> None:
+    exit_if_version_requested(sys.argv[1:])
     try:
         asyncio.run(run_server())
     except KeyboardInterrupt:
