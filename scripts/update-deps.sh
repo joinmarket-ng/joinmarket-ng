@@ -13,6 +13,8 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 FLATPAK_UPDATER="$SCRIPT_DIR/update-flatpak-deps.py"
 BITCOINTX_UPDATER="$SCRIPT_DIR/update-bitcointx.py"
 
+cd "$PROJECT_ROOT"
+
 run_python() {
     if command -v python3 >/dev/null 2>&1; then
         python3 "$@"
@@ -130,6 +132,11 @@ if [ "$UPDATE_DEV" = true ]; then
     echo "=== docs ==="
     run_pip_compile -U --strip-extras --generate-hashes requirements-docs.in -o requirements-docs.txt
     echo ""
+
+    # Security tooling is hash-locked for CI, just like documentation tooling.
+    echo "=== security tooling ==="
+    run_pip_compile -U --strip-extras --generate-hashes requirements-security.in -o requirements-security.txt
+    echo ""
 fi
 
 if [ "$UPDATE_PROD" = true ]; then
@@ -150,7 +157,7 @@ echo "All dependencies updated successfully"
 echo "========================================="
 echo ""
 echo "Next steps:"
-echo "  1. Review changes: git diff */requirements*.txt requirements-docs.txt flatpak/org.joinmarketng.JamNG.yml docker-compose.yml tests/test_jmwalletd_dockerfile.py"
+echo "  1. Review changes: git diff */requirements*.txt requirements-docs.txt requirements-security.in requirements-security.txt flatpak/org.joinmarketng.JamNG.yml docker-compose.yml tests/test_jmwalletd_dockerfile.py"
 echo "  2. Test locally: pip install -r <package>/requirements-dev.txt"
 echo "  3. Run tests: pytest"
-echo "  4. Commit: git add */requirements*.txt requirements-docs.txt flatpak/org.joinmarketng.JamNG.yml docker-compose.yml tests/test_jmwalletd_dockerfile.py && git commit"
+echo "  4. Commit: git add */requirements*.txt requirements-docs.txt requirements-security.in requirements-security.txt flatpak/org.joinmarketng.JamNG.yml docker-compose.yml tests/test_jmwalletd_dockerfile.py && git commit"

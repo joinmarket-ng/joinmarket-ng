@@ -7,11 +7,16 @@ auto-generated sections in component READMEs. User guides link to that reference
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+class HelpGenerationError(Exception):
+    """Required CLI help or a target document could not be generated."""
 
 
 def get_command_help(command: list[str]) -> str:
@@ -34,7 +39,7 @@ def get_command_help(command: list[str]) -> str:
             capture_output=True,
             text=True,
             timeout=10,
-            check=False,
+            check=True,
             env=env,
         )
         # Return stdout or stderr (typer outputs to stdout)
@@ -74,7 +79,7 @@ def discover_subcommands(base_command: str) -> list[str]:
     """
     help_text = get_command_help([base_command, "--help"])
     if not help_text:
-        return []
+        raise HelpGenerationError(f"Could not discover subcommands for {base_command}")
 
     # Strip ANSI codes for easier parsing
     clean_text = strip_ansi(help_text)
@@ -179,17 +184,21 @@ def generate_all_help_sections(base_command: str) -> str:
 
     # Main command help
     main_help = get_command_help([base_command, "--help"])
-    if main_help:
-        sections.append(create_help_section(f"{base_command} --help", main_help))
+    if not main_help:
+        raise HelpGenerationError(f"Could not generate help for {base_command}")
+    sections.append(create_help_section(f"{base_command} --help", main_help))
 
     # Subcommand help
     subcommands = discover_subcommands(base_command)
     for subcmd in subcommands:
         subcmd_help = get_command_help([base_command, subcmd, "--help"])
-        if subcmd_help:
-            sections.append(
-                create_help_section(f"{base_command} {subcmd} --help", subcmd_help)
+        if not subcmd_help:
+            raise HelpGenerationError(
+                f"Could not generate help for {base_command} {subcmd}"
             )
+        sections.append(
+            create_help_section(f"{base_command} {subcmd} --help", subcmd_help)
+        )
 
     return "\n".join(sections)
 
@@ -206,8 +215,7 @@ def update_readme_help(readme_path: Path, command: str) -> bool:
         True if file was modified, False otherwise
     """
     if not readme_path.exists():
-        print(f"Warning: {readme_path} not found", file=sys.stderr)
-        return False
+        raise HelpGenerationError(f"{readme_path} not found")
 
     # Read current README
     content = readme_path.read_text()
@@ -215,8 +223,7 @@ def update_readme_help(readme_path: Path, command: str) -> bool:
     # Generate new help sections
     help_sections = generate_all_help_sections(command)
     if not help_sections:
-        print(f"Warning: No help sections generated for {command}", file=sys.stderr)
-        return False
+        raise HelpGenerationError(f"No help sections generated for {command}")
 
     # Define markers for auto-generated section
     start_marker = f"<!-- AUTO-GENERATED HELP START: {command} -->"
@@ -245,7 +252,7 @@ def update_readme_help(readme_path: Path, command: str) -> bool:
     return True
 
 
-def main() -> int:
+def main(*, exit_zero_on_changes: bool = False) -> int:
     """Main entry point."""
     # Find project root (directory containing this script's parent)
     script_dir = Path(__file__).parent
@@ -286,6 +293,7 @@ def main() -> int:
     ]
 
     modified = False
+    failed = False
 
     for command, readmes in commands_to_update:
         print(f"Processing {command}...", file=sys.stderr)
@@ -293,6 +301,7 @@ def main() -> int:
         # Check if command is available
         help_text = get_command_help([command, "--help"])
         if not help_text:
+            failed = True
             print(
                 f"Warning: Command '{command}' not available. "
                 f"Make sure the package is installed.",
@@ -302,13 +311,26 @@ def main() -> int:
 
         # Update all target docs for this command.
         for readme in readmes:
-            if update_readme_help(readme, command):
-                modified = True
+            try:
+                if update_readme_help(readme, command):
+                    modified = True
+            except HelpGenerationError as exc:
+                print(f"Warning: {exc}", file=sys.stderr)
+                failed = True
 
     # Return exit code for pre-commit
     # 0 = no changes, 1 = changes made (pre-commit will fail and show diff)
+    if exit_zero_on_changes:
+        return 1 if failed else 0
     return 1 if modified else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--exit-zero-on-changes",
+        action="store_true",
+        help="Exit successfully after updating documentation (for maintenance command chains)",
+    )
+    args = parser.parse_args()
+    sys.exit(main(exit_zero_on_changes=args.exit_zero_on_changes))
