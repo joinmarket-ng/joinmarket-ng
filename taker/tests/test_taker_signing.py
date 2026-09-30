@@ -236,6 +236,93 @@ class TestTakerSigning:
         return config
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", ["destination", "change", "explicit", "counterparty", "sweep"])
+    async def test_generated_output_reuse_policy(
+        self,
+        tmp_path: Path,
+        test_mnemonic: str,
+        mock_config: MagicMock,
+        taker_utxos: list[UTXOInfo],
+        case: str,
+    ) -> None:
+        from jmcore.bitcoin import serialize_transaction
+        from jmwallet.wallet.service import WalletService
+
+        from taker.taker import Taker
+
+        wallet = WalletService(
+            mnemonic=test_mnemonic,
+            backend=MagicMock(),
+            network="regtest",
+            data_dir=tmp_path,
+        )
+        for index, utxo in enumerate(taker_utxos):
+            assert wallet.get_address(0, 0, index) == utxo.address
+        taker = Taker.__new__(Taker)
+        taker.wallet = wallet
+        taker.config = mock_config
+        mock_config.initial_confirmation_timeout_sec = 60
+        taker._session = CoinJoinSession()
+        session = taker._session
+        session.attach(taker)
+        session.selected_utxos = taker_utxos
+        session.reserved_inputs = {(utxo.txid, utxo.vout) for utxo in taker_utxos}
+        assert wallet.reserve_coinjoin_inputs(
+            session.reserved_inputs, ttl=300, owner=session.input_lock_owner
+        )
+        wallet.utxo_cache[0] = taker_utxos
+        session.cj_destination = wallet.get_new_internal_address(1)
+        session.cj_destination_is_internal = case != "explicit"
+        session.taker_change_address = wallet.get_new_internal_address(0) if case != "sweep" else ""
+        outputs = [TxOutput.from_address(session.cj_destination, 1_000_000)]
+        if session.taker_change_address:
+            outputs.append(TxOutput.from_address(session.taker_change_address, 490_000))
+        if case in {"destination", "explicit"}:
+            wallet.addresses_with_history.add(session.cj_destination)
+        elif case == "change":
+            wallet.addresses_with_history.add(session.taker_change_address)
+        elif case == "counterparty":
+            external = wallet.get_address(0, 0, 9)
+            wallet.addresses_with_history.add(external)
+            outputs.append(TxOutput.from_address(external, 1_000))
+        session.unsigned_tx = serialize_transaction(
+            2, [TxInput.from_hex(utxo.txid, utxo.vout) for utxo in taker_utxos], outputs, 0
+        )
+
+        with patch.object(wallet, "sign_input", wraps=wallet.sign_input) as sign:
+            signatures = await session._sign_our_inputs()
+        if case in {"destination", "change"}:
+            assert signatures == []
+            sign.assert_not_called()
+            assert session.signing_boundary_crossed is False
+            taker.release_input_locks()
+            assert wallet.get_locked_input_outpoints() == set()
+        else:
+            assert len(signatures) == len(taker_utxos)
+            assert session.signing_boundary_crossed is True
+
+    def test_reset_clears_generated_destination_provenance(self) -> None:
+        session = CoinJoinSession()
+        session.cj_destination_is_internal = True
+        session.cj_destination = "previous-round"
+        session.reset()
+        assert session.cj_destination_is_internal is False
+        assert session.cj_destination == ""
+
+    @pytest.mark.asyncio
+    async def test_build_records_generated_destination_provenance(self) -> None:
+        session = CoinJoinSession()
+        with patch.object(session, "maker_fee_plan", side_effect=ValueError("stop before build")):
+            for internal in [True, False]:
+                assert (
+                    await session._phase_build_tx(
+                        destination="test-destination", mixdepth=0, destination_is_internal=internal
+                    )
+                    is False
+                )
+                assert session.cj_destination_is_internal is internal
+
+    @pytest.mark.asyncio
     async def test_sign_our_inputs_basic(
         self,
         mock_wallet: MagicMock,

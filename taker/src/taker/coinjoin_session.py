@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import get_txid, pubkey_to_p2wpkh_script
+from jmcore.bitcoin import address_to_scriptpubkey, get_txid, pubkey_to_p2wpkh_script
 from jmcore.constants import BITCOIN_DUST_THRESHOLD, DUST_THRESHOLD
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
@@ -174,6 +174,7 @@ class CoinJoinSession:
 
         # Addresses recorded for broadcast verification and history reconciliation.
         self.cj_destination: str = ""
+        self.cj_destination_is_internal: bool = False
         self.taker_change_address: str = ""
 
         # Sweep-only: the tx-fee budget reserved at order-selection time. At
@@ -238,6 +239,7 @@ class CoinJoinSession:
         self.failed_signer_nicks = set()
         self.declined_signer_nicks = set()
         self.cj_destination = ""
+        self.cj_destination_is_internal = False
         self.taker_change_address = ""
         self._sweep_tx_fee_budget = 0
         self.crypto_session = None
@@ -1105,11 +1107,14 @@ class CoinJoinSession:
                 continue
         return result
 
-    async def _phase_build_tx(self, destination: str, mixdepth: int) -> bool:
+    async def _phase_build_tx(
+        self, destination: str, mixdepth: int, *, destination_is_internal: bool = False
+    ) -> bool:
         """Build the unsigned CoinJoin transaction."""
         try:
             # Store destination for broadcast verification
             self.cj_destination = destination
+            self.cj_destination_is_internal = destination_is_internal
 
             # Calculate total input needed (now with exact maker UTXOs)
             maker_fee_plan = self.maker_fee_plan()
@@ -2107,6 +2112,13 @@ class CoinJoinSession:
             # still leaves the round safely releasable.
             if not self.renew_input_locks("sign taker inputs"):
                 return []
+
+            generated_scripts = []
+            if self.cj_destination_is_internal:
+                generated_scripts.append(address_to_scriptpubkey(self.cj_destination))
+            if self.taker_change_address:
+                generated_scripts.append(address_to_scriptpubkey(self.taker_change_address))
+            self.wallet.validate_generated_outputs(tx, generated_scripts)
 
             # Sign each of our UTXOs
             for utxo in self.selected_utxos:

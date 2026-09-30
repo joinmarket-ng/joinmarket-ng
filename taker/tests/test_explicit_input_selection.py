@@ -9,6 +9,7 @@ import pytest
 from _taker_test_helpers import make_taker_config, make_utxo
 from jmcore.models import Offer, OfferType
 
+from taker.coinjoin_session import CoinJoinSession
 from taker.taker import Taker, TakerState
 
 
@@ -162,6 +163,49 @@ async def test_coinjoin_preselects_exact_explicit_set(tmp_path: Path, amount: in
     assert taker._session.strict_input_selection is True
     wallet.select_utxos.assert_not_called()
     wallet.get_all_utxos.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generated_destination_provenance_survives_round_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = make_utxo(txid_char="a", value=25_000_000, confirmations=10)
+    wallet = _wallet([selected])
+    taker = Taker(wallet, _backend(), _config(tmp_path))
+    offer = _offer()
+    taker.directory_client.fetch_orderbook = AsyncMock(return_value=[offer])
+    taker._update_offers_with_bond_values = AsyncMock()  # type: ignore[method-assign]
+    taker.orderbook_manager.select_makers = Mock(  # type: ignore[method-assign]
+        return_value=({"maker1": offer}, 0)
+    )
+    commitment = Mock()
+    commitment.commitment.commitment = bytes.fromhex("ab" * 32)
+    taker.podle_manager.generate_fresh_commitment = Mock(  # type: ignore[method-assign]
+        return_value=commitment
+    )
+    taker._run_fill_with_replacements = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    taker._run_auth_with_replacements = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    build = AsyncMock(return_value=False)
+    monkeypatch.setattr(CoinJoinSession, "_phase_build_tx", build)
+    external = "bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu"
+    for requested, resolved, internal in [
+        ("INTERNAL", "bcrt1qinternaldest", True),
+        (external, external, False),
+    ]:
+        build.reset_mock()
+        assert (
+            await taker.do_coinjoin(
+                amount=5_000_000,
+                destination=requested,
+                mixdepth=0,
+                input_utxos=[f"{selected.txid}:{selected.vout}"],
+            )
+            is None
+        )
+        build.assert_awaited_once_with(
+            destination=resolved, mixdepth=0, destination_is_internal=internal
+        )
+    wallet.get_new_internal_address.assert_called_once_with(1)
 
 
 @pytest.mark.asyncio

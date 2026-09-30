@@ -19,7 +19,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import Any
 
-from jmcore.bitcoin import parse_transaction
+from jmcore.bitcoin import address_to_scriptpubkey, parse_transaction
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     estimate_p2wpkh_vsize,
@@ -673,6 +673,14 @@ class CoinJoinSession:
             ):
                 self.state = CoinJoinState.FAILED
                 return False, {"error": "Maker input lock ownership was lost before signing"}
+
+            self.wallet.validate_generated_outputs(
+                parse_transaction(tx_hex),
+                [
+                    address_to_scriptpubkey(self.cj_address),
+                    address_to_scriptpubkey(self.change_address),
+                ],
+            )
 
             # Signing may produce a usable signature before returning or
             # raising. Cross this boundary first so no later failure can make

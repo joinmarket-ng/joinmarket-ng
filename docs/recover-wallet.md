@@ -53,6 +53,19 @@ successful import followed by `info` only proves that the phrase was accepted
 and reports currently discovered data. It does not prove that all old history,
 labels, freezes, address metadata, or coverage was restored.
 
+Use `jm-wallet address --prompt-bip39-passphrase new 0` to issue a receiving
+address, not the removed `jm-maker generate-address` command. The wallet command
+checks address history and durably reserves the result instead of deriving a
+fixed index.
+
+Before signing, JoinMarket NG also rejects wallet-generated CoinJoin and change
+outputs with locally known funding history. Fresh reservations and pending
+CoinJoin records alone do not trigger this check. Intentional payment recipients
+and generic PSBT signing are unchanged. This is a defense against known reuse,
+not proof that an imported wallet's undiscovered history is complete. If it
+rejects a transaction, inspect recovery and address allocation rather than
+repeatedly retrying the same outputs.
+
 On a pruned or assumeUTXO node, check that the blocks needed for historical
 recovery are available before requesting a scan. A snapshot supplies current
 unspent coins, not previously spent addresses. Finishing background validation

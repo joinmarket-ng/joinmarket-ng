@@ -1085,7 +1085,8 @@ class Taker(TakerMonitoringMixin):
             explicitly_selected_utxos, manually_selected_utxos, mixdepth = requested_inputs
 
             # Determine destination address
-            if destination == "INTERNAL":
+            destination_is_internal = destination == "INTERNAL"
+            if destination_is_internal:
                 dest_mixdepth = (mixdepth + 1) % self.wallet.mixdepth_count
                 # Use internal chain (/1) for CoinJoin outputs, not external (/0)
                 # This matches the reference implementation behavior where all JM-generated
@@ -1543,6 +1544,7 @@ class Taker(TakerMonitoringMixin):
             tx_success = await self._session._phase_build_tx(
                 destination=destination,
                 mixdepth=mixdepth,
+                destination_is_internal=destination_is_internal,
             )
             if not tx_success:
                 logger.error("Transaction build failed")

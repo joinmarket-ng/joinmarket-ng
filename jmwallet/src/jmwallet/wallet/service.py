@@ -5,12 +5,14 @@ JoinMarket wallet service with mixdepth support.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from itertools import count, islice
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from jmcore.bitcoin import ParsedTransaction, scriptpubkey_to_address
 from jmcore.btc_script import mk_freeze_script
 from loguru import logger
 
@@ -23,6 +25,7 @@ from jmwallet.wallet.display import WalletDisplayMixin
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.psbt_signer import WalletPSBTSigningMixin
 from jmwallet.wallet.signer import WalletSigningMixin
+from jmwallet.wallet.signing import TransactionSigningError
 from jmwallet.wallet.sync import WalletSyncMixin
 from jmwallet.wallet.utxo_metadata import (
     AUTO_FREEZE_REUSE_LABEL,
@@ -569,6 +572,44 @@ class WalletService(
     def get_private_key(self, mixdepth: int, change: int, index: int) -> bytes:
         """Get private key for given path"""
         return self._derive_key(mixdepth, change, index).get_private_key_bytes()
+
+    def validate_generated_outputs(
+        self, tx: ParsedTransaction, generated_scripts: Sequence[bytes]
+    ) -> None:
+        """Reject known reuse of explicitly designated generated outputs before signing.
+
+        Reservations and pending CoinJoin history are not funding evidence.
+        Missing historical data does not prove freshness. This local-only check
+        leaves intentional recipients and generic PSBT signing to their callers.
+        """
+        if not generated_scripts:
+            return
+        if len(set(generated_scripts)) != len(generated_scripts):
+            raise TransactionSigningError("Generated output scripts must be distinct")
+        counts = Counter(output.script for output in tx.outputs)
+        if any(counts[script] != 1 for script in generated_scripts):
+            raise TransactionSigningError("Each generated output must appear exactly once")
+
+        funded_addresses = set(self.addresses_with_history)
+        if self.metadata_store is not None:
+            funded_addresses.update(self.metadata_store.get_used_addresses())
+            # Read a detached snapshot: load() clears live reservations and other
+            # metadata even on read failure. Keep all previously known positives.
+            snapshot = UTXOMetadataStore(self.metadata_store.path)
+            snapshot.load()
+            funded_addresses.update(snapshot.get_used_addresses())
+        funded_scripts: set[bytes] = set()
+        for utxos in self.utxo_cache.values():
+            for utxo in utxos:
+                funded_addresses.add(utxo.address)
+                funded_scripts.add(bytes.fromhex(utxo.scriptpubkey))
+
+        for script in generated_scripts:
+            address = scriptpubkey_to_address(script, self.network)
+            if script in funded_scripts or address in funded_addresses:
+                raise TransactionSigningError(
+                    "Refusing to sign: a generated output has known funding history"
+                )
 
     def get_key_for_address(self, address: str) -> HDKey | None:
         """Get HD key for a known address"""

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from bitcointx.core.key import CKey
@@ -18,6 +20,9 @@ from jmcore.encryption import CryptoSession
 from loguru import logger
 
 from maker.fidelity import FidelityBondInfo, create_fidelity_bond_proof
+
+if TYPE_CHECKING:
+    from maker.coinjoin import CoinJoinSession
 
 
 def _session_key(taker_nick: str, generation_id: int = 0) -> tuple[int, str]:
@@ -1568,11 +1573,12 @@ async def test_signing_failure_crosses_lock_retention_boundary():
     )
     session.state = CoinJoinState.IOAUTH_SENT
 
+    tx_hex = _maker_signing_tx(session)
     with (
         patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
         patch.object(session, "_sign_transaction", new=AsyncMock(return_value=[])),
     ):
-        success, _ = await session.handle_tx("00")
+        success, _ = await session.handle_tx(tx_hex)
 
     assert success is False
     assert session.state == CoinJoinState.SIG_SENT
@@ -1587,6 +1593,69 @@ def _fee_policy_tx(output_value: int) -> str:
         outputs=[TxOutput(value=output_value, script=bytes.fromhex("0014" + "11" * 20))],
         locktime=0,
     ).hex()
+
+
+def _maker_signing_tx(session: CoinJoinSession, input_txid: str = "aa" * 32) -> str:
+    """Valid regtest outputs for tests that simulate the signing boundary."""
+    from jmcore.bitcoin import TxInput, TxOutput, scriptpubkey_to_address, serialize_transaction
+
+    cj_script = bytes.fromhex("0014" + "11" * 20)
+    change_script = bytes.fromhex("0014" + "22" * 20)
+    session.cj_address = scriptpubkey_to_address(cj_script, "regtest")
+    session.change_address = scriptpubkey_to_address(change_script, "regtest")
+    return serialize_transaction(
+        version=2,
+        inputs=[TxInput.from_hex(input_txid, 0), TxInput.from_hex("bb" * 32, 1)],
+        outputs=[
+            TxOutput(value=18_000, script=cj_script),
+            TxOutput(value=1_000, script=change_script),
+        ],
+        locktime=0,
+    ).hex()
+
+
+@pytest.mark.parametrize("reused_output", ["cj_address", "change_address"])
+@pytest.mark.asyncio
+async def test_maker_rejects_known_reuse_before_signing(tmp_path: Path, reused_output: str) -> None:
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from jmwallet.wallet.service import WalletService
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    wallet = WalletService(
+        mnemonic="abandon " * 11 + "about",
+        backend=MagicMock(),
+        network="regtest",
+        data_dir=tmp_path,
+    )
+    session = CoinJoinSession(
+        taker_nick="J5ReuseTaker",
+        offer=MagicMock(),
+        wallet=wallet,
+        backend=MagicMock(),
+    )
+    tx_hex = _maker_signing_tx(session)
+    session.state = CoinJoinState.IOAUTH_SENT
+    outpoint = ("aa" * 32, 0)
+    session.our_utxos = {outpoint: MagicMock()}
+    assert wallet.reserve_coinjoin_inputs({outpoint}, ttl=300, owner=session.input_lock_owner)
+    assert wallet.metadata_store is not None
+    wallet.metadata_store.mark_address_used(getattr(session, reused_output))
+
+    with (
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session, "_sign_transaction", new=AsyncMock()) as sign,
+    ):
+        success, response = await session.handle_tx(tx_hex)
+
+    assert success is False
+    assert "known funding history" in response["error"]
+    sign.assert_not_awaited()
+    assert session.signing_boundary_crossed is False
+    assert session.state == CoinJoinState.FAILED
+    wallet.release_coinjoin_inputs({outpoint}, owner=session.input_lock_owner)
+    assert wallet.get_locked_input_outpoints() == set()
 
 
 @pytest.mark.asyncio
@@ -1648,13 +1717,14 @@ async def test_maker_minimum_fee_policy_skips_backend_lookup_failure():
     session.wallet.network = "regtest"
     session.wallet.renew_coinjoin_inputs.return_value = True
 
+    tx_hex = _maker_signing_tx(session)
     signed = AsyncMock(return_value=["signature"])
     with (
         patch("maker.coinjoin.logger") as mock_logger,
         patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
         patch.object(session, "_sign_transaction", new=signed),
     ):
-        success, _ = await session.handle_tx(_fee_policy_tx(19_000))
+        success, _ = await session.handle_tx(tx_hex)
 
     assert success is True
     signed.assert_awaited_once()
@@ -1854,13 +1924,15 @@ async def test_valid_input_owner_is_renewed_before_signing(tmp_path):
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from jmwallet.wallet.service import WalletService
-    from jmwallet.wallet.utxo_metadata import UTXOMetadataStore
 
     from maker.coinjoin import CoinJoinSession, CoinJoinState
 
-    wallet = WalletService.__new__(WalletService)
-    wallet.network = "regtest"
-    wallet.metadata_store = UTXOMetadataStore(path=tmp_path / "metadata.jsonl")
+    wallet = WalletService(
+        mnemonic="abandon " * 11 + "about",
+        backend=MagicMock(),
+        network="regtest",
+        data_dir=tmp_path,
+    )
     outpoint = ("ab" * 32, 0)
     session = CoinJoinSession(
         taker_nick="J5OwnedInputTaker",
@@ -1873,16 +1945,17 @@ async def test_valid_input_owner_is_renewed_before_signing(tmp_path):
     assert wallet.reserve_coinjoin_inputs({outpoint}, ttl=10, owner=session.input_lock_owner)
     old_expiry = wallet.metadata_store.records[f"{outpoint[0]}:{outpoint[1]}"].lock_until
     sign = AsyncMock(return_value=["signature"])
+    tx_hex = _maker_signing_tx(session, input_txid=outpoint[0])
 
     with (
         patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
         patch.object(session, "_sign_transaction", new=sign),
         patch("jmcore.bitcoin.get_txid", return_value="cd" * 32),
     ):
-        success, _ = await session.handle_tx("00")
+        success, _ = await session.handle_tx(tx_hex)
 
     assert success is True
-    sign.assert_awaited_once_with("00")
+    sign.assert_awaited_once_with(tx_hex)
     wallet.metadata_store.load()
     record = wallet.metadata_store.records[f"{outpoint[0]}:{outpoint[1]}"]
     assert record.lock_owner == session.input_lock_owner

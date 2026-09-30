@@ -972,6 +972,45 @@ async def _run_mock_send(
 
 
 @pytest.mark.asyncio
+async def test_send_cli_rejects_known_reused_change_before_signing(tmp_path: Path) -> None:
+    from jmwallet.cli.send import _send_transaction
+    from jmwallet.wallet.service import WalletService
+
+    with _mock_send_execution(tmp_path) as (backend_settings, mocks):
+        wallet = WalletService(
+            mnemonic="abandon " * 11 + "about",
+            backend=mocks.backend,
+            network="regtest",
+            data_dir=tmp_path,
+        )
+        change = wallet.get_address(0, 1, 0)
+        wallet.addresses_with_history.add(change)
+        mocks.wallet.get_new_internal_address.return_value = change
+        mocks.wallet.get_key_for_address.return_value = wallet.get_key_for_address(change)
+        mocks.wallet.validate_generated_outputs.side_effect = wallet.validate_generated_outputs
+
+        with pytest.raises(typer.Exit) as exc:
+            await _send_transaction(
+                mnemonic="abandon " * 11 + "about",
+                destination="bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
+                amount=50_000,
+                mixdepth=0,
+                fee_rate=1.0,
+                block_target=None,
+                backend_settings=backend_settings,
+                skip_confirmation=True,
+                broadcast=True,
+                interactive_utxo_selection=False,
+            )
+
+        assert exc.value.exit_code == 1
+        mocks.wallet.sign_input.assert_not_called()
+        mocks.backend.broadcast_transaction.assert_not_awaited()
+        mocks.append_history.assert_not_called()
+        assert mocks.wallet.validate_generated_outputs.call_args.args[1]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("rbf", "expected_sequence"),
     [(True, 0xFFFFFFFD), (False, 0xFFFFFFFE)],

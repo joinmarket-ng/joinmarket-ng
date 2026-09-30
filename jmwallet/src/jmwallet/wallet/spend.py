@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import TYPE_CHECKING
@@ -640,6 +641,7 @@ def build_and_sign_direct_tx(
     outputs: list[DirectTxOutput],
     locktime: int,
     rbf: bool = True,
+    generated_scripts: Sequence[bytes] = (),
 ) -> BuiltDirectTx:
     """Shuffle, serialize, and sign a fully validated direct transaction."""
     if not utxos:
@@ -681,6 +683,7 @@ def build_and_sign_direct_tx(
     ]
     unsigned_tx = serialize_transaction(2, tx_inputs, tx_outputs, locktime)
     parsed = deserialize_transaction(unsigned_tx)
+    wallet.validate_generated_outputs(parsed, generated_scripts)
 
     witnesses: list[list[bytes]] = []
     for index, utxo in enumerate(ordered_utxos):
@@ -879,6 +882,7 @@ async def prepare_direct_send(
         outputs=outputs,
         locktime=locktime,
         rbf=rbf,
+        generated_scripts=[change_script] if change_script is not None else [],
     )
     tx_hex = built.raw.hex()
 

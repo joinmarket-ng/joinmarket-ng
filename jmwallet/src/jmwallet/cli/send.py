@@ -746,6 +746,7 @@ async def _send_transaction(
             )
         ]
         change_addr = ""
+        generated_scripts: list[bytes] = []
         if change_amount > 0:
             change_addr = wallet.get_new_internal_address(mixdepth)
             change_key = wallet.get_key_for_address(change_addr)
@@ -759,6 +760,7 @@ async def _send_transaction(
             change_script = pubkey_to_p2wpkh_script(
                 change_key.get_public_key_bytes(compressed=True).hex()
             )
+            generated_scripts.append(change_script)
             outputs.append(
                 DirectTxOutput(
                     value_sats=change_amount,
@@ -779,6 +781,7 @@ async def _send_transaction(
                 outputs=outputs,
                 locktime=locktime,
                 rbf=rbf,
+                generated_scripts=generated_scripts,
             )
         except (TransactionSigningError, ValueError) as exc:
             logger.error("Transaction construction or signing failed")
