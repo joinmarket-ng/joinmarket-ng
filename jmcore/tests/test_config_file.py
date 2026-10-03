@@ -224,3 +224,106 @@ def test_set_preserves_a_config_symlink_alias(tmp_path: Path) -> None:
         == 'alias "password" # \\ &'
     )
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+
+def _template_shaped_config() -> str:
+    return (
+        "# ============================================================================\n"
+        "# Wallet Settings\n"
+        "# ============================================================================\n"
+        "\n"
+        "[wallet]\n"
+        "# Number of mixing depths\n"
+        "# mixdepth_count = 5\n"
+        "\n"
+        "# Mnemonic file settings (optional defaults)\n"
+        "# mnemonic_file =\n"
+        "# mnemonic_password =\n"
+        "\n"
+        "# ============================================================================\n"
+        "# Logging Settings\n"
+        "# ============================================================================\n"
+        "\n"
+        "[logging]\n"
+        "# Log level\n"
+        'level = "INFO"\n'
+        "\n"
+        "# sensitive = false\n"
+        "\n"
+        "# ============================================================================\n"
+        "# TUI Settings\n"
+        "# ============================================================================\n"
+        "\n"
+        "[tui]\n"
+        '# log_level = "INFO"\n'
+    )
+
+
+def test_set_places_new_keys_before_the_next_chapter_banner(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(_template_shaped_config())
+
+    assert (
+        _run_helper("set", config_path, "wallet", "mnemonic_file", value="wallet.m").returncode == 0
+    )
+    assert (
+        _run_helper("set", config_path, "wallet", "mnemonic_password", value="pw").returncode == 0
+    )
+
+    config_text = config_path.read_text()
+    logging_banner = config_text.index("# Logging Settings")
+    assert config_text.index('mnemonic_file = "wallet.m"') < logging_banner
+    assert config_text.index('mnemonic_password = "pw"') < logging_banner
+    parsed = tomlkit.parse(config_text)
+    assert parsed["wallet"]["mnemonic_file"] == "wallet.m"
+    assert parsed["wallet"]["mnemonic_password"] == "pw"
+    assert parsed["logging"]["level"] == "INFO"
+
+
+def test_set_places_new_key_before_banner_in_chapter_with_values(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(_template_shaped_config())
+
+    assert _run_helper("set", config_path, "logging", "sensitive", value="true").returncode == 0
+
+    config_text = config_path.read_text()
+    assert config_text.index('level = "INFO"') < config_text.index('sensitive = "true"')
+    assert config_text.index('sensitive = "true"') < config_text.index("# TUI Settings")
+
+
+def test_set_updates_a_well_placed_key_in_place(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        _template_shaped_config().replace("# mnemonic_file =\n", 'mnemonic_file = "old.mnemonic"\n')
+    )
+
+    assert _run_helper("set", config_path, "wallet", "mnemonic_file", value="new.m").returncode == 0
+
+    config_text = config_path.read_text()
+    assert config_text.count('mnemonic_file = "new.m"') == 1
+    assert config_text.index('mnemonic_file = "new.m"') < config_text.index("# Logging Settings")
+    assert "# mnemonic_password =" in config_text
+
+    before = config_path.stat()
+    same_value = _run_helper("set", config_path, "wallet", "mnemonic_file", value="new.m")
+    assert same_value.returncode == 0, same_value.stderr.decode()
+    assert config_path.stat().st_ino == before.st_ino
+
+
+def test_set_relocates_a_key_written_after_the_chapter_banner(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    broken = _template_shaped_config().replace(
+        "\n[logging]\n", 'mnemonic_file = "wallet.m"\n\n[logging]\n'
+    )
+    assert broken.index('mnemonic_file = "wallet.m"') > broken.index("# Logging Settings")
+    config_path.write_text(broken)
+
+    result = _run_helper("set", config_path, "wallet", "mnemonic_file", value="wallet.m")
+
+    assert result.returncode == 0, result.stderr.decode()
+    config_text = config_path.read_text()
+    assert config_text.count('mnemonic_file = "wallet.m"') == 1
+    assert config_text.index('mnemonic_file = "wallet.m"') < config_text.index("# Logging Settings")
+    parsed = tomlkit.parse(config_text)
+    assert parsed["wallet"]["mnemonic_file"] == "wallet.m"
+    assert parsed["logging"]["level"] == "INFO"

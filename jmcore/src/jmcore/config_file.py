@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import tomlkit
-from tomlkit.items import Table
+from tomlkit.items import Comment, Table, Whitespace
 from tomlkit.toml_document import TOMLDocument
 
 from jmcore.secure_files import atomic_write_sensitive_file, read_sensitive_file
@@ -25,6 +25,7 @@ class ConfigFileError(Exception):
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_BANNER_RE = re.compile(r"^#\s*=+\s*$")
 
 
 def _validate_identifier(kind: str, value: str) -> None:
@@ -53,6 +54,60 @@ def _get_table(document: TOMLDocument, section: str) -> Table | None:
     return table_value
 
 
+def _chapter_banner_cut(table: Table) -> int | None:
+    """Return the body index where the next chapter's banner comments start.
+
+    Template chapters end with a ``# ====`` separator banner that TOMLKit
+    attaches to the preceding table as trailing trivia. Keys must be inserted
+    before that banner so they stay inside their own chapter. ``None`` means
+    there is no banner (for example the last chapter) and appending is fine.
+    """
+    body = table.value.body
+    banner_index: int | None = None
+    for index, (item_key, item) in enumerate(body):
+        if (
+            item_key is None
+            and isinstance(item, Comment)
+            and _BANNER_RE.match(item.trivia.comment.strip())
+        ):
+            banner_index = index
+            break
+    if banner_index is None:
+        return None
+    cut = banner_index
+    while cut > 0 and body[cut - 1][0] is None and isinstance(body[cut - 1][1], Whitespace):
+        cut -= 1
+    return cut
+
+
+def _table_key_index(table: Table, key: str) -> int | None:
+    """Return the body index of an existing key, or ``None`` when absent."""
+    for index, (item_key, _item) in enumerate(table.value.body):
+        if item_key is not None and item_key.key == key:
+            return index
+    return None
+
+
+def _insert_table_value(table: Table, key: str, value: str) -> None:
+    """Append a new key, keeping the next chapter's banner comments last."""
+    cut = _chapter_banner_cut(table)
+    if cut is None:
+        table[key] = value
+        return
+    body = table.value.body
+    banner_trivia = body[cut:]
+    del body[cut:]
+    table[key] = value
+    body.extend(banner_trivia)
+
+
+def _write_document(path: Path, document: TOMLDocument) -> None:
+    try:
+        atomic_write_sensitive_file(path, tomlkit.dumps(document).encode("utf-8"))
+    except OSError as exc:
+        raise ConfigFileError("cannot write config") from exc
+
+
 def get_config_value(path: Path, section: str, key: str) -> str | None:
     """Return a string config value, or ``None`` when the file or key is absent."""
     _validate_identifier("section", section)
@@ -68,7 +123,12 @@ def get_config_value(path: Path, section: str, key: str) -> str | None:
 
 
 def set_config_value(path: Path, section: str, key: str, value: str) -> None:
-    """Set a string config value without rewriting the file for a no-op."""
+    """Set a string config value without rewriting the file for a no-op.
+
+    New keys are inserted before the next chapter's banner comments so that
+    template-generated files keep every key inside its own chapter. Keys that
+    were previously written after such a banner are moved back on update.
+    """
     _validate_identifier("section", section)
     _validate_identifier("key", key)
     document = _read_document(path)
@@ -80,14 +140,21 @@ def set_config_value(path: Path, section: str, key: str, value: str) -> None:
         current_value = table[key]
         if not isinstance(current_value, str):
             raise ConfigFileError("config value is not a string")
-        if current_value == value:
+        key_index = _table_key_index(table, key)
+        cut = _chapter_banner_cut(table)
+        if cut is not None and key_index is not None and key_index > cut:
+            # The key sits after the next chapter's banner comments, which
+            # makes it look like it belongs to that chapter. Move it back.
+            table.remove(key)
+        elif current_value == value:
+            return
+        else:
+            table[key] = value
+            _write_document(path, document)
             return
 
-    table[key] = value
-    try:
-        atomic_write_sensitive_file(path, tomlkit.dumps(document).encode("utf-8"))
-    except OSError as exc:
-        raise ConfigFileError("cannot write config") from exc
+    _insert_table_value(table, key, value)
+    _write_document(path, document)
 
 
 def remove_config_value(path: Path, section: str, key: str) -> None:
@@ -106,10 +173,7 @@ def remove_config_value(path: Path, section: str, key: str) -> None:
     if not isinstance(value, str):
         raise ConfigFileError("config value is not a string")
     del table[key]
-    try:
-        atomic_write_sensitive_file(path, tomlkit.dumps(document).encode("utf-8"))
-    except OSError as exc:
-        raise ConfigFileError("cannot write config") from exc
+    _write_document(path, document)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
