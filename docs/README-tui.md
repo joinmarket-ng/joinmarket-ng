@@ -40,6 +40,17 @@ wallet. Viewing recovery words is sensitive; do not screen-share or capture it.
 The BIP39 passphrase prompt is separate from wallet-file decryption. Verify the
 derived wallet identity before accepting it, especially after recovery.
 
+### Wallet Identity and BIP39 Passphrase Caching
+
+When a command needs the BIP39 passphrase, the menu computes the wallet
+fingerprint from the decrypted mnemonic and shows it in a confirmation dialog.
+Confirm only if the fingerprint matches the wallet you intend to use.
+
+Once confirmed, the passphrase is cached as `BIP39_PASSPHRASE` for the rest of
+that menu action (inside a subshell), so subsequent prompts in the same flow
+use the same derived wallet without asking again. The cache is not written to
+`config.toml`; it disappears when the subshell exits.
+
 ## Maker Bot Control
 
 Start, stop, and inspect the maker here. On Raspiblitz the menu controls a
@@ -49,9 +60,10 @@ systemd service; standalone installations manage a local maker process.
 
 Starting an encrypted wallet requires its password. Choosing to store it writes
 it in plain text to `config.toml` for unattended startup. Declining permanent
-storage does not remove all exposure: on Raspiblitz it is staged in a
-permission-restricted `.maker.env` file while the maker runs. Other wallet
-commands can reuse that staged credential. Protect the host in either case.
+storage does not remove all exposure: on Raspiblitz both the wallet password and
+the BIP39 passphrase are staged in a permission-restricted `.maker.env` file
+while the maker runs. Other wallet commands can reuse that staged credential.
+Protect the host in either case.
 
 Use [unattended maker guidance](maker-service.md) to decide whether automatic
 startup is appropriate; do not assume wallet-file encryption protects against

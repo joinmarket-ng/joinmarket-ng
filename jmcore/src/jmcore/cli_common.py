@@ -871,8 +871,11 @@ def resolve_mnemonic(
     resolved_passphrase = ""
     if bip39_passphrase:
         resolved_passphrase = bip39_passphrase
-    elif env_passphrase := os.environ.get("BIP39_PASSPHRASE"):
-        resolved_passphrase = env_passphrase
+    elif "BIP39_PASSPHRASE" in os.environ:
+        # Explicitly exported (even empty) means "use this value, do not prompt".
+        # This lets a TUI subshell cache "no passphrase" without falling through
+        # to an interactive prompt.
+        resolved_passphrase = os.environ.get("BIP39_PASSPHRASE", "")
     elif settings.wallet.bip39_passphrase is not None:
         resolved_passphrase = settings.wallet.bip39_passphrase.get_secret_value()
     elif prompt_bip39_passphrase:

@@ -155,7 +155,7 @@ def test_tui_history_syncs_before_reading() -> None:
     history_block = content.split("# HIST - CoinJoin History", 1)[1].split(
         "# FREEZE - Freeze/Unfreeze UTXOs", 1
     )[0]
-    assert history_block.index("jm-wallet info >/dev/null") < history_block.index(
+    assert history_block.index("jm-wallet info") < history_block.index(
         'jm-wallet history "${HIST_ARGS[@]}"'
     )
 
@@ -1366,24 +1366,25 @@ def test_tui_script_maker_restart_uses_both_helpers() -> None:
 def test_tui_script_defines_maker_env_helpers() -> None:
     """The script must define the .maker.env password helpers.
 
-    On Raspiblitz the temporary wallet password is delivered to the maker via
-    the systemd EnvironmentFile (.maker.env), NOT config.toml. The TUI needs
-    helpers to write and read it."""
+    On Raspiblitz the temporary wallet password and BIP39 passphrase are
+    delivered to the maker via the systemd EnvironmentFile (.maker.env), NOT
+    config.toml. The TUI needs helpers to write and read them."""
     content = SCRIPT_PATH.read_text()
     assert "get_maker_env_password()" in content
+    assert "get_maker_env_bip39_passphrase()" in content
     assert "write_maker_env()" in content
     assert "stage_maker_password()" in content
 
 
 def test_tui_script_write_maker_env_targets_maker_env_not_config() -> None:
-    """write_maker_env must write MNEMONIC_PASSWORD to .maker.env, never config.
+    """write_maker_env must write MNEMONIC_PASSWORD and BIP39_PASSPHRASE to .maker.env, never config.
 
     Regression for the bug where the cleartext password kept reappearing in
-    config.toml: the TUI must stage the password in .maker.env (chmod 600)
-    only."""
+    config.toml: the TUI must stage secrets in .maker.env (chmod 600) only."""
     content = SCRIPT_PATH.read_text()
     block = content.split("write_maker_env()", 1)[1].split("\n}", 1)[0]
-    assert 'MNEMONIC_PASSWORD="' in block, "must write the env var to .maker.env"
+    assert 'MNEMONIC_PASSWORD="' in block, "must write MNEMONIC_PASSWORD to .maker.env"
+    assert 'BIP39_PASSPHRASE="' in block, "must write BIP39_PASSPHRASE to .maker.env"
     assert '"$MAKER_ENV"' in block, "must target the .maker.env file"
     assert "chmod 600" in block, "must restrict .maker.env permissions"
     assert "CONFIG_FILE" not in block, "must never touch config.toml"
@@ -1407,10 +1408,11 @@ def test_tui_script_ensure_wallet_password_reads_maker_env() -> None:
 
 
 def test_tui_script_stage_maker_password_does_not_write_config() -> None:
-    """stage_maker_password must not persist the password to config.toml."""
+    """stage_maker_password must not persist secrets to config.toml."""
     content = SCRIPT_PATH.read_text()
     block = content.split("stage_maker_password()", 1)[1].split("\n}", 1)[0]
     assert "write_maker_env" in block, "must stage into .maker.env"
+    assert "ensure_wallet_unlocked_global" in block, "must stage BIP39 passphrase"
     assert "set_config_value" not in block, "must never write config.toml"
     assert "store_password" not in block, "must not store the password permanently"
 
@@ -1434,6 +1436,86 @@ def test_tui_script_maker_start_raspiblitz_uses_stage_not_double_prompt() -> Non
     assert "stage_maker_password" in restart_block, (
         "RESTART must stage the password on Raspiblitz"
     )
+
+
+def test_tui_script_stage_maker_password_always_stages_passphrase() -> None:
+    """stage_maker_password must reach the passphrase staging on every path.
+
+    Regression: the early returns for an unencrypted wallet or a password
+    stored in config.toml skipped .maker.env staging entirely, so the headless
+    maker silently derived the wrong (passphrase-less) wallet while the TUI
+    operated on the passphrase-derived one.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("stage_maker_password() {", 1)[1].split("\n}", 1)[0]
+    staging_point = block.index("ensure_wallet_unlocked_global")
+    assert "return 0" not in block[:staging_point], (
+        "early return before ensure_wallet_unlocked_global skips passphrase staging"
+    )
+    assert block.index("write_maker_env") > staging_point, (
+        "write_maker_env must run after the passphrase is resolved"
+    )
+
+
+def test_tui_script_write_maker_env_omits_empty_password_line() -> None:
+    """write_maker_env must not write an empty MNEMONIC_PASSWORD line.
+
+    An empty MNEMONIC_PASSWORD is indistinguishable from "not set" for the
+    downstream CLIs, so the line is only written when a password is staged
+    (e.g. it must be absent when the password lives in config.toml and only
+    the BIP39 passphrase is staged).
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("write_maker_env()", 1)[1].split("\n}", 1)[0]
+    assert 'if [ -n "$password" ]; then' in block
+
+
+def test_tui_script_wallet_switch_clears_bip39_passphrase() -> None:
+    """Switching or clearing the active wallet must clear the stored passphrase.
+
+    Regression: set_active_wallet_config cleared mnemonic_password but not
+    bip39_passphrase, so a stale passphrase was silently applied to the newly
+    selected wallet -- and the config path shows no fingerprint confirmation.
+    """
+    content = SCRIPT_PATH.read_text()
+    for fn in ("set_active_wallet_config()", "clear_active_wallet_config()"):
+        block = content.split(fn, 1)[1].split("\n}", 1)[0]
+        assert "clear_config_value wallet bip39_passphrase" in block, (
+            f"{fn} must clear the stored BIP39 passphrase"
+        )
+
+
+def test_tui_script_maker_env_without_passphrase_falls_through() -> None:
+    """A legacy .maker.env without BIP39_PASSPHRASE must not pin an empty one.
+
+    Regression: get_maker_env_bip39_passphrase fails when the key is absent;
+    ensure_wallet_unlocked_global must then fall through to config / prompt
+    instead of exporting an empty passphrase.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("ensure_wallet_unlocked_global() {", 1)[1].split("\n}", 1)[0]
+    assert "if passphrase=$(get_maker_env_bip39_passphrase); then" in block
+
+
+def test_tui_script_fingerprint_confirmation_fails_closed() -> None:
+    """Fingerprint confirmation must not trust a stale cache or skip silently.
+
+    Regression: a stale FINGERPRINT_CACHE could be confirmed against a newly
+    entered passphrase, and a failed fingerprint computation silently skipped
+    the confirmation dialog.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("ensure_wallet_unlocked_global() {", 1)[1].split("\n}", 1)[0]
+    assert 'if [ -n "$fingerprint" ]' not in block, (
+        "fingerprint confirmation must be unconditional (fail closed)"
+    )
+    assert 'rm -f "$FINGERPRINT_CACHE"\n    if ! cache_wallet_fingerprint "$passphrase"' in block, (
+        "stale fingerprint cache must be cleared before recomputing"
+    )
+    assert '[ ! -s "$FINGERPRINT_CACHE" ]' in block, (
+        "must fail closed when no fingerprint was produced"
+    )
+
 
 
 def test_tui_script_unified_error_message() -> None:

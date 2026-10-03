@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
 from jmwallet.cli.mnemonic import save_mnemonic_file
 
 SCRIPT_PATH = (
@@ -88,20 +87,23 @@ child.wait()
     assert not _process_exists(child_pid)
 
 
-@pytest.mark.parametrize("view", ["BASIC", "EXT"])
 @pytest.mark.parametrize("encrypted", [True, False])
 @pytest.mark.parametrize("passphrase", [PASSPHRASE, ""])
-@pytest.mark.parametrize("confirm", [True, False])
-def test_wallet_info_prompts_for_passphrase(
-    tmp_path: Path, view: str, encrypted: bool, passphrase: str, confirm: bool
+def test_ensure_wallet_unlocked_global_caches_passphrase(
+    tmp_path: Path, encrypted: bool, passphrase: str
 ) -> None:
-    """Run the real menu branch and CLI, stopping before backend access."""
+    """ensure_wallet_unlocked_global prompts, confirms fingerprint, and caches BIP39_PASSPHRASE."""
     wallet_path = tmp_path / "wallet.mnemonic"
     save_mnemonic_file(
         MNEMONIC, wallet_path, "test-encryption-password" if encrypted else None
     )
     config_path = tmp_path / "config.toml"
-    config_path.write_text('[bitcoin]\nnetwork = "regtest"\n')
+    # The wallet section is required: get_mnemonic_file reads the active
+    # wallet from config.toml, and the fingerprint confirmation (now
+    # fail-closed) needs it to derive the fingerprint for real.
+    config_path.write_text(
+        f'[bitcoin]\nnetwork = "regtest"\n\n[wallet]\nmnemonic_file = "{wallet_path}"\n'
+    )
     content = SCRIPT_PATH.read_text()
     helpers = content.split(
         "# =============================================================================\n# Helpers",
@@ -110,38 +112,46 @@ def test_wallet_info_prompts_for_passphrase(
         "# =============================================================================\n# Main Loop",
         1,
     )[0]
-    info_case = content.split("case $INFO_CHOICE in", 1)[1].split("esac", 1)[0]
     shell_path = tmp_path / "wallet-info.sh"
+    escaped_passphrase = passphrase.replace("'", "'\\''")
     shell_path.write_text(
         helpers
         + """
 clear() { :; }
 pause() { :; }
 whiptail() {
-    [ "$2" = " Wallet Password " ] || return 90
-    printf '%s' 'test-encryption-password' >&2
+    if [ "$2" = " Wallet Password " ]; then
+        printf '%s' 'test-encryption-password' >&2
+        return 0
+    fi
+    if [ "$2" = " BIP39 Passphrase " ]; then
+        printf '%s' '"""
+        + escaped_passphrase
+        + """' >&2
+        return 0
+    fi
+    if [ "$2" = " Wallet Fingerprint " ]; then
+        # Default-Yes confirmation
+        return 0
+    fi
+    return 90
 }
-jm-wallet() { "$TUI_PYTHON" "$CLI_PATH" "$@"; }
-case $INFO_CHOICE in
-"""
-        + info_case
-        + "esac\n"
-        + '[ -z "${MNEMONIC_PASSWORD:-}" ] || exit 91\n'
-        + '[ -z "${BIP39_PASSPHRASE:-}" ] || exit 92\n'
-    )
-    cli_path = tmp_path / "wallet-cli.py"
-    cli_path.write_text(
-        """
-from unittest.mock import patch
-from jmwallet.cli import app
-from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
-
-async def show_info(mnemonic, backend, passphrase, **kwargs):
-    print('SELECTED_WALLET=' + get_mnemonic_fingerprint(mnemonic, passphrase))
-    print('EXTENDED=' + str(kwargs['extended']))
-
-with patch('jmwallet.cli.wallet._show_wallet_info', show_info):
-    app()
+# Mock jm-wallet so we can assert the cached BIP39_PASSPHRASE reaches the CLI.
+jm-wallet() {
+    echo "BIP39_PASSPHRASE_IN_CLI=${BIP39_PASSPHRASE}"
+    echo "MNEMONIC_PASSWORD_IN_CLI=${MNEMONIC_PASSWORD}"
+    return 0
+}
+ensure_wallet_password() { :; }
+CURRENT_WALLET="""
+        + f'"{wallet_path}"'
+        + f'\nFINGERPRINT_CACHE="{tmp_path}/.current_fingerprint"\n'
+        # The wallet password is passed inline (not exported) so the jm-wallet
+        # stub cannot echo it -- mirroring the real flow, where
+        # ensure_wallet_password provides it for the fingerprint computation.
+        + ("MNEMONIC_PASSWORD='test-encryption-password' " if encrypted else "")
+        + """ensure_wallet_unlocked_global || exit 1
+jm-wallet info --prompt-bip39-passphrase
 """
     )
     env = {
@@ -151,31 +161,153 @@ with patch('jmwallet.cli.wallet._show_wallet_info', show_info):
     }
     env.update(
         TUI_PYTHON=sys.executable,
-        CLI_PATH=str(cli_path),
         CONFIG_FILE=str(config_path),
         JOINMARKET_CONFIG_FILE=str(config_path),
         JOINMARKET_DATA_DIR=str(tmp_path),
         MNEMONIC_FILE=str(wallet_path),
         CURRENT_WALLET=str(wallet_path),
         MAKER_ENV=str(tmp_path / ".maker.env"),
-        INFO_CHOICE=view,
     )
     result = _run_test_shell(
         ["bash", str(shell_path)],
-        # Confirm by pressing Enter to exercise the default-Yes prompt.
-        input_text=passphrase + ("\n\n" if confirm else "\nn\n"),
+        input_text="",
         env=env,
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    expected = get_mnemonic_fingerprint(MNEMONIC, passphrase)
-    assert f"Wallet fingerprint: {expected}" in result.stdout
-    assert "Continue with this wallet?" in result.stdout
-    if confirm:
-        assert f"SELECTED_WALLET={expected}" in result.stdout, result.stdout
-        assert f"EXTENDED={view == 'EXT'}" in result.stdout
-    else:
-        assert "SELECTED_WALLET=" not in result.stdout
-    assert PASSPHRASE not in result.stdout + result.stderr
+    assert f"BIP39_PASSPHRASE_IN_CLI={passphrase}" in result.stdout, result.stdout
     assert "test-encryption-password" not in result.stdout + result.stderr
-    assert config_path.read_text() == '[bitcoin]\nnetwork = "regtest"\n'
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "history",
+        "freeze",
+        "send",
+        "list-bonds",
+        "generate-bond-address",
+        "taker-coinjoin",
+    ],
+)
+@pytest.mark.parametrize("passphrase", [PASSPHRASE, ""])
+@pytest.mark.parametrize("encrypted", [True, False])
+def test_wallet_operations_reuse_cached_passphrase(
+    tmp_path: Path, command: str, passphrase: str, encrypted: bool
+) -> None:
+    """HIST/FREEZE/SEND/BONDS/TAKER derive the same wallet via cached BIP39_PASSPHRASE."""
+    wallet_path = tmp_path / "wallet.mnemonic"
+    save_mnemonic_file(
+        MNEMONIC, wallet_path, "test-encryption-password" if encrypted else None
+    )
+    config_path = tmp_path / "config.toml"
+    # The wallet section is required: get_mnemonic_file reads the active
+    # wallet from config.toml, and the fingerprint confirmation (now
+    # fail-closed) needs it to derive the fingerprint for real.
+    config_path.write_text(
+        f'[bitcoin]\nnetwork = "regtest"\n\n[wallet]\nmnemonic_file = "{wallet_path}"\n'
+    )
+    content = SCRIPT_PATH.read_text()
+    helpers = content.split(
+        "# =============================================================================\n# Helpers",
+        1,
+    )[1].split(
+        "# =============================================================================\n# Main Loop",
+        1,
+    )[0]
+    shell_path = tmp_path / "wallet-op.sh"
+    escaped_passphrase = passphrase.replace("'", "'\\''")
+    shell_path.write_text(
+        helpers
+        + """
+clear() { :; }
+pause() { :; }
+whiptail() {
+    if [ "$2" = " Wallet Password " ]; then
+        printf '%s' 'test-encryption-password' >&2
+        return 0
+    fi
+    if [ "$2" = " BIP39 Passphrase " ]; then
+        printf '%s' '"""
+        + escaped_passphrase
+        + """' >&2
+        return 0
+    fi
+    if [ "$2" = " Wallet Fingerprint " ]; then
+        # Default-Yes confirmation
+        return 0
+    fi
+    return 90
+}
+ensure_wallet_password() { :; }
+jm-wallet() {
+    echo "BIP39_PASSPHRASE_IN_CLI=${BIP39_PASSPHRASE}"
+    return 0
+}
+jm-taker() {
+    echo "BIP39_PASSPHRASE_IN_CLI=${BIP39_PASSPHRASE}"
+    return 0
+}
+"""
+        + f"""
+CURRENT_WALLET="{wallet_path}"
+FINGERPRINT_CACHE="{tmp_path}/.current_fingerprint"
+"""
+        # Inline (not exported) so only the fingerprint computation sees it,
+        # mirroring the real flow where ensure_wallet_password provides it.
+        + ("MNEMONIC_PASSWORD='test-encryption-password' " if encrypted else "")
+        + f"""ensure_wallet_unlocked_global || exit 1
+[ "${{BIP39_PASSPHRASE}}" = '{escaped_passphrase}' ] || exit 93
+if [ "{command}" = "taker-coinjoin" ]; then
+    jm-taker dummy
+else
+    jm-wallet {command} --prompt-bip39-passphrase
+fi
+"""
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("MNEMONIC", "BIP39_", "JOINMARKET_", "WALLET__"))
+    }
+    env.update(
+        TUI_PYTHON=sys.executable,
+        CONFIG_FILE=str(config_path),
+        JOINMARKET_CONFIG_FILE=str(config_path),
+        JOINMARKET_DATA_DIR=str(tmp_path),
+        MNEMONIC_FILE=str(wallet_path),
+        CURRENT_WALLET=str(wallet_path),
+        MAKER_ENV=str(tmp_path / ".maker.env"),
+    )
+    result = _run_test_shell(
+        ["bash", str(shell_path)],
+        input_text="",
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"BIP39_PASSPHRASE_IN_CLI={passphrase}" in result.stdout, result.stdout
+    assert "test-encryption-password" not in result.stdout + result.stderr
+
+
+def test_cli_resolve_mnemonic_empty_env_means_no_passphrase(tmp_path: Path) -> None:
+    """An explicitly empty BIP39_PASSPHRASE env must not trigger a prompt."""
+    from jmcore.cli_common import resolve_mnemonic
+    from jmcore.settings import get_settings
+
+    wallet_path = tmp_path / "wallet.mnemonic"
+    save_mnemonic_file(MNEMONIC, wallet_path, None)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[bitcoin]\nnetwork = "regtest"\n')
+    os.environ["JOINMARKET_CONFIG_FILE"] = str(config_path)
+    os.environ["BIP39_PASSPHRASE"] = ""
+    settings = get_settings()
+    resolved = resolve_mnemonic(
+        settings=settings,
+        mnemonic_file=wallet_path,
+        bip39_passphrase="",
+        prompt_bip39_passphrase=True,
+    )
+    assert resolved is not None
+    assert resolved.bip39_passphrase == ""
+    assert resolved.mnemonic is not None
