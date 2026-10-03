@@ -2170,6 +2170,25 @@ def test_tui_script_config_center_delpw_clears_password() -> None:
     )
 
 
+def test_tui_script_config_center_delpp_clears_passphrase() -> None:
+    """DELPP case calls clear_config_value for bip39_passphrase.
+
+    Mirrors DELPW: offers a menu item, requires an active wallet, skips with
+    an info dialog when nothing is stored, and asks for confirmation
+    (default No) before clearing.
+    """
+    content = SCRIPT_PATH.read_text()
+    assert '"DELPP"' in content, "Config Center must have DELPP menu item"
+    delpp_case = content.split("DELPP)", 1)[1].split(";;", 1)[0]
+    assert "clear_config_value wallet bip39_passphrase" in delpp_case, (
+        "DELPP must clear passphrase"
+    )
+    assert "get_stored_bip39_passphrase" in delpp_case, (
+        "DELPP must check for a stored passphrase first"
+    )
+    assert "--defaultno" in delpp_case, "DELPP must default to No"
+
+
 # ---------------------------------------------------------------------------
 # Docker image tests
 # ---------------------------------------------------------------------------

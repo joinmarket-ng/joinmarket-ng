@@ -2515,9 +2515,10 @@ No:  automatic coin selection from one mixdepth." 12 64
         check_stale_wallet
         CCHOICE=$(whiptail --title " Config Center " \
           --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-          20 64 8 \
+          21 64 9 \
           "LOG"    "Configure Log Level" \
           "DELPW"  "Delete Active Wallet Password" \
+          "DELPP"  "Delete Active Wallet Passphrase" \
           ""   "" \
           "EDIT"   "Edit config.toml manually (nano)" \
           "BACKUP" "Backup config.toml" \
@@ -2577,6 +2578,29 @@ No:  automatic coin selection from one mixdepth." 12 64
                 whiptail --title " Password Deleted " --msgbox "Wallet password removed from config.toml." 8 50
               else
                 whiptail --title " Config Error " --msgbox "Could not remove the wallet password from config.toml." 8 55
+              fi
+            fi
+            ;;
+
+          DELPP)
+            if ! ensure_active_wallet; then
+              continue
+            fi
+
+            STORED_PP=$(get_stored_bip39_passphrase)
+            if [ -z "$STORED_PP" ]; then
+              whiptail --title " Delete Passphrase " --msgbox "No BIP39 passphrase is currently stored in config.toml." 8 50
+              continue
+            fi
+
+            if whiptail --title " Delete Passphrase " --yesno \
+              "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nDelete the stored BIP39 passphrase for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the passphrase on next use." \
+              13 60 --defaultno 3>&1 1>&2 2>&3; then
+
+              if clear_config_value wallet bip39_passphrase; then
+                whiptail --title " Passphrase Deleted " --msgbox "BIP39 passphrase removed from config.toml." 8 50
+              else
+                whiptail --title " Config Error " --msgbox "Could not remove the BIP39 passphrase from config.toml." 8 55
               fi
             fi
             ;;

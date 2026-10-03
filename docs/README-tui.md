@@ -65,6 +65,9 @@ maker needs to start unattended and you trust the security of the machine. A
 stored passphrase also lets the maker recover the correct wallet after a crash
 or a boot autostart, where no interactive prompt is possible.
 
+Remove a stored passphrase at any time via the Config Center (C → DELPP).
+
+
 ## Maker Bot Control
 
 Start, stop, and inspect the maker here. On Raspiblitz the menu controls a
