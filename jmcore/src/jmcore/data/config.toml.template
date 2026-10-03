@@ -265,6 +265,14 @@
 # and you trust the security of this machine. Prefer leaving it unset and
 # entering the password interactively when prompted by jm-wallet / jm-maker.
 # mnemonic_password = ""        # Password for encrypted mnemonic (plaintext!)
+#
+# SECURITY WARNING: bip39_passphrase is stored IN PLAIN TEXT in this file.
+# Anyone who can read config.toml can derive your wallet together with your
+# seed backup. Only set it when you need unattended maker operation with a
+# passphrase-protected wallet and you trust the security of this machine.
+# Prefer leaving it unset and entering the passphrase interactively when
+# prompted by jm-wallet / jm-maker.
+# bip39_passphrase = ""         # BIP39 passphrase for the mnemonic (plaintext!)
 
 # ============================================================================
 # Logging Settings

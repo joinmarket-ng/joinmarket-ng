@@ -556,6 +556,16 @@ store_password() {
     fi
 }
 
+# Helper: Store the BIP39 passphrase in config.toml.
+#
+# Unlike store_password there is no Raspiblitz bonus-script command for the
+# passphrase; writing config.toml directly works in both environments (the
+# TUI already does so for the log level and the delete-password flow).
+store_bip39_passphrase() {
+    local passphrase="$1"
+    set_config_value wallet bip39_passphrase "$passphrase"
+}
+
 # Helper: Verify that a password can decrypt a wallet file.
 # Returns 0 if the password matches, non-zero otherwise.
 # Usage: verify_wallet_password "/path/to/wallet.mnemonic" "password"
@@ -633,6 +643,100 @@ prompt_and_store_password() {
         fi
     done
     unset pwd_store
+    return 1
+}
+
+# Helper: Prompt for the BIP39 passphrase, confirm it via the wallet
+# fingerprint, and store it in config.toml on success.
+#
+# A passphrase cannot be verified against the wallet file (any passphrase
+# derives a valid wallet), so the wallet fingerprint IS the verification:
+# it is computed from the mnemonic + entered passphrase and must be
+# confirmed by the user before anything is stored. Loops up to 3 times when
+# the fingerprint is rejected (likely a typo). User can cancel at any time.
+#
+# Usage: prompt_and_store_bip39_passphrase
+# Returns 0 when the passphrase was stored, 1 otherwise.
+prompt_and_store_bip39_passphrase() {
+    local attempts=0
+    local max_attempts=3
+    local pp_entry fingerprint
+
+    # Fingerprint derivation needs the decrypted mnemonic. Use the wallet
+    # password from the environment or config.toml without exporting it
+    # session-wide.
+    local fp_password="${MNEMONIC_PASSWORD:-}"
+    if [ -z "$fp_password" ]; then
+        fp_password=$(get_stored_mnemonic_password)
+    fi
+
+    # Security warning first (#453). Make the trade-off explicit.
+    if ! whiptail --title " Security Warning " \
+        --yesno "Storing the BIP39 passphrase in config.toml saves it in PLAIN TEXT.\n\nAnyone with read access to:\n  $CONFIG_FILE\ncan derive your wallet (together with your seed backup).\n\nOnly store the passphrase if the maker bot needs to start\nunattended and you trust the security of this machine.\n\nContinue and store the passphrase?" \
+        18 70 --defaultno 3>&1 1>&2 2>&3; then
+        return 1
+    fi
+
+    local retry=""
+    while [ $attempts -lt $max_attempts ]; do
+        pp_entry=$(whiptail --title " BIP39 Passphrase " \
+            --passwordbox "${retry}Enter the BIP39 passphrase for:\n$(basename "$CURRENT_WALLET")" \
+            10 60 3>&1 1>&2 2>&3)
+        local rc=$?
+        if [ $rc -ne 0 ]; then
+            # User cancelled
+            unset pp_entry
+            return 1
+        fi
+        if [ -z "$pp_entry" ]; then
+            # An empty passphrase means "no passphrase" - nothing to store.
+            unset pp_entry
+            whiptail --title " Info " \
+                --msgbox "Empty passphrase - this wallet does not use one.\nNothing to store." \
+                8 55
+            return 1
+        fi
+
+        # Compute the fingerprint for user confirmation. Clear any stale
+        # cache first so a failed computation can never confirm against a
+        # previous wallet's fingerprint, and fail closed if none could be
+        # produced.
+        rm -f "$FINGERPRINT_CACHE"
+        if ! MNEMONIC_PASSWORD="$fp_password" cache_wallet_fingerprint "$pp_entry" \
+            || [ ! -s "$FINGERPRINT_CACHE" ]; then
+            unset pp_entry
+            whiptail --title " Error " \
+                --msgbox "Could not compute the wallet fingerprint for confirmation.\nFor encrypted wallets the password must be stored first.\n\nPassphrase was NOT saved." \
+                10 60
+            return 1
+        fi
+        fingerprint=$(cat "$FINGERPRINT_CACHE")
+
+        if whiptail --title " Wallet Fingerprint " \
+            --yesno "Wallet fingerprint: ${fingerprint}\n\nIs this the wallet you expect?\nThe passphrase is only stored when you confirm." \
+            12 60 3>&1 1>&2 2>&3; then
+            if ! store_bip39_passphrase "${pp_entry}"; then
+                unset pp_entry
+                whiptail --title " Config Error " \
+                    --msgbox "Could not save the BIP39 passphrase to config.toml." 8 55
+                return 1
+            fi
+            unset pp_entry
+            whiptail --title " Passphrase Stored " \
+                --msgbox "BIP39 passphrase saved to config.toml." 8 55
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        local remaining=$((max_attempts - attempts))
+        if [ $remaining -gt 0 ]; then
+            retry="Fingerprint rejected. ${remaining} attempt(s) remaining.\n\n"
+        else
+            whiptail --title " Not Confirmed " \
+                --msgbox "The fingerprint was not confirmed.\n\nToo many attempts. Passphrase was NOT saved." \
+                10 60
+        fi
+    done
+    unset pp_entry
     return 1
 }
 
@@ -1222,6 +1326,21 @@ ensure_active_wallet() {
                 fi
             fi
         fi
+
+        # Offer passphrase storage as well when none is stored yet. There is
+        # no way to detect whether a wallet uses a passphrase, so ask.
+        local stored_pp
+        stored_pp=$(get_stored_bip39_passphrase)
+        if [ -z "$stored_pp" ]; then
+            if whiptail --title " Store Passphrase " \
+                --yesno "Active wallet: $(basename "$CURRENT_WALLET")\n\nDoes this wallet use a BIP39 passphrase?\nStore it in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
+                13 64 --defaultno 3>&1 1>&2 2>&3; then
+                clear
+                if ! prompt_and_store_bip39_passphrase; then
+                    echo "Passphrase not stored."
+                fi
+            fi
+        fi
     fi
 
     return 0
@@ -1259,6 +1378,41 @@ offer_maker_password_storage() {
     clear
     if ! prompt_and_store_password "$CURRENT_WALLET"; then
         whiptail --title " Password " --msgbox "Password not stored." 8 50
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helper: Offer BIP39 passphrase storage for Maker with context-specific
+# explanation.
+#
+# When the wallet uses a passphrase, the Maker needs it stored for automatic
+# restart after crashes: the passphrase staged in .maker.env is only written
+# when the maker is started from this TUI, so a crash/restart or a Raspiblitz
+# boot autostart derives the wrong (empty-passphrase) wallet unless the
+# passphrase is in config.toml. Called after offer_maker_password_storage()
+# in Maker START/RESTART.
+# ---------------------------------------------------------------------------
+offer_maker_passphrase_storage() {
+    # Check if passphrase already stored
+    local stored_pp
+    stored_pp=$(get_stored_bip39_passphrase)
+    if [ -n "$stored_pp" ]; then
+        return 0  # Already stored
+    fi
+
+    # There is no way to detect whether a wallet uses a passphrase (every
+    # passphrase derives a valid wallet), so ask explicitly.
+    if ! whiptail --title " Store Passphrase for Maker " \
+        --yesno "Does this wallet use a BIP39 passphrase?\n\nFor automatic restart after a crash, the Maker needs\nthe passphrase stored in config.toml.\n\nWithout stored passphrase: a restarted Maker derives a\nDIFFERENT wallet and will not offer your coins.\n\nStore passphrase now?" \
+        16 64 --defaultno 3>&1 1>&2 2>&3; then
+        return 0  # User declined
+    fi
+
+    clear
+    if ! prompt_and_store_bip39_passphrase; then
+        whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
     fi
 
     return 0
@@ -1936,6 +2090,19 @@ No:  automatic coin selection from one mixdepth." 12 64
                   else
                       whiptail --title " Wallet Selected " --msgbox "Active wallet set to: $WNAME\n\nStored password cleared; you will be prompted\nfor the password on next use.\n\nRestart the maker service for changes to take effect." 12 60
                   fi
+
+                  # Offer passphrase storage as well when none is stored yet
+                  # (mirrors the password storage offer above). There is no
+                  # way to detect whether a wallet uses a passphrase, so ask.
+                  STORED_PP=$(get_stored_bip39_passphrase)
+                  if [ -z "$STORED_PP" ]; then
+                      if whiptail --title " Store Passphrase " \
+                          --yesno "Does this wallet use a BIP39 passphrase?\nStore it in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
+                          13 64 --defaultno 3>&1 1>&2 2>&3; then
+                          prompt_and_store_bip39_passphrase || \
+                              whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
+                      fi
+                  fi
               else
                   whiptail --title " Error " --msgbox "File not found: $DATA_DIR/wallets/$WNAME" 8 55
               fi
@@ -2029,6 +2196,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                   continue
               fi
               offer_maker_password_storage
+              offer_maker_passphrase_storage
               if [ "$RASPIBLITZ" = "1" ]; then
                   # Raspiblitz: the maker runs under systemd and reads the
                   # password from .maker.env. Prompt once here and stage it so
@@ -2092,6 +2260,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                   continue
               fi
               offer_maker_password_storage
+              offer_maker_passphrase_storage
               if [ "$MAKER_STATUS" = "RUNNING" ]; then
                   echo "=== Restarting Maker Bot ==="
               else

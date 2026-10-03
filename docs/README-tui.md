@@ -51,6 +51,20 @@ that menu action (inside a subshell), so subsequent prompts in the same flow
 use the same derived wallet without asking again. The cache is not written to
 `config.toml`; it disappears when the subshell exits.
 
+### Storing the BIP39 Passphrase
+
+For unattended maker operation the passphrase can be stored in `config.toml`
+(`wallet.bip39_passphrase`). The menu offers this when you select a wallet and
+when you start or restart the maker. Before anything is stored you must confirm
+the wallet fingerprint derived with the entered passphrase, because a passphrase
+cannot be verified any other way — every passphrase derives a valid wallet.
+
+The passphrase is stored **in plain text**: anyone who can read `config.toml`
+can derive your wallet together with your seed backup. Only store it when the
+maker needs to start unattended and you trust the security of the machine. A
+stored passphrase also lets the maker recover the correct wallet after a crash
+or a boot autostart, where no interactive prompt is possible.
+
 ## Maker Bot Control
 
 Start, stop, and inspect the maker here. On Raspiblitz the menu controls a

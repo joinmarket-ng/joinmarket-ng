@@ -1509,13 +1509,185 @@ def test_tui_script_fingerprint_confirmation_fails_closed() -> None:
     assert 'if [ -n "$fingerprint" ]' not in block, (
         "fingerprint confirmation must be unconditional (fail closed)"
     )
-    assert 'rm -f "$FINGERPRINT_CACHE"\n    if ! cache_wallet_fingerprint "$passphrase"' in block, (
-        "stale fingerprint cache must be cleared before recomputing"
-    )
+    assert (
+        'rm -f "$FINGERPRINT_CACHE"\n    if ! cache_wallet_fingerprint "$passphrase"'
+        in block
+    ), "stale fingerprint cache must be cleared before recomputing"
     assert '[ ! -s "$FINGERPRINT_CACHE" ]' in block, (
         "must fail closed when no fingerprint was produced"
     )
 
+
+# ---------------------------------------------------------------------------
+# BIP39 Passphrase Storage (SETPP)
+# ---------------------------------------------------------------------------
+
+
+def test_tui_script_has_store_bip39_passphrase_helper() -> None:
+    """The script must include store_bip39_passphrase() helper.
+
+    Unlike store_password there is no Raspiblitz bonus-script command for the
+    passphrase, so the helper writes config.toml directly in both environments.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    assert "store_bip39_passphrase()" in content
+
+    block = content.split("store_bip39_passphrase() {", 1)[1].split("\n}", 1)[0]
+    assert 'set_config_value wallet bip39_passphrase "$passphrase"' in block, (
+        "must write the passphrase to config.toml"
+    )
+    assert "RASPIBLITZ" not in block, (
+        "no environment branch: config write works on Raspiblitz too"
+    )
+
+
+def test_tui_script_prompt_and_store_bip39_passphrase_flow() -> None:
+    """prompt_and_store_bip39_passphrase must confirm via wallet fingerprint.
+
+    A passphrase cannot be verified against the wallet file (every passphrase
+    derives a valid wallet), so the fingerprint confirmation IS the
+    verification and must happen before anything is stored.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    assert "prompt_and_store_bip39_passphrase()" in content
+
+    block = content.split("prompt_and_store_bip39_passphrase() {", 1)[1]
+    block = block.split("\n}", 1)[0]
+
+    # Plaintext security warning, defaulting to No (mirrors #453).
+    assert "PLAIN TEXT" in block
+    assert "--defaultno" in block
+
+    # Fingerprint must be computed from the entered passphrase and confirmed
+    # BEFORE storing; a failed computation must fail closed.
+    fp_pos = block.index("cache_wallet_fingerprint")
+    store_pos = block.index('store_bip39_passphrase "${pp_entry}"')
+    assert fp_pos < store_pos, "fingerprint confirmation must precede storing"
+    assert 'rm -f "$FINGERPRINT_CACHE"' in block, "stale cache must be cleared"
+    assert '[ ! -s "$FINGERPRINT_CACHE" ]' in block, "must fail closed"
+    assert "Wallet fingerprint:" in block
+
+    # Empty passphrase means "no passphrase" and must not be stored.
+    assert 'if [ -z "$pp_entry" ]; then' in block
+
+    # Limited retries when the fingerprint is rejected (likely a typo).
+    assert "max_attempts=3" in block
+    assert "Fingerprint rejected" in block
+
+
+def test_tui_script_has_offer_maker_passphrase_storage_helper() -> None:
+    """The script must include offer_maker_passphrase_storage() helper.
+
+    A passphrase-protected wallet needs the passphrase stored for automatic
+    restart after crashes; otherwise a restarted maker derives the wrong
+    (empty-passphrase) wallet.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    assert "offer_maker_passphrase_storage()" in content
+
+    # Must explain the auto-restart requirement in the dialog text so the user
+    # understands the functional necessity, not just convenience.
+    maker_block = content.split("offer_maker_passphrase_storage()", 1)[1]
+    assert "automatic restart" in maker_block.lower()
+
+
+def test_tui_script_offer_maker_passphrase_skips_if_already_stored() -> None:
+    """offer_maker_passphrase_storage must skip if passphrase already stored.
+
+    Prevents double-prompt scenario: if the SEL flow just stored the
+    passphrase, Maker START must not ask again.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    maker_block = content.split("offer_maker_passphrase_storage() {", 1)[1]
+    maker_block = maker_block.split("\n}", 1)[0]
+
+    assert "get_stored_bip39_passphrase" in maker_block, (
+        "Must check existing stored passphrase"
+    )
+    assert 'if [ -n "$stored_pp" ]; then' in maker_block, (
+        "Must check if stored_pp is non-empty"
+    )
+    assert "return 0" in maker_block, "Must return early if passphrase already stored"
+
+
+def test_tui_script_maker_start_restart_offer_passphrase_storage() -> None:
+    """Maker START and RESTART must offer passphrase storage after the password.
+
+    Order matters: the password may be needed to decrypt the mnemonic for the
+    fingerprint confirmation, so the password offer must come first.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    start_block = content.split("START)", 1)[1].split("STOP)", 1)[0]
+    pwd_pos = start_block.find("offer_maker_password_storage")
+    pp_pos = start_block.find("offer_maker_passphrase_storage")
+    assert pwd_pos != -1, "password offer must be called in Maker START"
+    assert pp_pos != -1, "passphrase offer must be called in Maker START"
+    assert pwd_pos < pp_pos, "passphrase offer must come after password offer"
+
+    restart_block = content.split("RESTART)", 1)[1].split("BONDS)", 1)[0]
+    pwd_pos = restart_block.find("offer_maker_password_storage")
+    pp_pos = restart_block.find("offer_maker_passphrase_storage")
+    assert pwd_pos != -1, "password offer must be called in Maker RESTART"
+    assert pp_pos != -1, "passphrase offer must be called in Maker RESTART"
+    assert pwd_pos < pp_pos, "passphrase offer must come after password offer"
+
+
+def test_tui_script_ensure_active_wallet_offers_passphrase_on_change() -> None:
+    """ensure_active_wallet() must offer passphrase storage when wallet changed.
+
+    Mirrors the password storage offer: only when wallet_just_changed, and
+    only when no passphrase is stored yet, so the user is not nagged on
+    every operation.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    ensure_block = content.split("ensure_active_wallet()", 1)[1]
+    ensure_block = ensure_block.split("offer_maker_password_storage()", 1)[0]
+
+    changed_block = ensure_block.split('if [ "$wallet_just_changed" = "yes" ]', 1)[1]
+    assert "get_stored_bip39_passphrase" in changed_block, (
+        "must skip the offer when a passphrase is already stored"
+    )
+    assert "prompt_and_store_bip39_passphrase" in changed_block, (
+        "must offer passphrase storage when the wallet changed"
+    )
+
+
+def test_tui_script_select_wallet_offers_passphrase_storage() -> None:
+    """W -> SEL must offer passphrase storage after selecting a wallet.
+
+    Mirrors the password storage offer in the same flow so both credentials
+    can be recorded at the same point.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    sel_block = content.split("SEL)", 1)[1]
+    assert "get_stored_bip39_passphrase" in sel_block, (
+        "must skip the offer when a passphrase is already stored"
+    )
+    assert "prompt_and_store_bip39_passphrase" in sel_block, (
+        "must offer passphrase storage after wallet selection"
+    )
+
+
+def test_tui_template_documents_bip39_passphrase() -> None:
+    """config.toml.template must document wallet.bip39_passphrase.
+
+    The commented-out default must carry the same plaintext security warning
+    as mnemonic_password.
+    """
+    template_path = (
+        REPO_ROOT / "jmcore" / "src" / "jmcore" / "data" / "config.toml.template"
+    )
+    template = template_path.read_text()
+
+    assert '# bip39_passphrase = ""' in template
+    assert "bip39_passphrase is stored IN PLAIN TEXT" in template
 
 
 def test_tui_script_unified_error_message() -> None:
