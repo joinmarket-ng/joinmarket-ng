@@ -188,6 +188,14 @@ class WalletConfig(BaseModel):
         default_factory=lambda: SecretStr(""),
         description="BIP39 passphrase (13th/25th word)",
     )
+    wallet_with_passphrase: bool = Field(
+        default=False,
+        description=(
+            "Whether the wallet uses a BIP39 passphrase. Gates interactive "
+            "passphrase prompting on wallet unlock (opt-in; default false "
+            "never prompts)."
+        ),
+    )
 
     # Network settings
     network: NetworkType = Field(

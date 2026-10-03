@@ -291,14 +291,17 @@ fi
 
 
 def test_cli_resolve_mnemonic_empty_env_means_no_passphrase(tmp_path: Path) -> None:
-    """An explicitly empty BIP39_PASSPHRASE env must not trigger a prompt."""
+    """An explicitly empty BIP39_PASSPHRASE env must not trigger a prompt when
+    wallet_with_passphrase is enabled (the TUI session cache relies on this)."""
     from jmcore.cli_common import resolve_mnemonic
     from jmcore.settings import get_settings
 
     wallet_path = tmp_path / "wallet.mnemonic"
     save_mnemonic_file(MNEMONIC, wallet_path, None)
     config_path = tmp_path / "config.toml"
-    config_path.write_text('[bitcoin]\nnetwork = "regtest"\n')
+    config_path.write_text(
+        '[bitcoin]\nnetwork = "regtest"\n[wallet]\nwallet_with_passphrase = true\n'
+    )
     os.environ["JOINMARKET_CONFIG_FILE"] = str(config_path)
     os.environ["BIP39_PASSPHRASE"] = ""
     settings = get_settings()

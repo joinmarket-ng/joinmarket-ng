@@ -18,20 +18,24 @@ def _run_helper(
     key: str,
     *,
     value: str | None = None,
+    as_bool: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
+    argv = [
+        sys.executable,
+        "-m",
+        "jmcore.config_file",
+        command,
+        "--config",
+        str(config_path),
+        "--section",
+        section,
+        "--key",
+        key,
+    ]
+    if as_bool:
+        argv.append("--bool")
     return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "jmcore.config_file",
-            command,
-            "--config",
-            str(config_path),
-            "--section",
-            section,
-            "--key",
-            key,
-        ],
+        argv,
         input=None if value is None else value.encode(),
         check=False,
         capture_output=True,
@@ -327,3 +331,52 @@ def test_set_relocates_a_key_written_after_the_chapter_banner(tmp_path: Path) ->
     parsed = tomlkit.parse(config_text)
     assert parsed["wallet"]["mnemonic_file"] == "wallet.m"
     assert parsed["logging"]["level"] == "INFO"
+
+
+def test_set_get_and_remove_boolean_values(tmp_path: Path) -> None:
+    """Booleans round-trip as TOML booleans with a stable text rendering."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[wallet]\n")
+
+    assert (
+        _run_helper(
+            "set", config_path, "wallet", "wallet_with_passphrase", value="true", as_bool=True
+        ).returncode
+        == 0
+    )
+    config_text = config_path.read_text()
+    assert "wallet_with_passphrase = true" in config_text
+    assert tomlkit.parse(config_text)["wallet"]["wallet_with_passphrase"] is True
+    assert _run_helper("get", config_path, "wallet", "wallet_with_passphrase").stdout == b"true"
+
+    # A trailing newline from the stdin producer is tolerated.
+    assert (
+        _run_helper(
+            "set", config_path, "wallet", "wallet_with_passphrase", value="false\n", as_bool=True
+        ).returncode
+        == 0
+    )
+    assert tomlkit.parse(config_path.read_text())["wallet"]["wallet_with_passphrase"] is False
+    assert _run_helper("get", config_path, "wallet", "wallet_with_passphrase").stdout == b"false"
+
+    result = _run_helper("remove", config_path, "wallet", "wallet_with_passphrase")
+    assert result.returncode == 0, result.stderr.decode()
+    assert "wallet_with_passphrase" not in config_path.read_text()
+
+
+def test_boolean_values_reject_invalid_input_and_type_changes(tmp_path: Path) -> None:
+    """--bool accepts only 'true'/'false' and never changes a key's type."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[wallet]\nflag = true\nname = "value"\n')
+
+    invalid = _run_helper("set", config_path, "wallet", "flag", value="yes", as_bool=True)
+    assert invalid.returncode == 2
+    assert config_path.read_text() == '[wallet]\nflag = true\nname = "value"\n'
+
+    # String write to a boolean key and boolean write to a string key both fail.
+    assert _run_helper("set", config_path, "wallet", "flag", value="false").returncode == 2
+    assert (
+        _run_helper("set", config_path, "wallet", "name", value="true", as_bool=True).returncode
+        == 2
+    )
+    assert config_path.read_text() == '[wallet]\nflag = true\nname = "value"\n'

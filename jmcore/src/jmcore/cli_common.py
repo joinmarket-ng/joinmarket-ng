@@ -760,9 +760,13 @@ def resolve_mnemonic(
 
     BIP39 passphrase priority:
     1. --bip39-passphrase argument
-    2. BIP39_PASSPHRASE environment variable
+    2. BIP39_PASSPHRASE environment variable (an exported but empty value
+       counts as an explicit answer only when wallet.wallet_with_passphrase
+       is enabled; otherwise it is treated as unset and falls through)
     3. Config file wallet.bip39_passphrase setting
-    4. Interactive prompt (if --prompt-bip39-passphrase is set)
+    4. Interactive prompt (if --prompt-bip39-passphrase is set or
+       wallet.wallet_with_passphrase is enabled; the setting fails loudly
+       when no interactive terminal is available)
     5. Empty string (default - no passphrase)
 
     For encrypted mnemonic files, the password is resolved as:
@@ -871,14 +875,35 @@ def resolve_mnemonic(
     resolved_passphrase = ""
     if bip39_passphrase:
         resolved_passphrase = bip39_passphrase
-    elif "BIP39_PASSPHRASE" in os.environ:
-        # Explicitly exported (even empty) means "use this value, do not prompt".
-        # This lets a TUI subshell cache "no passphrase" without falling through
-        # to an interactive prompt.
+    elif "BIP39_PASSPHRASE" in os.environ and settings.wallet.wallet_with_passphrase:
+        # With wallet_with_passphrase enabled, an exported BIP39_PASSPHRASE is
+        # authoritative even when empty: it counts as an explicit session
+        # answer ("no passphrase"), which lets a TUI subshell cache that
+        # answer instead of re-prompting on every spawned command. With the
+        # default (setting disabled), an empty value is treated as unset and
+        # falls through to the walrus branch below, matching standard CLI
+        # behavior.
         resolved_passphrase = os.environ.get("BIP39_PASSPHRASE", "")
+    elif env_passphrase := os.environ.get("BIP39_PASSPHRASE"):
+        resolved_passphrase = env_passphrase
     elif settings.wallet.bip39_passphrase is not None:
         resolved_passphrase = settings.wallet.bip39_passphrase.get_secret_value()
-    elif prompt_bip39_passphrase:
+    elif prompt_bip39_passphrase or settings.wallet.wallet_with_passphrase:
+        # A persistent prompt request (the wallet_with_passphrase setting)
+        # must never silently fall back to an empty passphrase when no
+        # interactive terminal is available (e.g. under systemd): that would
+        # derive the WRONG (passphrase-less) wallet. The one-shot CLI flag
+        # keeps the legacy behavior: piped stdin works, empty input aborts.
+        if settings.wallet.wallet_with_passphrase and not prompt_bip39_passphrase:
+            from jmcore.confirmation import is_interactive_mode
+
+            if not is_interactive_mode():
+                raise ValueError(
+                    "wallet.wallet_with_passphrase is enabled but no passphrase was "
+                    "provided via BIP39_PASSPHRASE env or wallet.bip39_passphrase "
+                    "config, and no interactive terminal is available. Refusing to "
+                    "silently derive the passphrase-less wallet."
+                )
         # Lazy import typer only when needed for prompting
         try:
             import typer

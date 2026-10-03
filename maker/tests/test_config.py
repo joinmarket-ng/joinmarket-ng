@@ -543,6 +543,33 @@ class TestBuildMakerConfig:
         )
         assert config.max_sats_freeze_reuse == 9_999
 
+    def test_wallet_with_passphrase_forwarded(self) -> None:
+        """``wallet.wallet_with_passphrase`` must reach the MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings(wallet={"wallet_with_passphrase": True})
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.wallet_with_passphrase is True
+
+    def test_wallet_with_passphrase_defaults_to_false(self) -> None:
+        """Without the setting, the MakerConfig never prompts for passphrases."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        config = build_maker_config(
+            settings=JoinMarketSettings(),
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.wallet_with_passphrase is False
+
     def test_max_sats_freeze_reuse_defaults_to_freeze_all(self) -> None:
         """Default ``max_sats_freeze_reuse`` is -1 (freeze all reuse)."""
         from jmcore.settings import JoinMarketSettings

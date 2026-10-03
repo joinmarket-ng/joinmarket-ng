@@ -1031,6 +1031,188 @@ class TestResolveMnemonic:
         assert not any("INVALID BIP39 checksum" in entry for entry in logs)
 
 
+class TestResolveMnemonicPassphraseFlag:
+    """resolve_mnemonic() prompting gated by wallet_with_passphrase."""
+
+    VALID_MNEMONIC = "abandon " * 11 + "about"
+
+    def test_flag_true_prompts_when_interactive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the flag set, an interactive session is asked for the passphrase."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("BIP39_PASSPHRASE", raising=False)
+        settings = JoinMarketSettings(data_dir=tmp_path, wallet={"wallet_with_passphrase": True})
+
+        with (
+            patch("jmcore.confirmation.is_interactive_mode", return_value=True),
+            patch("typer.prompt", return_value="entered pass") as mock_prompt,
+            patch("jmcore.cli_common._confirm_prompted_wallet") as mock_confirm,
+        ):
+            result = resolve_mnemonic(settings, mnemonic=self.VALID_MNEMONIC)
+
+        assert result is not None
+        assert result.bip39_passphrase == "entered pass"
+        mock_prompt.assert_called_once()
+        mock_confirm.assert_called_once_with(self.VALID_MNEMONIC, "entered pass")
+
+    def test_flag_true_fails_loudly_when_non_interactive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Flag set + no passphrase source + no TTY must raise, not silently
+        derive the wrong (passphrase-less) wallet."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("BIP39_PASSPHRASE", raising=False)
+        settings = JoinMarketSettings(data_dir=tmp_path, wallet={"wallet_with_passphrase": True})
+
+        with (
+            patch("jmcore.confirmation.is_interactive_mode", return_value=False),
+            pytest.raises(ValueError, match=r"wallet\.wallet_with_passphrase is enabled"),
+        ):
+            resolve_mnemonic(settings, mnemonic=self.VALID_MNEMONIC)
+
+    def test_cli_prompt_flag_keeps_legacy_piped_stdin_behavior(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--prompt-bip39-passphrase does NOT fail-fast without a TTY: piped
+        stdin remains a valid answer channel for the one-shot CLI flag. Only
+        the persistent wallet_with_passphrase setting fails loudly (it applies
+        to unattended restarts where a silent wrong-wallet derivation is the
+        risk)."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("BIP39_PASSPHRASE", raising=False)
+        settings = JoinMarketSettings(data_dir=tmp_path)
+
+        with (
+            patch("jmcore.confirmation.is_interactive_mode", return_value=False),
+            patch("typer.prompt", return_value="piped pass") as mock_prompt,
+            patch("jmcore.cli_common._confirm_prompted_wallet"),
+        ):
+            result = resolve_mnemonic(
+                settings, mnemonic=self.VALID_MNEMONIC, prompt_bip39_passphrase=True
+            )
+
+        assert result is not None
+        assert result.bip39_passphrase == "piped pass"
+        mock_prompt.assert_called_once()
+
+    def test_flag_true_env_var_wins_over_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exported BIP39_PASSPHRASE satisfies the flag without prompting."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("BIP39_PASSPHRASE", "env pass")
+        settings = JoinMarketSettings(data_dir=tmp_path, wallet={"wallet_with_passphrase": True})
+
+        with (
+            patch("jmcore.confirmation.is_interactive_mode", return_value=False),
+            patch("typer.prompt", side_effect=AssertionError("must not prompt")),
+        ):
+            result = resolve_mnemonic(settings, mnemonic=self.VALID_MNEMONIC)
+
+        assert result is not None
+        assert result.bip39_passphrase == "env pass"
+
+    def test_flag_true_exported_empty_env_is_authoritative(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the flag set, an exported but EMPTY BIP39_PASSPHRASE is an
+        explicit "no passphrase" session answer (the TUI caches it this way)
+        and must neither prompt nor raise the non-interactive error."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("BIP39_PASSPHRASE", "")
+        settings = JoinMarketSettings(data_dir=tmp_path, wallet={"wallet_with_passphrase": True})
+
+        with (
+            patch("jmcore.confirmation.is_interactive_mode", return_value=False),
+            patch("typer.prompt", side_effect=AssertionError("must not prompt")),
+        ):
+            result = resolve_mnemonic(settings, mnemonic=self.VALID_MNEMONIC)
+
+        assert result is not None
+        assert result.bip39_passphrase == ""
+
+    def test_flag_false_exported_empty_env_falls_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the default (flag off), an exported but empty BIP39_PASSPHRASE
+        is treated as unset: it does not count as an answer and the
+        --prompt-bip39-passphrase flow still asks interactively."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("BIP39_PASSPHRASE", "")
+        settings = JoinMarketSettings(data_dir=tmp_path)
+
+        with (
+            patch("typer.prompt", return_value="typed pass") as mock_prompt,
+            patch("jmcore.cli_common._confirm_prompted_wallet"),
+        ):
+            result = resolve_mnemonic(
+                settings, mnemonic=self.VALID_MNEMONIC, prompt_bip39_passphrase=True
+            )
+
+        assert result is not None
+        assert result.bip39_passphrase == "typed pass"
+        mock_prompt.assert_called_once()
+
+    def test_flag_true_config_passphrase_wins_over_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stored wallet.bip39_passphrase satisfies the flag without prompting."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("BIP39_PASSPHRASE", raising=False)
+        settings = JoinMarketSettings(
+            data_dir=tmp_path,
+            wallet={"wallet_with_passphrase": True, "bip39_passphrase": "stored pass"},
+        )
+
+        with (
+            patch("jmcore.confirmation.is_interactive_mode", return_value=False),
+            patch("typer.prompt", side_effect=AssertionError("must not prompt")),
+        ):
+            result = resolve_mnemonic(settings, mnemonic=self.VALID_MNEMONIC)
+
+        assert result is not None
+        assert result.bip39_passphrase == "stored pass"
+
+    def test_flag_false_never_prompts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default (flag off): empty passphrase, no prompt, no error."""
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("BIP39_PASSPHRASE", raising=False)
+        settings = JoinMarketSettings(data_dir=tmp_path)
+
+        with patch("typer.prompt", side_effect=AssertionError("must not prompt")):
+            result = resolve_mnemonic(settings, mnemonic=self.VALID_MNEMONIC)
+
+        assert result is not None
+        assert result.bip39_passphrase == ""
+
+
 class TestCreateBackendCreationHeight:
     """Tests for create_backend() with creation_height parameter."""
 

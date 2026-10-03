@@ -326,6 +326,7 @@ class TestBuildTakerConfig:
         settings.wallet.scan_lookback_blocks = 1000
         settings.wallet.default_fee_block_target = 3  # Has a default value
         settings.wallet.max_fee_rate_sat_vb = 1_000.0  # fee-rate cap
+        settings.wallet.wallet_with_passphrase = False
 
         return settings
 
@@ -653,6 +654,24 @@ class TestBuildTakerConfig:
         assert mock_cls.call_args is not None
         assert mock_cls.call_args.kwargs["scan_start_height"] == 765_432
         assert mock_cls.call_args.kwargs["scan_lookback_blocks"] == 12_345
+
+    def test_wallet_with_passphrase_reaches_config(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """``wallet.wallet_with_passphrase`` must survive the settings -> taker
+        config round trip."""
+        mock_settings.wallet.wallet_with_passphrase = True
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.wallet_with_passphrase is True
 
     def test_neutrino_fee_source_in_backend_config(
         self, sample_mnemonic: str, mock_settings: MagicMock

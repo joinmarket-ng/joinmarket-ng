@@ -352,6 +352,7 @@ def build_maker_config(
         smart_scan=settings.wallet.smart_scan,
         background_full_rescan=settings.wallet.background_full_rescan,
         scan_lookback_blocks=settings.wallet.scan_lookback_blocks,
+        wallet_with_passphrase=settings.wallet.wallet_with_passphrase,
         tor_control=tor_control_cfg,
         onion_host=settings.maker.onion_host,
         onion_serving_host=effective_onion_host,

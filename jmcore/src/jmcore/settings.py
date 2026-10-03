@@ -531,6 +531,20 @@ class WalletSettings(BaseModel):
         default=None,
         description="BIP39 passphrase (13th/25th word). For security, prefer BIP39_PASSPHRASE env var.",
     )
+    wallet_with_passphrase: bool = Field(
+        default=False,
+        description=(
+            "Whether the wallet uses a BIP39 passphrase. Passphrases are "
+            "strictly opt-in: with the default false, no passphrase prompt is "
+            "ever shown and wallets unlock with an empty passphrase. Set to "
+            "true ONLY if the wallet actually has a passphrase: interactive "
+            "commands then ask for it on wallet unlock (unless provided via "
+            "BIP39_PASSPHRASE env or wallet.bip39_passphrase), and "
+            "non-interactive commands fail loudly instead of silently "
+            "deriving the wrong (passphrase-less) wallet. The setting is "
+            "global and applies to all wallets until set back to false."
+        ),
+    )
 
 
 class NotificationSettings(BaseModel):

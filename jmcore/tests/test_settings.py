@@ -120,12 +120,15 @@ class TestConfigTemplate:
 
             canonical_keys = template_keys.get(section)
             assert canonical_keys is not None, f"Missing [{section}] in config.toml.template"
-            expected_keys = set(type(nested_settings).model_fields) - excluded_fields.get(
-                section, set()
-            )
-            assert canonical_keys == expected_keys
+            excluded = excluded_fields.get(section, set())
+            expected_keys = set(type(nested_settings).model_fields) - excluded
+            # Excluded fields are also documented (commented) in the template,
+            # so subtract them from the template side as well.
+            assert canonical_keys - excluded == expected_keys
 
-            derived_env_names.update(f"{section}__{key}".upper() for key in canonical_keys)
+            derived_env_names.update(
+                f"{section}__{key}".upper() for key in canonical_keys - excluded
+            )
             expected_env_names.update(f"{section}__{key}".upper() for key in expected_keys)
 
         assert JoinMarketSettings.model_config["env_nested_delimiter"] == "__"
@@ -1560,3 +1563,20 @@ class TestEnsureConfigFile:
         assert result == config_file
         assert config_file.exists()
         assert not (data_dir / "config.toml").exists()
+
+
+class TestWalletWithPassphraseSetting:
+    """The wallet_with_passphrase flag gates all BIP39 passphrase prompting."""
+
+    def test_wallet_with_passphrase_defaults_to_false(self) -> None:
+        """Passphrases are strictly opt-in: the default never prompts."""
+        assert JoinMarketSettings().wallet.wallet_with_passphrase is False
+
+    def test_wallet_with_passphrase_parses_from_config_dict(self) -> None:
+        settings = JoinMarketSettings(wallet={"wallet_with_passphrase": True})
+        assert settings.wallet.wallet_with_passphrase is True
+
+    def test_wallet_with_passphrase_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """WALLET__WALLET_WITH_PASSPHRASE maps to the nested setting."""
+        monkeypatch.setenv("WALLET__WALLET_WITH_PASSPHRASE", "true")
+        assert JoinMarketSettings().wallet.wallet_with_passphrase is True
