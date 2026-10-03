@@ -92,7 +92,9 @@ child.wait()
 def test_ensure_wallet_unlocked_global_caches_passphrase(
     tmp_path: Path, encrypted: bool, passphrase: str
 ) -> None:
-    """ensure_wallet_unlocked_global prompts, confirms fingerprint, and caches BIP39_PASSPHRASE."""
+    """With the flag on, ensure_wallet_unlocked_global prompts, confirms the
+    fingerprint, and caches BIP39_PASSPHRASE (config sets
+    wallet_with_passphrase=true)."""
     wallet_path = tmp_path / "wallet.mnemonic"
     save_mnemonic_file(
         MNEMONIC, wallet_path, "test-encryption-password" if encrypted else None
@@ -103,6 +105,7 @@ def test_ensure_wallet_unlocked_global_caches_passphrase(
     # fail-closed) needs it to derive the fingerprint for real.
     config_path.write_text(
         f'[bitcoin]\nnetwork = "regtest"\n\n[wallet]\nmnemonic_file = "{wallet_path}"\n'
+        "wallet_with_passphrase = true\n"
     )
     content = SCRIPT_PATH.read_text()
     helpers = content.split(
@@ -179,6 +182,91 @@ jm-wallet info --prompt-bip39-passphrase
     assert "test-encryption-password" not in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("encrypted", [True, False])
+def test_ensure_wallet_unlocked_global_skips_prompt_without_flag(
+    tmp_path: Path, encrypted: bool
+) -> None:
+    """Without wallet_with_passphrase, unlock never prompts for a passphrase.
+
+    Passphrases are strictly opt-in: the flag is unset here, so
+    ensure_wallet_unlocked_global must export an explicitly empty
+    BIP39_PASSPHRASE without calling the whiptail passphrase dialog (the
+    whiptail stub fails the script if the dialog is ever shown).
+    """
+    wallet_path = tmp_path / "wallet.mnemonic"
+    save_mnemonic_file(
+        MNEMONIC, wallet_path, "test-encryption-password" if encrypted else None
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[bitcoin]\nnetwork = "regtest"\n\n[wallet]\nmnemonic_file = "{wallet_path}"\n'
+    )
+    content = SCRIPT_PATH.read_text()
+    helpers = content.split(
+        "# =============================================================================\n# Helpers",
+        1,
+    )[1].split(
+        "# =============================================================================\n# Main Loop",
+        1,
+    )[0]
+    shell_path = tmp_path / "wallet-no-prompt.sh"
+    shell_path.write_text(
+        helpers
+        + """
+clear() { :; }
+pause() { :; }
+whiptail() {
+    if [ "$2" = " Wallet Password " ]; then
+        printf '%s' 'test-encryption-password' >&2
+        return 0
+    fi
+    if [ "$2" = " BIP39 Passphrase " ]; then
+        # The passphrase dialog must never appear without the flag.
+        return 1
+    fi
+    if [ "$2" = " Wallet Fingerprint " ]; then
+        return 0
+    fi
+    return 90
+}
+jm-wallet() {
+    echo "BIP39_PASSPHRASE_IN_CLI=${BIP39_PASSPHRASE}"
+    return 0
+}
+ensure_wallet_password() { :; }
+"""
+        + f'CURRENT_WALLET="{wallet_path}"\n'
+        + f'FINGERPRINT_CACHE="{tmp_path}/.current_fingerprint"\n'
+        + ("MNEMONIC_PASSWORD='test-encryption-password' " if encrypted else "")
+        + """ensure_wallet_unlocked_global || exit 1
+jm-wallet info --prompt-bip39-passphrase
+"""
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("MNEMONIC", "BIP39_", "JOINMARKET_", "WALLET__"))
+    }
+    env.update(
+        TUI_PYTHON=sys.executable,
+        CONFIG_FILE=str(config_path),
+        JOINMARKET_CONFIG_FILE=str(config_path),
+        JOINMARKET_DATA_DIR=str(tmp_path),
+        MNEMONIC_FILE=str(wallet_path),
+        CURRENT_WALLET=str(wallet_path),
+        MAKER_ENV=str(tmp_path / ".maker.env"),
+    )
+    result = _run_test_shell(
+        ["bash", str(shell_path)],
+        input_text="",
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "BIP39_PASSPHRASE_IN_CLI=" in result.stdout, result.stdout
+    assert PASSPHRASE not in result.stdout
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -195,7 +283,8 @@ jm-wallet info --prompt-bip39-passphrase
 def test_wallet_operations_reuse_cached_passphrase(
     tmp_path: Path, command: str, passphrase: str, encrypted: bool
 ) -> None:
-    """HIST/FREEZE/SEND/BONDS/TAKER derive the same wallet via cached BIP39_PASSPHRASE."""
+    """HIST/FREEZE/SEND/BONDS/TAKER derive the same wallet via cached BIP39_PASSPHRASE
+    (config sets wallet_with_passphrase=true so the prompt path runs)."""
     wallet_path = tmp_path / "wallet.mnemonic"
     save_mnemonic_file(
         MNEMONIC, wallet_path, "test-encryption-password" if encrypted else None
@@ -206,6 +295,7 @@ def test_wallet_operations_reuse_cached_passphrase(
     # fail-closed) needs it to derive the fingerprint for real.
     config_path.write_text(
         f'[bitcoin]\nnetwork = "regtest"\n\n[wallet]\nmnemonic_file = "{wallet_path}"\n'
+        "wallet_with_passphrase = true\n"
     )
     content = SCRIPT_PATH.read_text()
     helpers = content.split(

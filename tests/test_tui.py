@@ -2423,3 +2423,82 @@ def test_tui_script_uses_portable_backup_detection() -> None:
     assert '[ -f "$_f" ] || continue' in glob_block, (
         "Must filter for regular files to exclude non-matching globs"
     )
+
+
+# ---------------------------------------------------------------------------
+# wallet_with_passphrase flag (opt-in passphrase mode)
+# ---------------------------------------------------------------------------
+
+
+def test_tui_script_wallet_with_passphrase_flag_gates_unlock_prompt() -> None:
+    """ensure_wallet_unlocked_global must skip the prompt unless the flag is on.
+
+    Passphrases are strictly opt-in: with wallet_with_passphrase unset/false the
+    TUI exports an empty BIP39_PASSPHRASE (so downstream CLIs treat it as an
+    explicit "no passphrase") and never shows the passphrase dialog. The flag
+    check must run AFTER staged (.maker.env) and stored (config.toml)
+    passphrases so an explicit secret always wins, and BEFORE the whiptail
+    prompt.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("ensure_wallet_unlocked_global() {", 1)[1].split("\n}", 1)[0]
+
+    gate = 'if [ "$(get_wallet_with_passphrase)" != "true" ]; then'
+    assert gate in block, "unlock must be gated on the wallet_with_passphrase flag"
+    assert 'export BIP39_PASSPHRASE=""' in block, (
+        "flag off must export an explicit empty passphrase"
+    )
+    assert block.index(gate) > block.index("get_stored_bip39_passphrase"), (
+        "a stored passphrase must win over the flag"
+    )
+    assert block.index(gate) < block.index("--passwordbox"), (
+        "the flag check must run before the interactive prompt"
+    )
+
+
+def test_tui_script_no_passphrase_meta_question() -> None:
+    """The "Does this wallet use a BIP39 passphrase?" question must be gone.
+
+    The wallet_with_passphrase flag replaces the meta-question everywhere:
+    storage offers are gated on the flag instead of asking the user to
+    self-report per wallet.
+    """
+    content = SCRIPT_PATH.read_text()
+    assert "Does this wallet use a BIP39 passphrase?" not in content
+
+
+def test_tui_script_passphrase_storage_offers_require_flag() -> None:
+    """All SETPP storage offers must be gated on wallet_with_passphrase=true.
+
+    offer_maker_passphrase_storage and the two wallet-change offers must not
+    appear when the wallet does not use a passphrase.
+    """
+    content = SCRIPT_PATH.read_text()
+
+    block = content.split("offer_maker_passphrase_storage() {", 1)[1].split("\n}", 1)[0]
+    assert block.index(
+        'if [ "$(get_wallet_with_passphrase)" != "true" ]; then'
+    ) < block.index("get_stored_bip39_passphrase"), (
+        "maker storage offer must bail out before checking stored state when flag is off"
+    )
+
+    # Both wallet-change storage offers are wrapped in a flag check.
+    assert (
+        content.count('if [ "$(get_wallet_with_passphrase)" = "true" ]; then') == 2
+    ), "both wallet-change passphrase storage offers must be flag-gated"
+
+
+def test_tui_script_config_center_has_passphrase_mode_toggle() -> None:
+    """The Config Center must offer a wallet_with_passphrase on/off toggle."""
+    content = SCRIPT_PATH.read_text()
+
+    assert '"PPFLAG"' in content, (
+        "Config Center menu must offer the passphrase mode entry"
+    )
+    assert "set_config_bool wallet wallet_with_passphrase" in content, (
+        "the toggle must persist the flag as a TOML boolean"
+    )
+    assert "set_config_bool() {" in content, "set_config_bool helper must exist"
+
+    helper = content.split("get_wallet_with_passphrase() {", 1)[1].split("\n}", 1)[0]
+    assert "--section wallet --key wallet_with_passphrase" in helper

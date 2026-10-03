@@ -150,6 +150,26 @@ from, without printing the words. However, this option filters whole log records
 and does not redact their contents. Detailed exception tracebacks can include
 variable values. Keep these logs private and review them before sharing excerpts.
 
+## Wallet Passphrase Mode
+
+`[wallet].wallet_with_passphrase` defaults to `false`. BIP39 passphrases are
+strictly opt-in: with the default, no passphrase prompt is ever shown and
+wallets unlock with an empty passphrase.
+
+Set it to `true` only if your wallet actually has a passphrase. Interactive
+commands then ask for the passphrase on wallet unlock, and unattended
+(non-interactive) commands fail loudly instead of silently deriving the wrong
+(passphrase-less) wallet. The passphrase itself is resolved with the usual
+priority: `--bip39-passphrase` CLI argument, `BIP39_PASSPHRASE` environment
+variable, then `[wallet].bip39_passphrase`. A stored or exported passphrase
+always satisfies the flag without prompting. With the flag enabled, an
+exported `BIP39_PASSPHRASE` is authoritative even when empty — this is how
+the TUI caches a "no passphrase" answer for the session so spawned commands
+do not re-prompt. With the default (flag disabled), an empty exported value
+is treated as unset and falls through to the next source, matching standard
+CLI behavior. The setting is global and applies to all wallets until set
+back to `false`.
+
 ## Wallet History Reconstruction
 
 `[wallet].reconstruct_history` defaults to `true`. When a wallet with no local

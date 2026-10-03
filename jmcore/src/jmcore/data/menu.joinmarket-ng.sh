@@ -297,6 +297,14 @@ get_stored_bip39_passphrase() {
         --config "$CONFIG_FILE" --section wallet --key bip39_passphrase
 }
 
+# Helper: Get the wallet_with_passphrase flag from config.toml ("true"/"false",
+# empty if unset). Unset means "false": passphrases are strictly opt-in and no
+# passphrase prompt is shown unless the user explicitly enabled the flag.
+get_wallet_with_passphrase() {
+    "$TUI_PYTHON" -m jmcore.config_file get \
+        --config "$CONFIG_FILE" --section wallet --key wallet_with_passphrase
+}
+
 # Helper: Read the temporary wallet password from .maker.env (empty if absent).
 #
 # On Raspiblitz the wallet password (when NOT permanently stored in
@@ -370,6 +378,16 @@ set_config_value() {
     local key=$2
     local value=$3
     printf '%s' "$value" | "$TUI_PYTHON" -m jmcore.config_file set \
+        --config "$CONFIG_FILE" --section "$section" --key "$key"
+}
+
+# Helper: Set a boolean value in config.toml (written as a TOML boolean, not a
+# quoted string). Value must be exactly "true" or "false".
+set_config_bool() {
+    local section=$1
+    local key=$2
+    local value=$3
+    printf '%s' "$value" | "$TUI_PYTHON" -m jmcore.config_file set --bool \
         --config "$CONFIG_FILE" --section "$section" --key "$key"
 }
 
@@ -889,7 +907,10 @@ PY
 #   1. Already exported BIP39_PASSPHRASE in this shell.
 #   2. Staged BIP39_PASSPHRASE from .maker.env (Raspiblitz/systemd).
 #   3. wallet.bip39_passphrase configured in config.toml.
-#   4. Prompt the user, then compute and display the wallet fingerprint so the
+#   4. wallet_with_passphrase flag in config.toml: passphrases are opt-in, so
+#      unless the flag is "true" the wallet unlocks with an empty passphrase
+#      and NO prompt is shown.
+#   5. Prompt the user, then compute and display the wallet fingerprint so the
 #      user can confirm the correct wallet is being derived.
 #
 # Side effects:
@@ -923,6 +944,16 @@ ensure_wallet_unlocked_global() {
     if [ -n "$passphrase" ]; then
         export BIP39_PASSPHRASE="$passphrase"
         cache_wallet_fingerprint "$passphrase"
+        return 0
+    fi
+
+    # Passphrases are strictly opt-in: unless wallet_with_passphrase is
+    # enabled in config.toml, unlock with an empty passphrase without asking.
+    # The empty value is exported so downstream CLIs treat it as an explicit
+    # "no passphrase" and never prompt either.
+    if [ "$(get_wallet_with_passphrase)" != "true" ]; then
+        export BIP39_PASSPHRASE=""
+        [ -f "$FINGERPRINT_CACHE" ] || cache_wallet_fingerprint "" || true
         return 0
     fi
 
@@ -1327,17 +1358,19 @@ ensure_active_wallet() {
             fi
         fi
 
-        # Offer passphrase storage as well when none is stored yet. There is
-        # no way to detect whether a wallet uses a passphrase, so ask.
-        local stored_pp
-        stored_pp=$(get_stored_bip39_passphrase)
-        if [ -z "$stored_pp" ]; then
-            if whiptail --title " Store Passphrase " \
-                --yesno "Active wallet: $(basename "$CURRENT_WALLET")\n\nDoes this wallet use a BIP39 passphrase?\nStore it in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
-                13 64 --defaultno 3>&1 1>&2 2>&3; then
-                clear
-                if ! prompt_and_store_bip39_passphrase; then
-                    echo "Passphrase not stored."
+        # Offer passphrase storage as well when the wallet uses a passphrase
+        # (wallet_with_passphrase flag) and none is stored yet.
+        if [ "$(get_wallet_with_passphrase)" = "true" ]; then
+            local stored_pp
+            stored_pp=$(get_stored_bip39_passphrase)
+            if [ -z "$stored_pp" ]; then
+                if whiptail --title " Store Passphrase " \
+                    --yesno "Active wallet: $(basename "$CURRENT_WALLET")\n\nStore this wallet's BIP39 passphrase in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
+                    12 64 --defaultno 3>&1 1>&2 2>&3; then
+                    clear
+                    if ! prompt_and_store_bip39_passphrase; then
+                        echo "Passphrase not stored."
+                    fi
                 fi
             fi
         fi
@@ -1395,6 +1428,12 @@ offer_maker_password_storage() {
 # in Maker START/RESTART.
 # ---------------------------------------------------------------------------
 offer_maker_passphrase_storage() {
+    # Passphrases are strictly opt-in: without the wallet_with_passphrase flag
+    # the wallet has no passphrase and there is nothing to store.
+    if [ "$(get_wallet_with_passphrase)" != "true" ]; then
+        return 0
+    fi
+
     # Check if passphrase already stored
     local stored_pp
     stored_pp=$(get_stored_bip39_passphrase)
@@ -1402,11 +1441,9 @@ offer_maker_passphrase_storage() {
         return 0  # Already stored
     fi
 
-    # There is no way to detect whether a wallet uses a passphrase (every
-    # passphrase derives a valid wallet), so ask explicitly.
     if ! whiptail --title " Store Passphrase for Maker " \
-        --yesno "Does this wallet use a BIP39 passphrase?\n\nFor automatic restart after a crash, the Maker needs\nthe passphrase stored in config.toml.\n\nWithout stored passphrase: a restarted Maker derives a\nDIFFERENT wallet and will not offer your coins.\n\nStore passphrase now?" \
-        16 64 --defaultno 3>&1 1>&2 2>&3; then
+        --yesno "This wallet uses a BIP39 passphrase.\n\nFor automatic restart after a crash, the Maker needs\nthe passphrase stored in config.toml.\n\nWithout stored passphrase: a restarted Maker derives a\nDIFFERENT wallet and will not offer your coins.\n\nStore passphrase now?" \
+        15 64 --defaultno 3>&1 1>&2 2>&3; then
         return 0  # User declined
     fi
 
@@ -2091,16 +2128,18 @@ No:  automatic coin selection from one mixdepth." 12 64
                       whiptail --title " Wallet Selected " --msgbox "Active wallet set to: $WNAME\n\nStored password cleared; you will be prompted\nfor the password on next use.\n\nRestart the maker service for changes to take effect." 12 60
                   fi
 
-                  # Offer passphrase storage as well when none is stored yet
-                  # (mirrors the password storage offer above). There is no
-                  # way to detect whether a wallet uses a passphrase, so ask.
-                  STORED_PP=$(get_stored_bip39_passphrase)
-                  if [ -z "$STORED_PP" ]; then
-                      if whiptail --title " Store Passphrase " \
-                          --yesno "Does this wallet use a BIP39 passphrase?\nStore it in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
-                          13 64 --defaultno 3>&1 1>&2 2>&3; then
-                          prompt_and_store_bip39_passphrase || \
-                              whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
+                  # Offer passphrase storage as well when the wallet uses a
+                  # passphrase (wallet_with_passphrase flag, mirrors the
+                  # password storage offer above) and none is stored yet.
+                  if [ "$(get_wallet_with_passphrase)" = "true" ]; then
+                      STORED_PP=$(get_stored_bip39_passphrase)
+                      if [ -z "$STORED_PP" ]; then
+                          if whiptail --title " Store Passphrase " \
+                              --yesno "Store this wallet's BIP39 passphrase in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
+                              11 64 --defaultno 3>&1 1>&2 2>&3; then
+                              prompt_and_store_bip39_passphrase || \
+                                  whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
+                          fi
                       fi
                   fi
               else
@@ -2515,8 +2554,9 @@ No:  automatic coin selection from one mixdepth." 12 64
         check_stale_wallet
         CCHOICE=$(whiptail --title " Config Center " \
           --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-          21 64 9 \
+          22 64 10 \
           "LOG"    "Configure Log Level" \
+          "PPFLAG" "BIP39 Passphrase Mode (on/off)" \
           "DELPW"  "Delete Active Wallet Password" \
           "DELPP"  "Delete Active Wallet Passphrase" \
           ""   "" \
@@ -2556,6 +2596,36 @@ No:  automatic coin selection from one mixdepth." 12 64
             if [ -n "$LOG_CHOICE" ]; then
               export LOGGING__LEVEL="$LOG_CHOICE"
               whiptail --title " Log Level " --msgbox "Log level set to: $LOG_CHOICE\n\nApplies to subsequent commands launched here.\nAlready-running processes are unchanged.\nExternally managed services use their own logging configuration." 12 70
+            fi
+            ;;
+
+          PPFLAG)
+            PP_CURRENT=$(get_wallet_with_passphrase)
+            if [ "$PP_CURRENT" = "true" ]; then
+              PP_CURRENT="ON"
+            else
+              PP_CURRENT="OFF"
+            fi
+
+            PP_CHOICE=$(whiptail --title " BIP39 Passphrase Mode " --notags \
+              --menu "\nDoes your wallet use a BIP39 passphrase?\n\nCurrent: ${PP_CURRENT}\n\nON: you are asked for the passphrase on wallet unlock.\nOFF (default): no passphrase prompts; wallets unlock directly.\n\nThe setting is global and applies to all wallets." \
+              19 70 2 \
+              "ON"  "Wallet uses a passphrase (ask on unlock)" \
+              "OFF" "No passphrase (default, no prompts)" 3>&1 1>&2 2>&3) || continue
+
+            if [ "$PP_CHOICE" = "ON" ]; then
+              PP_VALUE="true"
+            else
+              PP_VALUE="false"
+            fi
+            if set_config_bool wallet wallet_with_passphrase "$PP_VALUE"; then
+              # The derived wallet may change with this flag; drop the cached
+              # fingerprint so the next action recomputes it.
+              rm -f "$FINGERPRINT_CACHE"
+              whiptail --title " BIP39 Passphrase Mode " \
+                --msgbox "BIP39 passphrase mode set to: $PP_CHOICE" 8 50
+            else
+              whiptail --title " Config Error " --msgbox "Could not save the setting to config.toml." 8 55
             fi
             ;;
 
