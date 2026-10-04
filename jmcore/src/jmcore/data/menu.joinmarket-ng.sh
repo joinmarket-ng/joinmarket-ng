@@ -342,13 +342,20 @@ get_maker_env_bip39_passphrase() {
     printf '%s' "$val"
 }
 
-# Helper: Write the wallet password and optional BIP39 passphrase to .maker.env
-# for the systemd EnvironmentFile, using systemd's double-quoted C-escape format
-# so special characters survive. chmod 600. Secrets are NEVER written to
-# config.toml (no cleartext leak); .maker.env is removed when the maker stops.
+# Helper: Write the wallet password, optional BIP39 passphrase and expected
+# wallet fingerprint to .maker.env for the systemd EnvironmentFile, using
+# systemd's double-quoted C-escape format so special characters survive.
+# chmod 600. Secrets are NEVER written to config.toml (no cleartext leak);
+# .maker.env is removed when the maker stops.
+# EXPECTED_FINGERPRINT binds the staged passphrase to the wallet it was staged
+# for: ensure_wallet_unlocked_global refuses a staged passphrase whose
+# derivation does not match the active wallet (cross-wallet guard). The
+# fingerprint is public, not a secret. Empty means "not determinable" and
+# fails closed (the staged passphrase is then ignored).
 write_maker_env() {
     local password="$1"
     local bip39_passphrase="${2:-}"
+    local expected_fingerprint="${3:-}"
     local escaped
     : > "$MAKER_ENV"
     # The password line is only written when there is a password to stage:
@@ -360,7 +367,26 @@ write_maker_env() {
     fi
     escaped=$(printf '%s' "$bip39_passphrase" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
     printf 'BIP39_PASSPHRASE="%s"\n' "$escaped" >> "$MAKER_ENV"
+    # Hex fingerprint only -- no characters that would need systemd escaping.
+    printf 'EXPECTED_FINGERPRINT="%s"\n' "$expected_fingerprint" >> "$MAKER_ENV"
     chmod 600 "$MAKER_ENV"
+}
+
+# Helper: Read the expected wallet fingerprint from .maker.env. The line is
+# written by write_maker_env and binds the staged BIP39 passphrase to the
+# wallet it was staged for. Returns 1 when the file or the line is absent
+# (legacy .maker.env written before the cross-wallet guard).
+get_maker_env_expected_fingerprint() {
+    [ -f "$MAKER_ENV" ] || return 1
+    local line val
+    line=$(grep -m1 '^EXPECTED_FINGERPRINT=' "$MAKER_ENV" 2>/dev/null) || return 1
+    val=${line#EXPECTED_FINGERPRINT=}
+    # Strip surrounding double quotes (hex fingerprint: no escapes to reverse).
+    if [ "${val#\"}" != "$val" ]; then
+        val=${val#\"}
+        val=${val%\"}
+    fi
+    printf '%s' "$val"
 }
 
 # Helper: Remove a value in config.toml.
@@ -893,7 +919,10 @@ PY
     
     [ -n "$fingerprint" ] || return 1
     
-    echo "$fingerprint" > "$FINGERPRINT_CACHE"
+    # Create with restrictive permissions atomically: the fingerprint is not a
+    # secret but privacy-relevant, so the file must not be world-readable even
+    # briefly between creation and chmod.
+    ( umask 077; printf '%s\n' "$fingerprint" > "$FINGERPRINT_CACHE" )
     chmod 600 "$FINGERPRINT_CACHE"
     return 0
 }
@@ -928,12 +957,42 @@ ensure_wallet_unlocked_global() {
         return 0
     fi
 
-    # Raspiblitz/systemd staging: passphrase is pre-configured for headless operation.
+    # Raspiblitz/systemd staging: passphrase is pre-configured for headless
+    # operation. This staged path intentionally runs BEFORE the
+    # wallet_with_passphrase flag check: explicit headless staging takes
+    # precedence over the opt-in flag.
+    #
+    # Cross-wallet guard: a passphrase cannot be verified against the wallet
+    # file (every passphrase derives a valid wallet), so the staged passphrase
+    # is bound to its wallet via EXPECTED_FINGERPRINT. Without the guard a
+    # passphrase staged for wallet A would silently derive the wrong wallet
+    # after the user switches the active wallet to B. On mismatch (or when no
+    # fingerprint was recorded) the staged value is discarded and we fall
+    # through to config / interactive prompt.
     if [ -f "$MAKER_ENV" ]; then
         if passphrase=$(get_maker_env_bip39_passphrase); then
-            export BIP39_PASSPHRASE="$passphrase"
-            cache_wallet_fingerprint "$passphrase"
-            return 0
+            local expected_fingerprint actual_fingerprint=""
+            if ! expected_fingerprint=$(get_maker_env_expected_fingerprint); then
+                # Legacy .maker.env (written before the fingerprint guard):
+                # keep the previous trust behaviour.
+                export BIP39_PASSPHRASE="$passphrase"
+                cache_wallet_fingerprint "$passphrase"
+                return 0
+            fi
+            if cache_wallet_fingerprint "$passphrase"; then
+                actual_fingerprint=$(cat "$FINGERPRINT_CACHE" 2>/dev/null)
+            fi
+            if [ -n "$expected_fingerprint" ] && [ "$actual_fingerprint" = "$expected_fingerprint" ]; then
+                export BIP39_PASSPHRASE="$passphrase"
+                return 0
+            fi
+            # Mismatch or unverifiable: the staged passphrase belongs to a
+            # different wallet (or its fingerprint was never recorded). Discard
+            # it -- never derive silently with the wrong passphrase.
+            rm -f "$FINGERPRINT_CACHE"
+            whiptail --title " Staged Passphrase Mismatch " \
+                --msgbox "The BIP39 passphrase staged for the maker service belongs to a different wallet (fingerprint mismatch).\n\nIt was NOT applied. You will be asked for the passphrase of the active wallet instead." \
+                14 72 3>&1 1>&2 2>&3 || true
         fi
         # Key absent (legacy .maker.env written before passphrase support):
         # fall through to config / interactive prompt instead of pinning "".
@@ -1182,7 +1241,15 @@ stage_maker_password() {
     if ! ensure_wallet_unlocked_global; then
         return 1
     fi
-    write_maker_env "${password_to_stage}" "${BIP39_PASSPHRASE:-}"
+    # Bind the staged passphrase to THIS wallet: record the fingerprint of the
+    # wallet+passphrase derivation so ensure_wallet_unlocked_global can refuse
+    # the staged passphrase after the active wallet is switched (cross-wallet
+    # guard). Empty when the fingerprint cannot be computed -- fails closed.
+    local expected_fingerprint=""
+    if cache_wallet_fingerprint "${BIP39_PASSPHRASE:-}"; then
+        expected_fingerprint=$(cat "$FINGERPRINT_CACHE" 2>/dev/null)
+    fi
+    write_maker_env "${password_to_stage}" "${BIP39_PASSPHRASE:-}" "$expected_fingerprint"
     return 0
 }
 

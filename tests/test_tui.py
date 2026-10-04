@@ -1519,6 +1519,97 @@ def test_tui_script_fingerprint_confirmation_fails_closed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-wallet staging guard + fingerprint cache permissions
+# ---------------------------------------------------------------------------
+
+
+def test_tui_script_write_maker_env_records_expected_fingerprint() -> None:
+    """write_maker_env must bind the staged passphrase to its wallet.
+
+    Regression guard for the cross-wallet staging flaw: a staged BIP39
+    passphrase must carry the fingerprint of the wallet it was staged for, so
+    a later wallet switch cannot silently derive the wrong wallet.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("write_maker_env()", 1)[1].split("\n}", 1)[0]
+    assert 'local expected_fingerprint="${3:-}"' in block, (
+        "fingerprint must be the third argument"
+    )
+    assert 'EXPECTED_FINGERPRINT="' in block, (
+        "must record the expected wallet fingerprint in .maker.env"
+    )
+    assert '"$MAKER_ENV"' in block, "must target the .maker.env file"
+
+
+def test_tui_script_stage_maker_password_binds_passphrase_to_wallet() -> None:
+    """stage_maker_password must compute the wallet fingerprint before staging.
+
+    The fingerprint recorded in .maker.env is the anchor for the cross-wallet
+    guard in ensure_wallet_unlocked_global, so it must be derived from the
+    active wallet+passphrase BEFORE write_maker_env runs.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("stage_maker_password()", 1)[1].split("\n}", 1)[0]
+    assert 'cache_wallet_fingerprint "${BIP39_PASSPHRASE:-}"' in block, (
+        "must derive the fingerprint of the wallet being staged for"
+    )
+    assert (
+        'write_maker_env "${password_to_stage}" "${BIP39_PASSPHRASE:-}" "$expected_fingerprint"'
+        in block
+    ), "must pass the expected fingerprint to write_maker_env"
+    fp_pos = block.index("cache_wallet_fingerprint")
+    write_pos = block.index('write_maker_env "${password_to_stage}"')
+    assert fp_pos < write_pos, "fingerprint must be computed before staging"
+
+
+def test_tui_script_staged_passphrase_verified_against_active_wallet() -> None:
+    """ensure_wallet_unlocked_global must refuse a foreign staged passphrase.
+
+    Regression: the staged .maker.env passphrase was applied to ANY active
+    wallet without verification; after a wallet switch the TUI silently
+    derived (and displayed the fingerprint of) the wrong wallet. The guard
+    must fail closed: empty/unrecorded expected fingerprint or any mismatch
+    discards the staged value and falls through to config / prompt.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("ensure_wallet_unlocked_global() {", 1)[1].split("\n}", 1)[0]
+    assert "get_maker_env_expected_fingerprint" in block, (
+        "staged passphrase must be checked against the recorded fingerprint"
+    )
+    # Legacy .maker.env without the guard line keeps the previous behaviour.
+    assert "Legacy .maker.env (written before the fingerprint guard)" in block
+    # Fail closed when no fingerprint was recorded (empty expected).
+    assert (
+        '[ -n "$expected_fingerprint" ] && [ "$actual_fingerprint" = "$expected_fingerprint" ]'
+        in block
+    ), "match must require a non-empty recorded fingerprint"
+    cmp_pos = block.index('"$actual_fingerprint" = "$expected_fingerprint"')
+    # The staged value is only trusted AFTER the fingerprint comparison.
+    export_pos = block.index('export BIP39_PASSPHRASE="$passphrase"', cmp_pos)
+    assert export_pos > cmp_pos
+    # On mismatch the wrong fingerprint cache must be discarded and the user
+    # informed; the flow then falls through to config / interactive prompt.
+    rm_pos = block.index('rm -f "$FINGERPRINT_CACHE"', cmp_pos)
+    assert rm_pos > cmp_pos, "mismatch must clear the wrong fingerprint cache"
+    assert "Staged Passphrase Mismatch" in block, "user must be informed on mismatch"
+
+
+def test_tui_script_fingerprint_cache_created_with_restrictive_umask() -> None:
+    """FINGERPRINT_CACHE must be created with umask 077 (atomic permissions).
+
+    The fingerprint is privacy-relevant: between file creation and chmod the
+    file must never be world-readable.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("cache_wallet_fingerprint() {", 1)[1].split("\n}", 1)[0]
+    assert '( umask 077; printf \'%s\\n\' "$fingerprint" > "$FINGERPRINT_CACHE" )' in block, (
+        "cache must be created with restrictive permissions atomically"
+    )
+    assert "chmod 600" in block, "chmod 600 must remain as defence in depth"
+
+
+
+# ---------------------------------------------------------------------------
 # BIP39 Passphrase Storage (SETPP)
 # ---------------------------------------------------------------------------
 
