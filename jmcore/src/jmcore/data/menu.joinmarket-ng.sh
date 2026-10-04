@@ -179,32 +179,34 @@ TUI_PYTHON=$(command -v python3)
 
 # ---- CLI logging inside the TUI --------------------------------------------
 # jm-wallet / jm-* commands use loguru and log to stderr.
-# In a menu UI, INFO-level logs pollute the output (issue #459), so the
-# default is WARNING.  Users who want progress messages (e.g. "Connecting
-# to directory servers...") can set [tui] log_level in config.toml or
-# override per session: LOGGING__LEVEL=INFO jm-ng
-#
-# Priority: environment variable > config.toml > built-in default (WARNING)
-if [ -z "${LOGGING__LEVEL:-}" ]; then
-    TUI_LOG_LEVEL=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
+# Follow global logging unless the session or [tui] explicitly overrides it.
+# Set [tui] log_level = "WARNING" for quiet menu output (issue #459).
+# Priority: initial environment > [tui] log_level > [logging] level > INFO.
+TUI_SESSION_LOG_LEVEL="${LOGGING__LEVEL:-}"
+get_tui_log_level() {
+    if [ -n "$TUI_SESSION_LOG_LEVEL" ]; then
+        printf '%s' "$TUI_SESSION_LOG_LEVEL"
+        return
+    fi
+    "$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
 import sys, pathlib
 try:
     import tomllib
 except ImportError:
     import tomli as tomllib
 path = pathlib.Path(sys.argv[1])
+level = "INFO"
 if path.exists():
     try:
         data = tomllib.loads(path.read_text())
-        val = data.get("tui", {}).get("log_level")
-        if val is not None:
-            print(val.upper())
+        level = (data.get("tui", {}).get("log_level")
+                 or data.get("logging", {}).get("level") or "INFO").upper()
     except Exception:
         pass
+print(level)
 PYEOF
-)
-    export LOGGING__LEVEL="${TUI_LOG_LEVEL:-WARNING}"
-fi
+}
+export LOGGING__LEVEL="$(get_tui_log_level)"
 
 # ---- Defaults for send/coinjoin parameters ----------------------------------
 DEFAULT_AMOUNT="0"
@@ -2168,21 +2170,32 @@ No:  automatic coin selection from one mixdepth." 12 64
 
         case $CCHOICE in
           LOG)
-            CURRENT_LOG="${LOGGING__LEVEL:-WARNING}"
+            CURRENT_LOG="${LOGGING__LEVEL:-INFO}"
 
             LOG_CHOICE=$(whiptail --title " Log Level " --notags \
               --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nSelect log level:\n\nCurrent: ${CURRENT_LOG}" \
-              18 64 4 \
+              20 68 6 \
+              "GLOBAL"  "Follow global logging (or session environment)" \
+              "TRACE"   "TRACE   - Most verbose troubleshooting output" \
               "DEBUG"   "DEBUG   - Detailed debugging information" \
               "INFO"    "INFO    - General information messages" \
-              "WARNING" "WARNING - Warning messages only (default)" \
+              "WARNING" "WARNING - Warning messages only (quiet menu)" \
               "ERROR"   "ERROR   - Error messages only" 3>&1 1>&2 2>&3) || continue
 
-            if set_config_value tui log_level "$LOG_CHOICE"; then
-              export LOGGING__LEVEL="$LOG_CHOICE"
-              whiptail --title " Log Level " --msgbox "Log level set to: $LOG_CHOICE\n\nChanges take effect immediately." 9 50
-            else
+            if [ "$LOG_CHOICE" = "GLOBAL" ]; then
+              clear_config_value tui log_level || {
+                whiptail --title " Config Error " --msgbox "Could not save the log level to config.toml." 8 55
+                continue
+              }
+              LOG_CHOICE="$(get_tui_log_level)"
+            elif ! set_config_value tui log_level "$LOG_CHOICE"; then
               whiptail --title " Config Error " --msgbox "Could not save the log level to config.toml." 8 55
+              continue
+            fi
+
+            if [ -n "$LOG_CHOICE" ]; then
+              export LOGGING__LEVEL="$LOG_CHOICE"
+              whiptail --title " Log Level " --msgbox "Log level set to: $LOG_CHOICE\n\nApplies to subsequent commands launched here.\nAlready-running processes are unchanged.\nExternally managed services use their own logging configuration." 12 70
             fi
             ;;
 

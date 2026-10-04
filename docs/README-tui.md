@@ -62,3 +62,20 @@ someone who can also read the unlock credentials.
 Read [bond operations](fidelity-bond-operations.md) before creating a bond. A
 lock cannot be undone early. The menu's bond controls do not replace backup
 and signer-compatibility checks.
+
+## Logging
+
+The menu follows `[logging] level` by default (INFO when unset). An explicit
+`[tui] log_level` overrides it for commands launched by the menu; use WARNING
+for quiet output or DEBUG for troubleshooting. An initial `LOGGING__LEVEL`
+environment variable takes precedence at startup.
+
+Config Center's log-level selector saves an override and applies it to subsequent
+commands launched in that menu session. Choose **Follow global logging** to remove
+the saved override and return to the global level or initial session environment.
+It does not reconfigure an already-running maker. Restart standalone makers to
+pick up the change; externally managed services, including Raspiblitz, use their
+own logging configuration.
+
+On upgrade, existing explicit TUI overrides remain unchanged. Configurations
+without an override now follow global logging instead of defaulting to WARNING.

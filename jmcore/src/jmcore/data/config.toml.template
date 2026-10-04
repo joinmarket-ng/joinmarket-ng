@@ -684,9 +684,11 @@
 # ============================================================================
 
 [tui]
-# Log level for CLI output inside the TUI.
-# "WARNING" = only errors and warnings (default, clean output)
+# Optional log level override for CLI commands launched inside the TUI.
+# By default, follow [logging] level (INFO when unset).
+# "WARNING" = only errors and warnings (clean output)
 # "INFO"    = show progress messages (e.g. "Connecting to directory servers...")
 # "DEBUG"   = verbose output for troubleshooting
 # Can be overridden per session: LOGGING__LEVEL=INFO jm-ng
+# Changes apply to subsequently launched commands, not already-running makers.
 # log_level = "WARNING"

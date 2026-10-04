@@ -1430,7 +1430,10 @@ class OrderbookWatcherSettings(BaseModel):
 class TuiSettings(BaseModel):
     """Menu settings, consumed by the shell TUI rather than Python components."""
 
-    log_level: str = Field(default="WARNING", description="Log level for TUI-launched commands")
+    log_level: str | None = Field(
+        default=None,
+        description="Optional log level override for TUI-launched commands; otherwise follow logging.level",
+    )
 
 
 class LoggingSettings(BaseModel):

@@ -796,17 +796,54 @@ def test_tui_main_exits_without_whiptail() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tui_exports_quiet_log_level_by_default() -> None:
-    """Child jm-* commands launched from the TUI must default to WARNING so
-    loguru INFO messages from jmcore.settings/jmwallet do not pollute the
-    whiptail output panes (issue #459). The user can still override by
-    pre-setting LOGGING__LEVEL before launching jm-ng, or by setting
-    [tui] log_level in config.toml."""
+@pytest.mark.parametrize(
+    "config_text,session_level,expected",
+    [
+        (None, None, "INFO"),
+        ("", None, "INFO"),
+        ("[tui]\n# log_level = 'WARNING'\n", None, "INFO"),
+        ("[logging]\nlevel = 'DEBUG'\n", None, "DEBUG"),
+        ("[logging]\nlevel = 'TRACE'\n[tui]\nlog_level = 'WARNING'\n", None, "WARNING"),
+        (
+            "[logging]\nlevel = 'DEBUG'\n[tui]\nlog_level = 'WARNING'\n",
+            "ERROR",
+            "ERROR",
+        ),
+    ],
+)
+def test_tui_log_level_startup_precedence(
+    tmp_path: Path, config_text: str | None, session_level: str | None, expected: str
+) -> None:
+    """Subsequent child commands inherit global logging unless explicitly overridden."""
     content = SCRIPT_PATH.read_text()
-    assert 'if [ -z "${LOGGING__LEVEL:-}"' in content
-    # WARNING must be the built-in fallback when neither the env var nor
-    # [tui] log_level in config.toml is set.
-    assert 'export LOGGING__LEVEL="${TUI_LOG_LEVEL:-WARNING}"' in content
+    logging_block = (
+        "# ---- CLI logging inside the TUI"
+        + content.split("# ---- CLI logging inside the TUI", 1)[1].split(
+            "# ---- Defaults for send/coinjoin parameters", 1
+        )[0]
+    )
+    config_path = tmp_path / "config.toml"
+    if config_text is not None:
+        config_path.write_text(config_text)
+    env = os.environ.copy()
+    env.pop("LOGGING__LEVEL", None)
+    if session_level is not None:
+        env["LOGGING__LEVEL"] = session_level
+    env["TUI_PYTHON"] = sys.executable
+    env["CONFIG_FILE"] = str(config_path)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            logging_block
+            + '\n"$TUI_PYTHON" -c "import os; print(os.environ[\'LOGGING__LEVEL\'])"',
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == expected
 
 
 def test_tui_clears_stale_mnemonic_file_entry() -> None:
@@ -1771,6 +1808,103 @@ def test_tui_script_config_center_log_level_sets_value() -> None:
     c_block = content.split("C)\n", 1)[1].split("U)\n", 1)[0]
     # Check that log_level setting exists in Config Center
     assert "set_config_value tui log_level" in c_block, "LOG must call set_config_value"
+
+
+@pytest.mark.parametrize(
+    "choice,session_level,invalid_config,expected,saved_override",
+    [
+        ("DEBUG", None, False, "DEBUG", "DEBUG"),
+        ("GLOBAL", None, False, "TRACE", None),
+        ("GLOBAL", "ERROR", False, "ERROR", None),
+        ("DEBUG GLOBAL", "ERROR", False, "ERROR", None),
+        ("DEBUG GLOBAL", None, False, "TRACE", None),
+        ("CANCEL", None, False, "WARNING", "WARNING"),
+        ("DEBUG", None, True, "INFO", None),
+        ("GLOBAL", None, True, "INFO", None),
+    ],
+)
+def test_tui_log_level_menu_updates_subsequent_children_only_after_saving(
+    tmp_path: Path,
+    choice: str,
+    session_level: str | None,
+    invalid_config: bool,
+    expected: str,
+    saved_override: str | None,
+) -> None:
+    import tomllib
+
+    content = SCRIPT_PATH.read_text()
+    logging_block = (
+        "# ---- CLI logging inside the TUI"
+        + content.split("# ---- CLI logging inside the TUI", 1)[1].split(
+            "# ---- Defaults for send/coinjoin parameters", 1
+        )[0]
+    )
+    helpers = content.split(
+        "# =============================================================================\n# Helpers",
+        1,
+    )[1].split(
+        "# =============================================================================\n# Main Loop",
+        1,
+    )[0]
+    config_center = content.split("# Config Center submenu", 1)[1]
+    menu_body = config_center.split("LOG)", 1)[1].split(";;", 1)[0]
+    config_path = tmp_path / "config.toml"
+    config_text = (
+        "invalid = ["
+        if invalid_config
+        else "[logging]\nlevel = 'TRACE'\n[tui]\nlog_level = 'WARNING'\n"
+    )
+    config_path.write_text(config_text)
+    env = os.environ.copy()
+    env.pop("LOGGING__LEVEL", None)
+    if session_level is not None:
+        env["LOGGING__LEVEL"] = session_level
+    env.update(
+        TUI_PYTHON=sys.executable,
+        CONFIG_FILE=str(config_path),
+        TEST_CHOICES=choice,
+    )
+    script = (
+        logging_block
+        + helpers
+        + """
+whiptail() {
+    if [[ "$*" == *--menu* ]]; then
+        [ "$TEST_CHOICE" = CANCEL ] && return 1
+        printf '%s' "$TEST_CHOICE" >&2
+    else
+        printf 'dialog:%s\n' "$*"
+    fi
+}
+for TEST_CHOICE in $TEST_CHOICES; do
+"""
+        + menu_body
+        + """
+"$TUI_PYTHON" -c "import os; print('step:' + os.environ['LOGGING__LEVEL'])"
+done
+"$TUI_PYTHON" -c "import os; print('child:' + os.environ['LOGGING__LEVEL'])"
+"""
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, capture_output=True, text=True, check=True
+    )
+    assert f"child:{expected}" in result.stdout
+    if invalid_config:
+        assert config_path.read_text() == config_text
+        assert "Could not save the log level" in result.stdout
+    else:
+        config = tomllib.loads(config_path.read_text())
+        assert config["logging"]["level"] == "TRACE"
+        assert config.get("tui", {}).get("log_level") == saved_override
+        if choice != "CANCEL":
+            assert "Applies to subsequent commands launched here" in result.stdout
+            assert "Already-running processes are unchanged" in result.stdout
+            assert "Changes take effect immediately" not in result.stdout
+        if choice == "DEBUG GLOBAL":
+            assert result.stdout.index("step:DEBUG") < result.stdout.index(
+                f"step:{expected}"
+            )
 
 
 def test_tui_script_config_center_delpw_clears_password() -> None:

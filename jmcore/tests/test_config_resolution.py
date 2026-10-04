@@ -78,6 +78,21 @@ def test_legacy_wallet_toml_fails_without_rewriting(isolated_config: Path, canon
     assert isolated_config.read_text() == content
 
 
+@pytest.mark.parametrize("override", [None, "WARNING", "DEBUG"])
+def test_tui_logging_override_is_optional_and_preserved(
+    isolated_config: Path, override: str | None
+) -> None:
+    content = '[logging]\nlevel = "TRACE"\n[tui]\n'
+    if override is not None:
+        content += f'log_level = "{override}"\n'
+    isolated_config.write_text(content)
+
+    settings = JoinMarketSettings()
+    assert settings.tui.log_level == override
+    assert settings.logging.level == "TRACE"
+    assert isolated_config.read_text() == content
+
+
 def test_legacy_wallet_direct_input_fails() -> None:
     with pytest.raises(ValidationError, match="WALLET__BACKGROUND_FULL_RESCAN"):
         WalletSettings.model_validate({"background_full_scan": False})
