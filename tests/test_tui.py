@@ -1390,6 +1390,22 @@ def test_tui_script_write_maker_env_targets_maker_env_not_config() -> None:
     assert "set_config_value" not in block, "must never write config.toml"
 
 
+def test_tui_script_write_maker_env_creates_file_with_restrictive_umask() -> None:
+    """write_maker_env must create .maker.env with umask 077 atomically.
+
+    The file holds the cleartext wallet password; between creation and the
+    chmod 600 it must never be world-readable, so creation runs under
+    umask 077 in a subshell.
+    """
+    content = SCRIPT_PATH.read_text()
+    block = content.split("write_maker_env()", 1)[1].split("\n}", 1)[0]
+    assert "umask 077" in block, "creation must run under umask 077"
+    assert "( umask 077;" in block, "umask must be subshell-scoped, not global"
+    umask_pos = block.index("umask 077")
+    chmod_pos = block.index("chmod 600")
+    assert umask_pos < chmod_pos, "restrictive umask must precede the chmod"
+
+
 def test_tui_script_ensure_wallet_password_reads_maker_env() -> None:
     """ensure_wallet_password must reuse a running maker's .maker.env password.
 

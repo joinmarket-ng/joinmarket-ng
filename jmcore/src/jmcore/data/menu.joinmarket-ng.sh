@@ -318,7 +318,10 @@ write_maker_env() {
     local password="$1"
     local escaped
     escaped=$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-    printf 'MNEMONIC_PASSWORD="%s"\n' "$escaped" > "$MAKER_ENV"
+    # Create with restrictive permissions atomically: the file holds the
+    # cleartext wallet password and must not be world-readable even briefly
+    # between creation and chmod.
+    ( umask 077; printf 'MNEMONIC_PASSWORD="%s"\n' "$escaped" > "$MAKER_ENV" )
     chmod 600 "$MAKER_ENV"
 }
 
