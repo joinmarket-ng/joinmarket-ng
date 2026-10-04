@@ -372,10 +372,14 @@
 # value may make jm-ng makers fingerprintable).
 # min_size = 100000
 
-# Do not sign CoinJoins below this miner fee floor. Full-node makers combine
-# this with the local mempool minimum and a conservative estimate; Neutrino
-# makers cannot verify foreign prevout values and therefore cannot enforce it.
-# min_fee_rate_sat_vb = 1.0
+# Full-node makers reject CoinJoins below the highest available fee floor:
+# an optional static floor, the local mempool minimum, and a block-target estimate.
+# The static floor is disabled by default (0). Set min_fee_block_target = -1
+# to skip estimation, including the backend's fallback when estimation fails.
+# The local mempool minimum remains enforced. With no available source and no
+# static floor, no positive minimum is imposed. Neutrino makers cannot verify
+# foreign prevout values and therefore cannot enforce this policy.
+# min_fee_rate_sat_vb = 0.0
 # min_fee_block_target = 10
 
 # IMPORTANT: offer_type determines which fee setting is used.

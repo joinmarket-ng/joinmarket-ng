@@ -128,14 +128,99 @@ def test_low_fee_error_parser_rejects_untrusted_or_invalid_messages(message: obj
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("static_floor,max_fee_rate", [(0.0, 1.0), (1.0, 0.0), (float("nan"), 1.0)])
+@pytest.mark.parametrize(
+    "static_floor,max_fee_rate",
+    [(-0.1, 1.0), (1.0, 0.0), (float("nan"), 1.0), (float("inf"), 1.0), (False, 1.0)],
+)
 async def test_resolve_min_fee_rate_rejects_invalid_runtime_policy_values(
     static_floor: float, max_fee_rate: float
 ) -> None:
-    with pytest.raises(ValueError, match="finite positive"):
+    with pytest.raises(ValueError, match="finite"):
         await resolve_min_fee_rate(
             MagicMock(),
             static_floor=static_floor,
             block_target=10,
             max_fee_rate=max_fee_rate,
+        )
+
+
+@pytest.mark.asyncio
+async def test_zero_static_floor_allows_sub_one_fee_rates() -> None:
+    backend = MagicMock()
+    backend.get_mempool_min_fee = AsyncMock(return_value=0.1)
+    backend.can_estimate_fee.return_value = True
+    backend.estimate_fee = AsyncMock(return_value=0.2)
+
+    minimum = await resolve_min_fee_rate(
+        backend, static_floor=0.0, block_target=10, max_fee_rate=1_000.0
+    )
+
+    assert minimum == 0.2
+    assert fee_rate_meets_minimum(89, 100, minimum)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_state", ["unavailable", "invalid", "failed"])
+async def test_zero_static_floor_does_not_invent_fallback(source_state: str) -> None:
+    backend = MagicMock()
+    backend.get_mempool_min_fee = AsyncMock(return_value=None)
+    backend.can_estimate_fee.return_value = False
+    backend.estimate_fee = AsyncMock()
+    if source_state == "invalid":
+        backend.get_mempool_min_fee.return_value = float("nan")
+        backend.can_estimate_fee.return_value = True
+        backend.estimate_fee.return_value = -1.0
+    elif source_state == "failed":
+        backend.get_mempool_min_fee.side_effect = RuntimeError("offline")
+        backend.can_estimate_fee.return_value = True
+        backend.estimate_fee.side_effect = RuntimeError("offline")
+
+    assert (
+        await resolve_min_fee_rate(backend, static_floor=0.0, block_target=10, max_fee_rate=1_000.0)
+        == 0.0
+    )
+    assert fee_rate_meets_minimum(0, 100, 0.0)
+    assert not fee_rate_meets_minimum(-1, 100, 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "static_floor,mempool_minimum,expected", [(0.0, None, 0.0), (0.0, 0.1, 0.1), (1.0, 0.1, 1.0)]
+)
+async def test_disabled_estimator_retains_other_floors(
+    static_floor: float, mempool_minimum: float | None, expected: float
+) -> None:
+    backend = MagicMock()
+    backend.get_mempool_min_fee = AsyncMock(return_value=mempool_minimum)
+    backend.estimate_fee = AsyncMock()
+
+    assert (
+        await resolve_min_fee_rate(
+            backend, static_floor=static_floor, block_target=-1, max_fee_rate=1_000.0
+        )
+        == expected
+    )
+    backend.get_mempool_min_fee.assert_awaited_once()
+    backend.can_estimate_fee.assert_not_called()
+    backend.estimate_fee.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disabled_estimator_still_enforces_mempool_cap() -> None:
+    backend = MagicMock()
+    backend.get_mempool_min_fee = AsyncMock(return_value=4.0)
+    backend.estimate_fee = AsyncMock()
+
+    with pytest.raises(MinimumFeeRateExceedsCapError):
+        await resolve_min_fee_rate(backend, static_floor=0.0, block_target=-1, max_fee_rate=3.0)
+    backend.can_estimate_fee.assert_not_called()
+    backend.estimate_fee.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_target", [-2, 0, 1009, True])
+async def test_resolve_min_fee_rate_rejects_invalid_block_targets(block_target: int) -> None:
+    with pytest.raises(ValueError, match="block target"):
+        await resolve_min_fee_rate(
+            MagicMock(), static_floor=0.0, block_target=block_target, max_fee_rate=1_000.0
         )

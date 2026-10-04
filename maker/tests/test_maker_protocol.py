@@ -1697,6 +1697,53 @@ async def test_maker_minimum_fee_policy_rejects_low_fee_and_missing_prevout():
 
 
 @pytest.mark.asyncio
+async def test_zero_minimum_fee_still_verifies_prevouts_and_negative_fees() -> None:
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from jmwallet.backends.base import UTXO
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    backend = MagicMock()
+    backend.can_lookup_arbitrary_utxos.return_value = True
+    backend.requires_neutrino_metadata.return_value = False
+    backend.get_utxo = AsyncMock(
+        return_value=UTXO("bb" * 32, 1, 10_000, "bcrt1qforeign", 1, "0014" + "22" * 20)
+    )
+    session = CoinJoinSession(
+        taker_nick="J5FeePolicy",
+        offer=MagicMock(),
+        wallet=MagicMock(),
+        backend=backend,
+        minimum_fee_rate_sat_vb=0.0,
+    )
+    session.our_utxos = {("aa" * 32, 0): MagicMock(value=10_000)}
+    session.state = CoinJoinState.IOAUTH_SENT
+    session.wallet.network = "regtest"
+    session.wallet.renew_coinjoin_inputs.return_value = True
+
+    assert await session._verify_minimum_miner_fee(_fee_policy_tx(20_000), None) is None
+    assert await session._verify_minimum_miner_fee(_fee_policy_tx(20_001), None) == (
+        "CoinJoin has a negative miner fee"
+    )
+    backend.get_utxo.return_value = None
+    assert "Could not look up all foreign prevouts" in (
+        await session._verify_minimum_miner_fee(_fee_policy_tx(20_000), None)
+    )
+    # Exercise the signing boundary too: zero must not be mistaken for disabled verification.
+    tx_hex = _maker_signing_tx(session)
+
+    with (
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session, "_sign_transaction", new=AsyncMock()) as signed,
+    ):
+        success, error = await session.handle_tx(tx_hex)
+    assert success is False
+    assert "Could not look up all foreign prevouts" in error["error"]
+    signed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_maker_minimum_fee_policy_skips_backend_lookup_failure():
     from unittest.mock import AsyncMock, MagicMock, patch
 

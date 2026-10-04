@@ -55,6 +55,7 @@ from pydantic_settings import (
 )
 
 from jmcore.constants import DUST_THRESHOLD
+from jmcore.fee_policy import validate_min_fee_block_target
 from jmcore.models import (
     DIRECTORY_NODES_MAINNET,
     DIRECTORY_NODES_SIGNET,
@@ -712,17 +713,23 @@ class MakerSettings(BaseModel):
         ),
     )
     min_fee_rate_sat_vb: float = Field(
-        default=1.0,
-        gt=0.0,
+        default=0.0,
+        ge=0.0,
         allow_inf_nan=False,
-        description="Minimum CoinJoin miner fee rate in sat/vB",
+        description="Static CoinJoin miner fee floor in sat/vB (0 disables the static floor)",
     )
     min_fee_block_target: int = Field(
         default=10,
-        ge=1,
+        ge=-1,
         le=1008,
-        description="Block target for the conservative CoinJoin miner-fee floor",
+        description="Block target for the CoinJoin miner-fee floor (-1 disables estimation)",
     )
+
+    @field_validator("min_fee_block_target")
+    @classmethod
+    def validate_fee_block_target(cls, value: int) -> int:
+        return validate_min_fee_block_target(value)
+
     offer_type: str = Field(
         default="sw0reloffer",
         description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",

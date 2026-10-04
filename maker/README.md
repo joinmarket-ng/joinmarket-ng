@@ -46,6 +46,29 @@ can manage multiple wallet mnemonic files, and you can switch between them
 with `--mnemonic-file`. Use separate `--data-dir` values for takers only when
 you specifically want isolated config and runtime state.
 
+## CoinJoin Miner Fee Policy
+
+Although the taker pays the miner fee, a maker's inputs also depend on the
+transaction confirming. Full-node makers reject underpriced CoinJoins before
+signing to reduce the risk of delayed confirmation and tied-up inputs.
+
+The required rate is the highest of the local mempool minimum, the backend's
+estimate for `min_fee_block_target` (default 10), and an optional static
+`min_fee_rate_sat_vb` floor. The static floor defaults to `0` (disabled), so
+sub-1 sat/vB transactions can be accepted when local policy and estimates allow.
+Set `[maker] min_fee_block_target = -1` to ignore estimation, while retaining
+the mempool minimum and any explicit static floor.
+
+Bitcoin Core estimation can fluctuate. The descriptor backend retains its
+existing 1 sat/vB fallback if estimation fails; `-1` also bypasses this fallback.
+If no positive source is available and the static floor is disabled, no positive
+minimum is imposed. This does not guarantee relay or confirmation. Neutrino
+makers cannot verify foreign prevouts and do not enforce this fee policy.
+
+Upgrading preserves explicit configured floors, including `1.0`. Omitted or
+commented floors adopt the new `0` default on restart. No configuration or wallet
+data migration is performed. DEBUG logs identify the resolved floor and its source.
+
 ## Direct Connections and Identity Rotation
 
 With automatically created Tor onion services, identity rotation prepares a new

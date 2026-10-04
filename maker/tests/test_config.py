@@ -45,6 +45,59 @@ def test_minimum_fee_floor_cannot_exceed_maximum_fee_rate() -> None:
         MakerConfig(mnemonic=TEST_MNEMONIC, min_fee_rate_sat_vb=2.0, max_fee_rate_sat_vb=1.0)
 
 
+@pytest.mark.parametrize("block_target", [-1, 1, 10, 1008])
+def test_minimum_fee_block_target_accepts_opt_out_and_valid_targets(block_target: int) -> None:
+    from jmcore.settings import MakerSettings
+
+    assert MakerSettings(min_fee_block_target=block_target).min_fee_block_target == block_target
+    config = MakerConfig(mnemonic=TEST_MNEMONIC, min_fee_block_target=block_target)
+    assert config.min_fee_block_target == block_target
+
+
+@pytest.mark.parametrize("block_target", [-2, 0, 1009])
+def test_minimum_fee_block_target_rejects_invalid_targets(block_target: int) -> None:
+    from jmcore.settings import MakerSettings
+
+    with pytest.raises(ValidationError):
+        MakerSettings(min_fee_block_target=block_target)
+    with pytest.raises(ValidationError):
+        MakerConfig(mnemonic=TEST_MNEMONIC, min_fee_block_target=block_target)
+
+
+@pytest.mark.parametrize("floor", [-0.1, float("nan"), float("inf")])
+def test_minimum_fee_floor_rejects_negative_and_nonfinite_values(floor: float) -> None:
+    from jmcore.settings import MakerSettings
+
+    with pytest.raises(ValidationError):
+        MakerSettings(min_fee_rate_sat_vb=floor)
+    with pytest.raises(ValidationError):
+        MakerConfig(mnemonic=TEST_MNEMONIC, min_fee_rate_sat_vb=floor)
+
+
+@pytest.mark.parametrize(
+    "maker_toml,floor,target",
+    [
+        ("", 0.0, 10),
+        ("[maker]\n# min_fee_rate_sat_vb = 1.0\n", 0.0, 10),
+        ("[maker]\nmin_fee_rate_sat_vb = 1.0\n", 1.0, 10),
+        ("[maker]\nmin_fee_block_target = -1\n", 0.0, -1),
+        ("[maker]\nmin_fee_rate_sat_vb = 0.0\nmin_fee_block_target = -1\n", 0.0, -1),
+    ],
+)
+def test_minimum_fee_policy_upgrade_round_trip(maker_toml: str, floor: float, target: int) -> None:
+    import tomllib
+
+    from jmcore.settings import JoinMarketSettings
+
+    from maker.cli import build_maker_config
+
+    settings = JoinMarketSettings(**tomllib.loads(maker_toml))
+    config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+    assert config.min_fee_rate_sat_vb == settings.maker.min_fee_rate_sat_vb == floor
+    assert config.min_fee_block_target == settings.maker.min_fee_block_target == target
+    assert MakerConfig(mnemonic=TEST_MNEMONIC).min_fee_rate_sat_vb == 0.0
+
+
 def test_maximum_maker_lock_windows_fit_metadata_ttl_cap() -> None:
     from jmwallet.wallet.utxo_metadata import MAX_COINJOIN_LOCK_TTL
 
