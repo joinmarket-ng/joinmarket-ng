@@ -1866,6 +1866,40 @@ def test_tui_script_seed_uses_subshell_for_password() -> None:
     )
 
 
+def test_tui_script_seed_runs_full_unlock_before_showseed() -> None:
+    """SEED must run ensure_wallet_unlocked_global like BAL/HIST/FREEZE.
+
+    Showing seed words is at least as sensitive as balance/history: the
+    flag-gated passphrase prompt with fingerprint confirmation must run so
+    the user knows exactly which wallet the displayed seed belongs to.
+    """
+    content = SCRIPT_PATH.read_text()
+    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
+    assert "ensure_wallet_unlocked_global || exit 1" in seed_block, (
+        "SEED must run the full unlock (flag-gated passphrase prompt)"
+    )
+    pwd_pos = seed_block.index('ensure_wallet_password "$CURRENT_WALLET"')
+    unlock_pos = seed_block.index("ensure_wallet_unlocked_global")
+    showseed_pos = seed_block.index("jm-wallet showseed")
+    assert pwd_pos < unlock_pos < showseed_pos, (
+        "unlock must run after the password check and before showseed"
+    )
+
+
+def test_tui_script_seed_showseed_skips_redundant_cli_confirm() -> None:
+    """showseed must be called with --yes inside the TUI.
+
+    The CLI's own typer.confirm is 1:1 redundant with the whiptail security
+    warning (--defaultno) that gates the SEED flow; without --yes the user
+    would have to confirm twice.
+    """
+    content = SCRIPT_PATH.read_text()
+    seed_block = content.split("SEED)", 1)[1].split("BACK)", 1)[0]
+    assert 'jm-wallet showseed -f "$CURRENT_WALLET" --yes' in seed_block
+    # The whiptail security warning must remain the single interactive gate.
+    assert "--defaultno" in seed_block
+
+
 def test_tui_script_send_password_after_clear_in_subshell() -> None:
     """SEND must clear screen first, then run password check in subshell.
 

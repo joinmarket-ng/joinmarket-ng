@@ -2246,7 +2246,13 @@ No:  automatic coin selection from one mixdepth." 12 64
               echo "Please wait..."
               (
                   ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                  jm-wallet showseed -f "$CURRENT_WALLET"
+                  # Full unlock, same protection as BAL/HIST/FREEZE: flag-gated
+                  # BIP39 passphrase prompt with fingerprint confirmation, so
+                  # the user knows exactly which wallet the seed belongs to.
+                  ensure_wallet_unlocked_global || exit 1
+                  # --yes skips the CLI's own confirmation prompt: it is 1:1
+                  # redundant with the whiptail security warning above.
+                  jm-wallet showseed -f "$CURRENT_WALLET" --yes
                   echo ""
                   echo ""
                   echo "Press [Enter] to continue."
