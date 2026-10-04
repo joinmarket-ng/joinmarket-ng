@@ -2450,6 +2450,19 @@ def test_tui_script_send_uses_whiptail_confirmation() -> None:
     assert "show_summary" not in s_block
 
 
+def test_tui_script_send_confirmation_defaults_to_no() -> None:
+    """The Confirm Send dialog must default to No (--defaultno).
+
+    Sending funds is irreversible; a distracted Enter must abort the send,
+    not trigger it.
+    """
+    content = SCRIPT_PATH.read_text()
+    s_block = content.split("S)\n", 1)[1].split("W)\n", 1)[0]
+    confirm = s_block.split('whiptail --title " Confirm Send "', 1)[1]
+    confirm = confirm.split("|| continue", 1)[0]
+    assert "--defaultno" in confirm, "Confirm Send must default to No"
+
+
 # ---------------------------------------------------------------------------
 # Config Center Tests (PR: Add Config Center to TUI)
 # ---------------------------------------------------------------------------

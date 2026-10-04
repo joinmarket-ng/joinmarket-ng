@@ -1832,7 +1832,7 @@ No:  automatic coin selection from one mixdepth." 12 64
   Fee Rate:        ${FEE_DISPLAY:-auto}
   Destination:     ${SEND_DEST}
 
-  Proceed with transaction?" 14 66 || continue
+  Proceed with transaction?" 14 66 --defaultno || continue
 
       # Execute the appropriate command
       clear
