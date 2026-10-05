@@ -98,7 +98,7 @@ nav:
       - Run a CoinJoin: README-taker.md
       - Run the tumbler: README-tumbler.md
       - Run a maker: README-maker.md
-      - Back up and recover: recover-wallet.md
+      - Back up, recover, or migrate: recover-wallet.md
       - Update: update.md
   - Understand Privacy:
       - CoinJoin and wallet concepts: technical/concepts.md
