@@ -16,36 +16,81 @@ JoinMarket NG supports the optional BIP39 passphrase ("25th word"):
 
 **Important Distinction:**
 
-- **File encryption password** (`--password`): Encrypts mnemonic file with AES (Fernet, key derived via Argon2id; legacy files using PBKDF2 are still readable)
+- **Mnemonic**: Recovery words, which must be backed up independently of local files.
+- **File encryption password**: Encrypts local seed material; it does not change wallet keys.
 - **BIP39 passphrase** (`--prompt-bip39-passphrase`): Used in seed derivation per BIP39
 
-The passphrase is provided when **using** the wallet, not when importing:
+By default, import/generate save mnemonic material without registering a derived
+identity. Advanced onboarding is opt-in:
+
+```toml
+[wallet]
+bip39_passphrase_enabled = true
+```
+
+With this setting, saved-wallet onboarding prompts for BIP39 when no credential is
+supplied, repeats a nonempty passphrase, and asks to register/select the derived
+identity. `--no-register-identity` keeps generation/import seed-only;
+`--register-identity` explicitly requests onboarding without enabling the setting.
+
+For an existing wallet, registration and selection are explicit:
 
 ```bash
-# Import only stores mnemonic (no passphrase)
-jm-wallet import --words 24
+jm-wallet identity register --mnemonic-file wallet.mnemonic --prompt-bip39-passphrase
+jm-wallet identity list --mnemonic-file wallet.mnemonic
+jm-wallet identity select <fingerprint> --mnemonic-file wallet.mnemonic
 
-# Passphrase provided at usage time:
-jm-wallet info --prompt-bip39-passphrase
-BIP39_PASSPHRASE="my phrase" jm-wallet info
+# For a wallet intentionally using no BIP39 passphrase:
+jm-wallet identity register --mnemonic-file wallet.mnemonic --no-bip39-passphrase
 ```
 
 When `--prompt-bip39-passphrase` prompts interactively, input stays hidden.
 After you press Enter, the CLI displays whether the passphrase is set or empty
 and the derived JoinMarket wallet fingerprint. It asks `Continue with this wallet?`
 before loading or scanning the wallet; the default is Yes. Compare the fingerprint
-with the one shown by a previous `jm-wallet info` invocation for the intended
-wallet. This identifies the wallet but cannot verify that a passphrase is correct:
-every passphrase derives a valid wallet.
+with independent records for the intended wallet. Every passphrase derives a
+valid wallet; a registered selection adds a local mismatch check before backend
+activity, but the short fingerprint is not an authentication proof.
 
 Environment and config passphrases retain precedence and do not prompt or require
-confirmation, including when the prompt flag is supplied. Without that flag,
-commands remain noninteractive with respect to the BIP39 passphrase.
+confirmation, including when the prompt flag is supplied. Registered passphrase
+wallets prompt when no credential is supplied even if onboarding is disabled.
+Registered wallets without passphrases do not prompt. Unregistered wallets retain
+legacy empty-passphrase behavior unless prompting is requested or enabled.
+
+`.meta` remembers public identities and their passphrase requirements, never
+passphrases. One mnemonic file can register several identities; registering or
+deriving another identity does not silently change its selection. `identity
+register --select` explicitly combines registration and selection. `--yes`
+acknowledges metadata disclosure without the registration confirmation prompt.
+`jm-wallet delete` rejects files holding several registered identities, since it
+would otherwise remove their shared seed material. Retire those wallets and
+handle the shared backup explicitly rather than deleting one as if it owned the
+whole mnemonic.
+
+Registered `history`, `list-bonds`, and `registry-show` reads, including explicit
+`--mnemonic-file` reads, use the selected identity without unlocking. Explicit
+prompt/credential requests still derive and validate the selection.
+`--wallet-fingerprint` remains the direct passwordless override. Legacy explicit
+mnemonic-file reads continue deriving rather than treating a cache as a binding.
+
+On upgrade, legacy cached fingerprints remain unverified hints. Missing metadata
+does not mean no passphrase and never schedules a migration scan. Register and
+select the intended identity to remove the warning. Registration preserves
+birthdays, recovery markers, and history namespaces. Corrupt or unsupported
+metadata requires deliberate repair, not an automatic rewrite. Back up the
+sidecar alongside the mnemonic file, but retain independent credential backups.
 
 **Security Notes:**
 
 - An empty passphrase (`""`) is valid and selects the wallet without a passphrase
 - Passphrase is case-sensitive and whitespace-sensitive
+- BIP39 uses NFKD Unicode normalization; passphrases are not trimmed.
+- Identity metadata reveals that a remembered passphrase wallet exists and can
+  help check passphrase guesses when the mnemonic is exposed. Do not register if
+  that disclosure conflicts with your privacy requirements.
+- Do not operate a registered passphrase wallet with older CLI versions: they do
+  not enforce the identity binding. Keep a compatible version with the backup.
 - Can be set in `[wallet] bip39_passphrase` in `config.toml`, but this is discouraged because it places the passphrase next to the encrypted mnemonic; prefer `--prompt-bip39-passphrase` or the `BIP39_PASSPHRASE` env variable.
 
 ### Wallet File Encryption
@@ -67,6 +112,13 @@ derived via PBKDF2-HMAC-SHA256 with 600,000 iterations). These files
 remain loadable. They are not silently re-encrypted: to migrate an
 existing wallet to Argon2id, create a new wallet and move funds, or
 trigger a re-save through any future password-change flow.
+
+New daemon containers with nonempty BIP39 passphrases use outer format version 2,
+with the same KDF layout and encrypted expected-identity metadata. Older daemons
+reject these files instead of opening the empty-passphrase wallet. Empty-passphrase
+containers remain version 1. Existing files are never rewritten merely on unlock;
+legacy containers remain identity-unconfirmed. This is an accidental rollback
+guard, not protection against deliberate header tampering.
 
 ### UTXO Selection
 

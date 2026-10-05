@@ -6,15 +6,27 @@ from __future__ import annotations
 
 import errno
 import os
-import stat
 import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Any
 
 import typer
 from jmcore.crypto import validate_bip39_checksum
 from jmcore.secure_files import atomic_write_private
+from jmcore.wallet_metadata import (
+    UPGRADE_GUIDANCE,
+    WalletIdentity,
+    load_mnemonic_meta,
+    metadata_lock,
+)
+from jmcore.wallet_metadata import (
+    meta_path as _meta_path,
+)
+from jmcore.wallet_metadata import (
+    write_mnemonic_meta as _write_mnemonic_meta,
+)
 from loguru import logger
 
 from jmwallet.mnemonic import generate_wallet_mnemonic
@@ -256,7 +268,7 @@ def load_mnemonic_file(
 
 # JSON value types stored in a ``.meta`` file. ``creation_height`` is an int;
 # ``fingerprint`` and ``fidelity_bond_recovery`` are strings.
-MnemonicMetaValue = int | str
+MnemonicMetaValue = Any
 
 FIDELITY_BOND_RECOVERY_PENDING = "pending"
 FIDELITY_BOND_RECOVERY_COMPLETE = "complete"
@@ -273,15 +285,6 @@ class FidelityBondRecoveryInProgressError(RuntimeError):
     """Another process already owns this mnemonic's recovery attempt."""
 
 
-def _meta_path(mnemonic_file: Path) -> Path:
-    """Return the path to the companion metadata file for a mnemonic file.
-
-    The metadata file lives alongside the mnemonic file with a ``.meta``
-    suffix appended, e.g. ``default.mnemonic`` -> ``default.mnemonic.meta``.
-    """
-    return mnemonic_file.with_name(mnemonic_file.name + ".meta")
-
-
 def reset_mnemonic_meta(mnemonic_file: Path) -> None:
     """Remove metadata that belongs to mnemonic contents being replaced."""
     with _mnemonic_meta_lock(mnemonic_file, recovery=True):
@@ -292,49 +295,16 @@ def reset_mnemonic_meta(mnemonic_file: Path) -> None:
 @contextmanager
 def _mnemonic_meta_lock(mnemonic_file: Path, *, recovery: bool = False) -> Iterator[None]:
     """Lock a stable sidecar, using a nonblocking lock for long recovery attempts."""
-    path = _meta_path(mnemonic_file)
-    lock_path = path.with_name(path.name + (".recovery.lock" if recovery else ".lock"))
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        lock_path,
-        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
-        0o600,
-    )
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError("Mnemonic metadata lock must be a regular file")
-        os.fchmod(fd, 0o600)
+    with ExitStack() as stack:
         try:
-            if sys.platform == "win32":  # pragma: no cover - Windows
-                import msvcrt
-
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"\0")
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_NBLCK if recovery else msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if recovery else 0))
+            stack.enter_context(metadata_lock(mnemonic_file, nonblocking=recovery))
         except OSError as exc:
             if recovery and exc.errno in {errno.EACCES, errno.EAGAIN}:
                 raise FidelityBondRecoveryInProgressError(
                     "Fidelity bond recovery is already running in another process"
                 ) from exc
             raise
-        # Closing this descriptor releases the lock, including on cancellation.
         yield
-    finally:
-        os.close(fd)
-
-
-def _write_mnemonic_meta(mnemonic_file: Path, meta: dict[str, MnemonicMetaValue]) -> None:
-    """Atomically persist a metadata dict to the companion ``.meta`` file."""
-    import json
-
-    path = _meta_path(mnemonic_file)
-    atomic_write_private(path, (json.dumps(meta, indent=2) + "\n").encode("utf-8"))
-    logger.bind(sensitive=True).debug(f"Saved mnemonic metadata to {path}")
 
 
 def save_mnemonic_meta(
@@ -376,40 +346,9 @@ def save_mnemonic_meta(
 
     # Merge into any existing metadata so concurrent fields are not lost.
     with _mnemonic_meta_lock(mnemonic_file):
-        meta = load_mnemonic_meta(mnemonic_file)
+        meta = load_mnemonic_meta(mnemonic_file, strict=True)
         meta.update(updates)
         _write_mnemonic_meta(mnemonic_file, meta)
-
-
-def load_mnemonic_meta(mnemonic_file: Path) -> dict[str, MnemonicMetaValue]:
-    """Load wallet metadata from a companion ``.meta`` file.
-
-    Returns an empty dict if the file does not exist (backward-compatible
-    with mnemonics created before this feature was added).
-
-    Args:
-        mnemonic_file: Path to the mnemonic file.
-
-    Returns:
-        Dict with metadata fields (``creation_height``, ``fingerprint``).
-    """
-    import json
-
-    path = _meta_path(mnemonic_file)
-    if not path.exists():
-        return {}
-
-    try:
-        data = json.loads(path.read_text())
-        if isinstance(data, dict):
-            return data
-        logger.warning("Mnemonic metadata file has unexpected format")
-        logger.bind(sensitive=True).warning(f"Mnemonic metadata file has unexpected format: {path}")
-        return {}
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read mnemonic metadata")
-        logger.bind(sensitive=True).warning(f"Failed to read mnemonic metadata from {path}: {exc}")
-        return {}
 
 
 def _fidelity_bond_recovery_key(wallet_fingerprint: str) -> str:
@@ -480,7 +419,7 @@ def mark_fidelity_bond_recovery_complete(
 ) -> None:
     """Persist recovery completion for the selected wallet."""
     with _mnemonic_meta_lock(mnemonic_file):
-        meta = load_mnemonic_meta(mnemonic_file)
+        meta = load_mnemonic_meta(mnemonic_file, strict=True)
         meta[_fidelity_bond_recovery_key(wallet_fingerprint)] = FIDELITY_BOND_RECOVERY_COMPLETE
         _write_mnemonic_meta(mnemonic_file, meta)
 
@@ -513,7 +452,7 @@ def fidelity_bond_recovery_attempt(
                 mnemonic_file, wallet_fingerprint
             )
             if claimed:
-                meta = load_mnemonic_meta(mnemonic_file)
+                meta = load_mnemonic_meta(mnemonic_file, strict=True)
                 meta[_fidelity_bond_recovery_key(wallet_fingerprint)] = (
                     FIDELITY_BOND_RECOVERY_STARTED
                 )
@@ -551,10 +490,25 @@ def update_mnemonic_meta_fingerprint(mnemonic_file: Path, fingerprint: str) -> N
     directory never breaks the calling command.
     """
     try:
-        if load_mnemonic_meta_fingerprint(mnemonic_file) == fingerprint.strip().lower():
-            return
-        save_mnemonic_meta(mnemonic_file, fingerprint=fingerprint)
-    except OSError as exc:  # pragma: no cover - defensive (read-only datadir)
+        with _mnemonic_meta_lock(mnemonic_file):
+            meta = load_mnemonic_meta(mnemonic_file, strict=True)
+            if "identity_version" in meta:
+                return
+            raw = meta.get("fingerprint")
+            try:
+                cached = WalletIdentity.validate_fingerprint(raw) if isinstance(raw, str) else None
+            except ValueError:
+                cached = None
+            if cached is not None:
+                if cached != fingerprint.strip().lower():
+                    logger.warning(
+                        "Derived wallet differs from the cached identity; cache unchanged. "
+                        + UPGRADE_GUIDANCE
+                    )
+                return
+            meta["fingerprint"] = WalletIdentity.validate_fingerprint(fingerprint)
+            _write_mnemonic_meta(mnemonic_file, meta)
+    except (OSError, ValueError) as exc:  # pragma: no cover - defensive (read-only datadir)
         logger.debug("Could not persist wallet fingerprint to metadata")
         logger.bind(sensitive=True).debug(
             f"Could not persist wallet fingerprint to metadata: {exc}"
@@ -612,7 +566,6 @@ def format_word_suggestions(matches: list[str], max_display: int = 8) -> str:
 
 def _read_char() -> str:
     """Read a single character from stdin without waiting for Enter."""
-    import sys
     import termios
     import tty
 
@@ -633,7 +586,6 @@ def _read_remaining_stdin() -> str:
     Returns empty string if no data is available.
     """
     import select
-    import sys
     import termios
     import tty
 
@@ -676,7 +628,6 @@ def _interactive_word_input(
         KeyboardInterrupt: If user presses Ctrl+C
         EOFError: If user presses Ctrl+D
     """
-    import sys
 
     buffer = ""
     suggestion_line = ""
@@ -794,7 +745,6 @@ def _interactive_word_input(
 
 def _supports_raw_terminal() -> bool:
     """Check if the terminal supports raw character input."""
-    import sys
 
     if not sys.stdin.isatty():
         return False

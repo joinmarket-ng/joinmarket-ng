@@ -258,6 +258,10 @@
 
 # Mnemonic file settings (optional defaults)
 # mnemonic_file = ""            # Path to mnemonic file
+# Enable BIP39 onboarding and prompting for unregistered wallets. Default: false.
+# Registered passphrase wallets still require their passphrase when this is false.
+# Recorded history uses the selected identity without unlocking either credential.
+# bip39_passphrase_enabled = false
 #
 # SECURITY WARNING: mnemonic_password is stored IN PLAIN TEXT in this file.
 # Anyone who can read config.toml can decrypt the wallet, which defeats the

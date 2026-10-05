@@ -40,6 +40,24 @@ wallet. Viewing recovery words is sensitive; do not screen-share or capture it.
 The BIP39 passphrase prompt is separate from wallet-file decryption. Verify the
 derived wallet identity before accepting it, especially after recovery.
 
+Ordinary wallets no longer get an unconditional BIP39 question. Config Center's
+**Configure BIP39 Onboarding** enables advanced generation/import and prompting
+for unregistered wallets. Registered wallet requirements apply independently of
+that setting. Supplied credentials still support unattended services.
+
+After upgrading, use **Register Derived Wallet Identity** with the intended
+passphrase, compare its fingerprint with your records, then **Select Registered
+Wallet Identity**. Registration does not automatically change the selected
+identity. Several passphrase wallets may share a mnemonic file. The menu shows
+the selected fingerprint; neither registration nor selection stores a passphrase.
+
+**CoinJoin History** shows recorded data without synchronization. For registered
+wallets it requires neither credential. **Refresh / Reconstruct Wallet History**
+explicitly unlocks and synchronizes, including deferred reconstruction. Legacy
+unregistered files may still require unlocking to identify the wallet; register
+and select their identity to enable passwordless viewing. Refresh is not a claim
+that historical recovery coverage is complete.
+
 ## Maker Bot Control
 
 Start, stop, and inspect the maker here. On Raspiblitz the menu controls a
@@ -56,6 +74,11 @@ commands can reuse that staged credential. Protect the host in either case.
 Use [unattended maker guidance](maker-service.md) to decide whether automatic
 startup is appropriate; do not assume wallet-file encryption protects against
 someone who can also read the unlock credentials.
+
+For a Raspiblitz systemd maker, provision the BIP39 credential in the service's
+protected environment separately. The menu stages only the mnemonic encryption
+password, not the BIP39 passphrase; an unattended service cannot answer a prompt.
+Use foreground CLI operation if you do not want to provision that credential.
 
 ## Fidelity Bonds
 

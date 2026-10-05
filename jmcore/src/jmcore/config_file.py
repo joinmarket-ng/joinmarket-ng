@@ -112,10 +112,31 @@ def remove_config_value(path: Path, section: str, key: str) -> None:
         raise ConfigFileError("cannot write config") from exc
 
 
+def set_config_bool(path: Path, section: str, key: str, value: bool) -> None:
+    """Set an actual TOML boolean without weakening the existing string API."""
+    _validate_identifier("section", section)
+    _validate_identifier("key", key)
+    document = _read_document(path)
+    table = _get_table(document, section)
+    if table is None:
+        table = tomlkit.table()
+        document[section] = table
+    if key in table:
+        if not isinstance(table[key], bool):
+            raise ConfigFileError("config value is not a boolean")
+        if table[key] == value:
+            return
+    table[key] = value
+    try:
+        atomic_write_sensitive_file(path, tomlkit.dumps(document).encode("utf-8"))
+    except OSError as exc:
+        raise ConfigFileError("cannot write config") from exc
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read and update TUI TOML config values")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("get", "set", "remove"):
+    for command in ("get", "set", "set-bool", "remove"):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--config", type=Path, required=True)
         command_parser.add_argument("--section", required=True)
@@ -131,12 +152,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             value = get_config_value(args.config, args.section, args.key)
             if value is not None:
                 sys.stdout.write(value)
-        elif args.command == "set":
+        elif args.command in {"set", "set-bool"}:
             try:
                 value = sys.stdin.buffer.read().decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ConfigFileError("config value must be UTF-8 text") from exc
-            set_config_value(args.config, args.section, args.key, value)
+            if args.command == "set-bool":
+                if value not in {"true", "false"}:
+                    raise ConfigFileError("boolean value must be true or false")
+                set_config_bool(args.config, args.section, args.key, value == "true")
+            else:
+                set_config_value(args.config, args.section, args.key, value)
         else:
             remove_config_value(args.config, args.section, args.key)
     except ConfigFileError as exc:

@@ -92,8 +92,14 @@ child.wait()
 @pytest.mark.parametrize("encrypted", [True, False])
 @pytest.mark.parametrize("passphrase", [PASSPHRASE, ""])
 @pytest.mark.parametrize("confirm", [True, False])
+@pytest.mark.parametrize("policy", ["enabled", "registered", "disabled"])
 def test_wallet_info_prompts_for_passphrase(
-    tmp_path: Path, view: str, encrypted: bool, passphrase: str, confirm: bool
+    tmp_path: Path,
+    view: str,
+    encrypted: bool,
+    passphrase: str,
+    confirm: bool,
+    policy: str,
 ) -> None:
     """Run the real menu branch and CLI, stopping before backend access."""
     wallet_path = tmp_path / "wallet.mnemonic"
@@ -101,7 +107,25 @@ def test_wallet_info_prompts_for_passphrase(
         MNEMONIC, wallet_path, "test-encryption-password" if encrypted else None
     )
     config_path = tmp_path / "config.toml"
-    config_path.write_text('[bitcoin]\nnetwork = "regtest"\n')
+    config_text = '[bitcoin]\nnetwork = "regtest"\n'
+    if policy == "enabled":
+        config_text += "[wallet]\nbip39_passphrase_enabled = true\n"
+    config_path.write_text(config_text)
+    if policy == "registered":
+        from jmcore.wallet_metadata import (
+            WalletIdentity,
+            register_identity,
+            select_identity,
+        )
+
+        fingerprint = get_mnemonic_fingerprint(MNEMONIC, passphrase)
+        register_identity(
+            wallet_path,
+            WalletIdentity(
+                fingerprint=fingerprint, bip39="required" if passphrase else "none"
+            ),
+        )
+        select_identity(wallet_path, fingerprint)
     content = SCRIPT_PATH.read_text()
     helpers = content.split(
         "# =============================================================================\n# Helpers",
@@ -168,14 +192,21 @@ with patch('jmwallet.cli.wallet._show_wallet_info', show_info):
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    expected = get_mnemonic_fingerprint(MNEMONIC, passphrase)
-    assert f"Wallet fingerprint: {expected}" in result.stdout
-    assert "Continue with this wallet?" in result.stdout
-    if confirm:
+    prompts = policy == "enabled" or (policy == "registered" and bool(passphrase))
+    expected = get_mnemonic_fingerprint(
+        MNEMONIC, passphrase if policy != "disabled" else ""
+    )
+    if prompts:
+        assert f"Wallet fingerprint: {expected}" in result.stdout
+        assert "Continue with this wallet?" in result.stdout
+    else:
+        assert "Enter BIP39 passphrase" not in result.stdout
+        assert "Continue with this wallet?" not in result.stdout
+    if confirm or not prompts:
         assert f"SELECTED_WALLET={expected}" in result.stdout, result.stdout
         assert f"EXTENDED={view == 'EXT'}" in result.stdout
     else:
         assert "SELECTED_WALLET=" not in result.stdout
     assert PASSPHRASE not in result.stdout + result.stderr
     assert "test-encryption-password" not in result.stdout + result.stderr
-    assert config_path.read_text() == '[bitcoin]\nnetwork = "regtest"\n'
+    assert config_path.read_text() == config_text

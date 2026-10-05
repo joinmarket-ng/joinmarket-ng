@@ -34,6 +34,8 @@ from jmwallet.cli.mnemonic import (
 )
 
 if TYPE_CHECKING:
+    from jmcore.settings import JoinMarketSettings
+
     from jmwallet.wallet.service import WalletService
 
 
@@ -206,9 +208,27 @@ def delete_wallet(
         resolved.mnemonic,
         resolved.bip39_passphrase or "",
     )
+    from jmcore.wallet_metadata import load_mnemonic_meta, registered_identities, selected_identity
+
     from jmwallet.cli.mnemonic import load_mnemonic_meta_fingerprint
 
-    cached_fingerprint = load_mnemonic_meta_fingerprint(resolved_mnemonic_file)
+    identities = registered_identities(resolved_mnemonic_file)
+    meta = load_mnemonic_meta(resolved_mnemonic_file, strict=True)
+    entries = meta.get("identities", {})
+    if len(identities) > 1 or not isinstance(entries, dict) or len(entries) != len(identities):
+        logger.error(
+            "This mnemonic file holds multiple registered wallet identities "
+            "or unconfirmed entries. Deletion would "
+            "remove their shared seed material. Back up the mnemonic and sidecar and retire "
+            "all derived wallets explicitly; this command will not delete the shared file."
+        )
+        raise typer.Exit(1)
+    identity = selected_identity(resolved_mnemonic_file)
+    cached_fingerprint = (
+        identity.fingerprint
+        if identity is not None
+        else load_mnemonic_meta_fingerprint(resolved_mnemonic_file)
+    )
     if (
         cached_fingerprint is not None
         and cached_fingerprint != fingerprint
@@ -381,6 +401,13 @@ def import_mnemonic(
         bool,
         typer.Option("--force", "-f", help="Overwrite existing file without confirmation"),
     ] = False,
+    register_identity: Annotated[
+        bool | None,
+        typer.Option(
+            "--register-identity/--no-register-identity",
+            help="Confirm and select a derived wallet identity (default: follow BIP39 setting)",
+        ),
+    ] = None,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -410,7 +437,7 @@ def import_mnemonic(
         MNEMONIC="word1 word2 ..." jm-wallet import  # Via env var
         jm-wallet import -o my-wallet.mnemonic    # Custom output file
     """
-    setup_cli(data_dir=data_dir)
+    settings = setup_cli(data_dir=data_dir)
 
     if word_count not in (12, 15, 18, 21, 24):
         logger.error(f"Invalid word count: {word_count}. Must be 12, 15, 18, 21, or 24.")
@@ -503,6 +530,40 @@ def import_mnemonic(
         "A visible balance or an idle scan does not prove complete recovery. "
         "Historical recovery requires a backend with the necessary block and history data."
     )
+    _onboard_saved_identity(settings, output_file, password, register_identity)
+
+
+def _onboard_saved_identity(
+    settings: JoinMarketSettings,
+    output_file: Path,
+    password: str | None,
+    register: bool | None,
+) -> None:
+    enabled = settings.wallet.bip39_passphrase_enabled if register is None else register
+    if not enabled:
+        typer.echo(
+            "Mnemonic saved without identity registration. "
+            "Use `jm-wallet identity register` to confirm the intended wallet."
+        )
+        return
+    from jmwallet.cli.identity import confirm_and_register
+
+    try:
+        confirm_and_register(
+            settings,
+            output_file,
+            password=password,
+            confirm_bip39_passphrase=True,
+            select=True,
+        )
+    except (ValueError, OSError, typer.Abort) as exc:
+        typer.echo(
+            "Mnemonic was saved, but identity registration did not complete. "
+            "The saved seed was not deleted."
+        )
+        if not isinstance(exc, typer.Abort):
+            logger.error(str(exc))
+        raise typer.Exit(1) from exc
 
 
 # Hard cap (seconds) for the best-effort chain tip lookup performed by
@@ -600,6 +661,13 @@ def generate(
         bool,
         typer.Option("--force", "-f", help="Overwrite existing file without confirmation"),
     ] = False,
+    register_identity: Annotated[
+        bool | None,
+        typer.Option(
+            "--register-identity/--no-register-identity",
+            help="Confirm and select a derived wallet identity (default: follow BIP39 setting)",
+        ),
+    ] = None,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -621,7 +689,7 @@ def generate(
     order of precedence). Use --no-save to only display the mnemonic without
     saving.
     """
-    setup_cli(data_dir=data_dir)
+    settings = setup_cli(data_dir=data_dir)
 
     try:
         # Auto-enable save if output_file is specified (even if --no-save was used)
@@ -703,6 +771,7 @@ def generate(
                 typer.echo("WARNING: File is NOT encrypted")
                 typer.echo("For production use, generate again with a password!")
             typer.echo("KEEP THIS FILE SECURE - IT CONTROLS YOUR FUNDS!")
+            _onboard_saved_identity(settings, output_file, password, register_identity)
         else:
             typer.echo("\nMnemonic NOT saved (--no-save was used)")
             typer.echo("To save it, run: jm-wallet generate")

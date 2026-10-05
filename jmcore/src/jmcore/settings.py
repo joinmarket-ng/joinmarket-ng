@@ -531,6 +531,13 @@ class WalletSettings(BaseModel):
         default=None,
         description="BIP39 passphrase (13th/25th word). For security, prefer BIP39_PASSPHRASE env var.",
     )
+    bip39_passphrase_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable BIP39 onboarding and prompts for unregistered wallets. Registered wallet "
+            "requirements always apply; identity-only reads never need the passphrase."
+        ),
+    )
 
 
 class NotificationSettings(BaseModel):

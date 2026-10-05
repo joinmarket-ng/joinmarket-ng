@@ -350,6 +350,19 @@ set_config_value() {
         --config "$CONFIG_FILE" --section "$section" --key "$key"
 }
 
+wallet_identity_summary() {
+    "$TUI_PYTHON" - "$1" <<'PY'
+import sys
+from pathlib import Path
+from jmcore.wallet_metadata import selected_identity
+try:
+    identity = selected_identity(Path(sys.argv[1]))
+    print(f"{identity.fingerprint} (BIP39: {identity.bip39})" if identity else "identity unconfirmed")
+except (OSError, ValueError):
+    print("identity unavailable; register/select explicitly")
+PY
+}
+
 # Clear the saved password before changing the active wallet. If saving the
 # new wallet fails, the old wallet remains selected without a mismatched secret.
 set_active_wallet_config() {
@@ -633,6 +646,8 @@ prompt_and_store_password() {
 #   )
 ensure_wallet_password() {
     local wallet_path="$1"
+    # The displayed wallet must also be the subprocess mnemonic source.
+    export MNEMONIC_FILE="$wallet_path"
     local attempts=0
     local max_attempts=3
     local pwd_entry
@@ -921,7 +936,7 @@ check_stale_wallet() {
         CURRENT_WALLET=""
     fi
     if [ -n "$CURRENT_WALLET" ]; then
-        WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
+        WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET") | $(wallet_identity_summary "$CURRENT_WALLET")"
     else
         WALLET_INFO="Active Wallet: (none configured)"
     fi
@@ -1410,9 +1425,12 @@ No:  automatic coin selection from one mixdepth." 12 64
 
         WCHOICE=$(whiptail --title " Wallet Management " \
          --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-         20 64 9 \
+          23 78 12 \
           "BAL"      "View Wallet Info / Balance" \
           "HIST"     "CoinJoin History" \
+          "REFRESH"  "Refresh / Reconstruct Wallet History" \
+          "IDREG"    "Register Derived Wallet Identity" \
+          "IDSEL"    "Select Registered Wallet Identity" \
           "FREEZE"   "UTXO Freeze Manager" \
           "NEW"      "Create New Wallet (12 or 24-word seed)" \
           "IMP"      "Import Existing Wallet (from seed)" \
@@ -1455,7 +1473,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                           echo ""
                           (
                               ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                              jm-wallet info --prompt-bip39-passphrase
+                              jm-wallet info
                               pause
                           )
                           clear
@@ -1469,7 +1487,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                           echo ""
                           (
                               ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                              jm-wallet info --extended --prompt-bip39-passphrase
+                              jm-wallet info --extended
                               pause
                           )
                           clear
@@ -1544,15 +1562,49 @@ No:  automatic coin selection from one mixdepth." 12 64
               echo "Preparing wallet..."
               echo ""
               (
-                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                  # A background Core rescan may have completed since the last
-                  # wallet operation. Sync first so automatic imported-wallet
-                  # history reconstruction gets its deferred retry.
-                  jm-wallet info >/dev/null || exit 1
-                  jm-wallet history "${HIST_ARGS[@]}"
+                  jm-wallet history --mnemonic-file "$CURRENT_WALLET" "${HIST_ARGS[@]}"
                   pause
               )
               clear
+              ;;
+
+          # --------------------------------------------------------------
+          # REFRESH - Explicit backend synchronization and deferred reconstruction
+          # --------------------------------------------------------------
+          REFRESH)
+              ensure_active_wallet || continue
+              (
+                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  jm-wallet info
+                  pause
+              )
+              ;;
+          IDREG)
+              ensure_active_wallet || continue
+              (
+                  ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  jm-wallet identity register --mnemonic-file "$CURRENT_WALLET" \
+                      --prompt-bip39-passphrase --confirm-bip39-passphrase
+                  pause
+              )
+              ;;
+          IDSEL)
+              ensure_active_wallet || continue
+              IDENTITY_JSON=$(jm-wallet identity list --mnemonic-file "$CURRENT_WALLET" --json) || continue
+              IDENTITY_OPTIONS=()
+              while IFS=$'\t' read -r fingerprint status; do
+                  [ -n "$fingerprint" ] && IDENTITY_OPTIONS+=("$fingerprint" "$status")
+              done < <(printf '%s' "$IDENTITY_JSON" | "$TUI_PYTHON" -c '
+import json, sys
+for item in json.load(sys.stdin):
+    print(item["fingerprint"] + "\tBIP39: " + item["bip39"] + (" (selected)" if item["selected"] else ""))
+')
+              if [ ${#IDENTITY_OPTIONS[@]} -eq 0 ]; then
+                  whiptail --title " Identity Unconfirmed " --msgbox "Register the intended wallet identity first. Existing wallet data has not changed." 9 65
+                  continue
+              fi
+              IDENTITY_CHOICE=$(whiptail --title " Select Wallet Identity " --menu "Choose the intended derived wallet:" 18 70 8 "${IDENTITY_OPTIONS[@]}" 3>&1 1>&2 2>&3) || continue
+              jm-wallet identity select "$IDENTITY_CHOICE" --mnemonic-file "$CURRENT_WALLET"
               ;;
 
           # --------------------------------------------------------------
@@ -2167,6 +2219,7 @@ No:  automatic coin selection from one mixdepth." 12 64
           --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
           20 64 8 \
           "LOG"    "Configure Log Level" \
+          "BIP39"  "Configure BIP39 Onboarding" \
           "DELPW"  "Delete Active Wallet Password" \
           ""   "" \
           "EDIT"   "Edit config.toml manually (nano)" \
@@ -2178,6 +2231,14 @@ No:  automatic coin selection from one mixdepth." 12 64
         [ $? -ne 0 ] && break
 
         case $CCHOICE in
+          BIP39)
+            BIP39_CHOICE=$(whiptail --title " BIP39 Onboarding " --menu "Enable advanced BIP39 onboarding and prompts for unregistered wallets? Registered wallet requirements always apply. Recorded history does not need either credential." 16 75 2 \
+                "true" "Enable" "false" "Disable (default)" 3>&1 1>&2 2>&3) || continue
+            if ! printf '%s' "$BIP39_CHOICE" | "$TUI_PYTHON" -m jmcore.config_file set-bool \
+                --config "$CONFIG_FILE" --section wallet --key bip39_passphrase_enabled; then
+                show_config_save_error
+            fi
+            ;;
           LOG)
             CURRENT_LOG="${LOGGING__LEVEL:-INFO}"
 

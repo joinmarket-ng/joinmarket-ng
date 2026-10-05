@@ -149,14 +149,21 @@ def test_tui_prefers_its_virtual_environment() -> None:
     )
 
 
-def test_tui_history_syncs_before_reading() -> None:
-    """A completed background rescan must trigger deferred reconstruction."""
+def test_tui_history_is_offline_and_refresh_syncs() -> None:
+    """Recorded history stays offline; explicit refresh retries deferred reconstruction."""
     content = SCRIPT_PATH.read_text()
     history_block = content.split("# HIST - CoinJoin History", 1)[1].split(
-        "# FREEZE - Freeze/Unfreeze UTXOs", 1
+        "# REFRESH - Explicit backend synchronization", 1
     )[0]
-    assert history_block.index("jm-wallet info >/dev/null") < history_block.index(
-        'jm-wallet history "${HIST_ARGS[@]}"'
+    assert "ensure_wallet_password" not in history_block
+    assert "jm-wallet info" not in history_block
+    assert (
+        'jm-wallet history --mnemonic-file "$CURRENT_WALLET" "${HIST_ARGS[@]}"'
+        in history_block
+    )
+    refresh_block = content.split("REFRESH)", 1)[1].split("IDREG)", 1)[0]
+    assert refresh_block.index("ensure_wallet_password") < refresh_block.index(
+        "jm-wallet info"
     )
 
 
