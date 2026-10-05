@@ -1406,6 +1406,117 @@ def test_tui_script_write_maker_env_creates_file_with_restrictive_umask() -> Non
     assert umask_pos < chmod_pos, "restrictive umask must precede the chmod"
 
 
+@pytest.mark.parametrize("state", ["absent", "private", "readable", "symlink"])
+def test_tui_write_maker_env_replaces_privately(tmp_path: Path, state: str) -> None:
+    content = SCRIPT_PATH.read_text()
+    writer = (
+        "write_maker_env()"
+        + content.split("write_maker_env()", 1)[1].split("\n}", 1)[0]
+        + "\n}"
+    )
+    destination = tmp_path / ".maker.env"
+    old_file = tmp_path / "old-env"
+    old_file.write_text("old value\n")
+    if state == "symlink":
+        destination.symlink_to(old_file)
+    elif state != "absent":
+        destination.write_text("old value\n")
+        destination.chmod(0o644 if state == "readable" else 0o600)
+    password = 'test "quoted" \\ password'
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            writer
+            + """
+MAKER_ENV="$1"
+umask 022
+had_previous=0
+if [ -e "$MAKER_ENV" ]; then
+    exec 3< "$MAKER_ENV"
+    had_previous=1
+fi
+mv() {
+    test "$(stat -c %a "$3")" = 600 || return 1
+    if [ -e "$MAKER_ENV" ]; then
+        test "$(cat "$MAKER_ENV")" = 'old value' || return 1
+    fi
+    command mv "$@"
+}
+write_maker_env "$2" || exit 1
+if [ "$had_previous" = 1 ]; then
+    test "$(cat <&3)" = 'old value' || exit 1
+fi
+test "$(umask)" = 0022
+""",
+            "test",
+            str(destination),
+            password,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not destination.is_symlink()
+    assert destination.stat().st_mode & 0o777 == 0o600
+    assert (
+        destination.read_text()
+        == 'MNEMONIC_PASSWORD="test \\"quoted\\" \\\\ password"\n'
+    )
+    assert old_file.read_text() == "old value\n"
+    assert not list(tmp_path.glob(".maker.env.*"))
+
+
+@pytest.mark.parametrize(
+    "failure", ["sed", "mktemp", "chmod", "printf", "mv", "directory"]
+)
+def test_tui_stage_maker_password_propagates_write_failure(
+    tmp_path: Path, failure: str
+) -> None:
+    content = SCRIPT_PATH.read_text()
+    functions = "\n".join(
+        name + "()" + content.split(name + "()", 1)[1].split("\n}", 1)[0] + "\n}"
+        for name in ("write_maker_env", "stage_maker_password")
+    )
+    destination = tmp_path / ".maker.env"
+    if failure == "directory":
+        destination.mkdir()
+        injected_failure = ""
+    else:
+        destination.write_text("old value\n")
+        injected_failure = f"{failure}() {{ return 1; }}"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            functions
+            + "\n"
+            + injected_failure
+            + """
+MAKER_ENV="$1"
+jm-wallet() { return 0; }
+get_stored_mnemonic_password() { :; }
+ensure_wallet_password() { MNEMONIC_PASSWORD=test-secret; }
+stage_maker_password test-wallet
+""",
+            "test",
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0, (
+        "staging must not report success after a failed write"
+    )
+    if failure == "directory":
+        assert list(destination.iterdir()) == []
+    else:
+        assert destination.read_text() == "old value\n"
+    assert not list(tmp_path.glob(".maker.env.*"))
+
+
 def test_tui_script_ensure_wallet_password_reads_maker_env() -> None:
     """ensure_wallet_password must reuse a running maker's .maker.env password.
 

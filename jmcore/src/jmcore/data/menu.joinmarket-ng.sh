@@ -317,12 +317,19 @@ get_maker_env_password() {
 write_maker_env() {
     local password="$1"
     local escaped
-    escaped=$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-    # Create with restrictive permissions atomically: the file holds the
-    # cleartext wallet password and must not be world-readable even briefly
-    # between creation and chmod.
-    ( umask 077; printf 'MNEMONIC_PASSWORD="%s"\n' "$escaped" > "$MAKER_ENV" )
-    chmod 600 "$MAKER_ENV"
+    escaped=$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g') || return 1
+    # Replace rather than truncate: an older or interrupted write may have
+    # left a readable file. Keep the new secret private even in that case.
+    ( umask 077;
+      local temporary
+      temporary=$(mktemp "${MAKER_ENV}.XXXXXX") || exit 1
+      trap 'rm -f -- "$temporary"' EXIT
+      chmod 600 "$temporary" || exit 1
+      printf 'MNEMONIC_PASSWORD="%s"\n' "$escaped" > "$temporary" || exit 1
+      # Raspiblitz uses GNU mv: -T rejects directory destinations instead of
+      # moving the secret inside. This helper is only used on Raspiblitz.
+      mv -fT -- "$temporary" "$MAKER_ENV" || exit 1
+    )
 }
 
 # Helper: Remove a value in config.toml.
@@ -893,7 +900,6 @@ stage_maker_password() {
         return 1
     fi
     write_maker_env "${MNEMONIC_PASSWORD}"
-    return 0
 }
 
 # ---------------------------------------------------------------------------
