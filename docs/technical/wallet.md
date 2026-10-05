@@ -135,16 +135,79 @@ jm-taker coinjoin --amount=0 --mixdepth=0 --destination=INTERNAL
 
 | Algorithm | Behavior |
 |-----------|----------|
-| `default` | Minimum UTXOs only |
-| `gradual` | Minimum + 1 small UTXO |
-| `greedy` | All UTXOs from mixdepth |
-| `random` | Minimum + 0-2 random UTXOs |
+| `default` | Smallest sufficient single coin, otherwise largest-first; probabilistic random top-up to three inputs |
+| `gradual` | Smallest-first prefix of coins below the funding target, pruning its smallest leading coins while still funded |
+| `greedy` | Smallest-first funding prefix, pruning unnecessary preceding coins largest-first while retaining the crossing coin; exact matches keep the prefix |
+| `greediest` | Unpruned smallest-first prefix of coins below the funding target |
+| `random` | Shuffle coins until funded, prune individually unnecessary inputs in random order, then independently shuffle disclosure order |
+
+The funding target includes the CoinJoin amount, the maker's advertised mining-fee
+contribution, and a reserve for mandatory change, minus the maker's earned fee.
+`gradual` and `greediest` fall back to the smallest sufficient single coin when
+all subtarget coins together cannot fund the round. These three consolidation
+policies follow the reference implementation's value-based rules. Neither
+`greedy` nor `greediest` means spending every eligible coin, and their names do
+not guarantee a particular input count or net consolidation.
+
+The default policy balances frugal funding with inventory management. For an
+authorized pool of **n eligible coins**, if `n > 2` and funding uses fewer than
+three inputs, it tops up to **three total inputs** with probability `(n - 2) / n`.
+Extra coin identities are sampled randomly without replacement; disclosure order
+is also shuffled. With ten eligible coins the top-up probability is 80%, and with
+thirty it is about 93%. There is no top-up for one or two eligible coins, and no
+extra consolidation when funding already requires three or more inputs.
+
+A maker normally receives two outputs, so its whole-wallet UTXO count changes
+by `2 - input_count` for each successful round. For one-input funding, the default
+allows growth at very small inventories, is count-neutral on average at four
+eligible coins, and favors consolidation above four. Ten eligible coins give an
+expected reduction of 0.6 UTXOs per successful round. This is not a per-mixdepth
+ceiling: change returns to the source depth while the CoinJoin output enters the
+next depth, and source selection is based on eligible value, not coin count.
+
+All policies use only confirmed, unfrozen, unlocked coins, excluding fidelity
+bonds by default. Mixdepth-zero provenance restrictions still apply: the maker
+prefers its authorized rotation-lineage pool, otherwise uses just the smallest
+sufficient unrelated coin. It never mixes that coin with lineage funds. Only
+coins in the authorized, eligible pool count toward the default probability.
+
+`random` randomizes identities, not just the number of extra inputs. For positive
+funding targets, its pruning produces an **inclusion-minimal** selection: no
+individual selected input can be removed while preserving funding. It always
+retains at least one authentication input from a nonempty selection. It does not
+guarantee the minimum input count,
+uniform probabilities over funded subsets, consolidation, or a five-input cap.
+NG takers default to at most 15 inputs per maker and may reject larger selections;
+that rejection occurs after the maker has disclosed the selected outpoints.
 
 ```bash
 jm-maker start --merge-algorithm=greedy
 ```
 
-Privacy tradeoff: More inputs = faster consolidation but reveals UTXO clustering.
+Privacy tradeoffs differ by observer. The coordinating taker learns the selected
+co-owned inputs and both maker output addresses, including in a round that later
+aborts. Random selection can reveal different coins over repeated probes. A
+passive chain observer instead infers ownership from amounts, change reuse,
+co-spends, and history. Extra inputs may increase consolidation and linkage;
+smallest-sufficient selection is not universally better against subset-sum
+analysis. Matching reference selection conventions reduces some software
+differences, but deterministic value preferences and public sampler rules remain
+probabilistic fingerprinting evidence. The default's inventory-dependent top-up
+frequency can also disclose approximate eligible-pool size across repeated probes
+when the source pool and funding requirements stay stable. This is an intentional
+inventory-management tradeoff, not a way to hide the maker's inventory. Randomness
+does not break change chains or guarantee anonymity. See the pinned research discussions
+[Making JoinMarket makers harder to follow](https://gist.github.com/a228c625fcb6a27c32e298ec903dfc44/66f85345e8900638c1f42e6eed4bcc5ed0441423)
+and [Collaborative Transaction Privacy](https://gist.github.com/nothingmuch/d84ba390d89b5b08897af2d95009c2a1/46193b29f7d78cf45282b13f03ca80e924f32f28).
+
+**Upgrade behavior:** existing algorithm names remain accepted, but selection
+changes on subsequent maker rounds. An absent setting still selects `default`,
+now with the proportional top-up; `gradual` is no longer minimum-plus-one,
+`greedy` no longer spends all eligible coins, and `random` no longer adds zero to
+two smallest extras. `greediest` is new and older versions reject that setting.
+There is no wallet-format migration, startup sweep, rescan, or metadata rewrite.
+Consolidation occurs only during normal maker rounds, subject to the same locks
+and provenance safeguards. Taker and plain-send coin selection are unchanged.
 
 ### Forced Address-Reuse Auto-Freeze
 

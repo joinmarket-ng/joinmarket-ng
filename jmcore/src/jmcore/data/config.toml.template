@@ -435,7 +435,18 @@
 # gated by taker_utxo_age (default 5).
 # min_confirmations = 1
 
-# UTXO merge algorithm: "default", "gradual", "greedy", "random"
+# Maker UTXO selection: "default", "gradual", "greedy", "greediest", "random".
+# default: smallest sufficient coin, otherwise largest-first. With probability
+# (n-2)/n, top up to three inputs using randomly selected extras (n > 2 eligible
+# coins in the authorized source pool). Funding already needing >=3 is unchanged.
+# gradual/greedy/greediest: reference-style smallest-first policies, respectively
+# pruned subtarget prefix, pruned prefix favoring small coins, unpruned subtarget
+# prefix. Neither greedy nor greediest means spending every eligible coin.
+# random: shuffle until funded, randomly prune unnecessary inputs, then shuffle
+# disclosure order. This does not guarantee consolidation or a five-input limit.
+# Extra inputs reveal more co-owned coins to the taker and increase its mining
+# fees. Randomization and consolidation do not guarantee privacy. All policies
+# preserve frozen/bond exclusions, confirmations, locks, and md0 restrictions.
 # merge_algorithm = "default"
 
 # Source mixdepth selection policy:

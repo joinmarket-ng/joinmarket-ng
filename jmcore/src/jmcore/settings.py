@@ -806,7 +806,7 @@ class MakerSettings(BaseModel):
     )
     merge_algorithm: str = Field(
         default="default",
-        description="UTXO selection: default, gradual, greedy, random",
+        description="UTXO selection: default, gradual, greedy, greediest, random",
     )
     mixdepth_selection_policy: str = Field(
         default="balanced",

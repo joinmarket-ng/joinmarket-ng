@@ -593,17 +593,16 @@ class TestMd0CjOutputExemption:
         selected = wallet_with_cj_labels.select_utxos_with_merge(
             0, 55_000, min_confirmations=1, merge_algorithm="greedy"
         )
-        # Greedy on CJ pool: selects both cj-out UTXOs
+        # Reference greedy prunes the unnecessary 40k CJ input.
         assert all(u.label == "cj-out" for u in selected)
-        assert len(selected) == 2
+        assert [u.value for u in selected] == [60_000]
 
     def test_select_utxos_with_merge_md0_gradual_cj(self, wallet_with_cj_labels: WalletService):
-        """Gradual merge adds one extra CJ output."""
+        """Gradual falls back to a sufficient CJ coin when smaller coins cannot fund."""
         selected = wallet_with_cj_labels.select_utxos_with_merge(
             0, 55_000, min_confirmations=1, merge_algorithm="gradual"
         )
-        # Minimum = 1 (60k covers 55k), gradual = +1 = 2 CJ outs
-        assert len(selected) == 2
+        assert [u.value for u in selected] == [60_000]
         assert all(u.label == "cj-out" for u in selected)
 
     def test_select_utxos_with_merge_md0_non_cj_single_only(
@@ -614,21 +613,19 @@ class TestMd0CjOutputExemption:
         wallet_with_cj_labels.utxo_cache[0] = [
             u for u in wallet_with_cj_labels.utxo_cache[0] if not u.coinjoin_output
         ]
-        # Largest non-CJ is 70k, target is 50k
+        # Choose the smallest sufficient non-CJ coin without merging deposits.
         selected = wallet_with_cj_labels.select_utxos_with_merge(
             0, 50_000, min_confirmations=1, merge_algorithm="greedy"
         )
         assert len(selected) == 1
-        assert selected[0].value == 70_000
+        assert selected[0].value == 50_000
 
     def test_select_utxos_with_merge_md0_restrict_false(self, wallet_with_cj_labels: WalletService):
-        """restrict_md0=False allows full merge on md0."""
+        """restrict_md0=False allows value-based selection across all md0 coins."""
         selected = wallet_with_cj_labels.select_utxos_with_merge(
             0, 50_000, min_confirmations=1, merge_algorithm="greedy", restrict_md0=False
         )
-        # All 5 UTXOs in md0 should be selected (greedy)
-        assert len(selected) == 5
-        assert sum(u.value for u in selected) == 250_000
+        assert [u.value for u in selected] == [40_000, 30_000]
 
     def test_rotation_lineage_can_merge_equal_output_and_clean_change(
         self, wallet_with_cj_labels: WalletService
@@ -856,47 +853,36 @@ class TestSelectUtxosWithMerge:
         assert len(selected) == 1
         assert selected[0].value == 100_000
 
-    def test_gradual_algorithm_adds_one(self, wallet_service: WalletService):
-        """Gradual algorithm adds exactly one extra UTXO."""
+    def test_gradual_algorithm_prunes_subtarget_prefix(self, wallet_service: WalletService):
+        """Gradual prunes leading small coins from the first sufficient subtarget prefix."""
         selected = wallet_service.select_utxos_with_merge(
             1, 80_000, min_confirmations=1, merge_algorithm="gradual"
         )
-        # Should select 1 (minimum) + 1 (gradual) = 2 UTXOs
-        assert len(selected) == 2
-        # Extra should be smallest remaining (10k)
-        values = sorted([u.value for u in selected])
-        assert 10_000 in values  # Smallest was added
+        assert [u.value for u in selected] == [30_000, 50_000]
 
-    def test_greedy_algorithm_selects_all(self, wallet_service: WalletService):
-        """Greedy algorithm selects all eligible UTXOs."""
+    def test_greedy_algorithm_prunes_unnecessary_inputs(self, wallet_service: WalletService):
+        """Greedy favors small coins without spending the entire pool."""
         selected = wallet_service.select_utxos_with_merge(
             1, 80_000, min_confirmations=1, merge_algorithm="greedy"
         )
-        # Should select all 5 UTXOs
-        assert len(selected) == 5
-        assert sum(u.value for u in selected) == 210_000  # Total of all
+        assert [u.value for u in selected] == [50_000, 20_000, 10_000]
 
-    def test_random_algorithm_adds_zero_to_two(self, wallet_service: WalletService):
-        """Random algorithm adds 0-2 extra UTXOs."""
-        # Run multiple times to check range
-        counts = set()
-        for _ in range(50):
+    def test_random_algorithm_prunes_unnecessary_inputs(self, wallet_service: WalletService):
+        """Random selects sufficient, inclusion-minimal inputs rather than count-only extras."""
+        with patch(
+            "jmwallet.wallet.coin_selection.secure_random.shuffle", side_effect=lambda _: None
+        ):
             selected = wallet_service.select_utxos_with_merge(
                 1, 80_000, min_confirmations=1, merge_algorithm="random"
             )
-            counts.add(len(selected))
-
-        # Should see counts between 1 (min) and 3 (min + 2 random)
-        assert min(counts) >= 1
-        assert max(counts) <= 3
+        assert [u.value for u in selected] == [100_000]
 
     def test_greedy_respects_confirmations(self, wallet_service: WalletService):
         """Greedy algorithm still respects confirmation requirement."""
         selected = wallet_service.select_utxos_with_merge(
             1, 50_000, min_confirmations=5, merge_algorithm="greedy"
         )
-        # Only 2 UTXOs have 5+ confirms
-        assert len(selected) == 2
+        assert [u.value for u in selected] == [50_000]
         assert all(u.confirmations >= 5 for u in selected)
 
     def test_merge_insufficient_funds_raises(self, wallet_service: WalletService):
@@ -906,14 +892,13 @@ class TestSelectUtxosWithMerge:
                 0, 500_000, min_confirmations=1, merge_algorithm="greedy"
             )
 
-    def test_gradual_no_remaining_acts_like_default(self, wallet_service: WalletService):
-        """Gradual with no remaining UTXOs doesn't add any."""
-        # Request almost all funds - needs all UTXOs
+    def test_gradual_prunes_even_when_target_is_near_total(self, wallet_service: WalletService):
+        """Reference pruning drops the unnecessary leading 10k coin."""
         selected = wallet_service.select_utxos_with_merge(
             1, 200_000, min_confirmations=1, merge_algorithm="gradual"
         )
-        # All 5 UTXOs needed to meet 200k (total is 210k)
-        assert len(selected) == 5
+        assert [u.value for u in selected] == [20_000, 30_000, 50_000, 100_000]
+        assert sum(u.value for u in selected) == 200_000
 
     def test_mixdepth_0_returns_single_large_utxo(self, wallet_service: WalletService):
         """mixdepth 0 should strictly return 1 UTXO without merging."""
@@ -1228,26 +1213,29 @@ class TestFidelityBondUTXOFiltering:
         self, wallet_with_timelocked: WalletService
     ):
         """select_utxos_with_merge() excludes fidelity bond UTXOs by default."""
-        # Use greedy to get all eligible UTXOs
         selected = wallet_with_timelocked.select_utxos_with_merge(
-            1, 50_000, min_confirmations=1, merge_algorithm="greedy"
+            1, 250_000, min_confirmations=1, merge_algorithm="greedy"
         )
         # Should only include 2 regular UTXOs in md1
         assert len(selected) == 2
         assert all(not u.is_fidelity_bond for u in selected)
         assert sum(u.value for u in selected) == 250_000
+        with pytest.raises(ValueError, match="Insufficient funds"):
+            wallet_with_timelocked.select_utxos_with_merge(
+                1, 300_000, min_confirmations=1, merge_algorithm="greedy"
+            )
 
     def test_select_utxos_with_merge_include_fidelity_bonds(
         self, wallet_with_timelocked: WalletService
     ):
         """select_utxos_with_merge(include_fidelity_bonds=True) includes fidelity bonds."""
         selected = wallet_with_timelocked.select_utxos_with_merge(
-            1, 50_000, min_confirmations=1, merge_algorithm="greedy", include_fidelity_bonds=True
+            1, 550_000, min_confirmations=1, merge_algorithm="greedy", include_fidelity_bonds=True
         )
-        # Should include all 3 UTXOs in md1
-        assert len(selected) == 3
+        # Funding requires the explicitly enabled bond; greedy prunes the 200k coin.
+        assert len(selected) == 2
         assert any(u.is_fidelity_bond for u in selected)
-        assert sum(u.value for u in selected) == 750_000
+        assert sum(u.value for u in selected) == 550_000
 
 
 class TestSyncFidelityBondDeduplication:
@@ -1667,10 +1655,12 @@ class TestFrozenUTXOFiltering:
         selected = wallet_with_frozen.select_utxos_with_merge(
             1, 30_000, min_confirmations=1, merge_algorithm="greedy"
         )
-        # Greedy selects all spendable in md1: 50k + 30k = 80k (not the frozen 100k)
-        assert len(selected) == 2
-        assert sum(u.value for u in selected) == 80_000
+        assert [u.value for u in selected] == [30_000]
         assert all(not u.frozen for u in selected)
+        with pytest.raises(ValueError, match="Insufficient funds"):
+            wallet_with_frozen.select_utxos_with_merge(
+                1, 90_000, min_confirmations=1, merge_algorithm="greedy"
+            )
 
     @pytest.mark.asyncio
     async def test_get_balance_excludes_frozen(self, wallet_with_frozen: WalletService):

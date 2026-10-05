@@ -824,10 +824,11 @@ class CoinJoinSession:
         Select our UTXOs for the CoinJoin.
 
         Uses the configured merge_algorithm to determine UTXO selection:
-        - default: Minimum UTXOs needed
-        - gradual: +1 additional UTXO
-        - greedy: ALL UTXOs from the mixdepth
-        - random: +0 to +2 additional UTXOs
+        - default: Frugal funding with proportional random top-up to three inputs
+        - gradual: Pruned smallest-first subtarget prefix
+        - greedy: Pruned smallest-first prefix
+        - greediest: Unpruned smallest-first subtarget prefix
+        - random: Randomized funding, pruning and disclosure order
 
         Args:
             exclude_utxos: ``(txid, vout)`` outpoints that must not be selected

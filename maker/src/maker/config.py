@@ -164,21 +164,23 @@ class MergeAlgorithm(StrEnum):
     """
     UTXO selection algorithm for makers.
 
-    Determines how many UTXOs to use when participating in a CoinJoin.
-    Since takers pay all tx fees, makers can add extra inputs "for free"
-    which helps consolidate UTXOs and improves taker privacy.
+    Extra inputs increase taker-paid mining fees and disclose more co-owned
+    outpoints. Consolidation and randomization are not privacy guarantees.
 
-    - default: Select minimum UTXOs needed (frugal)
-    - gradual: Select 1 additional UTXO beyond minimum
-    - greedy: Select ALL UTXOs from the mixdepth (max consolidation)
-    - random: Select between 0-2 additional UTXOs randomly
+    - default: Smallest sufficient coin, otherwise largest-first; probabilistically
+      top up to three inputs with random extras as eligible inventory grows.
+    - gradual: Pruned smallest-first subtarget prefix (clientserver).
+    - greedy: Pruned smallest-first prefix, favoring small coins (clientserver).
+    - greediest: Unpruned smallest-first subtarget prefix (clientserver).
+    - random: Random funding prefix with randomized pruning and disclosure order.
 
-    Reference: joinmarket-clientserver policy.py merge_algorithm
+    Reference: joinmarket-clientserver src/jmclient/support.py
     """
 
     DEFAULT = "default"
     GRADUAL = "gradual"
     GREEDY = "greedy"
+    GREEDIEST = "greediest"
     RANDOM = "random"
 
 
@@ -428,12 +430,13 @@ class MakerConfig(WalletConfig):
         ),
     )
 
-    # UTXO merge algorithm - how many UTXOs to use
+    # Maker UTXO selection and consolidation policy
     merge_algorithm: MergeAlgorithm = Field(
         default=MergeAlgorithm.DEFAULT,
         description=(
-            "UTXO selection strategy: default (minimum), gradual (+1), "
-            "greedy (all), random (0-2 extra)"
+            "UTXO selection: default (frugal with proportional random top-up to three), "
+            "gradual (pruned subtarget prefix), greedy (pruned smallest-first), "
+            "greediest (unpruned subtarget prefix), random (randomized funding and pruning)"
         ),
     )
 

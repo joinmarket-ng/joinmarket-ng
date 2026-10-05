@@ -15,6 +15,25 @@ Earn fees by providing liquidity for CoinJoin transactions. Makers passively ear
 
 For full documentation, see [maker Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-maker/).
 
+## Maker UTXO Selection
+
+Set `[maker] merge_algorithm` in `config.toml`, or pass `--merge-algorithm`:
+`default`, `gradual`, `greedy`, `greediest`, or `random`.
+
+The default selects the smallest sufficient coin, otherwise funds largest-first.
+With probability `(n-2)/n`, it tops up to three inputs using random extras when
+the authorized pool has more than two eligible coins and funding needs fewer
+than three inputs. Larger inventories therefore favor consolidation without a
+fixed threshold. Frozen coins, bonds, locks, confirmations, and mixdepth-zero
+privacy restrictions still apply.
+
+The other policies use reference-style value selection or randomized funding
+and pruning. Neither `greedy` nor `greediest` spends every eligible coin. Extra
+inputs increase taker-paid mining fees and disclose more co-owned coins; neither
+consolidation nor randomness guarantees privacy. Existing policy names now use
+these revised rules on future rounds, without a wallet migration or startup sweep.
+See [selection rules and privacy tradeoffs](../docs/technical/wallet.md#utxo-selection).
+
 ## Multiple Local Instances
 
 If you want to run more than one maker on the same machine, give each maker
@@ -289,7 +308,7 @@ synchronization and address-history verification.
 │ --merge-algorithm       -M      TEXT                  UTXO selection         │
 │                                                       strategy: default,     │
 │                                                       gradual, greedy,       │
-│                                                       random                 │
+│                                                       greediest, random      │
 │                                                       [env var:              │
 │                                                       MERGE_ALGORITHM]       │
 │ --min-size                      INTEGER               Minimum CoinJoin size  │

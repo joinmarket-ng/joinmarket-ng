@@ -321,6 +321,14 @@ class TestMergeAlgorithm:
         )
         assert config.merge_algorithm == MergeAlgorithm.RANDOM
 
+    def test_set_merge_algorithm_greediest(self) -> None:
+        config = MakerConfig(mnemonic=TEST_MNEMONIC, merge_algorithm=MergeAlgorithm.GREEDIEST)
+        assert config.merge_algorithm.value == "greediest"
+        parsed = MakerConfig.model_validate(
+            {"mnemonic": TEST_MNEMONIC, "merge_algorithm": "greediest"}
+        )
+        assert parsed.merge_algorithm == MergeAlgorithm.GREEDIEST
+
     def test_merge_algorithm_from_string(self) -> None:
         """Test creating config with string value (JSON/YAML parsing)."""
         config = MakerConfig(
@@ -467,6 +475,32 @@ class TestCjFeeRelativeNormalization:
 
 class TestBuildMakerConfig:
     """Tests for build_maker_config function."""
+
+    @pytest.mark.parametrize("algorithm", list(MergeAlgorithm))
+    def test_merge_algorithm_settings_round_trip(self, algorithm: MergeAlgorithm) -> None:
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.merge_algorithm = algorithm.value
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.merge_algorithm == algorithm
+
+    def test_greediest_cli_override(self) -> None:
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.merge_algorithm = "gradual"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+            merge_algorithm="GREEDIEST",
+        )
+        assert config.merge_algorithm == MergeAlgorithm.GREEDIEST
 
     def test_mixdepth_selection_cli_override(self) -> None:
         from jmcore.settings import JoinMarketSettings

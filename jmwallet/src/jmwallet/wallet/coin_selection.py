@@ -302,6 +302,20 @@ def select_direct_send_utxos(
     return best_result
 
 
+def _maker_funding_prefix(utxos: list[UTXOInfo], target_amount: int) -> list[UTXOInfo]:
+    """Take the first sufficient prefix of an already funded maker pool.
+
+    Inspect at least one coin even when maker fees cover the funding target:
+    the maker still needs an input to authenticate its participation.
+    """
+    total = 0
+    for end, utxo in enumerate(utxos, start=1):
+        total += utxo.value
+        if total >= target_amount:
+            return utxos[:end]
+    return utxos.copy()
+
+
 class CoinSelectionMixin:
     """Mixin providing coin selection capabilities.
 
@@ -531,19 +545,25 @@ class CoinSelectionMixin:
         """
         Select UTXOs with merge algorithm for maker UTXO consolidation.
 
-        Unlike regular select_utxos(), this method can select MORE UTXOs than
-        strictly necessary based on the merge algorithm. Since takers pay tx fees,
-        makers can add extra inputs "for free" to consolidate their UTXOs.
+        Policies operate only within the authorized, eligible source pool.
+        Additional inputs consolidate coins but disclose more co-owned outpoints
+        to the taker and increase the mining fee paid by the taker.
 
         Args:
             mixdepth: Mixdepth to select from
             target_amount: Minimum target amount in satoshis
             min_confirmations: Minimum confirmations required
             merge_algorithm: Selection strategy:
-                - "default": Minimum UTXOs needed (same as select_utxos)
-                - "gradual": +1 additional UTXO beyond minimum
-                - "greedy": ALL eligible UTXOs from the mixdepth
-                - "random": +0 to +2 additional UTXOs randomly
+                - "default": Smallest sufficient coin, otherwise largest-first;
+                  with probability (n-2)/n, top up to three inputs using random
+                  extras, where n is the eligible pool size and n > 2.
+                - "gradual": Smallest-first subtarget prefix, pruning its smallest
+                  leading coins while funding remains sufficient.
+                - "greedy": Smallest-first prefix, pruning unnecessary preceding
+                  coins largest-first while retaining the crossing coin.
+                - "greediest": Unpruned smallest-first subtarget prefix.
+                - "random": Random funding prefix, then randomly prune individually
+                  unnecessary inputs. Randomizes identities, not just input count.
             include_fidelity_bonds: If True, include fidelity bond UTXOs.
                                     Defaults to False since they should never be
                                     automatically spent in CoinJoins.
@@ -603,21 +623,15 @@ class CoinSelectionMixin:
             largest_non_mergeable = non_mergeable[0].value if non_mergeable else 0
 
             if mergeable_pool_value >= target_amount:
-                # Select from rotation lineage (greedy by value, then apply merge)
-                selected: list[UTXOInfo] = []
-                total = 0
-                for utxo in mergeable:
-                    selected.append(utxo)
-                    total += utxo.value
-                    if total >= target_amount:
-                        break
-                # Apply merge algorithm to remaining CJ outputs only
-                min_count = len(selected)
-                remaining_mergeable = mergeable[min_count:]
-                selected = self._apply_merge_extras(selected, remaining_mergeable, merge_algorithm)
-                return selected
+                return self._select_maker_pool(mergeable, target_amount, merge_algorithm)
             elif largest_non_mergeable >= target_amount:
-                return [non_mergeable[0]]
+                # Never mix unrelated deposits, regardless of the merge policy.
+                return [
+                    min(
+                        (u for u in non_mergeable if u.value >= target_amount),
+                        key=lambda u: u.value,
+                    )
+                ]
             else:
                 raise ValueError(
                     f"Insufficient funds: rotation-lineage pool has {mergeable_pool_value}, "
@@ -626,16 +640,7 @@ class CoinSelectionMixin:
                     f"Cannot merge non-CJ md0 UTXOs for privacy reasons."
                 )
 
-        # First, select minimum needed (greedy by value)
-        selected = []
-        total = 0
-
-        for utxo in eligible:
-            selected.append(utxo)
-            total += utxo.value
-            if total >= target_amount:
-                break
-
+        total = sum(utxo.value for utxo in eligible)
         if total < target_amount:
             all_utxos = self.utxo_cache.get(mixdepth, [])
             unconfirmed_total = sum(
@@ -652,47 +657,83 @@ class CoinSelectionMixin:
                 f"Insufficient funds: need {target_amount:,} sats, have {total:,} sats"
             )
 
-        # Record where minimum selection ends
-        min_count = len(selected)
-
-        # Get remaining eligible UTXOs not yet selected
-        remaining = eligible[min_count:]
-
-        # Apply merge algorithm to add additional UTXOs
-        selected = self._apply_merge_extras(selected, remaining, merge_algorithm)
-
-        return selected
+        return self._select_maker_pool(eligible, target_amount, merge_algorithm)
 
     @staticmethod
-    def _apply_merge_extras(
-        selected: list[UTXOInfo],
-        remaining: list[UTXOInfo],
+    def _select_maker_pool(
+        pool: list[UTXOInfo],
+        target_amount: int,
         merge_algorithm: str,
     ) -> list[UTXOInfo]:
-        """Apply merge algorithm to add extra UTXOs beyond the minimum selection.
+        """Select from a sufficient, authorized pool sorted by value descending.
 
-        Args:
-            selected: Already-selected UTXOs (minimum needed).
-            remaining: Eligible UTXOs not yet selected, sorted by value descending.
-            merge_algorithm: ``"default"`` | ``"gradual"`` | ``"greedy"`` | ``"random"``.
-
-        Returns:
-            Extended ``selected`` list (may be mutated in-place).
+        Gradual, greedy and greediest mirror clientserver's value-based policies
+        for positive targets. No policy may pull in coins outside this pool.
         """
-        if merge_algorithm == "greedy":
-            # Add ALL remaining UTXOs
-            selected.extend(remaining)
-        elif merge_algorithm == "gradual" and remaining:
-            # Add exactly 1 more UTXO (smallest to preserve larger ones)
-            remaining_sorted = sorted(remaining, key=lambda u: u.value)
-            selected.append(remaining_sorted[0])
-        elif merge_algorithm == "random" and remaining:
-            # Add 0-2 additional UTXOs randomly
-            extra_count = secure_random.randint(0, min(2, len(remaining)))
-            if extra_count > 0:
-                # Prefer smaller UTXOs for consolidation
-                remaining_sorted = sorted(remaining, key=lambda u: u.value)
-                selected.extend(remaining_sorted[:extra_count])
-        # "default" - no additional UTXOs
+        if not pool:
+            return []
 
+        if merge_algorithm == "random":
+            shuffled = pool.copy()
+            secure_random.shuffle(shuffled)
+            selected = _maker_funding_prefix(shuffled, target_amount)
+            total = sum(u.value for u in selected)
+            pruning_order = selected.copy()
+            secure_random.shuffle(pruning_order)
+            removed: set[str] = set()
+            for utxo in pruning_order:
+                if len(selected) - len(removed) > 1 and total - utxo.value >= target_amount:
+                    removed.add(utxo.outpoint)
+                    total -= utxo.value
+            selected = [u for u in selected if u.outpoint not in removed]
+            # Selection/pruning order must not determine the disclosed auth input.
+            secure_random.shuffle(selected)
+            return selected
+
+        ascending = sorted(pool, key=lambda u: u.value)
+        if merge_algorithm in ("gradual", "greediest"):
+            smaller = [u for u in ascending if u.value < target_amount]
+            if not smaller or sum(u.value for u in smaller) < target_amount:
+                return [next(u for u in ascending if u.value >= target_amount)]
+            selected = _maker_funding_prefix(smaller, target_amount)
+            if merge_algorithm == "greediest":
+                return selected
+            total = sum(u.value for u in selected)
+            start = 0
+            while total - selected[start].value >= target_amount:
+                total -= selected[start].value
+                start += 1
+            return selected[start:]
+
+        if merge_algorithm == "greedy":
+            prefix = _maker_funding_prefix(ascending, target_amount)
+            total = sum(u.value for u in prefix)
+            if total == target_amount:
+                return prefix
+            selected = [prefix[-1]]
+            for utxo in reversed(prefix[:-1]):
+                if total - utxo.value >= target_amount:
+                    total -= utxo.value
+                else:
+                    selected.append(utxo)
+            return selected
+
+        # Unknown strings retain the old largest-first fallback; configuration
+        # parsing rejects them before a production maker reaches this method.
+        sufficient = (
+            next((u for u in ascending if u.value >= target_amount), None)
+            if merge_algorithm == "default"
+            else None
+        )
+        selected = (
+            [sufficient] if sufficient is not None else _maker_funding_prefix(pool, target_amount)
+        )
+        n = len(pool)
+        if merge_algorithm == "default" and n > 2 and len(selected) < 3:
+            if secure_random.randrange(n) >= 2:
+                selected_outpoints = {u.outpoint for u in selected}
+                remaining = [u for u in pool if u.outpoint not in selected_outpoints]
+                selected.extend(secure_random.sample(remaining, 3 - len(selected)))
+        if merge_algorithm == "default":
+            secure_random.shuffle(selected)
         return selected

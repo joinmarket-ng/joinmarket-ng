@@ -272,7 +272,7 @@ def build_maker_config(
     except ValueError:
         raise ValueError(
             f"Invalid merge algorithm: {effective_merge_algorithm_str}. "
-            "Must be one of: default, gradual, greedy, random"
+            "Must be one of: default, gradual, greedy, greediest, random"
         )
 
     effective_mixdepth_selection = (
@@ -631,7 +631,7 @@ def start(
             "--merge-algorithm",
             "-M",
             envvar="MERGE_ALGORITHM",
-            help="UTXO selection strategy: default, gradual, greedy, random",
+            help="UTXO selection strategy: default, gradual, greedy, greediest, random",
         ),
     ] = None,
     mixdepth_selection: Annotated[

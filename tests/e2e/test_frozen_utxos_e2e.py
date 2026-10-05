@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -63,6 +64,76 @@ GENERIC_TEST_MNEMONIC = (
 # ==============================================================================
 # Fixtures
 # ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_maker_policies_use_funded_md1_pool(
+    bitcoin_backend: DescriptorWalletBackend,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise real eligible pools, not only restricted deposit-md0 fallback."""
+    from tests.e2e.rpc_utils import send_from_test_funder
+
+    wallet = WalletService(
+        mnemonic="legal winner thank year wave sausage worth useful legal winner thank yellow",
+        backend=bitcoin_backend,
+        network="regtest",
+        mixdepth_count=2,
+        data_dir=tmp_path,
+    )
+    try:
+        await wallet.sync_all()
+        previous = {(u.txid, u.vout) for u in await wallet.get_utxos(1)}
+        values = [100_000, 100_000, 100_000, 600_000, 800_000, 2_000_000, 5_000_000]
+        for index, value in enumerate(values):
+            assert await send_from_test_funder(
+                wallet.get_receive_address(1, index),
+                value / 100_000_000,
+                confirmations=2,
+            ), "Could not fund the maker policy test pool"
+        await wallet.sync_all()
+        coins = [
+            u for u in await wallet.get_utxos(1) if (u.txid, u.vout) not in previous
+        ]
+        assert sorted(u.value for u in coins) == values
+        frozen = max(coins, key=lambda u: u.value)
+        wallet.freeze_utxo(frozen.outpoint)
+        eligible = {u.outpoint for u in coins if u is not frozen}
+
+        monkeypatch.setattr(
+            "jmwallet.wallet.coin_selection.secure_random.randrange", lambda n: n - 1
+        )
+        expected = {
+            "gradual": [600_000, 800_000],
+            "greedy": [100_000, 100_000, 800_000],
+            "greediest": [100_000, 100_000, 100_000, 600_000, 800_000],
+        }
+        for algorithm in ("default", "gradual", "greedy", "greediest", "random"):
+            selected = wallet.select_utxos_with_merge(
+                1, 1_000_000, merge_algorithm=algorithm, exclude=previous
+            )
+            assert selected
+            assert sum(u.value for u in selected) >= 1_000_000
+            assert {u.outpoint for u in selected} <= eligible
+            assert len({u.outpoint for u in selected}) == len(selected)
+            assert all(not u.frozen and u.confirmations >= 1 for u in selected)
+            if algorithm == "default":
+                assert len(selected) == 3
+                assert 2_000_000 in [u.value for u in selected]
+            elif algorithm in expected:
+                assert sorted(u.value for u in selected) == expected[algorithm]
+            else:
+                total = sum(u.value for u in selected)
+                assert all(total - u.value < 1_000_000 for u in selected)
+
+        monkeypatch.setattr(
+            "jmwallet.wallet.coin_selection.secure_random.randrange", lambda _: 0
+        )
+        selected = wallet.select_utxos_with_merge(1, 1_000_000, exclude=previous)
+        assert [u.value for u in selected] == [2_000_000]
+    finally:
+        await wallet.close()
 
 
 @pytest.fixture
@@ -459,7 +530,7 @@ class TestFreezeExcludesFromSelection:
         frozen_utxo = utxos[0]
         wallet.freeze_utxo(frozen_utxo.outpoint)
 
-        for algo in ("default", "gradual", "greedy", "random"):
+        for algo in ("default", "gradual", "greedy", "greediest", "random"):
             selected = wallet.select_utxos_with_merge(
                 0, 1, min_confirmations=0, merge_algorithm=algo
             )
@@ -739,7 +810,7 @@ class TestMakerFrozenUTXOs:
         wallet.freeze_utxo(frozen_utxo.outpoint)
 
         # Simulate what _select_our_utxos does: select_utxos_with_merge
-        for algo in ("default", "gradual", "greedy", "random"):
+        for algo in ("default", "gradual", "greedy", "greediest", "random"):
             selected = wallet.select_utxos_with_merge(
                 0, 1, min_confirmations=0, merge_algorithm=algo
             )
@@ -791,7 +862,7 @@ class TestMakerFrozenUTXOs:
             wallet=wallet,
             backend=bitcoin_backend,
             min_confirmations=0,
-            merge_algorithm="greedy",  # Greedy should pick ALL non-frozen
+            merge_algorithm="greedy",  # Value-based selection must still exclude frozen coins.
         )
         session.amount = 100_000
 
@@ -1103,7 +1174,7 @@ class TestCrossComponentFreezeIntegration:
         assert len(all_utxos_post) == len(all_utxos_pre) - 1
         assert outpoint not in {u.outpoint for u in all_utxos_post}
 
-        for algo in ("default", "gradual", "greedy", "random"):
+        for algo in ("default", "gradual", "greedy", "greediest", "random"):
             merged = wallet.select_utxos_with_merge(
                 0, 1, min_confirmations=0, merge_algorithm=algo
             )

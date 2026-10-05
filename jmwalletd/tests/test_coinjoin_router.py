@@ -1183,6 +1183,7 @@ class TestStartMaker:
     @patch("maker.bot.MakerBot")
     @patch("jmwalletd.routers.coinjoin.get_settings")
     @pytest.mark.parametrize("allow_clearnet_connections", [False, True])
+    @pytest.mark.parametrize("merge_algorithm", ["gradual", "greediest"])
     def test_start_maker_uses_runtime_settings(
         self,
         mock_get_settings: Mock,
@@ -1190,6 +1191,7 @@ class TestStartMaker:
         mock_backend: AsyncMock,
         authed_client: tuple[TestClient, str],
         allow_clearnet_connections: bool,
+        merge_algorithm: str,
     ) -> None:
         """REST makers retain request offers and configured runtime policy."""
         client, token = authed_client
@@ -1235,7 +1237,7 @@ class TestStartMaker:
         mock_settings.maker.size_factor = 0.25
         mock_settings.maker.min_confirmations = 7
         mock_settings.maker.allow_mixdepth_zero_merge = True
-        mock_settings.maker.merge_algorithm = "gradual"
+        mock_settings.maker.merge_algorithm = merge_algorithm
         mock_settings.maker.mixdepth_selection_policy = "concentrated"
         mock_settings.maker.min_fee_rate_sat_vb = 2.5
         mock_settings.maker.min_fee_block_target = 12
@@ -1312,7 +1314,7 @@ class TestStartMaker:
         assert maker_config.size_factor == 0.25
         assert maker_config.min_confirmations == 7
         assert maker_config.allow_mixdepth_zero_merge is True
-        assert maker_config.merge_algorithm.value == "gradual"
+        assert maker_config.merge_algorithm.value == merge_algorithm
         assert str(maker_config.mixdepth_selection_policy) == "concentrated"
         assert maker_config.min_fee_rate_sat_vb == 2.5
         assert maker_config.min_fee_block_target == 12

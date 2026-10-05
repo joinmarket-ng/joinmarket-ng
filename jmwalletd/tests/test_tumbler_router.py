@@ -587,6 +587,7 @@ class TestStartPlan:
             (True, "directory.internal:5222"),
         ],
     )
+    @pytest.mark.parametrize("merge_algorithm", ["gradual", "greediest"])
     def test_start_maker_factory_forwards_runtime_settings(
         self,
         app_with_wallet: TestClient,
@@ -595,6 +596,7 @@ class TestStartPlan:
         monkeypatch: pytest.MonkeyPatch,
         allow_clearnet_connections: bool,
         directory_server: str,
+        merge_algorithm: str,
     ) -> None:
         """Tumbler maker phases preserve network and maker policy settings."""
         from jmcore.models import NetworkType, OfferType
@@ -628,7 +630,7 @@ class TestStartPlan:
                 "size_factor": 0.25,
                 "min_confirmations": 7,
                 "allow_mixdepth_zero_merge": True,
-                "merge_algorithm": "gradual",
+                "merge_algorithm": merge_algorithm,
                 "mixdepth_selection_policy": "concentrated",
                 "min_fee_rate_sat_vb": 2.5,
                 "min_fee_block_target": 12,
@@ -709,7 +711,7 @@ class TestStartPlan:
         assert maker_config.size_factor == 0.25
         assert maker_config.min_confirmations == 7
         assert maker_config.allow_mixdepth_zero_merge is True
-        assert maker_config.merge_algorithm.value == "gradual"
+        assert maker_config.merge_algorithm.value == merge_algorithm
         assert str(maker_config.mixdepth_selection_policy) == "concentrated"
         assert maker_config.min_fee_rate_sat_vb == 2.5
         assert maker_config.min_fee_block_target == 12

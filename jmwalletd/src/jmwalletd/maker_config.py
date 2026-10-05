@@ -31,7 +31,8 @@ def _parse_merge_algorithm(value: str) -> MergeAlgorithm:
         return MergeAlgorithm(value.lower())
     except ValueError as exc:
         raise ValueError(
-            f"Invalid merge algorithm: {value}. Must be default, gradual, greedy, or random"
+            f"Invalid merge algorithm: {value}. "
+            "Must be default, gradual, greedy, greediest, or random"
         ) from exc
 
 

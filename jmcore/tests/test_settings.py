@@ -430,18 +430,21 @@ class TestSettingsFromEnv:
         with pytest.raises(ValidationError, match="rename it to wallet.background_full_rescan"):
             JoinMarketSettings()
 
-    def test_env_override_maker_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("algorithm", ["default", "gradual", "greedy", "greediest", "random"])
+    def test_env_override_maker_settings(
+        self, monkeypatch: pytest.MonkeyPatch, algorithm: str
+    ) -> None:
         """Test that environment variables override maker settings."""
         monkeypatch.setenv("MAKER__MIN_SIZE", "50000")
         monkeypatch.setenv("MAKER__CJ_FEE_RELATIVE", "0.002")
-        monkeypatch.setenv("MAKER__MERGE_ALGORITHM", "greedy")
+        monkeypatch.setenv("MAKER__MERGE_ALGORITHM", algorithm)
         monkeypatch.setenv("MAKER__MIXDEPTH_SELECTION_POLICY", "concentrated")
 
         settings = JoinMarketSettings()
 
         assert settings.maker.min_size == 50000
         assert settings.maker.cj_fee_relative == "0.002"
-        assert settings.maker.merge_algorithm == "greedy"
+        assert settings.maker.merge_algorithm == algorithm
         assert settings.maker.mixdepth_selection_policy == "concentrated"
 
     def test_env_override_maker_offer_type(self, monkeypatch: pytest.MonkeyPatch) -> None:

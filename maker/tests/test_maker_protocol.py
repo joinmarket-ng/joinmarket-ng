@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1093,7 +1094,10 @@ async def test_select_our_utxos_releases_lock_after_address_failure():
 
 
 @pytest.mark.asyncio
-async def test_handle_auth_allows_hp2_seen_after_fill(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reverse_inputs", [False, True])
+async def test_handle_auth_allows_hp2_seen_after_fill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reverse_inputs: bool
+) -> None:
     """An hp2 broadcast from the same round must not invalidate an accepted fill."""
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1128,11 +1132,17 @@ async def test_handle_auth_allows_hp2_seen_after_fill(tmp_path, monkeypatch):
         path="m/84'/0'/1'/0/0",
         mixdepth=1,
     )
-    selected_outpoints = {(selected.txid, selected.vout)}
+    second = replace(selected, txid="dd" * 32, vout=0, address="bcrt1qmakersecondinput")
+    ordered_inputs = [second, selected] if reverse_inputs else [selected, second]
+    selected_utxos = {(u.txid, u.vout): u for u in ordered_inputs}
     mock_key = MagicMock()
     mock_key.get_public_key_bytes.return_value = bytes.fromhex("02" + "ab" * 32)
     mock_key.get_private_key_bytes.return_value = bytes(32)
-    mock_wallet.get_key_for_address.return_value = mock_key
+    second_key = MagicMock()
+    second_key.get_public_key_bytes.return_value = bytes.fromhex("02" + "dc" * 32)
+    second_key.get_private_key_bytes.return_value = b"\x01" * 32
+    keys = {selected.address: mock_key, second.address: second_key}
+    mock_wallet.get_key_for_address.side_effect = keys.__getitem__
     offer = Offer(
         counterparty="J5AtomicMaker",
         ordertype=OfferType.SW0_RELATIVE,
@@ -1178,7 +1188,7 @@ async def test_handle_auth_allows_hp2_seen_after_fill(tmp_path, monkeypatch):
             "_select_our_utxos",
             new_callable=AsyncMock,
             return_value=(
-                {next(iter(selected_outpoints)): selected},
+                selected_utxos,
                 "bcrt1qcoinjoin",
                 "bcrt1qchange",
                 1,
@@ -1193,7 +1203,10 @@ async def test_handle_auth_allows_hp2_seen_after_fill(tmp_path, monkeypatch):
         )
 
     assert success is True
-    assert response["utxo_list"]
+    assert response["utxo_list"].split(",") == [u.outpoint for u in ordered_inputs]
+    first_key = keys[ordered_inputs[0].address]
+    assert response["auth_pub"] == first_key.get_public_key_bytes.return_value.hex()
+    mock_wallet.get_key_for_address.assert_called_once_with(ordered_inputs[0].address)
     assert session.state == CoinJoinState.AUTH_RECEIVED
     mock_wallet.release_coinjoin_inputs.assert_not_called()
 
