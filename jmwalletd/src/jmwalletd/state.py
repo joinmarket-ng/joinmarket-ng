@@ -100,6 +100,7 @@ class DaemonState:
         self.wallet_mnemonic: str = ""
         self.wallet_name: str = ""
         self.wallet_password: str = ""  # kept for re-unlock verification
+        self.wallet_bip39_passphrase: str = ""  # operation/session scoped, cleared on lock
         self.wallet_lifecycle_lock = asyncio.Lock()
         self._wallet_lifecycle_operations = 0
         self._unlock_failures: dict[str, UnlockFailure] = {}
@@ -316,6 +317,7 @@ class DaemonState:
         self.wallet_mnemonic = ""
         self.wallet_name = ""
         self.wallet_password = ""
+        self.wallet_bip39_passphrase = ""
         self.maker_running = False
         self.taker_running = False
         self.coinjoin_state = CoinjoinState.NOT_RUNNING

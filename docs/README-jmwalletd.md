@@ -97,6 +97,34 @@ browser is enough.
 
 ## Configuration
 
+### BIP39 Passphrases
+
+Create, recover, and unlock request bodies accept an optional `bip39_passphrase`
+string, separate from the file-encryption `password`. Omission preserves the
+empty-passphrase behavior of existing clients. The CLI/TUI onboarding setting
+does not substitute credentials into REST requests. External JAM clients need
+their own support for entering this field; the daemon API extension alone does
+not add a web UI prompt.
+
+New containers remember the expected identity, never the passphrase. The active
+credential is forwarded to direct spending, CoinJoin, maker, and tumbler, then
+cleared on lock. A mismatch rejects unlock before changing the active session.
+An actual identity change resets tokens and WebSocket sessions; same-identity
+reopening preserves existing refresh-token validity.
+
+**Upgrade:** Existing PBKDF2 and version-1 files remain readable without rewriting
+or scans caused by missing identity metadata. Their identity remains unconfirmed;
+supply the intended credential and verify the wallet independently. A deliberate
+recovery into another named container can establish a binding, but is not a
+required upgrade step and may scan. New nonempty-passphrase containers use format
+version 2, which older daemons reject rather than opening the wrong wallet. Keep
+compatible software with backups.
+
+For API compatibility, failed unlocks still return `Invalid credentials.` Check
+both credentials and format support, and consult daemon warnings. See the
+[identity and format details](technical/wallet.md#bip39-passphrase-support) for
+metadata privacy and downgrade limitations.
+
 `jmwalletd` uses the shared JoinMarket NG config (`~/.joinmarket-ng/config.toml`)
 and the same environment override model as the other components (see
 [Configuration](technical/configuration.md)).

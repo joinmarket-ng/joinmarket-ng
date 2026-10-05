@@ -284,6 +284,7 @@ async def wallet_create(
                 password=body.password,
                 wallet_type=body.wallettype,
                 data_dir=state.data_dir,
+                bip39_passphrase=body.bip39_passphrase.get_secret_value(),
             )
         except FileExistsError as exc:
             raise WalletAlreadyExists() from exc
@@ -296,6 +297,7 @@ async def wallet_create(
         state.wallet_mnemonic = seedphrase
         state.wallet_name = body.walletname
         state.wallet_password = body.password
+        state.wallet_bip39_passphrase = body.bip39_passphrase.get_secret_value()
 
         # A generated wallet has no pre-existing history to suppress, so monitoring
         # can become live without risking a readiness error after seed generation.
@@ -340,6 +342,7 @@ async def wallet_recover(
                 seedphrase=body.seedphrase,
                 data_dir=state.data_dir,
                 scan_range=body.scan_range,
+                bip39_passphrase=body.bip39_passphrase.get_secret_value(),
             )
         except FileExistsError as exc:
             raise WalletAlreadyExists() from exc
@@ -352,6 +355,7 @@ async def wallet_recover(
         state.wallet_mnemonic = body.seedphrase
         state.wallet_name = body.walletname
         state.wallet_password = body.password
+        state.wallet_bip39_passphrase = body.bip39_passphrase.get_secret_value()
 
         state.start_tx_monitor()
         try:
@@ -400,7 +404,14 @@ async def wallet_unlock(
             raise UnlockBackoff()
 
         # If the same wallet is already unlocked, just verify password and re-issue tokens.
-        if state.wallet_loaded and state.wallet_name == walletname:
+        import unicodedata
+
+        requested_passphrase = body.bip39_passphrase.get_secret_value()
+        same_passphrase = hmac.compare_digest(
+            unicodedata.normalize("NFKD", requested_passphrase).encode("utf-8"),
+            unicodedata.normalize("NFKD", state.wallet_bip39_passphrase).encode("utf-8"),
+        )
+        if state.wallet_loaded and state.wallet_name == walletname and same_passphrase:
             stored_password = state.wallet_password
             same_password = (
                 body.password is not None
@@ -433,9 +444,17 @@ async def wallet_unlock(
         # verification deliberately only decrypts the wallet file here.
         if state.wallet_loaded:
             try:
-                await verify_wallet_password(wallet_path=wallet_path, password=body.password)
+                await verify_wallet_password(
+                    wallet_path=wallet_path,
+                    password=body.password,
+                    **({"bip39_passphrase": requested_passphrase} if requested_passphrase else {}),
+                )
             except ValueError:
                 logger.info("Failed wallet unlock")
+                logger.warning(
+                    "Verify the encryption password, BIP39 passphrase, and wallet-format support; "
+                    "the active session was preserved."
+                )
                 state.record_unlock_failure(walletname)
                 raise InvalidCredentials() from None
             await state._lock_wallet()
@@ -446,11 +465,16 @@ async def wallet_unlock(
                 password=body.password,
                 data_dir=state.data_dir,
                 sync_on_open=False,
+                bip39_passphrase=requested_passphrase,
             )
         except OSError:
             raise LockExists() from None
         except ValueError:
             logger.info("Failed wallet unlock")
+            logger.warning(
+                "Verify the encryption password, BIP39 passphrase, and wallet-format support. "
+                "Passphrase-bound wallets require current software."
+            )
             state.record_unlock_failure(walletname)
             raise InvalidCredentials() from None
 
@@ -459,6 +483,7 @@ async def wallet_unlock(
         state.wallet_mnemonic = seedphrase
         state.wallet_name = walletname
         state.wallet_password = body.password
+        state.wallet_bip39_passphrase = requested_passphrase
 
         # Kick off sync asynchronously so unlock returns immediately.
         if state._wallet_sync_task is not None and not state._wallet_sync_task.done():

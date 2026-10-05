@@ -114,6 +114,7 @@ async def create_wallet(
     password: str,
     wallet_type: str,
     data_dir: Path,
+    bip39_passphrase: str = "",
 ) -> tuple[Any, str]:
     """Create a new wallet and return ``(wallet_service, seedphrase)``.
 
@@ -149,6 +150,7 @@ async def create_wallet(
             data_dir=data_dir,
             mnemonic=seedphrase,
             network=_get_network(),
+            passphrase=bip39_passphrase,
         )
 
         # Record current block height as the wallet birthday. Since this is a
@@ -163,6 +165,7 @@ async def create_wallet(
         wallet_settings = _get_wallet_settings()
         ws = WalletService(
             mnemonic=seedphrase,
+            passphrase=bip39_passphrase,
             backend=backend,
             data_dir=data_dir,
             network=_get_network(),
@@ -188,6 +191,7 @@ async def create_wallet(
             password=password,
             wallet_type=wallet_type,
             creation_height=creation_height,
+            bip39_passphrase=bip39_passphrase,
         )
 
     logger.info("Created wallet")
@@ -203,6 +207,7 @@ async def recover_wallet(
     seedphrase: str,
     data_dir: Path,
     scan_range: int | None = None,
+    bip39_passphrase: str = "",
 ) -> Any:
     """Recover a wallet from a BIP39 seed phrase.
 
@@ -233,6 +238,7 @@ async def recover_wallet(
             seedphrase=seedphrase,
             data_dir=data_dir,
             scan_range=scan_range,
+            bip39_passphrase=bip39_passphrase,
         )
 
 
@@ -244,6 +250,7 @@ async def _recover_reserved_wallet(
     seedphrase: str,
     data_dir: Path,
     scan_range: int | None,
+    bip39_passphrase: str = "",
 ) -> Any:
     """Recover a wallet while the caller owns its exclusive path reservation."""
     from jmwallet.wallet.service import WalletService
@@ -253,6 +260,7 @@ async def _recover_reserved_wallet(
         data_dir=data_dir,
         mnemonic=seedphrase,
         network=_get_network(),
+        passphrase=bip39_passphrase,
     )
 
     wallet_settings = _get_wallet_settings()
@@ -265,6 +273,7 @@ async def _recover_reserved_wallet(
         effective_scan_range = max(scan_range, wallet_settings.scan_range)
     ws = WalletService(
         mnemonic=seedphrase,
+        passphrase=bip39_passphrase,
         backend=backend,
         data_dir=data_dir,
         network=_get_network(),
@@ -307,6 +316,7 @@ async def _recover_reserved_wallet(
             mnemonic=seedphrase,
             password=password,
             wallet_type=wallet_type,
+            bip39_passphrase=bip39_passphrase,
         )
     except Exception:
         wallet_path.unlink(missing_ok=True)
@@ -323,6 +333,7 @@ async def open_wallet_with_mnemonic(
     password: str,
     data_dir: Path,
     sync_on_open: bool = True,
+    bip39_passphrase: str = "",
 ) -> tuple[Any, str]:
     """Open (unlock) an existing wallet file and return mnemonic.
 
@@ -340,7 +351,10 @@ async def open_wallet_with_mnemonic(
         raise FileNotFoundError(f"Wallet file not found: {wallet_path}")
 
     seedphrase, creation_height = await _run_wallet_file_operation(
-        _load_wallet_file, wallet_path=wallet_path, password=password
+        _load_wallet_file,
+        wallet_path=wallet_path,
+        password=password,
+        **({"bip39_passphrase": bip39_passphrase} if bip39_passphrase else {}),
     )
 
     # Legacy or manually migrated wallet data may contain a phrase with an
@@ -361,6 +375,7 @@ async def open_wallet_with_mnemonic(
         data_dir=data_dir,
         mnemonic=seedphrase,
         network=_get_network(),
+        passphrase=bip39_passphrase,
     )
 
     # Propagate wallet creation height hint to the backend.  Passing None
@@ -371,6 +386,7 @@ async def open_wallet_with_mnemonic(
     wallet_settings = _get_wallet_settings()
     ws = WalletService(
         mnemonic=seedphrase,
+        passphrase=bip39_passphrase,
         backend=backend,
         data_dir=data_dir,
         network=_get_network(),
@@ -400,7 +416,9 @@ async def open_wallet_with_mnemonic(
     return ws, seedphrase
 
 
-async def verify_wallet_password(*, wallet_path: Path, password: str) -> None:
+async def verify_wallet_password(
+    *, wallet_path: Path, password: str, bip39_passphrase: str = ""
+) -> None:
     """Verify a wallet password without initializing a backend service.
 
     This lets a cross-wallet unlock authenticate its target before it tears
@@ -408,7 +426,12 @@ async def verify_wallet_password(*, wallet_path: Path, password: str) -> None:
     """
     if not wallet_path.exists():
         raise FileNotFoundError(f"Wallet file not found: {wallet_path}")
-    await _run_wallet_file_operation(_load_wallet_file, wallet_path=wallet_path, password=password)
+    await _run_wallet_file_operation(
+        _load_wallet_file,
+        wallet_path=wallet_path,
+        password=password,
+        **({"bip39_passphrase": bip39_passphrase} if bip39_passphrase else {}),
+    )
 
 
 async def open_wallet(
@@ -417,6 +440,7 @@ async def open_wallet(
     password: str,
     data_dir: Path,
     sync_on_open: bool = True,
+    bip39_passphrase: str = "",
 ) -> Any:
     """Open (unlock) an existing wallet file.
 
@@ -432,6 +456,7 @@ async def open_wallet(
         password=password,
         data_dir=data_dir,
         sync_on_open=sync_on_open,
+        bip39_passphrase=bip39_passphrase,
     )
     return ws
 
@@ -443,6 +468,7 @@ def _save_wallet_file(
     password: str,
     wallet_type: str,
     creation_height: int | None = None,
+    bip39_passphrase: str | None = None,
 ) -> None:
     """Persist an encrypted wallet file.
 
@@ -476,12 +502,21 @@ def _save_wallet_file(
     )
     fernet = Fernet(key)
 
-    wallet_data_dict: dict[str, str | int] = {
+    wallet_data_dict: dict[str, Any] = {
         "mnemonic": mnemonic,
         "wallet_type": wallet_type,
     }
     if creation_height is not None:
         wallet_data_dict["creation_height"] = creation_height
+    if bip39_passphrase is not None:
+        from jmcore.wallet_metadata import WalletIdentity
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+        wallet_data_dict["identity_version"] = 1
+        wallet_data_dict["wallet_identity"] = WalletIdentity(
+            fingerprint=get_mnemonic_fingerprint(mnemonic, bip39_passphrase),
+            bip39="required" if bip39_passphrase else "none",
+        ).model_dump()
 
     wallet_data = json.dumps(wallet_data_dict).encode()
 
@@ -492,6 +527,7 @@ def _save_wallet_file(
         time_cost=_ARGON2ID_TIME_COST,
         parallelism=_ARGON2ID_PARALLELISM,
         salt=salt,
+        version=2 if bip39_passphrase else 1,
     )
 
     ensure_private_directory(wallet_path.parent)
@@ -501,7 +537,9 @@ def _save_wallet_file(
     logger.bind(sensitive=True).debug("Saved wallet file (argon2id): {}", wallet_path)
 
 
-def _load_wallet_file(*, wallet_path: Path, password: str) -> tuple[str, int | None]:
+def _load_wallet_file(
+    *, wallet_path: Path, password: str, bip39_passphrase: str = ""
+) -> tuple[str, int | None]:
     """Load and decrypt a wallet file, returning the mnemonic and creation height.
 
     Auto-detects the on-disk format:
@@ -541,6 +579,27 @@ def _load_wallet_file(*, wallet_path: Path, password: str) -> tuple[str, int | N
 
     data = json.loads(decrypted)
     mnemonic: str = data["mnemonic"]
+    requires_identity = raw.startswith(_WALLET_MAGIC) and raw[4] == 2
+    if requires_identity or "identity_version" in data or "wallet_identity" in data:
+        from jmcore.wallet_metadata import WalletIdentity
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+        if type(data.get("identity_version")) is not int or data["identity_version"] != 1:
+            raise ValueError("Unsupported wallet identity version; use compatible software")
+        identity = WalletIdentity.model_validate(data.get("wallet_identity"))
+        if requires_identity and identity.bip39 != "required":
+            raise ValueError("Version 2 wallet requires complete passphrase identity metadata")
+        if get_mnemonic_fingerprint(mnemonic, bip39_passphrase) != identity.fingerprint or (
+            identity.bip39 == "required" and not bip39_passphrase
+        ):
+            raise ValueError("BIP39 passphrase does not match the saved wallet identity")
+    else:
+        logger.warning(
+            "Legacy daemon wallet identity is unconfirmed; no migration or rescan is scheduled. "
+            "Supply the intended bip39_passphrase when unlocking "
+            "and verify the wallet fingerprint. "
+            "A mnemonic recovery can create a separately named identity-bound container."
+        )
 
     raw_creation_height = data.get("creation_height")
     creation_height: int | None
@@ -631,6 +690,7 @@ def _pack_argon2id_header(
     time_cost: int,
     parallelism: int,
     salt: bytes,
+    version: int = 1,
 ) -> bytes:
     """Build the binary header for an Argon2id-encrypted wallet file."""
     if len(salt) != _SALT_LEN:
@@ -638,7 +698,7 @@ def _pack_argon2id_header(
         raise ValueError(msg)
     return (
         _WALLET_MAGIC
-        + bytes([_WALLET_FORMAT_VERSION, _KDF_ID_ARGON2ID])
+        + bytes([version, _KDF_ID_ARGON2ID])
         + memory_cost.to_bytes(4, "big")
         + time_cost.to_bytes(4, "big")
         + bytes([parallelism])
@@ -655,7 +715,7 @@ def _derive_key_from_header(raw: bytes, *, password: str) -> tuple[bytes, bytes]
 
     version = raw[4]
     kdf_id = raw[5]
-    if version != _WALLET_FORMAT_VERSION:
+    if version not in {_WALLET_FORMAT_VERSION, 2}:
         msg = f"Unsupported wallet file version: {version}"
         raise ValueError(msg)
     if kdf_id != _KDF_ID_ARGON2ID:

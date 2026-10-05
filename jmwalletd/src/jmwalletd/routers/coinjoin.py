@@ -44,6 +44,7 @@ def build_coinjoin_taker_config(
     jm_settings: Any,
     taker_config_cls: Any,
     config_overrides: dict[str, dict[str, str]] | None = None,
+    passphrase: str = "",
 ) -> Any:
     """Build a ``TakerConfig`` for a one-shot ``do_coinjoin`` request.
 
@@ -72,7 +73,7 @@ def build_coinjoin_taker_config(
     kwargs = build_taker_config_kwargs(
         jm_settings,
         mnemonic,
-        "",
+        passphrase,
         amount=body.amount_sats,
         destination=body.destination,
         mixdepth=body.mixdepth,
@@ -200,6 +201,7 @@ async def do_coinjoin(
                     force_new=True,
                     mnemonic=state.wallet_mnemonic,
                     network=bitcoin_network.value,
+                    passphrase=state.wallet_bip39_passphrase,
                 )
                 config = build_coinjoin_taker_config(
                     body=body,
@@ -207,6 +209,7 @@ async def do_coinjoin(
                     jm_settings=jm_settings,
                     taker_config_cls=TakerConfig,
                     config_overrides=state.config_overrides,
+                    passphrase=state.wallet_bip39_passphrase,
                 )
                 taker = Taker(
                     wallet=ws,
@@ -424,6 +427,7 @@ async def start_maker(
                     cj_fee_relative=cjfee_r,
                     cj_fee_absolute=cjfee_a,
                     tx_fee_contribution=txfee,
+                    passphrase=state.wallet_bip39_passphrase,
                 )
 
                 def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
