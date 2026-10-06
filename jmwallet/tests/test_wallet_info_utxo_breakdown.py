@@ -306,6 +306,8 @@ def test_show_utxos_flag_end_to_end(categorized_wallet):
                     "--backend",
                     "descriptor_wallet",
                     "--show-utxos",
+                    "--data-dir",
+                    tmpdir,
                 ],
             )
             assert result.exit_code == 0, f"Command failed: {result.stdout}"
@@ -329,6 +331,8 @@ def test_show_utxos_flag_end_to_end(categorized_wallet):
                     "mainnet",
                     "--backend",
                     "descriptor_wallet",
+                    "--data-dir",
+                    tmpdir,
                 ],
             )
             assert result.exit_code == 0, f"Command failed: {result.stdout}"
@@ -381,6 +385,8 @@ def test_show_utxos_headers_colored_on_tty(categorized_wallet):
                         "--backend",
                         "descriptor_wallet",
                         "--show-utxos",
+                        "--data-dir",
+                        tmpdir,
                     ],
                 )
             assert result.exit_code == 0, f"Command failed: {result.stdout}"
