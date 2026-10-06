@@ -191,9 +191,8 @@ class WalletConfig(BaseModel):
     wallet_with_passphrase: bool = Field(
         default=False,
         description=(
-            "Whether the wallet uses a BIP39 passphrase. Gates interactive "
-            "passphrase prompting on wallet unlock (opt-in; default false "
-            "never prompts)."
+            "Legacy compatibility field; credentials are resolved before runtime config "
+            "construction. Does not control prompting or override registered wallet requirements."
         ),
     )
 

@@ -258,6 +258,10 @@
 
 # Mnemonic file settings (optional defaults)
 # mnemonic_file = ""            # Path to mnemonic file
+# Enable BIP39 onboarding and prompting for unregistered wallets. Default: false.
+# Registered passphrase wallets still require their passphrase when this is false.
+# Recorded history uses the selected identity without unlocking either credential.
+# bip39_passphrase_enabled = false
 #
 # SECURITY WARNING: mnemonic_password is stored IN PLAIN TEXT in this file.
 # Anyone who can read config.toml can decrypt the wallet, which defeats the
@@ -274,17 +278,8 @@
 # prompted by jm-wallet / jm-maker.
 # bip39_passphrase = ""         # BIP39 passphrase for the mnemonic (plaintext!)
 #
-# Whether your wallet uses a BIP39 passphrase at all. Passphrases are strictly
-# opt-in: with the default false, no passphrase prompt is ever shown and
-# wallets unlock with an empty passphrase. Set to true ONLY if your wallet
-# actually has a passphrase: interactive commands then ask for it on wallet
-# unlock, and unattended commands fail loudly instead of silently deriving
-# the wrong (passphrase-less) wallet. With this enabled, an exported
-# BIP39_PASSPHRASE environment variable counts as an explicit answer even
-# when empty (the TUI caches the session answer this way); with the default
-# false, an empty exported value is treated as unset. The setting is global
-# and applies to all wallets until set back to false.
-# wallet_with_passphrase = false
+# Compatibility: wallet_with_passphrase is accepted as an input alias for
+# bip39_passphrase_enabled. Keep one spelling; conflicting values are rejected.
 
 # ============================================================================
 # Logging Settings

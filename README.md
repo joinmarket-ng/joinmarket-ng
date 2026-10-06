@@ -46,6 +46,8 @@ time.
 
 - [Get started](https://joinmarket-ng.github.io/joinmarket-ng/getting-started/):
   choose an interface, set up a backend, back up a wallet, and prepare for a CoinJoin.
+- [Migrating from existing JoinMarket?](https://joinmarket-ng.github.io/joinmarket-ng/recover-wallet/):
+  follow the wallet recovery and migration guide.
 - [Use your wallet](https://joinmarket-ng.github.io/joinmarket-ng/README-jmwallet/):
   receive, check balances, and send.
 - [Common questions](https://joinmarket-ng.github.io/joinmarket-ng/faq/) and

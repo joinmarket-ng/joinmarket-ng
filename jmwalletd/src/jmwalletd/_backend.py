@@ -61,6 +61,7 @@ async def get_backend(
     mnemonic: str | None = None,
     network: str | None = None,
     wallet_service: WalletService | None = None,
+    passphrase: str = "",
 ) -> Any:
     """Return a blockchain backend instance.
 
@@ -97,7 +98,7 @@ async def get_backend(
             if network is None:
                 msg = "get_backend: network is required when mnemonic is passed"
                 raise ValueError(msg)
-            descriptor_wallet_name = _wallet_name_for_mnemonic(mnemonic, network)
+            descriptor_wallet_name = _wallet_name_for_mnemonic(mnemonic, network, passphrase)
         elif wallet_service is not None:
             descriptor_wallet_name = wallet_name_for_service(wallet_service)
         else:

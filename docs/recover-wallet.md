@@ -47,6 +47,27 @@ jm-wallet info \
   --prompt-bip39-passphrase
 ```
 
+The default-disabled `[wallet] bip39_passphrase_enabled` setting opts into
+identity onboarding during import/generation, not storage of the passphrase.
+After verifying the intended wallet, remember its identity explicitly:
+
+```bash
+jm-wallet identity register \
+  --mnemonic-file "$HOME/.joinmarket-ng/wallets/recovered.mnemonic" \
+  --prompt-bip39-passphrase
+jm-wallet identity select <fingerprint> \
+  --mnemonic-file "$HOME/.joinmarket-ng/wallets/recovered.mnemonic"
+```
+
+For an existing installation upgrading from the previous release, no identity
+registration, rescan, or file migration happens automatically. Old cached
+fingerprints are unverified hints; missing metadata proves nothing about BIP39
+use. Register/select the intended identity when ready, without reimporting the
+seed or deleting history. Existing birthdays and recovery markers are preserved.
+Recorded history then needs no unlock, while key-deriving operations check the
+selected identity. Identity metadata has a privacy cost: it records the existence
+of that wallet and whether a passphrase is required, but never the passphrase.
+
 Compare the displayed wallet fingerprint, known receive addresses, and each
 mixdepth balance with records from the old wallet or an independent source. A
 successful import followed by `info` only proves that the phrase was accepted

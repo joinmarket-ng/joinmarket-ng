@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, SecretStr
 
 
 def _validate_wallet_name(value: str) -> str:
@@ -64,6 +64,7 @@ class CreateWalletRequest(BaseModel):
 
     walletname: WalletName
     password: str
+    bip39_passphrase: SecretStr = Field(default_factory=lambda: SecretStr(""))
     wallettype: str = "sw-fb"
 
 
@@ -84,6 +85,7 @@ class RecoverWalletRequest(BaseModel):
 
     walletname: WalletName
     password: str
+    bip39_passphrase: SecretStr = Field(default_factory=lambda: SecretStr(""))
     wallettype: str = "sw-fb"
     seedphrase: str
     scan_range: int | None = Field(
@@ -103,6 +105,7 @@ class UnlockWalletRequest(BaseModel):
     """POST /api/v1/wallet/{walletname}/unlock request."""
 
     password: str
+    bip39_passphrase: SecretStr = Field(default_factory=lambda: SecretStr(""))
 
 
 class UnlockWalletResponse(BaseModel):

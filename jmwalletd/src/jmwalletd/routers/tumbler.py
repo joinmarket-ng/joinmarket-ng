@@ -247,6 +247,7 @@ def build_tumbler_taker_config(
     jm_settings: Any,
     taker_config_cls: Any,
     config_overrides: dict[str, dict[str, str]] | None = None,
+    passphrase: str = "",
 ) -> Any:
     """Build a ``TakerConfig`` for a tumbler taker phase.
 
@@ -277,7 +278,7 @@ def build_tumbler_taker_config(
     kwargs = build_taker_config_kwargs(
         jm_settings,
         mnemonic,
-        "",
+        passphrase,
         amount=getattr(phase, "amount", 0) or 0,
         destination="",
         mixdepth=getattr(phase, "mixdepth", 0),
@@ -451,6 +452,7 @@ async def start_plan(
             jm_settings=jm_settings,
             taker_config_cls=TakerConfig,
             config_overrides=state.config_overrides,
+            passphrase=state.wallet_bip39_passphrase,
         )
         return Taker(wallet=ws, backend=backend, config=config)
 
@@ -460,7 +462,12 @@ async def start_plan(
             force_new=True,
             wallet_service=ws,
         )
-        config = build_daemon_maker_config(jm_settings, state.wallet_mnemonic, state.data_dir)
+        config = build_daemon_maker_config(
+            jm_settings,
+            state.wallet_mnemonic,
+            state.data_dir,
+            passphrase=state.wallet_bip39_passphrase,
+        )
         # Tumbler maker sessions must run as 0-fee sw0absoffer with no
         # fidelity bond. See ``tumbler.maker_policy`` for the rationale.
         from tumbler.maker_policy import apply_tumbler_maker_policy

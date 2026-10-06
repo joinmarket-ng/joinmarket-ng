@@ -62,6 +62,14 @@ allowed by the firewall; clients must verify the daemon's TLS certificate.
 
 ## Configuration
 
+### BIP39 Wallet Identity
+
+Create, recover, and unlock accept an optional `bip39_passphrase`, separate from
+the encryption password. Existing clients retain empty-passphrase behavior.
+New nonempty-passphrase containers require current software; old containers are
+not migrated on unlock. See [BIP39 API and upgrade guidance](../docs/README-jmwalletd.md#bip39-passphrases)
+before using passphrase wallets with external clients.
+
 `jmwalletd` uses the shared JoinMarket NG config (`~/.joinmarket-ng/config.toml`) and
 the same environment override model as other components.
 

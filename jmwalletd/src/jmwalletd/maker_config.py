@@ -54,6 +54,7 @@ def build_daemon_maker_config(
     cj_fee_relative: str | None = None,
     cj_fee_absolute: int | None = None,
     tx_fee_contribution: int | None = None,
+    passphrase: str = "",
 ) -> MakerConfig:
     """Build a daemon ``MakerConfig`` from settings and optional REST offer overrides.
 
@@ -119,6 +120,7 @@ def build_daemon_maker_config(
 
     return MakerConfig(
         mnemonic=SecretStr(mnemonic),
+        passphrase=SecretStr(passphrase),
         network=settings.network_config.network,
         bitcoin_network=settings.network_config.bitcoin_network or settings.network_config.network,
         data_dir=data_dir,

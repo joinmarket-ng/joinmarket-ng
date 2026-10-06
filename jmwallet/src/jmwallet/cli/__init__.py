@@ -58,6 +58,7 @@ from jmwallet.cli import (  # noqa: E402, F401
     debug_info,
     freeze,
     history_cmd,
+    identity,
     registry,
     send,
     sign_psbt,

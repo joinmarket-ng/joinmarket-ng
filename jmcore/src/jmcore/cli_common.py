@@ -55,6 +55,12 @@ from jmcore.settings import (
     get_settings,
     reset_settings,
 )
+from jmcore.wallet_metadata import (
+    UPGRADE_GUIDANCE,
+    WalletIdentity,
+    load_mnemonic_meta,
+    selected_identity,
+)
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -98,6 +104,60 @@ class ResolvedMnemonic:
     source: str  # Where the mnemonic came from (for logging)
     creation_height: int | None = None  # Block height at wallet creation time
     mnemonic_file: Path | None = None  # File backing the mnemonic, when present
+
+
+@dataclass(frozen=True)
+class MnemonicSource:
+    """Source provenance shared by public identity lookup and secret resolution."""
+
+    mnemonic: str | None
+    path: Path | None
+    description: str
+
+
+def select_mnemonic_source(
+    settings: JoinMarketSettings,
+    *,
+    mnemonic: str | None = None,
+    mnemonic_file: Path | None = None,
+) -> MnemonicSource | None:
+    if mnemonic:
+        return MnemonicSource(mnemonic, None, "--mnemonic argument")
+    if mnemonic_file is not None:
+        return MnemonicSource(None, mnemonic_file, f"--mnemonic-file ({mnemonic_file})")
+    if env_file := os.environ.get("MNEMONIC_FILE"):
+        return MnemonicSource(None, Path(env_file), f"MNEMONIC_FILE env ({env_file})")
+    if env_mnemonic := os.environ.get("MNEMONIC"):
+        return MnemonicSource(env_mnemonic, None, "MNEMONIC env")
+    if settings.wallet.mnemonic_file:
+        path = Path(settings.wallet.mnemonic_file)
+        return MnemonicSource(None, path, f"config file ({path})")
+    path = settings.get_data_dir() / "wallets" / "default.mnemonic"
+    if path.exists():
+        return MnemonicSource(None, path, f"default wallet ({path})")
+    return None
+
+
+def has_bip39_credential(settings: JoinMarketSettings) -> bool:
+    """Match existing environment/config credential precedence, including empty config."""
+    return bool(os.environ.get("BIP39_PASSPHRASE")) or settings.wallet.bip39_passphrase is not None
+
+
+def bip39_prompt_required(
+    settings: JoinMarketSettings,
+    identity: WalletIdentity | None,
+    *,
+    explicitly_requested: bool = False,
+) -> bool:
+    """Prompt policy shared by CLI resolution and the TUI credential dialog."""
+    return (
+        explicitly_requested
+        or (identity is not None and identity.bip39 == "required")
+        or (
+            (identity is None or identity.bip39 == "unknown")
+            and settings.wallet.bip39_passphrase_enabled
+        )
+    )
 
 
 # =============================================================================
@@ -723,18 +783,11 @@ def resolve_configured_mnemonic_file(settings: JoinMarketSettings) -> Path | Non
     2. Config file ``wallet.mnemonic_file`` setting
     3. Default wallet path (``<data_dir>/wallets/default.mnemonic``)
 
-    Raw-mnemonic sources (``--mnemonic``/``MNEMONIC`` env) have no backing
-    file and are intentionally ignored here. Returns ``None`` when no
-    file-based wallet is configured or the default does not exist.
+    Raw-mnemonic sources have no backing file and prevent using an unrelated
+    configured file. Returns ``None`` when the selected source is not a file.
     """
-    if env_file := os.environ.get("MNEMONIC_FILE"):
-        return Path(env_file)
-    if settings.wallet.mnemonic_file:
-        return Path(settings.wallet.mnemonic_file)
-    default_wallet = settings.get_data_dir() / "wallets" / "default.mnemonic"
-    if default_wallet.exists():
-        return default_wallet
-    return None
+    source = select_mnemonic_source(settings)
+    return source.path if source is not None else None
 
 
 def resolve_mnemonic(
@@ -746,6 +799,8 @@ def resolve_mnemonic(
     bip39_passphrase: str | None = None,
     prompt_bip39_passphrase: bool = False,
     required: bool = True,
+    validate_identity: bool = True,
+    expected_fingerprint: str | None = None,
 ) -> ResolvedMnemonic | None:
     """
     Resolve mnemonic from various sources with priority.
@@ -760,13 +815,9 @@ def resolve_mnemonic(
 
     BIP39 passphrase priority:
     1. --bip39-passphrase argument
-    2. BIP39_PASSPHRASE environment variable (an exported but empty value
-       counts as an explicit answer only when wallet.wallet_with_passphrase
-       is enabled; otherwise it is treated as unset and falls through)
+    2. BIP39_PASSPHRASE environment variable
     3. Config file wallet.bip39_passphrase setting
-    4. Interactive prompt (if --prompt-bip39-passphrase is set or
-       wallet.wallet_with_passphrase is enabled; the setting fails loudly
-       when no interactive terminal is available)
+    4. Interactive prompt (if --prompt-bip39-passphrase is set)
     5. Empty string (default - no passphrase)
 
     For encrypted mnemonic files, the password is resolved as:
@@ -789,9 +840,12 @@ def resolve_mnemonic(
     Raises:
         ValueError: If required but not found, or if loading fails
     """
+    selected_source = select_mnemonic_source(
+        settings, mnemonic=mnemonic, mnemonic_file=mnemonic_file
+    )
     resolved_mnemonic: str | None = None
-    source = ""
-    mnemonic_file_path: Path | None = None  # Track file path for .meta loading
+    source = selected_source.description if selected_source else ""
+    mnemonic_file_path = selected_source.path if selected_source else None
 
     # Resolve the encryption password once for all file-based paths so that
     # ``wallet.mnemonic_password`` from config.toml works no matter whether
@@ -805,43 +859,12 @@ def resolve_mnemonic(
     if effective_password is None and settings.wallet.mnemonic_password:
         effective_password = settings.wallet.mnemonic_password.get_secret_value()
 
-    # Priority 1: Direct mnemonic argument
-    if mnemonic:
-        resolved_mnemonic = mnemonic
-        source = "--mnemonic argument"
-
-    # Priority 2: Mnemonic file argument
-    elif mnemonic_file:
-        resolved_mnemonic = load_mnemonic_from_file(mnemonic_file, effective_password)
-        mnemonic_file_path = mnemonic_file
-        source = f"--mnemonic-file ({mnemonic_file})"
-
-    # Priority 3: MNEMONIC_FILE environment variable
-    elif env_file := os.environ.get("MNEMONIC_FILE"):
-        env_path = Path(env_file)
-        resolved_mnemonic = load_mnemonic_from_file(env_path, effective_password)
-        mnemonic_file_path = env_path
-        source = f"MNEMONIC_FILE env ({env_path})"
-
-    # Priority 4: MNEMONIC environment variable
-    elif env_mnemonic := os.environ.get("MNEMONIC"):
-        resolved_mnemonic = env_mnemonic
-        source = "MNEMONIC env"
-
-    # Priority 5: Config file wallet.mnemonic_file
-    elif settings.wallet.mnemonic_file:
-        config_path = Path(settings.wallet.mnemonic_file)
-        resolved_mnemonic = load_mnemonic_from_file(config_path, effective_password)
-        mnemonic_file_path = config_path
-        source = f"config file ({config_path})"
-
-    # Priority 6: Default wallet path
-    else:
-        default_wallet = settings.get_data_dir() / "wallets" / "default.mnemonic"
-        if default_wallet.exists():
-            resolved_mnemonic = load_mnemonic_from_file(default_wallet, effective_password)
-            mnemonic_file_path = default_wallet
-            source = f"default wallet ({default_wallet})"
+    if selected_source is not None:
+        resolved_mnemonic = (
+            load_mnemonic_from_file(mnemonic_file_path, effective_password)
+            if mnemonic_file_path is not None
+            else selected_source.mnemonic
+        )
 
     if resolved_mnemonic is None:
         if required:
@@ -870,39 +893,38 @@ def resolve_mnemonic(
             "a phrase without a valid checksum."
         )
 
+    identity = (
+        selected_identity(mnemonic_file_path)
+        if mnemonic_file_path is not None and validate_identity
+        else None
+    )
+    if mnemonic_file_path is not None and identity is None and validate_identity:
+        logger.warning(UPGRADE_GUIDANCE)
+    should_prompt = bip39_prompt_required(
+        settings, identity, explicitly_requested=prompt_bip39_passphrase
+    )
+
     # Resolve BIP39 passphrase
     # Priority: CLI arg > env var > config > prompt > empty
     resolved_passphrase = ""
-    if bip39_passphrase:
+    if bip39_passphrase is not None:
         resolved_passphrase = bip39_passphrase
-    elif "BIP39_PASSPHRASE" in os.environ and settings.wallet.wallet_with_passphrase:
-        # With wallet_with_passphrase enabled, an exported BIP39_PASSPHRASE is
-        # authoritative even when empty: it counts as an explicit session
-        # answer ("no passphrase"), which lets a TUI subshell cache that
-        # answer instead of re-prompting on every spawned command. With the
-        # default (setting disabled), an empty value is treated as unset and
-        # falls through to the walrus branch below, matching standard CLI
-        # behavior.
-        resolved_passphrase = os.environ.get("BIP39_PASSPHRASE", "")
+    elif "BIP39_PASSPHRASE" in os.environ and settings.wallet.bip39_passphrase_enabled:
+        resolved_passphrase = os.environ["BIP39_PASSPHRASE"]
     elif env_passphrase := os.environ.get("BIP39_PASSPHRASE"):
         resolved_passphrase = env_passphrase
     elif settings.wallet.bip39_passphrase is not None:
         resolved_passphrase = settings.wallet.bip39_passphrase.get_secret_value()
-    elif prompt_bip39_passphrase or settings.wallet.wallet_with_passphrase:
-        # A persistent prompt request (the wallet_with_passphrase setting)
-        # must never silently fall back to an empty passphrase when no
-        # interactive terminal is available (e.g. under systemd): that would
-        # derive the WRONG (passphrase-less) wallet. The one-shot CLI flag
-        # keeps the legacy behavior: piped stdin works, empty input aborts.
-        if settings.wallet.wallet_with_passphrase and not prompt_bip39_passphrase:
+    elif should_prompt:
+        if settings.wallet.bip39_passphrase_enabled and not prompt_bip39_passphrase:
             from jmcore.confirmation import is_interactive_mode
 
             if not is_interactive_mode():
                 raise ValueError(
-                    "wallet.wallet_with_passphrase is enabled but no passphrase was "
-                    "provided via BIP39_PASSPHRASE env or wallet.bip39_passphrase "
-                    "config, and no interactive terminal is available. Refusing to "
-                    "silently derive the passphrase-less wallet."
+                    "wallet.wallet_with_passphrase is enabled "
+                    "(compatibility alias for wallet.bip39_passphrase_enabled), "
+                    "but no passphrase was provided and no interactive terminal is available. "
+                    "Provide BIP39_PASSPHRASE or wallet.bip39_passphrase explicitly."
                 )
         # Lazy import typer only when needed for prompting
         try:
@@ -920,12 +942,34 @@ def resolve_mnemonic(
             resolved_passphrase = getpass.getpass("Enter BIP39 passphrase (leave empty for none): ")
         _confirm_prompted_wallet(resolved_mnemonic, resolved_passphrase)
 
+    expected_fingerprints = (expected_fingerprint, os.environ.get("EXPECTED_FINGERPRINT"))
+    if identity is not None or any(value is not None for value in expected_fingerprints):
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+        derived = get_mnemonic_fingerprint(resolved_mnemonic, resolved_passphrase)
+        if identity is not None and (
+            derived != identity.fingerprint
+            or (identity.bip39 == "required" and not resolved_passphrase)
+        ):
+            raise ValueError(
+                "Derived wallet does not match the selected identity. No wallet activity started. "
+                "Check the BIP39 passphrase, or use `jm-wallet identity register` and "
+                "`jm-wallet identity select` to intentionally select another wallet."
+            )
+        for fingerprint in expected_fingerprints:
+            if fingerprint is None:
+                continue
+            expected = WalletIdentity.validate_fingerprint(fingerprint)
+            if derived != expected:
+                raise ValueError(
+                    "Staged wallet fingerprint mismatch. No wallet activity started. "
+                    "Restage the maker credentials for the intended wallet."
+                )
+
     # Load wallet metadata (creation_height) from companion .meta file
     creation_height: int | None = None
     if mnemonic_file_path is not None:
         try:
-            from jmwallet.cli.mnemonic import load_mnemonic_meta
-
             meta = load_mnemonic_meta(mnemonic_file_path)
             raw_creation_height = meta.get("creation_height")
             if isinstance(raw_creation_height, int) and not isinstance(raw_creation_height, bool):

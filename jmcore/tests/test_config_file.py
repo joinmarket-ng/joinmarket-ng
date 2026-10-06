@@ -80,6 +80,26 @@ def test_set_get_and_remove_are_table_scoped_on_sparse_config(tmp_path: Path) ->
     assert tomlkit.parse(config_text)["tui"]["log_level"] == "INFO"
 
 
+def test_set_bool_preserves_comments_and_writes_typed_flag(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('# keep\n[wallet]\nmnemonic_file = "wallet.mnemonic"\n')
+    for value in ("true", "false"):
+        result = _run_helper("set-bool", path, "wallet", "bip39_passphrase_enabled", value=value)
+        assert result.returncode == 0, result.stderr
+        assert tomlkit.parse(path.read_text())["wallet"]["bip39_passphrase_enabled"] is (
+            value == "true"
+        )
+        assert "# keep" in path.read_text()
+    before = path.read_bytes()
+    assert (
+        _run_helper(
+            "set-bool", path, "wallet", "bip39_passphrase_enabled", value="other"
+        ).returncode
+        == 2
+    )
+    assert path.read_bytes() == before
+
+
 def test_set_adds_active_table_to_legacy_commented_config(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(
@@ -331,6 +351,43 @@ def test_set_relocates_a_key_written_after_the_chapter_banner(tmp_path: Path) ->
     parsed = tomlkit.parse(config_text)
     assert parsed["wallet"]["mnemonic_file"] == "wallet.m"
     assert parsed["logging"]["level"] == "INFO"
+
+
+def test_relocation_preserves_inline_comment(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        _template_shaped_config().replace(
+            "\n[logging]\n", 'mnemonic_file = "old" # preserve this note\n\n[logging]\n'
+        )
+    )
+    result = _run_helper("set", config_path, "wallet", "mnemonic_file", value="new")
+    assert result.returncode == 0, result.stderr.decode()
+    text = config_path.read_text()
+    assert 'mnemonic_file = "new" # preserve this note' in text
+    assert text.index('mnemonic_file = "new"') < text.index("# Logging Settings")
+
+
+def test_internal_separator_does_not_relocate_a_wallet_key(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[wallet]\n# ====\n# Advanced Settings\n# ====\n"
+        'mnemonic_file = "old" # keep here\n[logging]\nlevel = "INFO"\n'
+    )
+    result = _run_helper("set", config_path, "wallet", "mnemonic_file", value="new")
+    assert result.returncode == 0, result.stderr.decode()
+    text = config_path.read_text()
+    assert text.index("# Advanced Settings") < text.index('mnemonic_file = "new" # keep here')
+
+
+def test_bool_setter_stays_inside_chapter(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(_template_shaped_config())
+    result = _run_helper(
+        "set-bool", config_path, "wallet", "bip39_passphrase_enabled", value="true"
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    text = config_path.read_text()
+    assert text.index("bip39_passphrase_enabled = true") < text.index("# Logging Settings")
 
 
 def test_set_get_and_remove_boolean_values(tmp_path: Path) -> None:

@@ -11,20 +11,24 @@ Configuration is loaded with the following priority (highest to lowest):
 from __future__ import annotations
 
 import asyncio
+import re
+import unicodedata
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from jmcore.cli_common import resolve_mnemonic, setup_cli
+from jmcore.cli_common import resolve_mnemonic, select_mnemonic_source, setup_cli
 from jmcore.cli_help import SortedTyper, version_options
 from jmcore.config import build_tor_control_config
 from jmcore.models import NetworkType, OfferType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
+from jmcore.secure_files import read_private_file
 from jmcore.settings import (
     JoinMarketSettings,
     ensure_config_file,
 )
+from jmcore.wallet_metadata import WalletIdentity, selected_identity
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 from pydantic import SecretStr
@@ -39,6 +43,63 @@ app = SortedTyper(no_args_is_help=True, callback=version_options)
 
 def run_async(coro: Any) -> Any:
     return asyncio.run(coro)
+
+
+def _staged_wallet_binding(
+    path: Path,
+    settings: JoinMarketSettings,
+    mnemonic_file: Path | None,
+) -> tuple[str | None, SecretStr | None]:
+    """Validate declared staging without importing its secrets.
+
+    Accept the single-line assignment subset emitted by the TUI. Missing
+    staging is not proof of an empty wallet: ExecStopPost may have deleted a
+    rejected file before this service retry.
+    """
+    try:
+        text = read_private_file(path).decode("utf-8")
+    except FileNotFoundError:
+        source = select_mnemonic_source(settings, mnemonic_file=mnemonic_file)
+        identity = selected_identity(source.path) if source is not None and source.path else None
+        if identity is not None:
+            return identity.fingerprint, None
+        if settings.wallet.bip39_passphrase is not None:
+            # Config authorizes only this credential, not an unrelated env override.
+            return None, settings.wallet.bip39_passphrase
+        raise ValueError(
+            "Declared maker staging is missing and the wallet identity is unconfirmed. "
+            "Restage credentials or explicitly configure the intended BIP39 credential."
+        ) from None
+    except (OSError, UnicodeError):
+        raise ValueError("Cannot read declared maker staging. Restage credentials.") from None
+
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        assignment = re.fullmatch(r"([A-Z][A-Z0-9_]*)=(.*)", line)
+        if assignment is None:
+            raise ValueError("Malformed maker staging. Restage credentials.")
+        name, value = assignment.groups()
+        if name not in {"MNEMONIC_PASSWORD", "BIP39_PASSPHRASE", "EXPECTED_FINGERPRINT"}:
+            continue
+        if name in values or not re.fullmatch(r'"(?:[^"\\]|\\["\\])*"|[^\s"\\]*', value):
+            raise ValueError("Ambiguous maker staging. Restage credentials.")
+        values[name] = value
+    fingerprint = values.get("EXPECTED_FINGERPRINT")
+    if fingerprint is not None:
+        try:
+            return WalletIdentity.validate_fingerprint(fingerprint.strip('"')), None
+        except ValueError:
+            raise ValueError("Invalid staged wallet binding. Restage credentials.") from None
+    if "BIP39_PASSPHRASE" in values:
+        raise ValueError(
+            "Unbound BIP39 maker staging. Restage credentials for the intended wallet."
+        )
+    if "MNEMONIC_PASSWORD" not in values:
+        raise ValueError("Maker staging has no wallet credentials. Restage credentials.")
+    return None, None
 
 
 def build_maker_config(
@@ -661,6 +722,14 @@ def start(
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
     ] = None,
+    staged_credentials_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--staged-credentials-file",
+            envvar="JOINMARKET_STAGED_CREDENTIALS_FILE",
+            help="Service EnvironmentFile whose wallet binding must validate before startup",
+        ),
+    ] = None,
 ) -> None:
     """
     Start the maker bot.
@@ -681,14 +750,27 @@ def start(
 
     # Load mnemonic using unified resolver
     try:
+        staged_fingerprint, staged_config_credential = (
+            _staged_wallet_binding(staged_credentials_file, settings, mnemonic_file)
+            if staged_credentials_file is not None
+            else (None, None)
+        )
         resolved = resolve_mnemonic(
             settings,
             mnemonic_file=mnemonic_file,
             prompt_bip39_passphrase=prompt_bip39_passphrase,
+            expected_fingerprint=staged_fingerprint,
         )
         resolved_mnemonic = resolved.mnemonic if resolved else ""
         resolved_passphrase = resolved.bip39_passphrase if resolved else ""
         resolved_creation_height = resolved.creation_height if resolved else None
+        if staged_config_credential is not None and unicodedata.normalize(
+            "NFKD", resolved_passphrase
+        ) != unicodedata.normalize("NFKD", staged_config_credential.get_secret_value()):
+            raise ValueError(
+                "Missing maker staging: effective BIP39 credential conflicts with configuration. "
+                "Restage credentials or select the intended wallet identity."
+            )
     except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
         raise typer.Exit(1)

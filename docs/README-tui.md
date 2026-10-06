@@ -40,33 +40,23 @@ wallet. Viewing recovery words is sensitive; do not screen-share or capture it.
 The BIP39 passphrase prompt is separate from wallet-file decryption. Verify the
 derived wallet identity before accepting it, especially after recovery.
 
-### Wallet Identity and BIP39 Passphrase Caching
+Ordinary wallets no longer get an unconditional BIP39 question. Config Center's
+**Configure BIP39 Onboarding** enables advanced generation/import and prompting
+for unregistered wallets. Registered wallet requirements apply independently of
+that setting. Supplied credentials still support unattended services.
 
-When a command needs the BIP39 passphrase, the menu computes the wallet
-fingerprint from the decrypted mnemonic and shows it in a confirmation dialog.
-Confirm only if the fingerprint matches the wallet you intend to use.
+After upgrading, use **Register Derived Wallet Identity** with the intended
+passphrase, compare its fingerprint with your records, then **Select Registered
+Wallet Identity**. Registration does not automatically change the selected
+identity. Several passphrase wallets may share a mnemonic file. The menu shows
+the selected fingerprint; neither registration nor selection stores a passphrase.
 
-Once confirmed, the passphrase is cached as `BIP39_PASSPHRASE` for the rest of
-that menu action (inside a subshell), so subsequent prompts in the same flow
-use the same derived wallet without asking again. The cache is not written to
-`config.toml`; it disappears when the subshell exits.
-
-### Storing the BIP39 Passphrase
-
-For unattended maker operation the passphrase can be stored in `config.toml`
-(`wallet.bip39_passphrase`). The menu offers this when you select a wallet and
-when you start or restart the maker. Before anything is stored you must confirm
-the wallet fingerprint derived with the entered passphrase, because a passphrase
-cannot be verified any other way — every passphrase derives a valid wallet.
-
-The passphrase is stored **in plain text**: anyone who can read `config.toml`
-can derive your wallet together with your seed backup. Only store it when the
-maker needs to start unattended and you trust the security of the machine. A
-stored passphrase also lets the maker recover the correct wallet after a crash
-or a boot autostart, where no interactive prompt is possible.
-
-Remove a stored passphrase at any time via the Config Center (C → DELPP).
-
+**CoinJoin History** shows recorded data without synchronization. For registered
+wallets it requires neither credential. **Refresh / Reconstruct Wallet History**
+explicitly unlocks and synchronizes, including deferred reconstruction. Legacy
+unregistered files may still require unlocking to identify the wallet; register
+and select their identity to enable passwordless viewing. Refresh is not a claim
+that historical recovery coverage is complete.
 
 ## Maker Bot Control
 
@@ -77,14 +67,31 @@ systemd service; standalone installations manage a local maker process.
 
 Starting an encrypted wallet requires its password. Choosing to store it writes
 it in plain text to `config.toml` for unattended startup. Declining permanent
-storage does not remove all exposure: on Raspiblitz both the wallet password and
-the BIP39 passphrase are staged in a permission-restricted `.maker.env` file
-while the maker runs. Other wallet commands can reuse that staged credential.
-Protect the host in either case.
+storage does not remove all exposure: on Raspiblitz it is staged in a
+permission-restricted `.maker.env` file while the maker runs. Other wallet
+commands can reuse that staged credential. Protect the host in either case.
 
 Use [unattended maker guidance](maker-service.md) to decide whether automatic
 startup is appropriate; do not assume wallet-file encryption protects against
 someone who can also read the unlock credentials.
+
+On Raspiblitz the menu also stages the optional BIP39 passphrase and an expected
+wallet fingerprint in `.maker.env`. Both credentials are plaintext, even when
+permanent storage was declined. Staging validates the selected identity before
+writing; a failed write or canceled restart leaves the running maker untouched.
+Restart validates new credentials before stopping the old process.
+
+After upgrading, BIP39 staging without an expected fingerprint must be restaged
+explicitly from **Start / Restart Maker**. Password-only legacy staging remains
+usable. No identity registration, rescan, or credential deletion happens on
+upgrade. A mismatched staged fingerprint prevents wallet activity.
+
+Config Center can save a BIP39 passphrase to `config.toml` only after an explicit
+plaintext-storage warning and wallet confirmation. This is different from the
+operation-local cache used by wallet commands. Switching mnemonic files clears
+stored credentials and staging; selecting another registered identity clears the
+stored BIP39 passphrase and staging. Protect the host and back up the mnemonic
+and passphrase separately.
 
 ## Fidelity Bonds
 

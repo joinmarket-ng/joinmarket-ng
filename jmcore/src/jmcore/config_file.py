@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import tomlkit
-from tomlkit.items import Comment, Table, Whitespace
+from tomlkit.items import Comment, Item, Table, Whitespace
 from tomlkit.toml_document import TOMLDocument
 
 from jmcore.secure_files import atomic_write_sensitive_file, read_sensitive_file
@@ -54,7 +54,7 @@ def _get_table(document: TOMLDocument, section: str) -> Table | None:
     return table_value
 
 
-def _chapter_banner_cut(table: Table) -> int | None:
+def _chapter_banner_cut(table: Table, next_section: str | None) -> int | None:
     """Return the body index where the next chapter's banner comments start.
 
     Template chapters end with a ``# ====`` separator banner that TOMLKit
@@ -63,13 +63,28 @@ def _chapter_banner_cut(table: Table) -> int | None:
     there is no banner (for example the last chapter) and appending is fine.
     """
     body = table.value.body
+    if next_section is None:
+        return None
     banner_index: int | None = None
     for index, (item_key, item) in enumerate(body):
         if (
             item_key is None
             and isinstance(item, Comment)
             and _BANNER_RE.match(item.trivia.comment.strip())
+            and index + 2 < len(body)
         ):
+            heading, closing = body[index + 1][1], body[index + 2][1]
+            if not (
+                isinstance(heading, Comment)
+                and isinstance(closing, Comment)
+                and re.fullmatch(
+                    rf"#\s*{re.escape(next_section)}\s+(?:Settings|Configuration)\s*",
+                    heading.trivia.comment,
+                    flags=re.IGNORECASE,
+                )
+                and _BANNER_RE.match(closing.trivia.comment.strip())
+            ):
+                continue
             banner_index = index
             break
     if banner_index is None:
@@ -88,9 +103,20 @@ def _table_key_index(table: Table, key: str) -> int | None:
     return None
 
 
-def _insert_table_value(table: Table, key: str, value: str | bool) -> None:
+def _next_table_section(document: TOMLDocument, section: str) -> str | None:
+    seen = False
+    for name, value in document.items():
+        if seen and isinstance(value, Table):
+            return name
+        seen = name == section or seen
+    return None
+
+
+def _insert_table_value(
+    table: Table, key: str, value: str | bool | Item, next_section: str | None
+) -> None:
     """Append a new key, keeping the next chapter's banner comments last."""
-    cut = _chapter_banner_cut(table)
+    cut = _chapter_banner_cut(table, next_section)
     if cut is None:
         table[key] = value
         return
@@ -154,6 +180,8 @@ def set_config_value(
             raise ConfigFileError("boolean config value must be 'true' or 'false'")
         typed_value = stripped == "true"
     document = _read_document(path)
+    next_section = _next_table_section(document, section)
+    insertion_value: str | bool | Item = typed_value
     table = _get_table(document, section)
     if table is None:
         table = tomlkit.table()
@@ -169,10 +197,12 @@ def set_config_value(
         else:
             raise ConfigFileError("config value is not a string or boolean")
         key_index = _table_key_index(table, key)
-        cut = _chapter_banner_cut(table)
+        cut = _chapter_banner_cut(table, next_section)
         if cut is not None and key_index is not None and key_index > cut:
             # The key sits after the next chapter's banner comments, which
             # makes it look like it belongs to that chapter. Move it back.
+            table[key] = typed_value
+            insertion_value = table.item(key)
             table.remove(key)
         elif current_value == typed_value:
             return
@@ -181,7 +211,7 @@ def set_config_value(
             _write_document(path, document)
             return
 
-    _insert_table_value(table, key, typed_value)
+    _insert_table_value(table, key, insertion_value, next_section)
     _write_document(path, document)
 
 
@@ -207,7 +237,7 @@ def remove_config_value(path: Path, section: str, key: str) -> None:
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read and update TUI TOML config values")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("get", "set", "remove"):
+    for command in ("get", "set", "set-bool", "remove"):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--config", type=Path, required=True)
         command_parser.add_argument("--section", required=True)
@@ -229,12 +259,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             value = get_config_value(args.config, args.section, args.key)
             if value is not None:
                 sys.stdout.write(value)
-        elif args.command == "set":
+        elif args.command in {"set", "set-bool"}:
             try:
                 value = sys.stdin.buffer.read().decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ConfigFileError("config value must be UTF-8 text") from exc
-            set_config_value(args.config, args.section, args.key, value, as_bool=args.bool)
+            set_config_value(
+                args.config,
+                args.section,
+                args.key,
+                value,
+                as_bool=args.command == "set-bool" or args.bool,
+            )
         else:
             remove_config_value(args.config, args.section, args.key)
     except ConfigFileError as exc:

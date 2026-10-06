@@ -149,14 +149,21 @@ def test_tui_prefers_its_virtual_environment() -> None:
     )
 
 
-def test_tui_history_syncs_before_reading() -> None:
+def test_tui_history_is_offline_and_refresh_syncs() -> None:
     """A completed background rescan must trigger deferred reconstruction."""
     content = SCRIPT_PATH.read_text()
     history_block = content.split("# HIST - CoinJoin History", 1)[1].split(
-        "# FREEZE - Freeze/Unfreeze UTXOs", 1
+        "# REFRESH - Explicit backend synchronization", 1
     )[0]
-    assert history_block.index("jm-wallet info") < history_block.index(
-        'jm-wallet history "${HIST_ARGS[@]}"'
+    assert "ensure_wallet_password" not in history_block
+    assert "jm-wallet info" not in history_block
+    assert (
+        'jm-wallet history --mnemonic-file "$CURRENT_WALLET" "${HIST_ARGS[@]}"'
+        in history_block
+    )
+    refresh_block = content.split("REFRESH)", 1)[1].split("IDREG)", 1)[0]
+    assert refresh_block.index("ensure_wallet_password") < refresh_block.index(
+        "jm-wallet info"
     )
 
 
@@ -786,9 +793,8 @@ def test_tui_main_exits_without_whiptail() -> None:
     """When whiptail is missing, main() should exit with code 1."""
     from jmcore.tui import main
 
-    with patch("shutil.which", return_value=None):
-        with pytest.raises(SystemExit, match="1"):
-            main()
+    with patch("shutil.which", return_value=None), pytest.raises(SystemExit, match="1"):
+        main()
 
 
 # ---------------------------------------------------------------------------
@@ -1576,8 +1582,12 @@ def test_tui_script_staged_passphrase_verified_against_active_wallet() -> None:
     assert "get_maker_env_expected_fingerprint" in block, (
         "staged passphrase must be checked against the recorded fingerprint"
     )
-    # Legacy .maker.env without the guard line keeps the previous behaviour.
-    assert "Legacy .maker.env (written before the fingerprint guard)" in block
+    # Legacy BIP39 staging is unbound, so ordinary unlock must require restaging.
+    missing_binding = block.split("if ! expected_fingerprint=", 1)[1].split(
+        "\n            fi", 1
+    )[0]
+    assert "Restage Maker Credentials" in missing_binding
+    assert "return 1" in missing_binding
     # Fail closed when no fingerprint was recorded (empty expected).
     assert (
         '[ -n "$expected_fingerprint" ] && [ "$actual_fingerprint" = "$expected_fingerprint" ]'
@@ -1602,11 +1612,10 @@ def test_tui_script_fingerprint_cache_created_with_restrictive_umask() -> None:
     """
     content = SCRIPT_PATH.read_text()
     block = content.split("cache_wallet_fingerprint() {", 1)[1].split("\n}", 1)[0]
-    assert '( umask 077; printf \'%s\\n\' "$fingerprint" > "$FINGERPRINT_CACHE" )' in block, (
-        "cache must be created with restrictive permissions atomically"
-    )
+    assert (
+        '( umask 077; printf \'%s\\n\' "$fingerprint" > "$FINGERPRINT_CACHE" )' in block
+    ), "cache must be created with restrictive permissions atomically"
     assert "chmod 600" in block, "chmod 600 must remain as defence in depth"
-
 
 
 # ---------------------------------------------------------------------------
@@ -2357,7 +2366,7 @@ def _make_freeze_utxo(
     address: str = "bc1qaddr",
     value: int = 100000,
     frozen: bool = False,
-) -> "UTXOInfo":
+) -> UTXOInfo:
     from jmwallet.wallet.models import UTXOInfo
 
     return UTXOInfo(
@@ -2556,20 +2565,13 @@ def test_tui_script_uses_portable_backup_detection() -> None:
 
 
 def test_tui_script_wallet_with_passphrase_flag_gates_unlock_prompt() -> None:
-    """ensure_wallet_unlocked_global must skip the prompt unless the flag is on.
-
-    Passphrases are strictly opt-in: with wallet_with_passphrase unset/false the
-    TUI exports an empty BIP39_PASSPHRASE (so downstream CLIs treat it as an
-    explicit "no passphrase") and never shows the passphrase dialog. The flag
-    check must run AFTER staged (.maker.env) and stored (config.toml)
-    passphrases so an explicit secret always wins, and BEFORE the whiptail
-    prompt.
-    """
+    """Effective identity requirements control prompting, not the global flag alone."""
     content = SCRIPT_PATH.read_text()
     block = content.split("ensure_wallet_unlocked_global() {", 1)[1].split("\n}", 1)[0]
 
-    gate = 'if [ "$(get_wallet_with_passphrase)" != "true" ]; then'
-    assert gate in block, "unlock must be gated on the wallet_with_passphrase flag"
+    gate = 'if [ "$requires_prompt" != "true" ]; then'
+    assert "wallet_requires_passphrase_prompt" in block
+    assert gate in block, "unlock must use selected identity policy"
     assert 'export BIP39_PASSPHRASE=""' in block, (
         "flag off must export an explicit empty passphrase"
     )
@@ -2614,16 +2616,16 @@ def test_tui_script_passphrase_storage_offers_require_flag() -> None:
 
 
 def test_tui_script_config_center_has_passphrase_mode_toggle() -> None:
-    """The Config Center must offer a wallet_with_passphrase on/off toggle."""
+    """The Config Center writes the canonical preference, preserving alias input."""
     content = SCRIPT_PATH.read_text()
 
     assert '"PPFLAG"' in content, (
         "Config Center menu must offer the passphrase mode entry"
     )
-    assert "set_config_bool wallet wallet_with_passphrase" in content, (
+    assert "set_config_bool wallet bip39_passphrase_enabled" in content, (
         "the toggle must persist the flag as a TOML boolean"
     )
     assert "set_config_bool() {" in content, "set_config_bool helper must exist"
 
     helper = content.split("get_wallet_with_passphrase() {", 1)[1].split("\n}", 1)[0]
-    assert "--section wallet --key wallet_with_passphrase" in helper
+    assert "get_settings().wallet.bip39_passphrase_enabled" in helper
