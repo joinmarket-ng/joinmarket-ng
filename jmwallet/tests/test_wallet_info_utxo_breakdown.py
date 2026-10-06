@@ -399,3 +399,43 @@ def test_show_utxos_headers_colored_on_tty(categorized_wallet):
             # Plain text is still present underneath the ANSI codes.
             assert "Total Wallet Balance:" in result.stdout
             assert "Spendable Balance by Mixdepth:" in result.stdout
+
+
+@pytest.mark.parametrize("mixdepth_count", [3, 7])
+def test_basic_view_mixdepth_rows_follow_wallet_mixdepth_count(
+    categorized_wallet, mixdepth_count: int
+):
+    """The basic view prints exactly one balance row per configured mixdepth.
+
+    Regression: the per-mixdepth balance and frozen rows were hardcoded to
+    five mixdepths, so wallets with a non-default mixdepth count saw phantom
+    zero-sats rows for non-existent mixdepths (count below 5) or silently
+    missing mixdepths (count above 5), while the total in the same output
+    covered the real count.
+    """
+    mock_wallet, _ = categorized_wallet
+    mock_wallet.mixdepth_count = mixdepth_count
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mnemonic_file = Path(tmpdir) / "test.mnemonic"
+        mnemonic_file.write_text("abandon " * 11 + "about")
+
+        with patch("jmwallet.wallet.service.WalletService", return_value=mock_wallet):
+            result = runner.invoke(
+                app,
+                [
+                    "info",
+                    "--mnemonic-file",
+                    str(mnemonic_file),
+                    "--network",
+                    "mainnet",
+                    "--backend",
+                    "descriptor_wallet",
+                    "--data-dir",
+                    tmpdir,
+                ],
+            )
+            assert result.exit_code == 0, f"Command failed: {result.stdout}"
+            for md in range(mixdepth_count):
+                assert f"Mixdepth {md}:" in result.stdout
+            assert f"Mixdepth {mixdepth_count}:" not in result.stdout

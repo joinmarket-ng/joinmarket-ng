@@ -1181,7 +1181,8 @@ async def _show_wallet_info(
 
             print(f"\n{_colorize('Spendable Balance by Mixdepth:', _ANSI_BOLD_YELLOW)}")
             md_balances = [
-                await wallet.get_balance(md, include_fidelity_bonds=False) for md in range(5)
+                await wallet.get_balance(md, include_fidelity_bonds=False)
+                for md in range(wallet.mixdepth_count)
             ]
             # Right-align the sums so the ``sats`` column lines up, sizing the
             # column to the widest value so padding stays minimal for small sums.
@@ -1194,7 +1195,7 @@ async def _show_wallet_info(
                     for u in wallet.utxo_cache.get(md, [])
                     if u.frozen and not u.is_fidelity_bond
                 )
-                for md in range(5)
+                for md in range(wallet.mixdepth_count)
             ]
             frozen_width = max((len(f"{f:,}") for f in md_frozen), default=0)
             for md, balance in enumerate(md_balances):
