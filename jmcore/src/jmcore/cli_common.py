@@ -58,6 +58,7 @@ from jmcore.settings import (
 from jmcore.wallet_metadata import (
     UPGRADE_GUIDANCE,
     WalletIdentity,
+    adopt_legacy_identity,
     load_mnemonic_meta,
     selected_identity,
 )
@@ -794,6 +795,21 @@ def resolve_configured_mnemonic_file(settings: JoinMarketSettings) -> Path | Non
     return source.path if source is not None else None
 
 
+def _adopt_or_warn(mnemonic_file: Path, fingerprint: str, passphrase: str) -> None:
+    """Confirm an upgraded wallet automatically when it matches its legacy hint."""
+    identity = WalletIdentity(fingerprint=fingerprint, bip39="required" if passphrase else "none")
+    try:
+        adopted = adopt_legacy_identity(mnemonic_file, identity)
+    except (OSError, ValueError):
+        # Metadata is best effort here: legacy behavior continues unchanged.
+        logger.debug("Could not record the confirmed wallet identity")
+        adopted = False
+    if adopted:
+        logger.info("Wallet identity confirmed from existing wallet metadata.")
+    else:
+        logger.warning(UPGRADE_GUIDANCE)
+
+
 def resolve_mnemonic(
     settings: JoinMarketSettings,
     *,
@@ -902,8 +918,7 @@ def resolve_mnemonic(
         if mnemonic_file_path is not None and validate_identity
         else None
     )
-    if mnemonic_file_path is not None and identity is None and validate_identity:
-        logger.warning(UPGRADE_GUIDANCE)
+    legacy_file = mnemonic_file_path if identity is None and validate_identity else None
     should_prompt = bip39_prompt_required(
         settings, identity, explicitly_requested=prompt_bip39_passphrase
     )
@@ -947,7 +962,11 @@ def resolve_mnemonic(
         _confirm_prompted_wallet(resolved_mnemonic, resolved_passphrase)
 
     expected_fingerprints = (expected_fingerprint, os.environ.get("EXPECTED_FINGERPRINT"))
-    if identity is not None or any(value is not None for value in expected_fingerprints):
+    if (
+        identity is not None
+        or legacy_file is not None
+        or any(value is not None for value in expected_fingerprints)
+    ):
         from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
 
         derived = get_mnemonic_fingerprint(resolved_mnemonic, resolved_passphrase)
@@ -957,8 +976,8 @@ def resolve_mnemonic(
         ):
             raise ValueError(
                 "Derived wallet does not match the selected identity. No wallet activity started. "
-                "Check the BIP39 passphrase, or use `jm-wallet identity register` and "
-                "`jm-wallet identity select` to intentionally select another wallet."
+                "Check the BIP39 passphrase, or run `jm-wallet identity register --select` "
+                "with the intended passphrase to switch wallets."
             )
         for fingerprint in expected_fingerprints:
             if fingerprint is None:
@@ -969,6 +988,8 @@ def resolve_mnemonic(
                     "Staged wallet fingerprint mismatch. No wallet activity started. "
                     "Restage the maker credentials for the intended wallet."
                 )
+        if legacy_file is not None:
+            _adopt_or_warn(legacy_file, derived, resolved_passphrase)
 
     # Load wallet metadata (creation_height) from companion .meta file
     creation_height: int | None = None

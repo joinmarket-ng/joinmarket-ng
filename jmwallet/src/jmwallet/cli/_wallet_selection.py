@@ -38,7 +38,7 @@ from jmcore.cli_common import (
     select_mnemonic_source,
 )
 from jmcore.settings import JoinMarketSettings
-from jmcore.wallet_metadata import UPGRADE_GUIDANCE, selected_identity
+from jmcore.wallet_metadata import selected_identity
 from loguru import logger
 
 from jmwallet.cli.mnemonic import (
@@ -136,7 +136,8 @@ def resolve_wallet_fingerprint(
             if source.path is not None and mnemonic_file is None and not explicit_derivation:
                 cached_fp = load_mnemonic_meta_fingerprint(source.path)
                 if cached_fp is not None:
-                    logger.warning(UPGRADE_GUIDANCE)
+                    # The next unlock confirms a matching wallet automatically.
+                    logger.info("Using the recorded wallet fingerprint; no identity is selected.")
                     return cached_fp
             resolved = resolve_mnemonic(
                 settings,

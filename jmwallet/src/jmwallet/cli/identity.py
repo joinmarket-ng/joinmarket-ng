@@ -13,6 +13,7 @@ from jmcore.settings import JoinMarketSettings
 from jmcore.wallet_metadata import (
     UPGRADE_GUIDANCE,
     WalletIdentity,
+    load_mnemonic_meta,
     register_identity,
     registered_identities,
     select_identity,
@@ -70,11 +71,19 @@ def confirm_and_register(
         "Metadata remembers this public identity and passphrase status, never the passphrase."
     )
     if not yes:
-        typer.confirm("Register this identity" + (" and select it?" if select else "?"), abort=True)
-    register_identity(mnemonic_file, identity)
-    if select:
+        # Preview only; register_identity decides atomically under its lock.
+        selects = select or load_mnemonic_meta(mnemonic_file).get("selected_identity") is None
+        typer.confirm(
+            "Register this identity" + (" and select it?" if selects else "?"), abort=True
+        )
+    selected = register_identity(mnemonic_file, identity)
+    if select and not selected:
         select_identity(mnemonic_file, identity.fingerprint)
-    typer.echo("Identity registered" + (" and selected." if select else ". Selection unchanged."))
+        selected = True
+    typer.echo(
+        "Identity registered"
+        + (" and selected." if selected else ". The existing selection is unchanged.")
+    )
 
 
 def _path(settings: JoinMarketSettings, mnemonic_file: Path | None) -> Path:
@@ -91,7 +100,11 @@ def register(
     no_bip39_passphrase: Annotated[bool, typer.Option("--no-bip39-passphrase")] = False,
     confirm_bip39_passphrase: Annotated[bool, typer.Option("--confirm-bip39-passphrase")] = False,
     select: Annotated[
-        bool, typer.Option("--select", help="Explicitly select the registered identity")
+        bool,
+        typer.Option(
+            "--select",
+            help="Select it even when another identity is selected (first one is automatic)",
+        ),
     ] = False,
     yes: Annotated[
         bool, typer.Option("--yes", help="Confirm metadata disclosure noninteractively")

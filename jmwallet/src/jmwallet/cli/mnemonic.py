@@ -16,7 +16,6 @@ import typer
 from jmcore.crypto import validate_bip39_checksum
 from jmcore.secure_files import atomic_write_private
 from jmcore.wallet_metadata import (
-    UPGRADE_GUIDANCE,
     WalletIdentity,
     load_mnemonic_meta,
     metadata_lock,
@@ -500,11 +499,7 @@ def update_mnemonic_meta_fingerprint(mnemonic_file: Path, fingerprint: str) -> N
             except ValueError:
                 cached = None
             if cached is not None:
-                if cached != fingerprint.strip().lower():
-                    logger.warning(
-                        "Derived wallet differs from the cached identity; cache unchanged. "
-                        + UPGRADE_GUIDANCE
-                    )
+                # Wallet resolution already warned about a mismatch.
                 return
             meta["fingerprint"] = WalletIdentity.validate_fingerprint(fingerprint)
             _write_mnemonic_meta(mnemonic_file, meta)

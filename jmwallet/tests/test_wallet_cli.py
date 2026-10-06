@@ -1885,7 +1885,18 @@ def test_generate_force_overwrite():
         assert output_file.read_text() != "old content"
         # Should NOT show overwrite prompt
         assert "Overwrite existing wallet file?" not in result.stdout
-        assert load_mnemonic_meta(output_file) == {"fidelity_bond_recovery": "not_required"}
+        # Stale fields from the overwritten wallet are gone; the only fingerprint
+        # is the new wallet's passphrase-free hint, confirmed on first unlock.
+        from jmcore.cli_common import load_mnemonic_from_file
+
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+        new_fingerprint = get_mnemonic_fingerprint(load_mnemonic_from_file(output_file, None))
+        assert new_fingerprint != "aabbccdd"
+        assert load_mnemonic_meta(output_file) == {
+            "fidelity_bond_recovery": "not_required",
+            "fingerprint": new_fingerprint,
+        }
 
 
 def test_generate_records_creation_height(monkeypatch):
@@ -2254,7 +2265,15 @@ def test_import_force_overwrite():
 
         assert result.exit_code == 0
         assert output_file.read_text().strip() == mnemonic
-        assert load_mnemonic_meta(output_file) == {"fidelity_bond_recovery": "pending"}
+        # Stale fields from the overwritten wallet are gone; the only fingerprint
+        # is the new wallet's passphrase-free hint, confirmed on first unlock.
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+        assert get_mnemonic_fingerprint(mnemonic) != "aabbccdd"
+        assert load_mnemonic_meta(output_file) == {
+            "fidelity_bond_recovery": "pending",
+            "fingerprint": get_mnemonic_fingerprint(mnemonic),
+        }
 
 
 def test_import_invalid_word_count():

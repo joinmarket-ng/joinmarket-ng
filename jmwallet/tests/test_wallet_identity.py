@@ -160,21 +160,142 @@ def test_raw_mnemonic_has_no_unrelated_file_provenance(
     assert meta_path(source).read_bytes() == before
 
 
-def test_register_and_select_are_separate(wallet: tuple[Path, JoinMarketSettings]) -> None:
+def test_first_registration_selects_and_later_ones_keep_selection(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source, _ = wallet
+    # The configured wallet needs no --mnemonic-file.
+    monkeypatch.setenv("MNEMONIC_FILE", str(source))
     runner = CliRunner()
-    result = runner.invoke(
-        app, ["identity", "register", "-f", str(source), "--no-bip39-passphrase", "--yes"]
+    result = runner.invoke(app, ["identity", "register", "--no-bip39-passphrase", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "registered and selected" in result.output
+    first = WalletIdentity(fingerprint=get_mnemonic_fingerprint(MNEMONIC), bip39="none")
+    assert selected_identity(source) == first
+    monkeypatch.setenv("BIP39_PASSPHRASE", PASSPHRASE)
+    result = runner.invoke(app, ["identity", "register", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "existing selection is unchanged" in result.output
+    assert selected_identity(source) == first
+    result = runner.invoke(app, ["identity", "register", "--select", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert selected_identity(source) == WalletIdentity(
+        fingerprint=get_mnemonic_fingerprint(MNEMONIC, PASSPHRASE), bip39="required"
     )
+    result = runner.invoke(app, ["identity", "select", first.fingerprint])
     assert result.exit_code == 0, result.output
-    assert "Selection unchanged" in result.output
-    result = runner.invoke(
-        app, ["identity", "select", get_mnemonic_fingerprint(MNEMONIC), "-f", str(source)]
-    )
+    assert selected_identity(source) == first
+
+
+@pytest.mark.parametrize("passphrase", ["", PASSPHRASE])
+@pytest.mark.parametrize("credential", ["environment", "config", "argument"])
+def test_unlock_adopts_matching_legacy_hint(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    passphrase: str,
+    credential: str,
+) -> None:
+    source, settings = wallet
+    fp = get_mnemonic_fingerprint(MNEMONIC, passphrase)
+    save_mnemonic_meta(source, fingerprint=fp, creation_height=5, fidelity_bond_recovery="pending")
+    kwargs: dict[str, str] = {}
+    if passphrase and credential == "environment":
+        monkeypatch.setenv("BIP39_PASSPHRASE", passphrase)
+    elif passphrase and credential == "config":
+        settings.wallet.bip39_passphrase = SecretStr(passphrase)
+    elif passphrase:
+        kwargs["bip39_passphrase"] = passphrase
+    with patch("typer.prompt", side_effect=AssertionError("prompted")):
+        resolved = resolve_mnemonic(settings, **kwargs)  # type: ignore[arg-type]
+        assert resolved is not None and resolved.bip39_passphrase == passphrase
+        # Repeated unattended starts keep working after adoption.
+        assert resolve_mnemonic(settings, **kwargs) is not None  # type: ignore[arg-type]
+    identity = WalletIdentity(fingerprint=fp, bip39="required" if passphrase else "none")
+    assert selected_identity(source) == identity
+    meta = load_mnemonic_meta(source)
+    assert meta["creation_height"] == 5
+    assert meta["fidelity_bond_recovery"] == "pending"
+    if passphrase:
+        # The adopted binding now rejects an unlock that omits the passphrase.
+        monkeypatch.delenv("BIP39_PASSPHRASE", raising=False)
+        settings.wallet.bip39_passphrase = None
+        with (
+            patch("typer.prompt", return_value=""),
+            patch("typer.confirm", return_value=True),
+            pytest.raises(ValueError, match="does not match"),
+        ):
+            resolve_mnemonic(settings)
+
+
+@pytest.mark.parametrize("state", ["absent", "different", "unvalidated", "expected-mismatch"])
+def test_unlock_without_matching_evidence_keeps_legacy_behavior(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    source, settings = wallet
+    if state != "absent":
+        save_mnemonic_meta(
+            source,
+            fingerprint=(
+                get_mnemonic_fingerprint(MNEMONIC, PASSPHRASE)
+                if state == "different"
+                else get_mnemonic_fingerprint(MNEMONIC)
+            ),
+        )
+    before = meta_path(source).read_bytes() if meta_path(source).exists() else None
+    with patch("typer.prompt", side_effect=AssertionError("prompted")):
+        if state == "expected-mismatch":
+            with pytest.raises(ValueError, match="Staged wallet fingerprint mismatch"):
+                resolve_mnemonic(settings, expected_fingerprint="11223344")
+        else:
+            resolved = resolve_mnemonic(settings, validate_identity=state != "unvalidated")
+            assert resolved is not None and resolved.bip39_passphrase == ""
+    assert (meta_path(source).read_bytes() if meta_path(source).exists() else None) == before
+    assert selected_identity(source) is None
+
+
+@pytest.mark.parametrize("command", ["generate", "import"])
+def test_new_wallet_without_onboarding_is_confirmed_on_first_unlock(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    source, settings = wallet
+    output = source.with_name("new.mnemonic")
+    monkeypatch.setenv("JOINMARKET_DATA_DIR", str(source.parent))
+    env = {"MNEMONIC": MNEMONIC} if command == "import" else {}
+    with patch(
+        "jmwallet.cli.wallet._fetch_current_block_height", side_effect=ConnectionError("offline")
+    ):
+        result = CliRunner().invoke(
+            app, [command, "--output", str(output), "--no-prompt-password"], env=env
+        )
     assert result.exit_code == 0, result.output
-    result = runner.invoke(app, ["identity", "list", "-f", str(source), "--json"])
-    assert result.exit_code == 0, result.output
-    assert '"selected": true' in result.output
+    assert "identity register" not in result.output
+    from jmcore.cli_common import load_mnemonic_from_file
+
+    mnemonic = load_mnemonic_from_file(output, None)
+    fingerprint = get_mnemonic_fingerprint(mnemonic)
+    assert load_mnemonic_meta_fingerprint(output) == fingerprint
+    assert selected_identity(output) is None
+    monkeypatch.delenv("MNEMONIC", raising=False)
+    with patch("typer.prompt", side_effect=AssertionError("prompted")):
+        assert resolve_mnemonic(settings, mnemonic_file=output) is not None
+    assert selected_identity(output) == WalletIdentity(fingerprint=fingerprint, bip39="none")
+
+
+@pytest.mark.parametrize("error", [OSError("read-only"), ValueError("locked")])
+def test_failed_adoption_does_not_block_unlock(
+    wallet: tuple[Path, JoinMarketSettings], error: Exception
+) -> None:
+    source, settings = wallet
+    save_mnemonic_meta(source, fingerprint=get_mnemonic_fingerprint(MNEMONIC))
+    with patch("jmcore.cli_common.adopt_legacy_identity", side_effect=error):
+        resolved = resolve_mnemonic(settings)
+    assert resolved is not None and resolved.bip39_passphrase == ""
+    assert selected_identity(source) is None
 
 
 @pytest.mark.parametrize("command", ["history", "list-bonds", "registry-show"])

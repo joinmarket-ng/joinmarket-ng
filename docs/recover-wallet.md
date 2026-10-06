@@ -49,24 +49,29 @@ jm-wallet info \
 
 The default-disabled `[wallet] bip39_passphrase_enabled` setting opts into
 identity onboarding during import/generation, not storage of the passphrase.
-After verifying the intended wallet, remember its identity explicitly:
+A wallet imported without a passphrase is confirmed automatically the first time
+it is unlocked without one. For a passphrase wallet, after verifying the intended
+wallet, remember its identity; the first registered identity is also selected:
 
 ```bash
 jm-wallet identity register \
   --mnemonic-file "$HOME/.joinmarket-ng/wallets/recovered.mnemonic" \
   --prompt-bip39-passphrase
-jm-wallet identity select <fingerprint> \
-  --mnemonic-file "$HOME/.joinmarket-ng/wallets/recovered.mnemonic"
 ```
 
-For an existing installation upgrading from the previous release, no identity
-registration, rescan, or file migration happens automatically. Old cached
-fingerprints are unverified hints; missing metadata proves nothing about BIP39
-use. Register/select the intended identity when ready, without reimporting the
-seed or deleting history. Existing birthdays and recovery markers are preserved.
-Recorded history then needs no unlock, while key-deriving operations check the
-selected identity. Identity metadata has a privacy cost: it records the existence
-of that wallet and whether a passphrase is required, but never the passphrase.
+`--mnemonic-file` is only needed for a wallet other than the configured or
+default one.
+
+When upgrading from the previous release, the first unlock compares the derived
+wallet with the fingerprint that release recorded beside the mnemonic file. A
+match is registered and selected automatically, with or without a passphrase, so
+existing interactive and headless setups keep working without extra steps. No
+rescan, reimport, or history change happens. If nothing was recorded or the
+fingerprints differ, the wallet keeps working as before with a warning until you
+run `jm-wallet identity register` with the intended passphrase. Recorded history
+then needs no unlock, while key-deriving operations check the selected identity.
+Identity metadata records that wallet and whether a passphrase is required, but
+never the passphrase.
 
 Compare the displayed wallet fingerprint, known receive addresses, and each
 mixdepth balance with records from the old wallet or an independent source. A

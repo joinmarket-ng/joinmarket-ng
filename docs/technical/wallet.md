@@ -33,16 +33,21 @@ supplied, repeats a nonempty passphrase, and asks to register/select the derived
 identity. `--no-register-identity` keeps generation/import seed-only;
 `--register-identity` explicitly requests onboarding without enabling the setting.
 
-For an existing wallet, registration and selection are explicit:
+Upgraded wallets usually need no action (see below). Otherwise, register the
+identity explicitly. These commands use the configured or default mnemonic file;
+pass `--mnemonic-file` for another one:
 
 ```bash
-jm-wallet identity register --mnemonic-file wallet.mnemonic --prompt-bip39-passphrase
-jm-wallet identity list --mnemonic-file wallet.mnemonic
-jm-wallet identity select <fingerprint> --mnemonic-file wallet.mnemonic
+jm-wallet identity register --prompt-bip39-passphrase
+jm-wallet identity list
+jm-wallet identity select <fingerprint>
 
 # For a wallet intentionally using no BIP39 passphrase:
-jm-wallet identity register --mnemonic-file wallet.mnemonic --no-bip39-passphrase
+jm-wallet identity register --no-bip39-passphrase
 ```
+
+The first registered identity is selected automatically. Registering another
+one keeps the current selection unless `--select` is given.
 
 When `--prompt-bip39-passphrase` prompts interactively, input stays hidden.
 After you press Enter, the CLI displays whether the passphrase is set or empty
@@ -60,8 +65,8 @@ legacy empty-passphrase behavior unless prompting is requested or enabled.
 
 `.meta` remembers public identities and their passphrase requirements, never
 passphrases. One mnemonic file can register several identities; registering or
-deriving another identity does not silently change its selection. `identity
-register --select` explicitly combines registration and selection. `--yes`
+deriving another identity never replaces an existing selection. `identity
+register --select` explicitly combines registration and reselection. `--yes`
 acknowledges metadata disclosure without the registration confirmation prompt.
 `jm-wallet delete` rejects files holding several registered identities, since it
 would otherwise remove their shared seed material. Retire those wallets and
@@ -74,10 +79,17 @@ prompt/credential requests still derive and validate the selection.
 `--wallet-fingerprint` remains the direct passwordless override. Legacy explicit
 mnemonic-file reads continue deriving rather than treating a cache as a binding.
 
-On upgrade, legacy cached fingerprints remain unverified hints. Missing metadata
-does not mean no passphrase and never schedules a migration scan. Register and
-select the intended identity to remove the warning. Registration preserves
-birthdays, recovery markers, and history namespaces. Corrupt or unsupported
+On upgrade, earlier releases left the fingerprint of the last derived wallet in
+`.meta`. The first unlock that derives the same fingerprint, from any credential
+source, registers and selects that identity automatically (passphrase required
+or not). Interactive and headless setups therefore keep working unchanged. Until
+then, offline reads use the recorded fingerprint. A missing or different hint
+adopts nothing: the wallet keeps legacy behavior with a warning, and `identity
+register` confirms it. Missing metadata never means no passphrase and never
+schedules a migration scan. Wallets generated or imported with onboarding
+disabled record their passphrase-free fingerprint the same way.
+Adoption and registration preserve birthdays, recovery markers, and history
+namespaces. Corrupt or unsupported
 metadata requires deliberate repair, not an automatic rewrite. Back up the
 sidecar alongside the mnemonic file, but retain independent credential backups.
 

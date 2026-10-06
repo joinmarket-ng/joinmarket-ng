@@ -5,7 +5,12 @@ from unittest.mock import patch
 
 import pytest
 from jmcore.settings import JoinMarketSettings
-from jmcore.wallet_metadata import WalletIdentity, register_identity, select_identity
+from jmcore.wallet_metadata import (
+    WalletIdentity,
+    register_identity,
+    select_identity,
+    selected_identity,
+)
 from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
 from typer.testing import CliRunner
 
@@ -233,6 +238,33 @@ def test_password_only_legacy_and_manual_invocation_preserve_behavior(
     assert _invoke(source, settings, stage)[0]
     stage.write_text(f'BIP39_PASSPHRASE="{PASSPHRASE}"\n')
     assert _invoke(source, settings, None)[0]
+
+
+@pytest.mark.parametrize("passphrase", ["", PASSPHRASE])
+@pytest.mark.parametrize("hint", ["matching", "different", "absent"])
+def test_existing_headless_maker_keeps_starting_after_upgrade(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    passphrase: str,
+    hint: str,
+) -> None:
+    """Units written for earlier releases declare no staging and need no operator action."""
+    source, settings = wallet
+    fingerprint = get_mnemonic_fingerprint(MNEMONIC, passphrase)
+    if hint != "absent":
+        recorded = fingerprint if hint == "matching" else "11223344"
+        source.with_name(source.name + ".meta").write_text(f'{{"fingerprint":"{recorded}"}}')
+    if passphrase:
+        monkeypatch.setenv("BIP39_PASSPHRASE", passphrase)
+    for _ in range(2):  # Upgrade start, then an automatic restart.
+        assert _invoke(source, settings, None)[0]
+    identity = selected_identity(source)
+    if hint == "matching":
+        assert identity == WalletIdentity(
+            fingerprint=fingerprint, bip39="required" if passphrase else "none"
+        )
+    else:
+        assert identity is None
 
 
 def test_service_environment_declares_source_even_without_cli_option(

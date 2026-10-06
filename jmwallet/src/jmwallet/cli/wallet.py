@@ -530,7 +530,7 @@ def import_mnemonic(
         "A visible balance or an idle scan does not prove complete recovery. "
         "Historical recovery requires a backend with the necessary block and history data."
     )
-    _onboard_saved_identity(settings, output_file, password, register_identity)
+    _onboard_saved_identity(settings, output_file, password, register_identity, resolved_mnemonic)
 
 
 def _onboard_saved_identity(
@@ -538,13 +538,16 @@ def _onboard_saved_identity(
     output_file: Path,
     password: str | None,
     register: bool | None,
+    mnemonic: str,
 ) -> None:
     enabled = settings.wallet.bip39_passphrase_enabled if register is None else register
     if not enabled:
-        typer.echo(
-            "Mnemonic saved without identity registration. "
-            "Use `jm-wallet identity register` to confirm the intended wallet."
-        )
+        # Record the passphrase-free wallet as an unconfirmed hint, as earlier
+        # releases did. The first matching unlock confirms it automatically.
+        from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+        from jmwallet.cli.mnemonic import save_mnemonic_meta
+
+        save_mnemonic_meta(output_file, fingerprint=get_mnemonic_fingerprint(mnemonic, ""))
         return
     from jmwallet.cli.identity import confirm_and_register
 
@@ -771,7 +774,7 @@ def generate(
                 typer.echo("WARNING: File is NOT encrypted")
                 typer.echo("For production use, generate again with a password!")
             typer.echo("KEEP THIS FILE SECURE - IT CONTROLS YOUR FUNDS!")
-            _onboard_saved_identity(settings, output_file, password, register_identity)
+            _onboard_saved_identity(settings, output_file, password, register_identity, mnemonic)
         else:
             typer.echo("\nMnemonic NOT saved (--no-save was used)")
             typer.echo("To save it, run: jm-wallet generate")

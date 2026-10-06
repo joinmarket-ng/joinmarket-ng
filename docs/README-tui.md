@@ -45,11 +45,13 @@ Ordinary wallets no longer get an unconditional BIP39 question. Config Center's
 for unregistered wallets. Registered wallet requirements apply independently of
 that setting. Supplied credentials still support unattended services.
 
-After upgrading, use **Register Derived Wallet Identity** with the intended
-passphrase, compare its fingerprint with your records, then **Select Registered
-Wallet Identity**. Registration does not automatically change the selected
-identity. Several passphrase wallets may share a mnemonic file. The menu shows
-the selected fingerprint; neither registration nor selection stores a passphrase.
+After upgrading, the first unlock confirms the wallet automatically when it
+matches the fingerprint recorded by the previous release. Otherwise use
+**Register Derived Wallet Identity** with the intended passphrase and compare its
+fingerprint with your records; the first registered identity is selected. Use
+**Select Registered Wallet Identity** to switch between several passphrase
+wallets sharing a mnemonic file. The menu shows the selected fingerprint;
+neither registration nor selection stores a passphrase.
 
 `jm-ng` runs the menu with the Python and `jm-*` commands installed next to it.
 Launching the menu script directly, as Raspiblitz does, still prefers the

@@ -1,7 +1,8 @@
-"""Private mnemonic sidecars and explicit, public wallet identity selection.
+"""Private mnemonic sidecars and public wallet identity selection.
 
-Legacy fingerprints are only cache hints. Registration never implies recovery
-is needed, and deriving an identity never changes the selected wallet.
+A legacy fingerprint is a hint written by earlier releases. It is adopted only
+when an unlocked wallet derives the same fingerprint. Registration never implies
+recovery is needed, and never replaces an existing selection.
 """
 
 from __future__ import annotations
@@ -22,10 +23,9 @@ from jmcore.secure_files import atomic_write_private
 
 IDENTITY_VERSION = 1
 UPGRADE_GUIDANCE = (
-    "Wallet identity is unconfirmed. Existing wallet and recovery data are unchanged. "
-    "Run `jm-wallet identity register --mnemonic-file <file>` with the intended "
-    "BIP39 selection, then `jm-wallet identity select <fingerprint> --mnemonic-file <file>` "
-    "to remember it. Use --prompt-bip39-passphrase when needed."
+    "Wallet identity is unconfirmed: this wallet does not match the fingerprint recorded "
+    "for its mnemonic file, or none was recorded. If it is the intended wallet, run "
+    "`jm-wallet identity register` (add --prompt-bip39-passphrase for a passphrase wallet)."
 )
 
 
@@ -147,7 +147,7 @@ def selected_identity(mnemonic_file: Path) -> WalletIdentity | None:
         if meta.get("identity_version") == IDENTITY_VERSION:
             raise ValueError(
                 "No wallet identity selected. Run `jm-wallet identity list`, then "
-                "`jm-wallet identity select <fingerprint> --mnemonic-file <file>`."
+                "`jm-wallet identity select <fingerprint>`."
             )
         return None
     if not isinstance(selection, str):
@@ -160,8 +160,12 @@ def selected_identity(mnemonic_file: Path) -> WalletIdentity | None:
     return identity
 
 
-def register_identity(mnemonic_file: Path, identity: WalletIdentity) -> None:
-    """Register only, preserving selection, unknown fields, and recovery state."""
+def register_identity(mnemonic_file: Path, identity: WalletIdentity) -> bool:
+    """Register, selecting only when nothing is selected yet.
+
+    Preserves an existing selection, unknown fields, and recovery state.
+    Returns whether the identity became the selection.
+    """
     with metadata_lock(mnemonic_file):
         meta = load_mnemonic_meta(mnemonic_file, strict=True)
         entries = meta.get("identities", {})
@@ -172,7 +176,44 @@ def register_identity(mnemonic_file: Path, identity: WalletIdentity) -> None:
             raise ValueError("Identity already registered with a different passphrase requirement")
         entries[identity.fingerprint] = {"bip39": identity.bip39}
         meta.update(identity_version=IDENTITY_VERSION, identities=entries)
+        selected = meta.get("selected_identity") is None
+        if selected:
+            _select(meta, identity.fingerprint)
         write_mnemonic_meta(mnemonic_file, meta)
+        return selected
+
+
+def adopt_legacy_identity(mnemonic_file: Path, identity: WalletIdentity) -> bool:
+    """Register and select an unlocked wallet matching the legacy fingerprint.
+
+    Earlier releases recorded the fingerprint of the wallet they derived. A
+    matching derivation is affirmative evidence of the intended wallet, so the
+    upgrade needs no manual steps. Missing or different hints adopt nothing.
+    """
+    with metadata_lock(mnemonic_file):
+        meta = load_mnemonic_meta(mnemonic_file, strict=True)
+        if "identity_version" in meta or not isinstance(meta.get("fingerprint"), str):
+            return False
+        try:
+            recorded = WalletIdentity.validate_fingerprint(meta["fingerprint"])
+        except ValueError:
+            return False
+        if recorded != identity.fingerprint:
+            return False
+        meta.update(
+            identity_version=IDENTITY_VERSION,
+            identities={identity.fingerprint: {"bip39": identity.bip39}},
+        )
+        _select(meta, identity.fingerprint)
+        write_mnemonic_meta(mnemonic_file, meta)
+        return True
+
+
+def _select(meta: dict[str, Any], fingerprint: str) -> None:
+    meta["selected_identity"] = fingerprint
+    # Compatibility hint for older releases. New readers never let this
+    # mutable legacy field override an explicitly selected identity.
+    meta["fingerprint"] = fingerprint
 
 
 def select_identity(mnemonic_file: Path, fingerprint: str) -> None:
@@ -181,8 +222,5 @@ def select_identity(mnemonic_file: Path, fingerprint: str) -> None:
         identity = _registered_identities(meta).get(fingerprint.strip().lower())
         if identity is None:
             raise ValueError("Wallet identity is not registered")
-        meta["selected_identity"] = identity.fingerprint
-        # Compatibility hint for older releases. New readers never let this
-        # mutable legacy field override an explicitly selected identity.
-        meta["fingerprint"] = identity.fingerprint
+        _select(meta, identity.fingerprint)
         write_mnemonic_meta(mnemonic_file, meta)

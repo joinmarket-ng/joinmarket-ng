@@ -939,10 +939,14 @@ ensure_wallet_password() {
 }
 
 # Helper: Compute wallet fingerprint and cache it for menu display.
-# Usage: cache_wallet_fingerprint [passphrase]
+# Usage: cache_wallet_fingerprint [passphrase] [unlock|probe|select]
+#   unlock (default): check the selected identity, adopting a matching legacy one.
+#   probe: derive only, to compare candidate credentials before a decision.
+#   select: register and select the derived identity (an explicit user choice).
 # Returns 0 on success, 1 on failure. Writes to FINGERPRINT_CACHE.
 cache_wallet_fingerprint() {
     local passphrase="${1:-}"
+    local mode="${2:-unlock}"
     local mnemonic_file fingerprint
 
     mnemonic_file="${CURRENT_WALLET:-}"
@@ -954,24 +958,34 @@ cache_wallet_fingerprint() {
         JOINMARKET_CONFIG_FILE="$CONFIG_FILE" \
         BIP39_PASSPHRASE="$passphrase" \
         _MNEMONIC_PASSWORD="${MNEMONIC_PASSWORD:-}" \
+        _MODE="$mode" \
         "$TUI_PYTHON" - <<'PY'
 import os
 from pathlib import Path
 from jmcore.cli_common import resolve_mnemonic
 from jmcore.settings import get_settings
+from jmcore.wallet_metadata import WalletIdentity, register_identity, select_identity
 from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
 
 mnemonic_file = Path(os.environ["_MNEMONIC_FILE"])
 passphrase = os.environ.get("BIP39_PASSPHRASE", "")
 password = os.environ.get("_MNEMONIC_PASSWORD") or None
+mode = os.environ["_MODE"]
 
 resolved = resolve_mnemonic(
     get_settings(), mnemonic_file=mnemonic_file,
     password=password, bip39_passphrase=passphrase,
+    validate_identity=mode == "unlock",
 )
 if resolved is None:
     raise ValueError("No wallet credential source")
-print(get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase))
+fingerprint = get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase)
+if mode == "select":
+    register_identity(mnemonic_file, WalletIdentity(
+        fingerprint=fingerprint, bip39="required" if resolved.bip39_passphrase else "none",
+    ))
+    select_identity(mnemonic_file, fingerprint)
+print(fingerprint)
 PY
     ) || return 1
 
@@ -1027,14 +1041,17 @@ ensure_wallet_unlocked_global() {
         if [ "$prefix" != "$configured_passphrase" ] && staged_value=$(get_maker_env_bip39_passphrase && printf '.'); then
             staged_value=${staged_value%.}
             if [ "$staged_value" = "$prefix" ] && staged_binding=$(get_maker_env_expected_fingerprint) &&
-                cache_wallet_fingerprint "$staged_value" && [ "$(cat "$FINGERPRINT_CACHE")" = "$staged_binding" ]; then
-                cache_wallet_fingerprint "$configured_passphrase" || return 1
+                cache_wallet_fingerprint "$staged_value" probe && [ "$(cat "$FINGERPRINT_CACHE")" = "$staged_binding" ]; then
+                cache_wallet_fingerprint "$configured_passphrase" probe || return 1
                 if ! whiptail --title " Restore Exact Passphrase " \
                     --yesno "The configured passphrase has trailing newlines omitted by older TUI versions. Restoring them selects a different wallet.\n\nStaged fingerprint: ${staged_binding}\nConfigured fingerprint: $(cat "$FINGERPRINT_CACHE")\n\nReplace staging with the configured wallet? Confirm only after checking your wallet records." \
                     16 76 --defaultno 3>&1 1>&2 2>&3; then
                     rm -f "$FINGERPRINT_CACHE"
                     return 1
                 fi
+                # Confirmed wallet switch: the staged wallet may already be the
+                # selected identity, so select the configured one explicitly.
+                cache_wallet_fingerprint "$configured_passphrase" select || return 1
             fi
         fi
     fi
@@ -2084,8 +2101,11 @@ No:  automatic coin selection from one mixdepth." 12 64
               ensure_active_wallet || continue
               (
                   ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  # The first registration also selects; drop the displayed
+                  # fingerprint so the menu re-derives the selected wallet.
                   jm-wallet identity register --mnemonic-file "$CURRENT_WALLET" \
-                      --prompt-bip39-passphrase --confirm-bip39-passphrase
+                      --prompt-bip39-passphrase --confirm-bip39-passphrase \
+                      && rm -f "$FINGERPRINT_CACHE"
                   pause
               )
               ;;
