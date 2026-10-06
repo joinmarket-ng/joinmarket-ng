@@ -170,7 +170,13 @@ trap 'rm -f "$FINGERPRINT_CACHE"' EXIT
 # Prefer the environment paired with this TUI over global entry points or
 # appliance wrappers that happen to be earlier in PATH. Activate before TOML
 # reads so the config helper is always loaded from the selected installation.
-if [ -f "$VENV_BIN/activate" ]; then
+#
+# The jm-ng launcher pins its own installation instead: a default venv left by
+# an earlier install would otherwise supply outdated helpers and CLIs.
+JM_NG_PINNED=0
+if [ -x "${JM_NG_PYTHON:-}" ] && [ -x "${JM_NG_SCRIPTS:-}/jm-wallet" ]; then
+    JM_NG_PINNED=1
+elif [ -f "$VENV_BIN/activate" ]; then
     source "$VENV_BIN/activate"
 elif ! command -v jm-wallet &>/dev/null; then
     echo "ERROR: jm-wallet not found in PATH and no venv at $VENV_BIN"
@@ -178,7 +184,27 @@ elif ! command -v jm-wallet &>/dev/null; then
 fi
 # Ensure ~/.local/bin is in PATH (fallback for pip console scripts)
 export PATH="${HOME_JM}/.local/bin:$PATH"
-TUI_PYTHON=$(command -v python3)
+if [ "$JM_NG_PINNED" = 1 ]; then
+    export PATH="$JM_NG_SCRIPTS:$PATH"
+    TUI_PYTHON=$JM_NG_PYTHON
+else
+    TUI_PYTHON=$(command -v python3)
+fi
+
+# Succeed when the standalone installer's --update would update the
+# installation this menu runs from; print that installation's prefix.
+# A different one (an editable checkout, or a stale default venv) must not be
+# updated in its place.
+updater_manages_running_installation() {
+    UPDATER_VENV="${JMNG_VENV_DIR:-$HOME/.joinmarket-ng/venv}" "$TUI_PYTHON" - <<'PY'
+import os
+import sys
+
+print(sys.prefix)
+target = os.path.realpath(os.path.expanduser(os.environ["UPDATER_VENV"]))
+sys.exit(0 if os.path.realpath(sys.prefix) == target else 1)
+PY
+}
 
 # ---- CLI logging inside the TUI --------------------------------------------
 # jm-wallet / jm-* commands use loguru and log to stderr.
@@ -2913,6 +2939,21 @@ for item in json.load(sys.stdin):
       ;;
 
     U)
+      if [ "$RASPIBLITZ" != "1" ] && ! RUNNING_PREFIX=$(updater_manages_running_installation); then
+        whiptail --title " Update From Its Installation " --msgbox "\
+This menu runs JoinMarket-NG from:
+  ${RUNNING_PREFIX:-unknown}
+
+The updater manages a different installation:
+  ${JMNG_VENV_DIR:-$HOME/.joinmarket-ng/venv}
+
+Updating here would change that one instead. Update the running installation
+the way it was installed (for a source checkout: git pull, then reinstall), or
+start the updater-managed menu with its own jm-ng.
+
+See 'Multiple Installations' in docs/update.md." 19 78
+        continue
+      fi
       clear
                         echo "=== Update JoinMarket-NG ==="
                         echo ""
@@ -2923,11 +2964,11 @@ for item in json.load(sys.stdin):
       # versions/commits instead of generic labels.
       # Gather current version/commit from the installed package. We don't
       # rely on ${VENV_BIN}/python here: on standalone (pip -e) installs the
-      # user's venv may not live at the hard-coded VENV_BIN path. The
-      # activation above already puts the right interpreter on PATH.
-      CURRENT_VERSION=$(python3 -c "from jmcore.version import get_version; print(get_version())" 2>/dev/null || echo "unknown")
-      CURRENT_COMMIT=$(python3 -c "from jmcore.version import get_commit_hash; h=get_commit_hash(); print(h or '')" 2>/dev/null || echo "")
-      CURRENT_REF=$(python3 -c "from jmcore.version import get_build_ref; r=get_build_ref(); print(r or '')" 2>/dev/null || echo "")
+      # user's venv may not live at the hard-coded VENV_BIN path. TUI_PYTHON
+      # is the interpreter selected above.
+      CURRENT_VERSION=$("$TUI_PYTHON" -c "from jmcore.version import get_version; print(get_version())" 2>/dev/null || echo "unknown")
+      CURRENT_COMMIT=$("$TUI_PYTHON" -c "from jmcore.version import get_commit_hash; h=get_commit_hash(); print(h or '')" 2>/dev/null || echo "")
+      CURRENT_REF=$("$TUI_PYTHON" -c "from jmcore.version import get_build_ref; r=get_build_ref(); print(r or '')" 2>/dev/null || echo "")
 
       # Current label distinguishes a stable release ("v0.27.0 (abc1234)")
       # from a development build ("main / abc1234"): if we have a commit
@@ -3148,7 +3189,7 @@ Config: $CONFIG_FILE
 Data:   $DATA_DIR
 Logs:   $LOG_DIR
 
-CLI tools (from venv):
+CLI tools:
   jm-wallet generate               - Create new wallet
   jm-wallet import                 - Import from seed
   jm-wallet validate               - Validate a seed phrase

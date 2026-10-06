@@ -77,3 +77,33 @@ Do not use `--dev`, `--version main`, or `--skip-verify` for a funded wallet;
 those paths bypass signed release verification. See
 [supply-chain security](install-advanced.md#supply-chain-security) for the
 trust model and manual verification.
+
+## Multiple Installations
+
+The updater manages one virtual environment: `~/.joinmarket-ng/venv`, or
+`JMNG_VENV_DIR` when set. A source checkout or an earlier install can leave a
+second installation, and commands then run whichever comes first in `PATH`.
+The TUI refuses to update a different installation than the one it runs from.
+
+Check which installation each command comes from:
+
+```bash
+command -v jm-ng jm-wallet jm-maker
+jm-ng --version
+~/.joinmarket-ng/venv/bin/python -c 'from jmcore.version import get_version; print(get_version())'
+```
+
+Keep one installation. Wallets, `config.toml`, and history live in the data
+directory, not in the virtual environment, so retiring an unused environment
+does not touch them. To retire an outdated default environment while using
+another installation:
+
+```bash
+rm -rf ~/.joinmarket-ng/venv
+```
+
+Then remove the `source ~/.joinmarket-ng/activate.sh` line from your shell
+startup file, and point any systemd `ExecStart=` paths at the installation you
+keep (see [maker service](maker-service.md)). To return to the updater-managed
+installation instead, run the [saved updater](#saved-updater), which recreates
+a missing environment and `activate.sh`.

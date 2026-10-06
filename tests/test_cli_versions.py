@@ -19,7 +19,7 @@ from jmcore.version import get_version
 @pytest.mark.parametrize(
     ("module_name", "entrypoint", "startup_symbols"),
     [
-        ("jmcore.tui", "main", ["shutil.which", "_find_menu_script", "os.execvp"]),
+        ("jmcore.tui", "main", ["shutil.which", "_find_menu_script", "os.execvpe"]),
         (
             "directory_server.main",
             "main",

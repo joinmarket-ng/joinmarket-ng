@@ -4,6 +4,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -147,6 +148,122 @@ def test_tui_prefers_its_virtual_environment() -> None:
     assert activation.index('if [ -f "$VENV_BIN/activate" ]') < activation.index(
         "command -v jm-wallet"
     )
+
+
+@pytest.mark.parametrize("launcher", [True, False])
+def test_tui_uses_launcher_installation_over_default_venv(
+    tmp_path: Path, launcher: bool
+) -> None:
+    """jm-ng pins its installation; direct script launches still prefer the venv."""
+    content = SCRIPT_PATH.read_text()
+    activation = content.split("# ---- Activate virtual environment", 1)[1].split(
+        "# ---- CLI logging", 1
+    )[0]
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "activate").write_text('ACTIVATED=1\nexport PATH="$VENV_MARKER:$PATH"\n')
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "jm-wallet").write_text("#!/bin/sh\n")
+    (scripts / "jm-wallet").chmod(0o755)
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME_JM": str(tmp_path),
+        "VENV_BIN": str(venv),
+        "VENV_MARKER": str(venv),
+    }
+    if launcher:
+        env.update(JM_NG_PYTHON=sys.executable, JM_NG_SCRIPTS=str(scripts))
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            activation
+            + '\nprintf "%s\\n%s\\n%s\\n" "${ACTIVATED:-0}" "$TUI_PYTHON" "${PATH%%:*}"',
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    activated, python, first_path = result.stdout.splitlines()
+    if launcher:
+        assert (activated, python, first_path) == ("0", sys.executable, str(scripts))
+    else:
+        assert activated == "1"
+        assert python == shutil.which("python3", path=f"{venv}:{os.environ['PATH']}")
+
+
+@pytest.mark.parametrize("target", ["running", "symlink", "other", "default"])
+def test_tui_update_only_targets_running_installation(
+    tmp_path: Path, target: str
+) -> None:
+    """Update must not run the installer against a different installation."""
+    content = SCRIPT_PATH.read_text()
+    name = "updater_manages_running_installation"
+    function = (
+        name + "() {" + content.split(f"\n{name}() {{", 1)[1].split("\n}", 1)[0] + "\n}"
+    )
+    update_flow = content.split("\n    U)\n", 1)[1]
+    assert update_flow.index(f"! RUNNING_PREFIX=$({name})") < update_flow.index(
+        'TRUSTED_INSTALLER="$DATA_DIR/install.sh"'
+    )
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "TUI_PYTHON": sys.executable,
+    }
+    if target == "running":
+        env["JMNG_VENV_DIR"] = sys.prefix
+    elif target == "symlink":
+        (tmp_path / "link").symlink_to(sys.prefix)
+        env["JMNG_VENV_DIR"] = str(tmp_path / "link")
+    elif target == "other":
+        env["JMNG_VENV_DIR"] = str(tmp_path / "venv")
+    result = subprocess.run(
+        ["bash", "-c", function + f"\n{name}"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.stdout.strip() == sys.prefix
+    assert (result.returncode == 0) == (target in ("running", "symlink")), result.stderr
+
+
+def test_jm_ng_launcher_exports_its_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jmcore import tui
+
+    scripts = tmp_path / "bin"
+    scripts.mkdir()
+    (scripts / "jm-ng").touch()
+    (scripts / "jm-wallet").touch()
+    menu = tmp_path / "menu.sh"
+    menu.touch()
+    calls: list[tuple[str, list[str], dict[str, str]]] = []
+    monkeypatch.setattr("sys.argv", [str(scripts / "jm-ng")])
+    monkeypatch.setattr(tui.shutil, "which", lambda name: "/usr/bin/whiptail")
+    monkeypatch.setattr(tui, "_find_menu_script", lambda: menu)
+    monkeypatch.setattr(tui.os, "execvpe", lambda *args: calls.append(args))
+    tui.main()
+    [(program, argv, env)] = calls
+    assert (program, argv) == ("bash", ["bash", str(menu)])
+    assert env["JM_NG_PYTHON"] == sys.executable
+    assert env["JM_NG_SCRIPTS"] == str(scripts.resolve())
+
+    # Without paired console scripts, stale inherited pins are dropped and the
+    # menu falls back to its own discovery.
+    (scripts / "jm-wallet").unlink()
+    monkeypatch.setattr(tui.sysconfig, "get_path", lambda name: str(tmp_path / "none"))
+    monkeypatch.setenv("JM_NG_PYTHON", "/stale/python")
+    monkeypatch.setenv("JM_NG_SCRIPTS", "/stale/bin")
+    calls.clear()
+    tui.main()
+    [(_, _, env)] = calls
+    assert "JM_NG_PYTHON" not in env and "JM_NG_SCRIPTS" not in env
 
 
 def test_tui_history_is_offline_and_refresh_syncs() -> None:

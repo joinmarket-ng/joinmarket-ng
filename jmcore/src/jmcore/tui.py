@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import sysconfig
 from importlib import resources
 from pathlib import Path
 
@@ -97,8 +98,21 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    # Replace the current process with bash running the script
-    os.execvp("bash", ["bash", str(script)])
+    # Replace the current process with bash running the script, pinned to this
+    # installation (interpreter and console scripts as a pair) so a stale
+    # default venv cannot supply older helpers. Without its console scripts the
+    # menu keeps its own venv/PATH discovery.
+    env = {k: v for k, v in os.environ.items() if k not in ("JM_NG_PYTHON", "JM_NG_SCRIPTS")}
+    scripts = _installation_scripts_dir()
+    if scripts is not None:
+        env.update(JM_NG_PYTHON=sys.executable, JM_NG_SCRIPTS=str(scripts))
+    os.execvpe("bash", ["bash", str(script)], env)
+
+
+def _installation_scripts_dir() -> Path | None:
+    """Return the console-script directory paired with this launcher."""
+    candidates = [Path(sys.argv[0]).resolve().parent, Path(sysconfig.get_path("scripts"))]
+    return next((path for path in candidates if (path / "jm-wallet").is_file()), None)
 
 
 if __name__ == "__main__":

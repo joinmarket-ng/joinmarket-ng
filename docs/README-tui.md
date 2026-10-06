@@ -51,6 +51,12 @@ Wallet Identity**. Registration does not automatically change the selected
 identity. Several passphrase wallets may share a mnemonic file. The menu shows
 the selected fingerprint; neither registration nor selection stores a passphrase.
 
+`jm-ng` runs the menu with the Python and `jm-*` commands installed next to it.
+Launching the menu script directly, as Raspiblitz does, still prefers the
+default virtual environment. **Update** only runs when the menu uses the
+installation the updater manages; otherwise it explains how to update the
+running one. See [Multiple Installations](update.md#multiple-installations).
+
 **CoinJoin History** shows recorded data without synchronization. For registered
 wallets it requires neither credential. **Refresh / Reconstruct Wallet History**
 explicitly unlocks and synchronizes, including deferred reconstruction. Legacy

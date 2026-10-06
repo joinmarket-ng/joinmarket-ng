@@ -90,7 +90,7 @@ See [Installation](install.md) for general setup. For local development:
 
 ```bash
 cd joinmarket-ng
-source jmvenv/bin/activate  # If you used install.sh
+source ~/.joinmarket-ng/activate.sh  # If you used install.sh
 # OR create venv: python3 -m venv jmvenv && source jmvenv/bin/activate
 
 # Install jmcore first
