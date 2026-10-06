@@ -55,7 +55,12 @@ from jmcore.settings import (
     get_settings,
     reset_settings,
 )
-from jmcore.wallet_metadata import UPGRADE_GUIDANCE, load_mnemonic_meta, selected_identity
+from jmcore.wallet_metadata import (
+    UPGRADE_GUIDANCE,
+    WalletIdentity,
+    load_mnemonic_meta,
+    selected_identity,
+)
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -136,6 +141,23 @@ def select_mnemonic_source(
 def has_bip39_credential(settings: JoinMarketSettings) -> bool:
     """Match existing environment/config credential precedence, including empty config."""
     return bool(os.environ.get("BIP39_PASSPHRASE")) or settings.wallet.bip39_passphrase is not None
+
+
+def bip39_prompt_required(
+    settings: JoinMarketSettings,
+    identity: WalletIdentity | None,
+    *,
+    explicitly_requested: bool = False,
+) -> bool:
+    """Prompt policy shared by CLI resolution and the TUI credential dialog."""
+    return (
+        explicitly_requested
+        or (identity is not None and identity.bip39 == "required")
+        or (
+            (identity is None or identity.bip39 == "unknown")
+            and settings.wallet.bip39_passphrase_enabled
+        )
+    )
 
 
 # =============================================================================
@@ -778,6 +800,7 @@ def resolve_mnemonic(
     prompt_bip39_passphrase: bool = False,
     required: bool = True,
     validate_identity: bool = True,
+    expected_fingerprint: str | None = None,
 ) -> ResolvedMnemonic | None:
     """
     Resolve mnemonic from various sources with priority.
@@ -877,13 +900,8 @@ def resolve_mnemonic(
     )
     if mnemonic_file_path is not None and identity is None and validate_identity:
         logger.warning(UPGRADE_GUIDANCE)
-    should_prompt = (
-        prompt_bip39_passphrase
-        or (identity is not None and identity.bip39 == "required")
-        or (
-            (identity is None or identity.bip39 == "unknown")
-            and settings.wallet.bip39_passphrase_enabled
-        )
+    should_prompt = bip39_prompt_required(
+        settings, identity, explicitly_requested=prompt_bip39_passphrase
     )
 
     # Resolve BIP39 passphrase
@@ -891,11 +909,23 @@ def resolve_mnemonic(
     resolved_passphrase = ""
     if bip39_passphrase is not None:
         resolved_passphrase = bip39_passphrase
+    elif "BIP39_PASSPHRASE" in os.environ and settings.wallet.bip39_passphrase_enabled:
+        resolved_passphrase = os.environ["BIP39_PASSPHRASE"]
     elif env_passphrase := os.environ.get("BIP39_PASSPHRASE"):
         resolved_passphrase = env_passphrase
     elif settings.wallet.bip39_passphrase is not None:
         resolved_passphrase = settings.wallet.bip39_passphrase.get_secret_value()
     elif should_prompt:
+        if settings.wallet.bip39_passphrase_enabled and not prompt_bip39_passphrase:
+            from jmcore.confirmation import is_interactive_mode
+
+            if not is_interactive_mode():
+                raise ValueError(
+                    "wallet.wallet_with_passphrase is enabled "
+                    "(compatibility alias for wallet.bip39_passphrase_enabled), "
+                    "but no passphrase was provided and no interactive terminal is available. "
+                    "Provide BIP39_PASSPHRASE or wallet.bip39_passphrase explicitly."
+                )
         # Lazy import typer only when needed for prompting
         try:
             import typer
@@ -912,18 +942,29 @@ def resolve_mnemonic(
             resolved_passphrase = getpass.getpass("Enter BIP39 passphrase (leave empty for none): ")
         _confirm_prompted_wallet(resolved_mnemonic, resolved_passphrase)
 
-    if identity is not None:
+    expected_fingerprints = (expected_fingerprint, os.environ.get("EXPECTED_FINGERPRINT"))
+    if identity is not None or any(value is not None for value in expected_fingerprints):
         from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
 
         derived = get_mnemonic_fingerprint(resolved_mnemonic, resolved_passphrase)
-        if derived != identity.fingerprint or (
-            identity.bip39 == "required" and not resolved_passphrase
+        if identity is not None and (
+            derived != identity.fingerprint
+            or (identity.bip39 == "required" and not resolved_passphrase)
         ):
             raise ValueError(
                 "Derived wallet does not match the selected identity. No wallet activity started. "
                 "Check the BIP39 passphrase, or use `jm-wallet identity register` and "
                 "`jm-wallet identity select` to intentionally select another wallet."
             )
+        for fingerprint in expected_fingerprints:
+            if fingerprint is None:
+                continue
+            expected = WalletIdentity.validate_fingerprint(fingerprint)
+            if derived != expected:
+                raise ValueError(
+                    "Staged wallet fingerprint mismatch. No wallet activity started. "
+                    "Restage the maker credentials for the intended wallet."
+                )
 
     # Load wallet metadata (creation_height) from companion .meta file
     creation_height: int | None = None

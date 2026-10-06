@@ -150,6 +150,29 @@ from, without printing the words. However, this option filters whole log records
 and does not redact their contents. Detailed exception tracebacks can include
 variable values. Keep these logs private and review them before sharing excerpts.
 
+## Wallet BIP39 Onboarding
+
+`[wallet].bip39_passphrase_enabled` defaults to `false`. It controls advanced
+onboarding and prompting for unregistered or unknown identities, not the
+requirements of a registered wallet. A selected passphrase-required identity
+still requires its passphrase when this preference is disabled. A selected
+empty-passphrase identity does not require prompting when it is enabled.
+Recorded history uses selected metadata without unlocking either credential.
+
+`wallet_with_passphrase` remains an input alias. Keep one spelling; conflicting
+values are rejected. The TUI writes the canonical spelling.
+
+Credentials resolve in priority order: explicit CLI argument (where supported),
+`BIP39_PASSPHRASE` environment variable, `[wallet].bip39_passphrase`, then an
+interactive prompt when policy requires it. Supplied credentials must still
+match the selected identity. With onboarding enabled, an exported empty value
+is an explicit answer. With onboarding disabled, an empty exported value is
+treated as unset and falls through to the next source. This does not bypass a
+registered identity's requirement.
+
+For service staging and upgrade/restaging requirements, see
+[unattended maker guidance](../maker-service.md).
+
 ## Wallet History Reconstruction
 
 `[wallet].reconstruct_history` defaults to `true`. When a wallet with no local

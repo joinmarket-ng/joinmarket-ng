@@ -75,10 +75,23 @@ Use [unattended maker guidance](maker-service.md) to decide whether automatic
 startup is appropriate; do not assume wallet-file encryption protects against
 someone who can also read the unlock credentials.
 
-For a Raspiblitz systemd maker, provision the BIP39 credential in the service's
-protected environment separately. The menu stages only the mnemonic encryption
-password, not the BIP39 passphrase; an unattended service cannot answer a prompt.
-Use foreground CLI operation if you do not want to provision that credential.
+On Raspiblitz the menu also stages the optional BIP39 passphrase and an expected
+wallet fingerprint in `.maker.env`. Both credentials are plaintext, even when
+permanent storage was declined. Staging validates the selected identity before
+writing; a failed write or canceled restart leaves the running maker untouched.
+Restart validates new credentials before stopping the old process.
+
+After upgrading, BIP39 staging without an expected fingerprint must be restaged
+explicitly from **Start / Restart Maker**. Password-only legacy staging remains
+usable. No identity registration, rescan, or credential deletion happens on
+upgrade. A mismatched staged fingerprint prevents wallet activity.
+
+Config Center can save a BIP39 passphrase to `config.toml` only after an explicit
+plaintext-storage warning and wallet confirmation. This is different from the
+operation-local cache used by wallet commands. Switching mnemonic files clears
+stored credentials and staging; selecting another registered identity clears the
+stored BIP39 passphrase and staging. Protect the host and back up the mnemonic
+and passphrase separately.
 
 ## Fidelity Bonds
 

@@ -44,7 +44,9 @@ def confirm_and_register(
         settings,
         mnemonic_file=mnemonic_file,
         bip39_passphrase="" if no_bip39_passphrase else None,
-        prompt_bip39_passphrase=prompt_bip39_passphrase,
+        prompt_bip39_passphrase=(
+            prompt_bip39_passphrase or settings.wallet.bip39_passphrase_enabled
+        ),
         validate_identity=False,
         password=password,
     )

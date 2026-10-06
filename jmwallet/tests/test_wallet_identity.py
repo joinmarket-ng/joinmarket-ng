@@ -242,6 +242,7 @@ def test_selected_unknown_respects_prompt_preference(
     select_identity(source, fp)
     settings.wallet.bip39_passphrase_enabled = enabled
     with (
+        patch("jmcore.confirmation.is_interactive_mode", return_value=True),
         patch("typer.prompt", return_value=PASSPHRASE) as prompt,
         patch("typer.confirm", return_value=True),
     ):

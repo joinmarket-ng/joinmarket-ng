@@ -51,6 +51,34 @@ For a separate configuration location, add `--config-file /etc/joinmarket/config
 and `--data-dir /var/lib/joinmarket` to `ExecStart`, with a matching wallet path
 and ownership. Do not copy another wallet's data directory over this one.
 
+Services that import a TUI-generated `.maker.env` must also declare its source:
+
+```ini
+EnvironmentFile=-/home/youruser/.joinmarket-ng/.maker.env
+Environment="JOINMARKET_STAGED_CREDENTIALS_FILE=/home/youruser/.joinmarket-ng/.maker.env"
+```
+
+This is equivalent to `jm-maker start --staged-credentials-file PATH`. Staged
+BIP39 credentials, including an empty passphrase, require an expected wallet
+fingerprint. Python validates the effective credential against both that binding
+and the selected identity before backend access. It does not execute the file or
+import its secrets; systemd supplies credentials through `EnvironmentFile`.
+
+After upgrading, restage old unbound BIP39 credentials explicitly. Password-only
+legacy staging is unchanged. If staging is missing, startup requires either an
+explicitly configured BIP39 credential (including empty) or a registered selected
+identity whose requirements can be satisfied. An inherited credential alone does
+not authorize this missing-file fallback. Manual CLI invocations without a staging
+declaration are unaffected by stale `.maker.env` files.
+
+On Raspiblitz, update the appliance scripts and reconcile the unit as admin/root,
+then restart explicitly after installing the flag-supporting NG release. Older
+NG versions ignore the environment marker and do not enforce this contract.
+The appliance still deletes staging after stop/failure and retries automatically;
+BIP39-only staging may also be lost during appliance updates. These lifecycle
+limitations are unchanged. Restaging or configuring credentials is explicit;
+upgrades do not register identities or trigger rescans.
+
 ## Start And Check
 
 After arranging noninteractive credentials:

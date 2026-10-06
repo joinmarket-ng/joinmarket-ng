@@ -46,7 +46,15 @@ from pathlib import Path
 from typing import Any, ClassVar, Self
 
 from loguru import logger
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    SecretStr,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     EnvSettingsSource,
@@ -533,11 +541,34 @@ class WalletSettings(BaseModel):
     )
     bip39_passphrase_enabled: bool = Field(
         default=False,
+        validation_alias=AliasChoices("bip39_passphrase_enabled", "wallet_with_passphrase"),
         description=(
             "Enable BIP39 onboarding and prompts for unregistered wallets. Registered wallet "
             "requirements always apply; identity-only reads never need the passphrase."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_passphrase_preference(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "wallet_with_passphrase" in data:
+            canonical = data.get("bip39_passphrase_enabled")
+            legacy = data["wallet_with_passphrase"]
+            if canonical is not None and (
+                TypeAdapter(bool).validate_python(canonical)
+                != TypeAdapter(bool).validate_python(legacy)
+            ):
+                raise ValueError("Conflicting BIP39 onboarding preferences; keep one spelling")
+        return data
+
+    @property
+    def wallet_with_passphrase(self) -> bool:
+        """Compatibility spelling, never an independent wallet requirement."""
+        return self.bip39_passphrase_enabled
+
+    @wallet_with_passphrase.setter
+    def wallet_with_passphrase(self, value: bool) -> None:
+        self.bip39_passphrase_enabled = value
 
 
 class NotificationSettings(BaseModel):
@@ -1617,6 +1648,16 @@ def _warn_unknown_settings(
     for name, value in values.items():
         path = f"{prefix}.{name}" if prefix else name
         field = model.model_fields.get(name)
+        if field is None:
+            field = next(
+                (
+                    candidate
+                    for candidate in model.model_fields.values()
+                    if isinstance(candidate.validation_alias, AliasChoices)
+                    and name in candidate.validation_alias.choices
+                ),
+                None,
+            )
         if field is None:
             if path == "wallet.background_full_scan":
                 continue  # Validation reports the required rename as an error.

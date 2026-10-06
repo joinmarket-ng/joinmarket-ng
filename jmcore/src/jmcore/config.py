@@ -188,6 +188,13 @@ class WalletConfig(BaseModel):
         default_factory=lambda: SecretStr(""),
         description="BIP39 passphrase (13th/25th word)",
     )
+    wallet_with_passphrase: bool = Field(
+        default=False,
+        description=(
+            "Legacy compatibility field; credentials are resolved before runtime config "
+            "construction. Does not control prompting or override registered wallet requirements."
+        ),
+    )
 
     # Network settings
     network: NetworkType = Field(

@@ -162,6 +162,9 @@ DATA_DIR="${HOME_JM}/.joinmarket-ng"
 CONFIG_FILE="${DATA_DIR}/config.toml"
 LOG_DIR="${DATA_DIR}/logs"
 MAKER_ENV="${DATA_DIR}/.maker.env"
+FINGERPRINT_CACHE="${DATA_DIR}/.current_fingerprint"
+# Clear fingerprint cache on exit (security: don't leave wallet identity on disk)
+trap 'rm -f "$FINGERPRINT_CACHE"' EXIT
 
 # ---- Activate virtual environment -------------------------------------------
 # Prefer the environment paired with this TUI over global entry points or
@@ -288,6 +291,49 @@ get_stored_mnemonic_password() {
         --config "$CONFIG_FILE" --section wallet --key mnemonic_password
 }
 
+# Helper: Get stored bip39_passphrase from config.toml (empty if unset/commented).
+get_stored_bip39_passphrase() {
+    "$TUI_PYTHON" -m jmcore.config_file get \
+        --config "$CONFIG_FILE" --section wallet --key bip39_passphrase
+}
+
+# Helper: Get the wallet_with_passphrase flag from config.toml ("true"/"false",
+# empty if unset). Unset means "false": passphrases are strictly opt-in and no
+# passphrase prompt is shown unless the user explicitly enabled the flag.
+get_wallet_with_passphrase() {
+    JOINMARKET_CONFIG_FILE="$CONFIG_FILE" "$TUI_PYTHON" - <<'PY'
+from jmcore.settings import get_settings
+print(str(get_settings().wallet.bip39_passphrase_enabled).lower())
+PY
+}
+
+wallet_identity_summary() {
+    "$TUI_PYTHON" - "$1" <<'PY'
+import sys
+from pathlib import Path
+from jmcore.wallet_metadata import selected_identity
+try:
+    identity = selected_identity(Path(sys.argv[1]))
+    print(f"{identity.fingerprint} (BIP39: {identity.bip39})" if identity else "identity unconfirmed")
+except (OSError, ValueError):
+    print("identity unavailable; register/select explicitly")
+PY
+}
+
+wallet_requires_passphrase_prompt() {
+    JOINMARKET_CONFIG_FILE="$CONFIG_FILE" "$TUI_PYTHON" - "$CURRENT_WALLET" <<'PY'
+import sys
+from pathlib import Path
+from jmcore.cli_common import bip39_prompt_required
+from jmcore.settings import get_settings
+from jmcore.wallet_metadata import selected_identity
+try:
+    print(str(bip39_prompt_required(get_settings(), selected_identity(Path(sys.argv[1])))).lower())
+except (OSError, ValueError):
+    sys.exit(1)
+PY
+}
+
 # Helper: Read the temporary wallet password from .maker.env (empty if absent).
 #
 # On Raspiblitz the wallet password (when NOT permanently stored in
@@ -310,26 +356,71 @@ get_maker_env_password() {
     printf '%s' "$val"
 }
 
-# Helper: Write the wallet password to .maker.env for the systemd
-# EnvironmentFile, using systemd's double-quoted C-escape format so special
-# characters survive. chmod 600. The password is NEVER written to config.toml
-# (no cleartext leak); .maker.env is removed when the maker stops.
+# Helper: Read the staged BIP39 passphrase from .maker.env (empty if absent).
+get_maker_env_bip39_passphrase() {
+    [ -f "$MAKER_ENV" ] || return 1
+    local line val
+    line=$(grep -m1 '^BIP39_PASSPHRASE=' "$MAKER_ENV" 2>/dev/null) || return 1
+    val=${line#BIP39_PASSPHRASE=}
+    # Strip surrounding double quotes and reverse systemd's C-style escapes.
+    if [ "${val#\"}" != "$val" ]; then
+        val=${val#\"}
+        val=${val%\"}
+        val=$(printf '%s' "$val" | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g')
+    fi
+    printf '%s' "$val"
+}
+
+# Helper: Write the wallet password, optional BIP39 passphrase and expected
+# wallet fingerprint to .maker.env for the systemd EnvironmentFile, using
+# systemd's double-quoted C-escape format so special characters survive.
+# chmod 600. Secrets are NEVER written to config.toml (no cleartext leak);
+# .maker.env is removed when the maker stops.
+# EXPECTED_FINGERPRINT binds the staged passphrase to the wallet it was staged
+# for: ensure_wallet_unlocked_global refuses a staged passphrase whose
+# derivation does not match the active wallet (cross-wallet guard). The
+# fingerprint is public, not a secret. Empty means "not determinable" and
+# fails closed (the staged passphrase is then ignored).
 write_maker_env() {
     local password="$1"
+    local bip39_passphrase="${2:-}"
+    local expected_fingerprint="${3:-}"
     local escaped
     escaped=$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g') || return 1
-    # Replace rather than truncate: an older or interrupted write may have
-    # left a readable file. Keep the new secret private even in that case.
+    local escaped_passphrase
+    escaped_passphrase=$(printf '%s' "$bip39_passphrase" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g') || return 1
+    # Preserve the private, checked replacement from the maker-env hardening.
     ( umask 077;
       local temporary
       temporary=$(mktemp "${MAKER_ENV}.XXXXXX") || exit 1
       trap 'rm -f -- "$temporary"' EXIT
+      if [ -n "$password" ]; then
+          printf 'MNEMONIC_PASSWORD="%s"\n' "$escaped" > "$temporary" || exit 1
+      fi
+      if [ $# -gt 1 ]; then
+          printf 'BIP39_PASSPHRASE="%s"\n' "$escaped_passphrase" >> "$temporary" || exit 1
+          printf 'EXPECTED_FINGERPRINT="%s"\n' "$expected_fingerprint" >> "$temporary" || exit 1
+      fi
       chmod 600 "$temporary" || exit 1
-      printf 'MNEMONIC_PASSWORD="%s"\n' "$escaped" > "$temporary" || exit 1
-      # Raspiblitz uses GNU mv: -T rejects directory destinations instead of
-      # moving the secret inside. This helper is only used on Raspiblitz.
       mv -fT -- "$temporary" "$MAKER_ENV" || exit 1
     )
+}
+
+# Helper: Read the expected wallet fingerprint from .maker.env. The line is
+# written by write_maker_env and binds the staged BIP39 passphrase to the
+# wallet it was staged for. Returns 1 when the file or the line is absent
+# (legacy .maker.env written before the cross-wallet guard).
+get_maker_env_expected_fingerprint() {
+    [ -f "$MAKER_ENV" ] || return 1
+    local line val
+    line=$(grep -m1 '^EXPECTED_FINGERPRINT=' "$MAKER_ENV" 2>/dev/null) || return 1
+    val=${line#EXPECTED_FINGERPRINT=}
+    # Strip surrounding double quotes (hex fingerprint: no escapes to reverse).
+    if [ "${val#\"}" != "$val" ]; then
+        val=${val#\"}
+        val=${val%\"}
+    fi
+    printf '%s' "$val"
 }
 
 # Helper: Remove a value in config.toml.
@@ -350,29 +441,34 @@ set_config_value() {
         --config "$CONFIG_FILE" --section "$section" --key "$key"
 }
 
-wallet_identity_summary() {
-    "$TUI_PYTHON" - "$1" <<'PY'
-import sys
-from pathlib import Path
-from jmcore.wallet_metadata import selected_identity
-try:
-    identity = selected_identity(Path(sys.argv[1]))
-    print(f"{identity.fingerprint} (BIP39: {identity.bip39})" if identity else "identity unconfirmed")
-except (OSError, ValueError):
-    print("identity unavailable; register/select explicitly")
-PY
+# Helper: Set a boolean value in config.toml (written as a TOML boolean, not a
+# quoted string). Value must be exactly "true" or "false".
+set_config_bool() {
+    local section=$1
+    local key=$2
+    local value=$3
+    printf '%s' "$value" | "$TUI_PYTHON" -m jmcore.config_file set --bool \
+        --config "$CONFIG_FILE" --section "$section" --key "$key"
 }
 
-# Clear the saved password before changing the active wallet. If saving the
-# new wallet fails, the old wallet remains selected without a mismatched secret.
+# Clear the saved password and BIP39 passphrase before changing the active
+# wallet. If saving the new wallet fails, the old wallet remains selected
+# without a mismatched secret.
 set_active_wallet_config() {
     local wallet_path=$1
+    rm -f "$FINGERPRINT_CACHE"  # Clear fingerprint on wallet change
+    rm -f "$MAKER_ENV" || return 1
+    unset MNEMONIC_PASSWORD BIP39_PASSPHRASE EXPECTED_FINGERPRINT
     clear_config_value wallet mnemonic_password || return 1
+    clear_config_value wallet bip39_passphrase || return 1
     set_config_value wallet mnemonic_file "$wallet_path"
 }
 
 clear_active_wallet_config() {
+    rm -f "$FINGERPRINT_CACHE" "$MAKER_ENV" || return 1
+    unset MNEMONIC_PASSWORD BIP39_PASSPHRASE EXPECTED_FINGERPRINT
     clear_config_value wallet mnemonic_password || return 1
+    clear_config_value wallet bip39_passphrase || return 1
     clear_config_value wallet mnemonic_file
 }
 
@@ -542,6 +638,16 @@ store_password() {
     fi
 }
 
+# Helper: Store the BIP39 passphrase in config.toml.
+#
+# Unlike store_password there is no Raspiblitz bonus-script command for the
+# passphrase; writing config.toml directly works in both environments (the
+# TUI already does so for the log level and the delete-password flow).
+store_bip39_passphrase() {
+    local passphrase="$1"
+    set_config_value wallet bip39_passphrase "$passphrase"
+}
+
 # Helper: Verify that a password can decrypt a wallet file.
 # Returns 0 if the password matches, non-zero otherwise.
 # Usage: verify_wallet_password "/path/to/wallet.mnemonic" "password"
@@ -622,6 +728,100 @@ prompt_and_store_password() {
     return 1
 }
 
+# Helper: Prompt for the BIP39 passphrase, confirm it via the wallet
+# fingerprint, and store it in config.toml on success.
+#
+# A passphrase cannot be verified against the wallet file (any passphrase
+# derives a valid wallet), so the wallet fingerprint IS the verification:
+# it is computed from the mnemonic + entered passphrase and must be
+# confirmed by the user before anything is stored. Loops up to 3 times when
+# the fingerprint is rejected (likely a typo). User can cancel at any time.
+#
+# Usage: prompt_and_store_bip39_passphrase
+# Returns 0 when the passphrase was stored, 1 otherwise.
+prompt_and_store_bip39_passphrase() {
+    local attempts=0
+    local max_attempts=3
+    local pp_entry fingerprint
+
+    # Fingerprint derivation needs the decrypted mnemonic. Use the wallet
+    # password from the environment or config.toml without exporting it
+    # session-wide.
+    local fp_password="${MNEMONIC_PASSWORD:-}"
+    if [ -z "$fp_password" ]; then
+        fp_password=$(get_stored_mnemonic_password)
+    fi
+
+    # Security warning first (#453). Make the trade-off explicit.
+    if ! whiptail --title " Security Warning " \
+        --yesno "Storing the BIP39 passphrase in config.toml saves it in PLAIN TEXT.\n\nAnyone with read access to:\n  $CONFIG_FILE\ncan derive your wallet (together with your seed backup).\n\nOnly store the passphrase if the maker bot needs to start\nunattended and you trust the security of this machine.\n\nContinue and store the passphrase?" \
+        18 70 --defaultno 3>&1 1>&2 2>&3; then
+        return 1
+    fi
+
+    local retry=""
+    while [ $attempts -lt $max_attempts ]; do
+        pp_entry=$(whiptail --title " BIP39 Passphrase " \
+            --passwordbox "${retry}Enter the BIP39 passphrase for:\n$(basename "$CURRENT_WALLET")" \
+            10 60 3>&1 1>&2 2>&3)
+        local rc=$?
+        if [ $rc -ne 0 ]; then
+            # User cancelled
+            unset pp_entry
+            return 1
+        fi
+        if [ -z "$pp_entry" ]; then
+            # An empty passphrase means "no passphrase" - nothing to store.
+            unset pp_entry
+            whiptail --title " Info " \
+                --msgbox "Empty passphrase - this wallet does not use one.\nNothing to store." \
+                8 55
+            return 1
+        fi
+
+        # Compute the fingerprint for user confirmation. Clear any stale
+        # cache first so a failed computation can never confirm against a
+        # previous wallet's fingerprint, and fail closed if none could be
+        # produced.
+        rm -f "$FINGERPRINT_CACHE"
+        if ! MNEMONIC_PASSWORD="$fp_password" cache_wallet_fingerprint "$pp_entry" \
+            || [ ! -s "$FINGERPRINT_CACHE" ]; then
+            unset pp_entry
+            whiptail --title " Error " \
+                --msgbox "Could not compute the wallet fingerprint for confirmation.\nFor encrypted wallets the password must be stored first.\n\nPassphrase was NOT saved." \
+                10 60
+            return 1
+        fi
+        fingerprint=$(cat "$FINGERPRINT_CACHE")
+
+        if whiptail --title " Wallet Fingerprint " \
+            --yesno "Wallet fingerprint: ${fingerprint}\n\nIs this the wallet you expect?\nThe passphrase is only stored when you confirm." \
+            12 60 3>&1 1>&2 2>&3; then
+            if ! store_bip39_passphrase "${pp_entry}"; then
+                unset pp_entry
+                whiptail --title " Config Error " \
+                    --msgbox "Could not save the BIP39 passphrase to config.toml." 8 55
+                return 1
+            fi
+            unset pp_entry
+            whiptail --title " Passphrase Stored " \
+                --msgbox "BIP39 passphrase saved to config.toml." 8 55
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        local remaining=$((max_attempts - attempts))
+        if [ $remaining -gt 0 ]; then
+            retry="Fingerprint rejected. ${remaining} attempt(s) remaining.\n\n"
+        else
+            whiptail --title " Not Confirmed " \
+                --msgbox "The fingerprint was not confirmed.\n\nToo many attempts. Passphrase was NOT saved." \
+                10 60
+        fi
+    done
+    unset pp_entry
+    return 1
+}
+
 # Helper: Ensure MNEMONIC_PASSWORD is available for jm-wallet calls.
 #
 # Without this, jm-wallet commands that need the decrypted mnemonic fall
@@ -646,7 +846,6 @@ prompt_and_store_password() {
 #   )
 ensure_wallet_password() {
     local wallet_path="$1"
-    # The displayed wallet must also be the subprocess mnemonic source.
     export MNEMONIC_FILE="$wallet_path"
     local attempts=0
     local max_attempts=3
@@ -726,6 +925,169 @@ ensure_wallet_password() {
     done
     unset pwd_entry
     return 1
+}
+
+# Helper: Compute wallet fingerprint and cache it for menu display.
+# Usage: cache_wallet_fingerprint [passphrase]
+# Returns 0 on success, 1 on failure. Writes to FINGERPRINT_CACHE.
+cache_wallet_fingerprint() {
+    local passphrase="${1:-}"
+    local mnemonic_file fingerprint
+
+    mnemonic_file="${CURRENT_WALLET:-}"
+    [ -n "$mnemonic_file" ] || mnemonic_file=$(get_mnemonic_file) || return 1
+    [ -f "$mnemonic_file" ] || return 1
+
+    fingerprint=$(
+        _MNEMONIC_FILE="$mnemonic_file" \
+        JOINMARKET_CONFIG_FILE="$CONFIG_FILE" \
+        BIP39_PASSPHRASE="$passphrase" \
+        _MNEMONIC_PASSWORD="${MNEMONIC_PASSWORD:-}" \
+        "$TUI_PYTHON" - <<'PY'
+import os
+from pathlib import Path
+from jmcore.cli_common import resolve_mnemonic
+from jmcore.settings import get_settings
+from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+mnemonic_file = Path(os.environ["_MNEMONIC_FILE"])
+passphrase = os.environ.get("BIP39_PASSPHRASE", "")
+password = os.environ.get("_MNEMONIC_PASSWORD") or None
+
+resolved = resolve_mnemonic(
+    get_settings(), mnemonic_file=mnemonic_file,
+    password=password, bip39_passphrase=passphrase,
+)
+if resolved is None:
+    raise ValueError("No wallet credential source")
+print(get_mnemonic_fingerprint(resolved.mnemonic, resolved.bip39_passphrase))
+PY
+    ) || return 1
+
+    [ -n "$fingerprint" ] || return 1
+
+    # Create with restrictive permissions atomically: the fingerprint is not a
+    # secret but privacy-relevant, so the file must not be world-readable even
+    # briefly between creation and chmod.
+    ( umask 077; printf '%s\n' "$fingerprint" > "$FINGERPRINT_CACHE" )
+    chmod 600 "$FINGERPRINT_CACHE"
+    return 0
+}
+
+# Helper: Ensure the BIP39 passphrase for the current wallet is available in
+# the current (sub)shell as BIP39_PASSPHRASE. Each menu action runs in its own
+# subshell, so the cache lives for one action: all CLI invocations within that
+# action reuse it without prompting again.
+#
+# Resolution order:
+#   1. Already exported BIP39_PASSPHRASE in this shell.
+#   2. Staged BIP39_PASSPHRASE from .maker.env (Raspiblitz/systemd).
+#   3. wallet.bip39_passphrase configured in config.toml.
+#   4. Selected identity requirement, then the onboarding preference for
+#      unregistered identities. Registered requirements override the flag.
+#   5. Prompt the user, then compute and display the wallet fingerprint so the
+#      user can confirm the correct wallet is being derived.
+#
+# Side effects:
+#   - Sets BIP39_PASSPHRASE environment variable
+#   - Creates/updates FINGERPRINT_CACHE for menu display
+#
+# Returns 0 on success, 1 if the user cancels or confirms "No".
+# Always run inside a subshell so the export does not leak to the parent TUI.
+ensure_wallet_unlocked_global() {
+    local passphrase=""
+
+    # Already cached in this subshell - ensure fingerprint exists then return.
+    if [ -n "${BIP39_PASSPHRASE+set}" ]; then
+        cache_wallet_fingerprint "$BIP39_PASSPHRASE"
+        return $?
+    fi
+
+    # Raspiblitz/systemd staging: passphrase is pre-configured for headless
+    # operation. This staged path intentionally runs BEFORE the
+    # wallet_with_passphrase flag check: explicit headless staging takes
+    # precedence over the opt-in flag.
+    #
+    # Cross-wallet guard: a passphrase cannot be verified against the wallet
+    # file (every passphrase derives a valid wallet), so the staged passphrase
+    # is bound to its wallet via EXPECTED_FINGERPRINT. Without the guard a
+    # passphrase staged for wallet A would silently derive the wrong wallet
+    # after the user switches the active wallet to B. Reject missing/mismatched
+    # binding. Explicit restaging skips the old BIP39 credentials and resolves
+    # the intended wallet again before atomically replacing them.
+    if [ "${1:-}" != "restage" ] && [ -f "$MAKER_ENV" ]; then
+        if passphrase=$(get_maker_env_bip39_passphrase); then
+            local expected_fingerprint actual_fingerprint=""
+            if ! expected_fingerprint=$(get_maker_env_expected_fingerprint); then
+                whiptail --title " Restage Maker Credentials " --msgbox "Legacy BIP39 staging has no wallet binding. Restage credentials for the intended wallet before starting the maker." 10 70
+                return 1
+            fi
+            if cache_wallet_fingerprint "$passphrase"; then
+                actual_fingerprint=$(cat "$FINGERPRINT_CACHE" 2>/dev/null)
+            fi
+            if [ -n "$expected_fingerprint" ] && [ "$actual_fingerprint" = "$expected_fingerprint" ]; then
+                export BIP39_PASSPHRASE="$passphrase"
+                export EXPECTED_FINGERPRINT="$expected_fingerprint"
+                return 0
+            fi
+            # Mismatch or unverifiable: the staged passphrase belongs to a
+            # different wallet (or its fingerprint was never recorded). Discard
+            # it -- never derive silently with the wrong passphrase.
+            rm -f "$FINGERPRINT_CACHE"
+            whiptail --title " Staged Passphrase Mismatch " \
+                --msgbox "The BIP39 passphrase staged for the maker service belongs to a different wallet (fingerprint mismatch).\n\nIt was NOT applied. Restage maker credentials for the intended wallet." \
+                14 72 3>&1 1>&2 2>&3 || true
+            return 1
+        fi
+        # Key absent (legacy .maker.env written before passphrase support):
+        # fall through to config / interactive prompt instead of pinning "".
+    fi
+
+    # Permanent config setting: passphrase stored in config.toml.
+    passphrase=$(get_stored_bip39_passphrase)
+    if [ -n "$passphrase" ]; then
+        export BIP39_PASSPHRASE="$passphrase"
+        cache_wallet_fingerprint "$passphrase"
+        return $?
+    fi
+
+    # Registered identities determine the requirement. The onboarding flag
+    # controls prompting only when there is no confirmed requirement.
+    local requires_prompt
+    requires_prompt=$(wallet_requires_passphrase_prompt) || return 1
+    if [ "$requires_prompt" != "true" ]; then
+        export BIP39_PASSPHRASE=""
+        cache_wallet_fingerprint ""
+        return $?
+    fi
+
+    # Interactive prompt: user enters passphrase, confirm via fingerprint.
+    passphrase=$(whiptail --title " BIP39 Passphrase " \
+        --passwordbox "Enter the optional BIP39 passphrase for this wallet.\n\nLeave empty if the wallet was created without a passphrase." \
+        10 60 3>&1 1>&2 2>&3) || return 1
+
+    # Compute the fingerprint for user confirmation. Clear any stale cache
+    # first so a failed computation can never confirm against a previous
+    # wallet's fingerprint, and fail closed if none could be produced.
+    local fingerprint
+    rm -f "$FINGERPRINT_CACHE"
+    if ! cache_wallet_fingerprint "$passphrase" || [ ! -s "$FINGERPRINT_CACHE" ]; then
+        whiptail --title " Error " \
+            --msgbox "Could not compute the wallet fingerprint for confirmation. Aborting." \
+            8 60
+        return 1
+    fi
+    fingerprint=$(cat "$FINGERPRINT_CACHE")
+
+    if ! whiptail --title " Wallet Fingerprint " \
+        --yesno "Wallet fingerprint: ${fingerprint}\n\nContinue with this wallet?" \
+        10 60 3>&1 1>&2 2>&3; then
+        rm -f "$FINGERPRINT_CACHE"  # Clean up on rejection
+        return 1
+    fi
+
+    export BIP39_PASSPHRASE="$passphrase"
+    return 0
 }
 
 # Helper: Prompt the user for a *new* wallet encryption password (with
@@ -885,9 +1247,9 @@ maker_status() {
 # the bonus 'maker-start' does not prompt again (issue: maker asks 2x).
 #
 # Behaviour:
-#   - Unencrypted wallet: nothing to stage.
-#   - Password permanently stored in config.toml: the bonus script / systemd
-#     read it directly, nothing to stage.
+#   - Unencrypted wallet, or password permanently stored in config.toml: no
+#     password to stage, but the BIP39 passphrase (if any) is still staged so
+#     the headless maker derives the same wallet as the TUI.
 #   - Otherwise: prompt once (reusing an existing .maker.env if a maker is
 #     already running) and write .maker.env (chmod 600). Returns 1 if the
 #     user cancels.
@@ -897,24 +1259,43 @@ maker_status() {
 #   ( stage_maker_password "$CURRENT_WALLET" ) || ...
 stage_maker_password() {
     local wallet_path="$1"
+    export MNEMONIC_FILE="$wallet_path"
+    local need_password=1
 
     # Unencrypted wallet -- verify-password exits 2 when not encrypted.
     jm-wallet verify-password -f "$wallet_path" --no-prompt --password "" >/dev/null 2>&1
     if [ $? -eq 2 ]; then
-        return 0
+        need_password=0
+    elif [ -n "$(get_stored_mnemonic_password)" ]; then
+        # Permanently stored in config.toml -- read directly downstream.
+        need_password=0
     fi
 
-    # Permanently stored in config.toml -- read directly downstream.
-    if [ -n "$(get_stored_mnemonic_password)" ]; then
-        return 0
+    local password_to_stage=""
+    if [ $need_password -eq 1 ]; then
+        # Prompt once (ensure_wallet_password also reuses a running maker's
+        # .maker.env if present).
+        if ! ensure_wallet_password "$wallet_path"; then
+            return 1
+        fi
+        password_to_stage="${MNEMONIC_PASSWORD}"
     fi
 
-    # Prompt once (ensure_wallet_password also reuses a running maker's
-    # .maker.env) and stage the verified password for the systemd unit.
-    if ! ensure_wallet_password "$wallet_path"; then
+    # Stage the BIP39 passphrase as well, even when no password needs staging:
+    # otherwise the headless maker silently derives the wrong (passphrase-less)
+    # wallet while the TUI operates on the passphrase-derived one.
+    if ! ensure_wallet_unlocked_global restage; then
         return 1
     fi
-    write_maker_env "${MNEMONIC_PASSWORD}"
+    # Bind the staged passphrase to THIS wallet: record the fingerprint of the
+    # wallet+passphrase derivation so ensure_wallet_unlocked_global can refuse
+    # the staged passphrase after the active wallet is switched (cross-wallet
+    # guard). Empty when the fingerprint cannot be computed -- fails closed.
+    local expected_fingerprint=""
+    cache_wallet_fingerprint "${BIP39_PASSPHRASE:-}" || return 1
+    expected_fingerprint=$(cat "$FINGERPRINT_CACHE") || return 1
+    [[ "$expected_fingerprint" =~ ^[0-9a-f]{8}$ ]] || return 1
+    MAKER_ENV="${2:-$MAKER_ENV}" write_maker_env "${password_to_stage}" "${BIP39_PASSPHRASE:-}" "$expected_fingerprint"
 }
 
 # ---------------------------------------------------------------------------
@@ -934,11 +1315,15 @@ check_stale_wallet() {
             return 1
         fi
         CURRENT_WALLET=""
+        rm -f "$FINGERPRINT_CACHE"
     fi
     if [ -n "$CURRENT_WALLET" ]; then
-        WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET") | $(wallet_identity_summary "$CURRENT_WALLET")"
+        local wallet_name
+        wallet_name=$(basename "$CURRENT_WALLET")
+        WALLET_INFO="Active Wallet: ${wallet_name} | $(wallet_identity_summary "$CURRENT_WALLET")"
     else
         WALLET_INFO="Active Wallet: (none configured)"
+        rm -f "$FINGERPRINT_CACHE"
     fi
 }
 
@@ -975,7 +1360,9 @@ ensure_active_wallet() {
 
     # Already have a valid wallet - no password offer
     if [ -n "$CURRENT_WALLET" ] && [ -f "$CURRENT_WALLET" ]; then
-        WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
+        local wallet_name
+        wallet_name=$(basename "$CURRENT_WALLET")
+        WALLET_INFO="Active Wallet: ${wallet_name} | $(wallet_identity_summary "$CURRENT_WALLET")"
         return 0
     fi
 
@@ -1046,7 +1433,7 @@ ensure_active_wallet() {
     fi
 
     # Update WALLET_INFO
-    WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET")"
+    WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET") | $(wallet_identity_summary "$CURRENT_WALLET")"
 
     # Offer password storage ONLY when wallet just changed
     if [ "$wallet_just_changed" = "yes" ]; then
@@ -1061,6 +1448,23 @@ ensure_active_wallet() {
                     clear
                     if ! prompt_and_store_password "$CURRENT_WALLET"; then
                         echo "Password not stored."
+                    fi
+                fi
+            fi
+        fi
+
+        # Offer passphrase storage as well when the wallet uses a passphrase
+        # (wallet_with_passphrase flag) and none is stored yet.
+        if [ "$(get_wallet_with_passphrase)" = "true" ]; then
+            local stored_pp
+            stored_pp=$(get_stored_bip39_passphrase)
+            if [ -z "$stored_pp" ]; then
+                if whiptail --title " Store Passphrase " \
+                    --yesno "Active wallet: $(basename "$CURRENT_WALLET")\n\nStore this wallet's BIP39 passphrase in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
+                    12 64 --defaultno 3>&1 1>&2 2>&3; then
+                    clear
+                    if ! prompt_and_store_bip39_passphrase; then
+                        echo "Passphrase not stored."
                     fi
                 fi
             fi
@@ -1107,6 +1511,45 @@ offer_maker_password_storage() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Helper: Offer BIP39 passphrase storage for Maker with context-specific
+# explanation.
+#
+# When the wallet uses a passphrase, the Maker needs it stored for automatic
+# restart after crashes: the passphrase staged in .maker.env is only written
+# when the maker is started from this TUI, so a crash/restart or a Raspiblitz
+# boot autostart derives the wrong (empty-passphrase) wallet unless the
+# passphrase is in config.toml. Called after offer_maker_password_storage()
+# in Maker START/RESTART.
+# ---------------------------------------------------------------------------
+offer_maker_passphrase_storage() {
+    # Passphrases are strictly opt-in: without the wallet_with_passphrase flag
+    # the wallet has no passphrase and there is nothing to store.
+    if [ "$(get_wallet_with_passphrase)" != "true" ]; then
+        return 0
+    fi
+
+    # Check if passphrase already stored
+    local stored_pp
+    stored_pp=$(get_stored_bip39_passphrase)
+    if [ -n "$stored_pp" ]; then
+        return 0  # Already stored
+    fi
+
+    if ! whiptail --title " Store Passphrase for Maker " \
+        --yesno "This wallet uses a BIP39 passphrase.\n\nFor automatic restart after a crash, the Maker needs\nthe passphrase stored in config.toml.\n\nWithout stored passphrase: a restarted Maker derives a\nDIFFERENT wallet and will not offer your coins.\n\nStore passphrase now?" \
+        15 64 --defaultno 3>&1 1>&2 2>&3; then
+        return 0  # User declined
+    fi
+
+    clear
+    if ! prompt_and_store_bip39_passphrase; then
+        whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
+    fi
+
+    return 0
+}
+
 # =============================================================================
 # Main Loop
 # =============================================================================
@@ -1127,7 +1570,7 @@ check_stale_wallet
 if [ "${RASPIBLITZ}" -eq 1 ]; then
     CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
         --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-        20 64 8 \
+        21 64 8 \
         "S" "Send Bitcoin" \
         "W" "Wallet Management" \
         "M" "Maker Bot Control" \
@@ -1329,6 +1772,7 @@ No:  automatic coin selection from one mixdepth." 12 64
       echo "Please wait..."
       (
           ensure_wallet_password "$CURRENT_WALLET" || exit 1
+          ensure_wallet_unlocked_global || exit 1
           if [ "$SEND_CP" -gt 0 ] 2>/dev/null; then
               # CoinJoin via jm-taker
               echo "=== CoinJoin Send ==="
@@ -1473,6 +1917,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                           echo ""
                           (
                               ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                              ensure_wallet_unlocked_global || exit 1
                               jm-wallet info
                               pause
                           )
@@ -1487,6 +1932,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                           echo ""
                           (
                               ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                              ensure_wallet_unlocked_global || exit 1
                               jm-wallet info --extended
                               pause
                           )
@@ -1575,6 +2021,7 @@ No:  automatic coin selection from one mixdepth." 12 64
               ensure_active_wallet || continue
               (
                   ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  ensure_wallet_unlocked_global || exit 1
                   jm-wallet info
                   pause
               )
@@ -1604,7 +2051,10 @@ for item in json.load(sys.stdin):
                   continue
               fi
               IDENTITY_CHOICE=$(whiptail --title " Select Wallet Identity " --menu "Choose the intended derived wallet:" 18 70 8 "${IDENTITY_OPTIONS[@]}" 3>&1 1>&2 2>&3) || continue
-              jm-wallet identity select "$IDENTITY_CHOICE" --mnemonic-file "$CURRENT_WALLET"
+              clear_config_value wallet bip39_passphrase || continue
+              jm-wallet identity select "$IDENTITY_CHOICE" --mnemonic-file "$CURRENT_WALLET" || continue
+              rm -f "$FINGERPRINT_CACHE" "$MAKER_ENV"
+              unset BIP39_PASSPHRASE EXPECTED_FINGERPRINT
               ;;
 
           # --------------------------------------------------------------
@@ -1623,6 +2073,7 @@ for item in json.load(sys.stdin):
               echo ""
               (
                   ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                  ensure_wallet_unlocked_global || exit 1
                   jm-wallet freeze
                   pause
               )
@@ -1811,6 +2262,21 @@ for item in json.load(sys.stdin):
                   else
                       whiptail --title " Wallet Selected " --msgbox "Active wallet set to: $WNAME\n\nStored password cleared; you will be prompted\nfor the password on next use.\n\nRestart the maker service for changes to take effect." 12 60
                   fi
+
+                  # Offer passphrase storage as well when the wallet uses a
+                  # passphrase (wallet_with_passphrase flag, mirrors the
+                  # password storage offer above) and none is stored yet.
+                  if [ "$(get_wallet_with_passphrase)" = "true" ]; then
+                      STORED_PP=$(get_stored_bip39_passphrase)
+                      if [ -z "$STORED_PP" ]; then
+                          if whiptail --title " Store Passphrase " \
+                              --yesno "Store this wallet's BIP39 passphrase in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
+                              11 64 --defaultno 3>&1 1>&2 2>&3; then
+                              prompt_and_store_bip39_passphrase || \
+                                  whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
+                          fi
+                      fi
+                  fi
               else
                   whiptail --title " Error " --msgbox "File not found: $DATA_DIR/wallets/$WNAME" 8 55
               fi
@@ -1848,7 +2314,13 @@ for item in json.load(sys.stdin):
               echo "Please wait..."
               (
                   ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                  jm-wallet showseed -f "$CURRENT_WALLET"
+                  # Full unlock, same protection as BAL/HIST/FREEZE: flag-gated
+                  # BIP39 passphrase prompt with fingerprint confirmation, so
+                  # the user knows exactly which wallet the seed belongs to.
+                  ensure_wallet_unlocked_global || exit 1
+                  # --yes skips the CLI's own confirmation prompt: it is 1:1
+                  # redundant with the whiptail security warning above.
+                  jm-wallet showseed -f "$CURRENT_WALLET" --yes
                   echo ""
                   echo ""
                   echo "Press [Enter] to continue."
@@ -1904,6 +2376,7 @@ for item in json.load(sys.stdin):
                   continue
               fi
               offer_maker_password_storage
+              offer_maker_passphrase_storage
               if [ "$RASPIBLITZ" = "1" ]; then
                   # Raspiblitz: the maker runs under systemd and reads the
                   # password from .maker.env. Prompt once here and stage it so
@@ -1917,6 +2390,7 @@ for item in json.load(sys.stdin):
               else
                   (
                       ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                      ensure_wallet_unlocked_global || exit 1
                       maker_start
                   )
               fi
@@ -1966,6 +2440,7 @@ for item in json.load(sys.stdin):
                   continue
               fi
               offer_maker_password_storage
+              offer_maker_passphrase_storage
               if [ "$MAKER_STATUS" = "RUNNING" ]; then
                   echo "=== Restarting Maker Bot ==="
               else
@@ -1976,24 +2451,24 @@ for item in json.load(sys.stdin):
               echo "Preparing wallet..."
               echo ""
               if [ "$RASPIBLITZ" = "1" ]; then
-                  # Stop first so the bonus script clears the old .maker.env,
-                  # then stage the password once and start. The maker reads it
-                  # from .maker.env (never from config.toml).
-                  if [ "$MAKER_STATUS" = "RUNNING" ]; then
-                      echo "Stopping Maker Bot..."
-                      echo "Please wait..."
-                      maker_stop 2>&1
-                  fi
-                  if ! ( stage_maker_password "$CURRENT_WALLET" ); then
-                      pause
-                      clear
-                      continue
-                  fi
-                  maker_start
+                  (
+                      # Validate/confirm before stopping the current maker.
+                      # Its stop hook removes .maker.env, so keep the new
+                      # credentials in a private pending file until afterward.
+                      pending_env=$(mktemp "${MAKER_ENV}.restart.XXXXXX") || exit 1
+                      trap 'rm -f -- "$pending_env"' EXIT
+                      stage_maker_password "$CURRENT_WALLET" "$pending_env" || exit 1
+                      if [ "$MAKER_STATUS" = "RUNNING" ]; then
+                          maker_stop 2>&1 || exit 1
+                      fi
+                      mv -fT -- "$pending_env" "$MAKER_ENV" || exit 1
+                      maker_start
+                  )
                   RESTART_RC=$?
               else
                   (
                       ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                      ensure_wallet_unlocked_global || exit 1
                       if [ "$MAKER_STATUS" = "RUNNING" ]; then
                           echo "Stopping Maker Bot..."
                           echo "Please wait..."
@@ -2040,6 +2515,7 @@ for item in json.load(sys.stdin):
                         echo ""
                         (
                             ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                            ensure_wallet_unlocked_global || exit 1
                             jm-wallet list-bonds > "$BONDS_OUT_FILE" 2>&1 || exit 2
                         )
                         BONDS_RC=$?
@@ -2082,6 +2558,7 @@ for item in json.load(sys.stdin):
                         echo ""
                         (
                             ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                            ensure_wallet_unlocked_global || exit 1
 
                             # Lockdate (required) - validate format and warn on past dates
                             CURRENT_YM=$(date +%Y-%m)
@@ -2217,10 +2694,11 @@ for item in json.load(sys.stdin):
         check_stale_wallet
         CCHOICE=$(whiptail --title " Config Center " \
           --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-          20 64 8 \
+          22 64 10 \
           "LOG"    "Configure Log Level" \
-          "BIP39"  "Configure BIP39 Onboarding" \
+          "PPFLAG" "Configure BIP39 Onboarding" \
           "DELPW"  "Delete Active Wallet Password" \
+          "DELPP"  "Delete Active Wallet Passphrase" \
           ""   "" \
           "EDIT"   "Edit config.toml manually (nano)" \
           "BACKUP" "Backup config.toml" \
@@ -2231,14 +2709,6 @@ for item in json.load(sys.stdin):
         [ $? -ne 0 ] && break
 
         case $CCHOICE in
-          BIP39)
-            BIP39_CHOICE=$(whiptail --title " BIP39 Onboarding " --menu "Enable advanced BIP39 onboarding and prompts for unregistered wallets? Registered wallet requirements always apply. Recorded history does not need either credential." 16 75 2 \
-                "true" "Enable" "false" "Disable (default)" 3>&1 1>&2 2>&3) || continue
-            if ! printf '%s' "$BIP39_CHOICE" | "$TUI_PYTHON" -m jmcore.config_file set-bool \
-                --config "$CONFIG_FILE" --section wallet --key bip39_passphrase_enabled; then
-                show_config_save_error
-            fi
-            ;;
           LOG)
             CURRENT_LOG="${LOGGING__LEVEL:-INFO}"
 
@@ -2269,6 +2739,37 @@ for item in json.load(sys.stdin):
             fi
             ;;
 
+          PPFLAG)
+            PP_CURRENT=$(get_wallet_with_passphrase)
+            if [ "$PP_CURRENT" = "true" ]; then
+              PP_CURRENT="ON"
+            else
+              PP_CURRENT="OFF"
+            fi
+
+            PP_CHOICE=$(whiptail --title " BIP39 Passphrase Mode " --notags \
+              --menu "\nEnable BIP39 onboarding?\n\nCurrent: ${PP_CURRENT}\n\nON: prompt for unregistered wallets and confirm new identities.\nOFF (default): ordinary legacy wallets do not prompt.\n\nRegistered wallet requirements always apply. Recorded history stays offline." \
+              19 70 2 \
+              "ON"  "Enable advanced onboarding" \
+              "OFF" "Disable onboarding (default)" 3>&1 1>&2 2>&3) || continue
+
+            if [ "$PP_CHOICE" = "ON" ]; then
+              PP_VALUE="true"
+            else
+              PP_VALUE="false"
+            fi
+            if clear_config_value wallet wallet_with_passphrase && \
+                set_config_bool wallet bip39_passphrase_enabled "$PP_VALUE"; then
+              # The derived wallet may change with this flag; drop the cached
+              # fingerprint so the next action recomputes it.
+              rm -f "$FINGERPRINT_CACHE"
+              whiptail --title " BIP39 Passphrase Mode " \
+                --msgbox "BIP39 passphrase mode set to: $PP_CHOICE" 8 50
+            else
+              whiptail --title " Config Error " --msgbox "Could not save the setting to config.toml." 8 55
+            fi
+            ;;
+
           DELPW)
             if ! ensure_active_wallet; then
               continue
@@ -2288,6 +2789,30 @@ for item in json.load(sys.stdin):
                 whiptail --title " Password Deleted " --msgbox "Wallet password removed from config.toml." 8 50
               else
                 whiptail --title " Config Error " --msgbox "Could not remove the wallet password from config.toml." 8 55
+              fi
+            fi
+            ;;
+
+          DELPP)
+            if ! ensure_active_wallet; then
+              continue
+            fi
+
+            STORED_PP=$(get_stored_bip39_passphrase)
+            if [ -z "$STORED_PP" ]; then
+              whiptail --title " Delete Passphrase " --msgbox "No BIP39 passphrase is currently stored in config.toml." 8 50
+              continue
+            fi
+
+            if whiptail --title " Delete Passphrase " --yesno \
+              "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nDelete the stored BIP39 passphrase for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the passphrase on next use." \
+              13 60 --defaultno 3>&1 1>&2 2>&3; then
+
+              if clear_config_value wallet bip39_passphrase && rm -f "$MAKER_ENV" "$FINGERPRINT_CACHE"; then
+                unset BIP39_PASSPHRASE EXPECTED_FINGERPRINT
+                whiptail --title " Passphrase Deleted " --msgbox "BIP39 passphrase removed from config.toml." 8 50
+              else
+                whiptail --title " Config Error " --msgbox "Could not remove the BIP39 passphrase from config.toml." 8 55
               fi
             fi
             ;;

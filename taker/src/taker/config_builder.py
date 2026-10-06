@@ -253,6 +253,7 @@ def build_taker_config_kwargs(
         "smart_scan": settings.wallet.smart_scan,
         "background_full_rescan": settings.wallet.background_full_rescan,
         "scan_lookback_blocks": settings.wallet.scan_lookback_blocks,
+        "wallet_with_passphrase": settings.wallet.wallet_with_passphrase,
         "destination_address": SecretStr(destination),
         "amount": amount,
         "mixdepth": mixdepth,
