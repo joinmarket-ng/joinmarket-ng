@@ -52,12 +52,15 @@ from pydantic import (
     Field,
     SecretStr,
     TypeAdapter,
+    ValidationError,
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails
 from pydantic_settings import (
     BaseSettings,
     EnvSettingsSource,
+    InitSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
@@ -1491,6 +1494,35 @@ class LoggingSettings(BaseModel):
     )
 
 
+def _normalize_wallet_preference_source(values: dict[str, Any]) -> dict[str, Any]:
+    """Merge sources by canonical key, checking conflicts within each source only."""
+    wallet = values.get("wallet")
+    if not isinstance(wallet, dict) or "wallet_with_passphrase" not in wallet:
+        return values
+    wallet = wallet.copy()
+    if "bip39_passphrase_enabled" in wallet:
+        try:
+            WalletSettings.model_validate(
+                {key: wallet[key] for key in ("wallet_with_passphrase", "bip39_passphrase_enabled")}
+            )
+        except ValidationError as exc:
+            # Source-local validation must retain the public settings error context.
+            errors = [
+                InitErrorDetails(
+                    type=error["type"],
+                    loc=("wallet", *error["loc"]),
+                    input=error["input"],
+                    ctx=error.get("ctx", {}),
+                )
+                for error in exc.errors(include_url=False)
+            ]
+            raise ValidationError.from_exception_data("JoinMarketSettings", errors) from exc
+    else:
+        wallet["bip39_passphrase_enabled"] = wallet["wallet_with_passphrase"]
+    del wallet["wallet_with_passphrase"]
+    return values | {"wallet": wallet}
+
+
 class _CommaListEnvSettingsSource(EnvSettingsSource):
     """Custom env source that decodes list[str] fields from comma-separated strings.
 
@@ -1500,6 +1532,9 @@ class _CommaListEnvSettingsSource(EnvSettingsSource):
     "a,b" or a bare single value "a" for list[str] fields, making container
     environment variable configuration more ergonomic.
     """
+
+    def __call__(self) -> dict[str, Any]:
+        return _normalize_wallet_preference_source(super().__call__())
 
     def decode_complex_value(self, field_name: str, field_info: Any, value: Any) -> Any:
         if isinstance(value, str) and self._is_list_of_str(field_info):
@@ -1618,7 +1653,7 @@ class JoinMarketSettings(BaseSettings):
         toml_source = TomlConfigSettingsSource(settings_cls)
         comma_env = _CommaListEnvSettingsSource(settings_cls)
         return (
-            init_settings,
+            InitSettingsSource(settings_cls, _normalize_wallet_preference_source(init_settings())),
             comma_env,
             toml_source,
         )
@@ -1747,7 +1782,7 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
 
     def __call__(self) -> dict[str, Any]:
         """Return all config values as a flat dict for pydantic-settings."""
-        return self._config
+        return _normalize_wallet_preference_source(self._config)
 
 
 def get_config_path() -> Path:

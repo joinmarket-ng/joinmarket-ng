@@ -105,6 +105,30 @@ def test_declared_fingerprint_checks_effective_identity(
     assert _invoke(source, settings, stage)[0] is (fingerprint_state == "matching")
 
 
+@pytest.mark.parametrize("separator", ["\n", "\u0085", "\u2028", "\r\n"])
+@pytest.mark.parametrize("duplicate", [True, False])
+def test_quoted_staging_separators_preserve_wallet_and_duplicate_checks(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    separator: str,
+    duplicate: bool,
+) -> None:
+    source, settings = wallet
+    passphrase = f'one  {separator}  "two" \\ three  '
+    fingerprint = get_mnemonic_fingerprint(MNEMONIC, passphrase)
+    escaped = passphrase.replace("\\", "\\\\").replace('"', '\\"')
+    content = f'BIP39_PASSPHRASE="{escaped}"\nEXPECTED_FINGERPRINT="{fingerprint}"\n'
+    if duplicate:
+        content += f'EXPECTED_FINGERPRINT="{fingerprint}"\n'
+    stage = source.parent / ".maker.env"
+    # Preserve CR inside quoted values instead of translating text-mode newlines.
+    stage.write_bytes(content.encode("utf-8"))
+    monkeypatch.setenv("BIP39_PASSPHRASE", passphrase)
+    built, output = _invoke(source, settings, stage)
+    assert built is not duplicate
+    assert passphrase not in output
+
+
 @pytest.mark.parametrize("configured", [None, "", PASSPHRASE])
 def test_missing_declared_staging_requires_affirmative_identity(
     wallet: tuple[Path, JoinMarketSettings],

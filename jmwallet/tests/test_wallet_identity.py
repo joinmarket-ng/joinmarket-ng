@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import typer
 from jmcore.cli_common import resolve_mnemonic, select_mnemonic_source
 from jmcore.settings import JoinMarketSettings
 from jmcore.wallet_metadata import (
@@ -91,6 +92,29 @@ def test_registered_explicit_file_read_does_not_unlock(
         "jmwallet.cli._wallet_selection.resolve_mnemonic", side_effect=AssertionError("unlocked")
     ):
         assert _offline(settings, file=source) == fp
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("passphrase", ["", PASSPHRASE])
+def test_offline_reads_honor_explicit_empty_environment_when_enabled(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    passphrase: str,
+) -> None:
+    source, settings = wallet
+    fp = _select(source, passphrase)
+    before = meta_path(source).read_bytes()
+    settings.wallet.bip39_passphrase_enabled = enabled
+    monkeypatch.setenv("BIP39_PASSPHRASE", "")
+    with patch("typer.prompt", side_effect=AssertionError("prompted")):
+        if enabled and passphrase:
+            with pytest.raises(typer.Exit) as exc:
+                _offline(settings)
+            assert exc.value.exit_code == 1
+        else:
+            assert _offline(settings) == fp
+    assert meta_path(source).read_bytes() == before
 
 
 def test_registered_required_prompts_with_setting_disabled(

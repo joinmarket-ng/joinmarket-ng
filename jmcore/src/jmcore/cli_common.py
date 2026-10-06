@@ -139,8 +139,12 @@ def select_mnemonic_source(
 
 
 def has_bip39_credential(settings: JoinMarketSettings) -> bool:
-    """Match existing environment/config credential precedence, including empty config."""
-    return bool(os.environ.get("BIP39_PASSPHRASE")) or settings.wallet.bip39_passphrase is not None
+    """Match resolution policy for explicit credentials, including enabled empty env."""
+    return (
+        bool(os.environ.get("BIP39_PASSPHRASE"))
+        or (settings.wallet.bip39_passphrase_enabled and "BIP39_PASSPHRASE" in os.environ)
+        or settings.wallet.bip39_passphrase is not None
+    )
 
 
 def bip39_prompt_required(

@@ -1500,7 +1500,9 @@ def test_tui_script_maker_env_without_passphrase_falls_through() -> None:
     """
     content = SCRIPT_PATH.read_text()
     block = content.split("ensure_wallet_unlocked_global() {", 1)[1].split("\n}", 1)[0]
-    assert "if passphrase=$(get_maker_env_bip39_passphrase); then" in block
+    assert (
+        "if passphrase=$(get_maker_env_bip39_passphrase && printf '.'); then" in block
+    )
 
 
 def test_tui_script_fingerprint_confirmation_fails_closed() -> None:

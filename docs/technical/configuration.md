@@ -159,8 +159,10 @@ still requires its passphrase when this preference is disabled. A selected
 empty-passphrase identity does not require prompting when it is enabled.
 Recorded history uses selected metadata without unlocking either credential.
 
-`wallet_with_passphrase` remains an input alias. Keep one spelling; conflicting
-values are rejected. The TUI writes the canonical spelling.
+`wallet_with_passphrase` remains an input alias. Keep one spelling per source;
+conflicting values in the same source are rejected. CLI initialization values
+override environment variables, which override TOML, regardless of spelling.
+The TUI writes the canonical spelling.
 
 Credentials resolve in priority order: explicit CLI argument (where supported),
 `BIP39_PASSPHRASE` environment variable, `[wallet].bip39_passphrase`, then an

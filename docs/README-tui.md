@@ -80,11 +80,26 @@ wallet fingerprint in `.maker.env`. Both credentials are plaintext, even when
 permanent storage was declined. Staging validates the selected identity before
 writing; a failed write or canceled restart leaves the running maker untouched.
 Restart validates new credentials before stopping the old process.
+Matching staged BIP39 credentials are reused even when onboarding is disabled.
+Restaging unbound or mismatched BIP39 credentials requires an explicit credential
+or a confirmed prompt; missing identity metadata never authorizes replacing them
+with an empty passphrase.
 
 After upgrading, BIP39 staging without an expected fingerprint must be restaged
 explicitly from **Start / Restart Maker**. Password-only legacy staging remains
 usable. No identity registration, rescan, or credential deletion happens on
 upgrade. A mismatched staged fingerprint prevents wallet activity.
+
+The menu preserves leading, embedded, and trailing newlines in configured and
+staged credentials. Older versions could strip trailing LF or read only the first
+line of a staged value. Existing matching staging continues selecting its bound
+wallet, even if that wallet used a truncated credential. Restaging from config
+requires explicit fingerprint confirmation when restoring trailing LF would
+replace that matching prefix-wallet binding; declining leaves staging untouched.
+No automatic rewrite or rescan occurs. Without a binding, the menu cannot identify
+a previously truncated wallet: compare the exact credential's fingerprint with
+independent records before wallet activity. Lost characters cannot be recovered
+from staging alone; keep an independent backup of the complete passphrase.
 
 Config Center can save a BIP39 passphrase to `config.toml` only after an explicit
 plaintext-storage warning and wallet confirmation. This is different from the

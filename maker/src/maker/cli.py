@@ -11,7 +11,6 @@ Configuration is loaded with the following priority (highest to lowest):
 from __future__ import annotations
 
 import asyncio
-import re
 import unicodedata
 from pathlib import Path
 from typing import Annotated, Any
@@ -20,6 +19,7 @@ import typer
 from jmcore.cli_common import resolve_mnemonic, select_mnemonic_source, setup_cli
 from jmcore.cli_help import SortedTyper, version_options
 from jmcore.config import build_tor_control_config
+from jmcore.maker_env import parse_maker_env
 from jmcore.models import NetworkType, OfferType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
@@ -52,7 +52,8 @@ def _staged_wallet_binding(
 ) -> tuple[str | None, SecretStr | None]:
     """Validate declared staging without importing its secrets.
 
-    Accept the single-line assignment subset emitted by the TUI. Missing
+    Accept the quoted assignment subset emitted by the TUI, including literal
+    newlines in credentials (supported by systemd EnvironmentFile). Missing
     staging is not proof of an empty wallet: ExecStopPost may have deleted a
     rejected file before this service retry.
     """
@@ -73,24 +74,11 @@ def _staged_wallet_binding(
     except (OSError, UnicodeError):
         raise ValueError("Cannot read declared maker staging. Restage credentials.") from None
 
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith(("#", ";")):
-            continue
-        assignment = re.fullmatch(r"([A-Z][A-Z0-9_]*)=(.*)", line)
-        if assignment is None:
-            raise ValueError("Malformed maker staging. Restage credentials.")
-        name, value = assignment.groups()
-        if name not in {"MNEMONIC_PASSWORD", "BIP39_PASSPHRASE", "EXPECTED_FINGERPRINT"}:
-            continue
-        if name in values or not re.fullmatch(r'"(?:[^"\\]|\\["\\])*"|[^\s"\\]*', value):
-            raise ValueError("Ambiguous maker staging. Restage credentials.")
-        values[name] = value
+    values = parse_maker_env(text)
     fingerprint = values.get("EXPECTED_FINGERPRINT")
     if fingerprint is not None:
         try:
-            return WalletIdentity.validate_fingerprint(fingerprint.strip('"')), None
+            return WalletIdentity.validate_fingerprint(fingerprint), None
         except ValueError:
             raise ValueError("Invalid staged wallet binding. Restage credentials.") from None
     if "BIP39_PASSPHRASE" in values:

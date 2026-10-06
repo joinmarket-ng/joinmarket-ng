@@ -52,6 +52,57 @@ def test_preference_config_and_environment_round_trip(
         reset_settings()
 
 
+@pytest.mark.parametrize("config_spelling", ["bip39_passphrase_enabled", "wallet_with_passphrase"])
+@pytest.mark.parametrize("env_spelling", ["bip39_passphrase_enabled", "wallet_with_passphrase"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_preference_aliases_preserve_source_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_spelling: str,
+    env_spelling: str,
+    enabled: bool,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(f"[wallet]\n{config_spelling} = {str(not enabled).lower()}\n")
+    monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config))
+    monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path))
+    for spelling in ("bip39_passphrase_enabled", "wallet_with_passphrase"):
+        monkeypatch.delenv(f"WALLET__{spelling.upper()}", raising=False)
+    monkeypatch.setenv(f"WALLET__{env_spelling.upper()}", str(enabled).lower())
+    assert JoinMarketSettings().wallet.bip39_passphrase_enabled is enabled
+    init_spelling = (
+        "wallet_with_passphrase"
+        if env_spelling == "bip39_passphrase_enabled"
+        else "bip39_passphrase_enabled"
+    )
+    assert JoinMarketSettings(
+        wallet={init_spelling: not enabled}
+    ).wallet.bip39_passphrase_enabled is (not enabled)
+
+
+@pytest.mark.parametrize("source", ["init", "env", "config"])
+def test_preference_conflicts_within_source_still_reject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("[wallet]\n")
+    monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config))
+    for spelling in ("bip39_passphrase_enabled", "wallet_with_passphrase"):
+        monkeypatch.delenv(f"WALLET__{spelling.upper()}", raising=False)
+    values = {"bip39_passphrase_enabled": True, "wallet_with_passphrase": False}
+    if source == "config":
+        config.write_text(
+            "[wallet]\nbip39_passphrase_enabled = true\nwallet_with_passphrase = false\n"
+        )
+    elif source == "env":
+        monkeypatch.setenv("WALLET__BIP39_PASSPHRASE_ENABLED", "true")
+        monkeypatch.setenv("WALLET__WALLET_WITH_PASSPHRASE", "false")
+    with pytest.raises(ValidationError, match="Conflicting BIP39") as exc:
+        JoinMarketSettings(**({"wallet": values} if source == "init" else {}))
+    assert exc.value.title == "JoinMarketSettings"
+    assert exc.value.errors()[0]["loc"] == ("wallet",)
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 @pytest.mark.parametrize("status", [None, "none", "required", "unknown"])
 def test_identity_requirement_overrides_onboarding(enabled: bool, status: str | None) -> None:
