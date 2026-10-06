@@ -112,6 +112,10 @@ Use a source checkout for development or a custom environment. This path does
 not establish the signed-release updater, so verify the revision independently
 before using it with funds. Python 3.11 or later is required.
 
+For contributing, follow [Development](technical/development.md) instead: it
+installs every component with the `[dev]` extras and explains how to keep an
+existing virtual environment up to date.
+
 On Debian or Ubuntu:
 
 ```bash
