@@ -240,8 +240,6 @@ export LOGGING__LEVEL="$(get_tui_log_level)"
 # ---- Defaults for send/coinjoin parameters ----------------------------------
 DEFAULT_AMOUNT="0"
 DEFAULT_MIXDEPTH="0"
-DEFAULT_FEE_RATE=""
-DEFAULT_DESTINATION=""
 # Counterparty default: read from config.toml [taker] section, fall back to 10
 DEFAULT_COUNTERPARTIES=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
 import sys, pathlib
@@ -287,7 +285,7 @@ mkdir -p "$LOG_DIR"
 # Helper: Pause
 pause() {
   echo ""
-  read -p "Press [Enter] key to continue..." fakeEnterKey
+  read -r -p "Press [Enter] key to continue..." fakeEnterKey
   clear
 }
 
@@ -597,7 +595,7 @@ EOF
 
 # Helper: Stop Maker Bot (standalone mode)
 # Cleans up process and files when not using the Raspiblitz bonus script.
-stop_maker() {
+stop_maker_local() {
     if pgrep -f "jm-maker" > /dev/null 2>&1; then
         echo "Stopping maker bot..."
 
@@ -675,7 +673,7 @@ prompt_and_store_password() {
     jm-wallet verify-password -f "$wallet_path" --no-prompt --password "" \
         >/dev/null 2>&1
     if [ $? -eq 2 ]; then
-        whiptail --title " Info " --msgbox "This wallet is not encrypted.\nNo password to store." 8 50
+        whiptail --title " Password Storage " --msgbox "This wallet is not encrypted.\nNo password to store." 8 50
         return 1
     fi
 
@@ -779,7 +777,7 @@ prompt_and_store_bip39_passphrase() {
         if [ -z "$pp_entry" ]; then
             # An empty passphrase means "no passphrase" - nothing to store.
             unset pp_entry
-            whiptail --title " Info " \
+            whiptail --title " Passphrase Storage " \
                 --msgbox "Empty passphrase - this wallet does not use one.\nNothing to store." \
                 8 55
             return 1
@@ -1269,11 +1267,11 @@ post_wallet_create() {
                 fi
             else
                 if ! prompt_and_store_password "$wallet_path"; then
-                    whiptail --title " Password " --msgbox "Password not stored." 8 50
+                    whiptail --title " Wallet Password " --msgbox "Password not stored." 8 50
                 fi
             fi
         else
-            whiptail --title " Password " --msgbox "Password not stored." 8 50
+            whiptail --title " Wallet Password " --msgbox "Password not stored." 8 50
         fi
     fi
 }
@@ -1292,7 +1290,7 @@ maker_stop() {
     if [ "$RASPIBLITZ" = "1" ]; then
         sudo "$BONUS_SCRIPT" maker-stop
     else
-        stop_maker
+        stop_maker_local
     fi
 }
 
@@ -1575,7 +1573,7 @@ offer_maker_password_storage() {
 
     clear
     if ! prompt_and_store_password "$CURRENT_WALLET"; then
-        whiptail --title " Password " --msgbox "Password not stored." 8 50
+        whiptail --title " Wallet Password " --msgbox "Password not stored." 8 50
     fi
 
     return 0
@@ -1615,7 +1613,7 @@ offer_maker_passphrase_storage() {
 
     clear
     if ! prompt_and_store_bip39_passphrase; then
-        whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
+        whiptail --title " BIP39 Passphrase " --msgbox "Passphrase not stored." 8 50
     fi
 
     return 0
@@ -1636,32 +1634,30 @@ while true; do
   fi
 
   # Check if a wallet is configured
-check_stale_wallet
+  check_stale_wallet
 
-if [ "${RASPIBLITZ}" -eq 1 ]; then
-    CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
-        --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-        21 64 8 \
-        "S" "Send Bitcoin" \
-        "W" "Wallet Management" \
-        "M" "Maker Bot Control" \
-        "C" "Config Center" \
-        "U" "Update JoinMarket-NG" \
-        "I" "Info / Documentation" \
-        "B" "Exit to RaspiBlitz Menu" \
-        "X" "Exit to JoinMarket-NG CLI Shell" 3>&1 1>&2 2>&3)
-  else
-    CHOICE=$(whiptail --title " JoinMarket-NG Menu" \
-        --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
-        18 64 7 \
-        "S" "Send Bitcoin" \
-        "W" "Wallet Management" \
-        "M" "Maker Bot Control" \
-        "C" "Config Center" \
-        "U" "Update JoinMarket-NG" \
-        "I" "Info / Documentation" \
-        "X" "Exit to JoinMarket-NG CLI Shell" 3>&1 1>&2 2>&3)
+  # Build the main menu once; RaspiBlitz adds its own exit entry.
+  MAIN_MENU_ITEMS=(
+      "S" "Send Bitcoin"
+      "W" "Wallet Management"
+      "M" "Maker Bot Control"
+      "C" "Config Center"
+      "U" "Update JoinMarket-NG"
+      "I" "Info / Documentation"
+  )
+  MAIN_MENU_HEIGHT=18
+  MAIN_MENU_LIST_HEIGHT=7
+  if [ "${RASPIBLITZ}" -eq 1 ]; then
+      MAIN_MENU_ITEMS+=("B" "Exit to RaspiBlitz Menu")
+      MAIN_MENU_HEIGHT=21
+      MAIN_MENU_LIST_HEIGHT=8
   fi
+  MAIN_MENU_ITEMS+=("X" "Exit to JoinMarket-NG CLI Shell")
+
+  CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
+      --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+      "$MAIN_MENU_HEIGHT" 64 "$MAIN_MENU_LIST_HEIGHT" \
+      "${MAIN_MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
 
   exitstatus=$?
   if [ $exitstatus != 0 ]; then
@@ -2062,7 +2058,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                   STATS_DISPLAY="no"
               fi
 
-              show_summary "Confirm History -- $(basename "$CURRENT_WALLET")" \
+              show_summary "Confirm History: $(basename "$CURRENT_WALLET")" \
                 "Role filter|all|${ROLE_DISPLAY}" \
                 "Max entries|all|${LIMIT_DISPLAY}" \
                 "Show statistics|no|${STATS_DISPLAY}" || continue
@@ -2331,7 +2327,7 @@ for item in json.load(sys.stdin):
                       12 64 --defaultno 3>&1 1>&2 2>&3; then
 
                       prompt_and_store_password "$DATA_DIR/wallets/$WNAME" || \
-                          whiptail --title " Password " --msgbox "Password not stored." 8 50
+                          whiptail --title " Wallet Password " --msgbox "Password not stored." 8 50
                       whiptail --title " Wallet Selected " --msgbox "Active wallet set to: $WNAME\n\nRestart the maker service for changes to take effect." 10 60
                   else
                       whiptail --title " Wallet Selected " --msgbox "Active wallet set to: $WNAME\n\nStored password cleared; you will be prompted\nfor the password on next use.\n\nRestart the maker service for changes to take effect." 12 60
@@ -2348,7 +2344,7 @@ for item in json.load(sys.stdin):
                               --yesno "Store this wallet's BIP39 passphrase in config.toml?\nThis lets the maker start without prompting.\nChoose No to be asked for the passphrase on each use." \
                               11 64 --defaultno 3>&1 1>&2 2>&3; then
                               prompt_and_store_bip39_passphrase || \
-                                  whiptail --title " Passphrase " --msgbox "Passphrase not stored." 8 50
+                                  whiptail --title " BIP39 Passphrase " --msgbox "Passphrase not stored." 8 50
                           fi
                       fi
                   fi
@@ -2602,7 +2598,7 @@ for item in json.load(sys.stdin):
                             # Password failure - "Too many attempts" msgbox already shown
                             :
                         elif [ "$BONDS_RC" -ne 0 ]; then
-                            whiptail --title " Fidelity Bonds -- Error " --msgbox \
+                            whiptail --title " Fidelity Bonds: Error " --msgbox \
                                 "Failed to list Fidelity Bonds.\n\n${BONDS_OUT:-(no output)}" \
                                 20 76
                         elif printf '%s' "$BONDS_OUT" | grep -qi "No Fidelity Bonds"; then
@@ -3055,7 +3051,7 @@ except (json.JSONDecodeError, AttributeError):
             "STABLE"  "Latest stable release (v${LATEST_STABLE})" \
             "DEV"     "Latest main commit (${LATEST_MAIN})" \
             "VERSION" "Install a specific version" \
-            "BACK"    "Return to main menu" 3>&1 1>&2 2>&3) || break
+            "BACK"    "Back to Main Menu" 3>&1 1>&2 2>&3) || break
         TARGET_LABEL=""
         case $UCHOICE in
           STABLE)
@@ -3162,6 +3158,7 @@ except (json.JSONDecodeError, AttributeError):
                 TRUSTED_INSTALLER="$DATA_DIR/install.sh"
                 if [ -f "$TRUSTED_INSTALLER" ]; then
                     echo "Running trusted installer copy..."
+                    # shellcheck disable=SC2086 # UPDATE_ARGS is an intentional word-split argument list ("--dev" / "--version X")
                     bash "$TRUSTED_INSTALLER" --update $UPDATE_ARGS -y
                     UPDATE_RC=$?
                 else
@@ -3170,6 +3167,7 @@ except (json.JSONDecodeError, AttributeError):
                     echo "No trusted installer copy found; downloading installer..."
                     INSTALL_SCRIPT=$(mktemp)
                     curl -sSL "https://raw.githubusercontent.com/joinmarket-ng/joinmarket-ng/main/install.sh" -o "$INSTALL_SCRIPT"
+                    # shellcheck disable=SC2086 # UPDATE_ARGS is an intentional word-split argument list ("--dev" / "--version X")
                     bash "$INSTALL_SCRIPT" --update $UPDATE_ARGS -y
                     UPDATE_RC=$?
                     rm -f "$INSTALL_SCRIPT"

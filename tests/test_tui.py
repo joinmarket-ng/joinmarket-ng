@@ -285,9 +285,9 @@ def test_tui_history_is_offline_and_refresh_syncs() -> None:
 
 
 def test_tui_script_has_stop_maker_helper() -> None:
-    """The script must include the stop_maker helper for standalone mode."""
+    """The script must include the stop_maker_local helper for standalone mode."""
     content = SCRIPT_PATH.read_text()
-    assert "stop_maker()" in content
+    assert "stop_maker_local()" in content
 
 
 def test_tui_script_has_display_send_status() -> None:
@@ -2155,7 +2155,7 @@ def test_tui_script_sel_password_not_stored_msgbox() -> None:
     content = SCRIPT_PATH.read_text()
     sel_block = content.split("          SEL)\n", 1)[1].split("\n          ;;", 1)[0]
 
-    assert 'whiptail --title " Password "' in sel_block, (
+    assert 'whiptail --title " Wallet Password "' in sel_block, (
         "SEL must use whiptail msgbox for password feedback"
     )
     assert 'echo "Password not stored"' not in sel_block, (
