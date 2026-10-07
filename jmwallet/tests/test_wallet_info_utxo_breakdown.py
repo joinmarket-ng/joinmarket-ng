@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -401,7 +401,7 @@ def test_show_utxos_headers_colored_on_tty(categorized_wallet):
             assert "Spendable Balance by Mixdepth:" in result.stdout
 
 
-@pytest.mark.parametrize("mixdepth_count", [3, 7])
+@pytest.mark.parametrize("mixdepth_count", [1, 3, 5, 7, 10])
 def test_basic_view_mixdepth_rows_follow_wallet_mixdepth_count(
     categorized_wallet, mixdepth_count: int
 ):
@@ -413,8 +413,19 @@ def test_basic_view_mixdepth_rows_follow_wallet_mixdepth_count(
     missing mixdepths (count above 5), while the total in the same output
     covered the real count.
     """
-    mock_wallet, _ = categorized_wallet
+    mock_wallet, utxos = categorized_wallet
     mock_wallet.mixdepth_count = mixdepth_count
+    last_md = mixdepth_count - 1
+    for name in ("deposit", "cj_out"):
+        utxos[name].mixdepth = last_md
+    mock_wallet.utxo_cache = {0: [utxos["fb"]]}
+    mock_wallet.utxo_cache.setdefault(last_md, []).extend([utxos["deposit"], utxos["cj_out"]])
+    mock_wallet.get_balance.side_effect = lambda md, **kwargs: sum(
+        u.value
+        for u in mock_wallet.utxo_cache.get(md, [])
+        if not u.frozen and not u.is_fidelity_bond
+    )
+    mock_wallet.get_total_balance.return_value = utxos["cj_out"].value
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mnemonic_file = Path(tmpdir) / "test.mnemonic"
@@ -439,3 +450,17 @@ def test_basic_view_mixdepth_rows_follow_wallet_mixdepth_count(
             for md in range(mixdepth_count):
                 assert f"Mixdepth {md}:" in result.stdout
             assert f"Mixdepth {mixdepth_count}:" not in result.stdout
+            assert mock_wallet.get_balance.await_args_list == [
+                call(md, include_fidelity_bonds=False) for md in range(mixdepth_count)
+            ]
+            rows = [line for line in result.stdout.splitlines() if line.startswith("  Mixdepth ")]
+            assert len(rows) == mixdepth_count
+            assert f"Mixdepth {last_md}: 27,350 sats (9,812 frozen" in rows[-1]
+            for row in rows[:-1]:
+                assert row.endswith("0 sats") or row.endswith("0 sats (44,866 Fidelity Bonds)")
+            total_row = next(
+                line
+                for line in result.stdout.splitlines()
+                if line.startswith("Total Wallet Balance:")
+            )
+            assert total_row.endswith("82,028 sats")  # Spendable + frozen + fidelity bond.
