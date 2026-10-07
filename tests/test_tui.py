@@ -571,6 +571,9 @@ def test_tui_script_update_warns_running_maker() -> None:
     assert "MAKER_STATUS" in content
     # Check the warning mentions maker being running
     assert "Maker Bot is currently running" in content
+    # The warning must default to "No" so pressing Enter does not
+    # start an update while the maker is running.
+    assert '--title " Warning " --defaultno --yesno' in content
 
 
 def test_tui_script_update_shows_current_version_with_commit() -> None:
@@ -635,6 +638,9 @@ def test_tui_script_update_confirm_shows_current_and_target() -> None:
     assert "Target:" in confirm_block
     assert "${CURRENT_LABEL}" in confirm_block
     assert "${TARGET_LABEL}" in confirm_block
+    # The final confirmation must default to "No" so pressing Enter
+    # does not start the update unintentionally.
+    assert "--defaultno" in confirm_block
 
 
 def test_tui_script_update_requires_unsigned_dev_acknowledgement() -> None:

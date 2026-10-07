@@ -3119,14 +3119,14 @@ except (json.JSONDecodeError, AttributeError):
 
         # Warn if maker bot is running
         if [ "$MAKER_STATUS" = "RUNNING" ]; then
-            if ! whiptail --title " Warning " --yesno \
+            if ! whiptail --title " Warning " --defaultno --yesno \
                 "The Maker Bot is currently running.\n\nIt will be stopped during the update and must be restarted manually afterwards.\n\nContinue?" 12 60 3>&1 1>&2 2>&3; then
                 continue
             fi
         fi
 
         # Confirm dialog -- show both current and target (#451 point 4).
-        if ! whiptail --title " Confirm Update " --yesno \
+        if ! whiptail --title " Confirm Update " --defaultno --yesno \
             "Update JoinMarket-NG?\n\nCurrent:  ${CURRENT_LABEL}\nTarget:   ${TARGET_LABEL}\n\nThe TUI will close during the update.\nRestart it afterwards with: jm-ng" \
             14 64 3>&1 1>&2 2>&3; then
             # Cancel returns to the update menu (#451 point 6).
