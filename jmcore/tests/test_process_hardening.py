@@ -92,3 +92,18 @@ class TestHardenCurrentProcess:
         monkeypatch.delenv("JOINMARKET_DISABLE_PROCESS_HARDENING", raising=False)
         # Must not raise.
         process_hardening.harden_current_process()
+
+    def test_success_is_silent(self, monkeypatch):
+        """Entry points run this before logging is configured; success must not log."""
+        from loguru import logger
+
+        monkeypatch.setattr(process_hardening, "_disable_core_dumps", lambda: True)
+        monkeypatch.setattr(process_hardening, "_set_undumpable_linux", lambda: True)
+        monkeypatch.delenv("JOINMARKET_DISABLE_PROCESS_HARDENING", raising=False)
+        messages: list[str] = []
+        sink_id = logger.add(messages.append, level="TRACE")
+        try:
+            process_hardening.harden_current_process()
+        finally:
+            logger.remove(sink_id)
+        assert messages == []

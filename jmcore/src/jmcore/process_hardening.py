@@ -88,10 +88,8 @@ def harden_current_process() -> None:
     if os.environ.get("JOINMARKET_DISABLE_PROCESS_HARDENING") == "1":
         logger.warning("process hardening disabled via JOINMARKET_DISABLE_PROCESS_HARDENING=1")
         return
-    rlim_ok = _disable_core_dumps()
-    prctl_ok = _set_undumpable_linux()
-    logger.debug(
-        "process hardening: RLIMIT_CORE={} PR_SET_DUMPABLE={}",
-        "off" if rlim_ok else "skip",
-        "off" if prctl_ok else "skip",
-    )
+    # Entry points call this before logging is configured, so a success
+    # summary would reach stderr through loguru's default DEBUG sink on every
+    # CLI invocation. Only the failure paths above log.
+    _disable_core_dumps()
+    _set_undumpable_linux()
