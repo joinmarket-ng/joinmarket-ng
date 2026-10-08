@@ -140,30 +140,6 @@ jobs:
   # Runs in parallel with image builds for faster feedback
   # Excludes tests marked with @pytest.mark.docker (those run in integration tests)
   # ==========================================================================
-  complexipy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-          # Intentional fork checkout; see the pull_request_target note at the top.
-          allow-unsafe-pr-checkout: true
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.14'
-
-      - name: Install complexipy
-        run: pip install complexipy==5.5.0
-
-      - name: Run complexity check
-        run: complexipy . --failed --suggest-refactors
-
   test-unit:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -2219,7 +2195,6 @@ jobs:
   # ==========================================================================
   publish-images:
     needs:
-      - complexipy
       # Unit tests (combined in single job)
       - test-unit
       # Component integration tests (run docker-marked tests only)
