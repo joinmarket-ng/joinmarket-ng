@@ -1393,6 +1393,17 @@ class TestGetAddressType:
 class TestHashFunctions:
     """Tests for hash160, hash256."""
 
+    @pytest.mark.parametrize(
+        ("data", "expected"),
+        [
+            (b"", "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb"),
+            (b"hello", "b6a9c8c230722b7c748331a8b450f05566dc7d0f"),
+            (bytes(range(256)), "07a536d93e0b9a779874e1287a226b8230cda46e"),
+        ],
+    )
+    def test_hash160_vectors(self, data: bytes, expected: str) -> None:
+        assert hash160(data).hex() == expected
+
     def test_hash160_length(self) -> None:
         result = hash160(b"test")
         assert len(result) == 20

@@ -23,6 +23,7 @@ from typing import Any
 
 import base58
 import bech32 as bech32_lib
+from bitcointx.core import Hash160
 from pydantic import validate_call
 from pydantic.dataclasses import dataclass
 
@@ -270,13 +271,15 @@ def hash160(data: bytes) -> bytes:
     """
     RIPEMD160(SHA256(data)) - Used for Bitcoin addresses.
 
+    Uses bitcointx's fallback when OpenSSL does not provide RIPEMD160.
+
     Args:
         data: Input data to hash
 
     Returns:
         20-byte hash
     """
-    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
+    return Hash160(data)
 
 
 def hash256(data: bytes) -> bytes:

@@ -10,6 +10,7 @@ import hmac
 from typing import cast
 
 from bitcointx.core.key import CKey, CPubKey
+from jmcore.bitcoin import hash160
 from jmcore.constants import SECP256K1_N
 from jmcore.crypto import base58check_encode as _base58check_encode
 from jmcore.crypto import mnemonic_to_seed
@@ -64,10 +65,7 @@ class HDKey:
     @property
     def fingerprint(self) -> bytes:
         """Get the fingerprint of this key (first 4 bytes of hash160 of public key)."""
-        pubkey_bytes = bytes(self._public_key)
-        sha256_hash = hashlib.sha256(pubkey_bytes).digest()
-        ripemd160_hash = hashlib.new("ripemd160", sha256_hash).digest()
-        return ripemd160_hash[:4]
+        return hash160(bytes(self._public_key))[:4]
 
     @classmethod
     def from_seed(cls, seed: bytes) -> HDKey:

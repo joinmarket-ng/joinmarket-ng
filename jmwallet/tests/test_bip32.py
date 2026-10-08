@@ -172,6 +172,16 @@ def test_fingerprint(test_mnemonic):
     assert child.parent_fingerprint == master_key.fingerprint
 
 
+def test_fingerprint_bip32_vector() -> None:
+    """BIP32 test vector 1 fixes the master and first hardened child fingerprints."""
+    master_key = HDKey.from_seed(bytes(range(16)))
+    child = master_key.derive("m/0'")
+
+    assert master_key.fingerprint.hex() == "3442193e"
+    assert child.fingerprint.hex() == "5c1bd648"
+    assert child.parent_fingerprint == master_key.fingerprint
+
+
 def test_child_number_tracking(test_mnemonic):
     """Test that child number is tracked correctly through derivation."""
     seed = mnemonic_to_seed(test_mnemonic)

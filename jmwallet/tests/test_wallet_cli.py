@@ -7,11 +7,14 @@ from __future__ import annotations
 import csv
 import io
 import os
+import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from textwrap import dedent
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
@@ -335,6 +338,97 @@ class TestExtendedInfoColorGating:
             with patch("sys.stdout.isatty", return_value=True):
                 out = wallet_cli._colorize("Mixdepth 0", wallet_cli._ANSI_BOLD_CYAN)
         assert out == "Mixdepth 0"
+
+
+@pytest.mark.parametrize(
+    ("passphrase", "fingerprint", "address"),
+    [
+        ("", "5525def6", "bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk"),
+        ("test-extension", "9ec71ec9", "bcrt1qt88uz6q090x4cp43q9w09lpz7882amdt3t7evj"),
+    ],
+)
+def test_info_without_hashlib_ripemd160(
+    tmp_path: Path, passphrase: str, fingerprint: str, address: str
+) -> None:
+    """Cold imports must select the HASH160 fallback before real CLI key derivation."""
+    script = dedent(
+        """\
+        import hashlib
+        import sys
+        from pathlib import Path
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        original_new = hashlib.new
+
+        def without_ripemd160(name, *args, **kwargs):
+            if name.lower() == "ripemd160":
+                raise ValueError("unsupported hash type ripemd160")
+            return original_new(name, *args, **kwargs)
+
+        # bitcointx probes RIPEMD160 once at import time, so block it first.
+        hashlib.new = without_ripemd160
+
+        from jmcore.bitcoin import hash160
+        from jmwallet.wallet.bip32 import HDKey
+        from test_wallet_cli import _patch_wallet_sync_noop, _stub_backend_class
+        from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+        from jmwallet.cli import app
+        from typer.testing import CliRunner
+
+        assert hash160(b"").hex() == "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb"
+        master = HDKey.from_seed(bytes(range(16)))
+        child = master.derive("m/0'")
+        assert master.fingerprint.hex() == "3442193e"
+        assert child.fingerprint.hex() == "5c1bd648"
+        assert child.parent_fingerprint == master.fingerprint
+        assert child.get_xpub("testnet") == (
+            "tpubD8eQVK4Kdxg3gHrF62jGP7dKVCoYiEB8dFSpuTawkL5YxTus5j5pf83vaKnii"
+            "4bc6v2NVEy81P2gYrJczYne3QNNwMTS53p5uzDyHvnw2jm"
+        )
+
+        data_dir = Path(sys.argv[1])
+        mnemonic_file = data_dir / "recovered.mnemonic"
+        mnemonic_file.write_text("abandon " * 11 + "about")
+        backend = MagicMock(spec=DescriptorWalletBackend)
+        backend.get_utxos = AsyncMock(return_value=[])
+        backend.close = AsyncMock()
+        backend.address_has_history = AsyncMock(return_value=False)
+        backend.supports_watch_address = False
+        backend.supports_descriptor_scan = False
+
+        with (
+            patch(
+                "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+                _stub_backend_class(backend),
+            ),
+            _patch_wallet_sync_noop(),
+        ):
+            result = CliRunner().invoke(
+                app,
+                [
+                    "info", "--mnemonic-file", str(mnemonic_file),
+                    "--prompt-bip39-passphrase", "--network", "regtest",
+                    "--backend", "descriptor_wallet", "--extended", "--gap", "1",
+                    "--data-dir", str(data_dir),
+                    "--config-file", str(data_dir / "config.toml"),
+                ],
+                input=sys.argv[2] + "\\ny\\n",
+            )
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert "Wallet fingerprint: " + sys.argv[3] in result.stdout, result.stdout
+        assert sys.argv[4] in result.stdout, result.stdout
+        assert "m/84'/1'/0'/0/0" in result.stdout, result.stdout
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), passphrase, fingerprint, address],
+        cwd=Path(__file__).parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_bip39_import_with_passphrase_zpub_and_address():

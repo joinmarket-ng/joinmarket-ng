@@ -6,10 +6,10 @@ records.
 
 ## Preserve What Is Not In The Seed
 
-Keep the mnemonic and its exact BIP39 passphrase. The passphrase selects a
-different wallet and is not the same as the password that encrypts a local
-wallet file. Record the file-encryption password if you still need to open that
-file, but it does not derive keys.
+Keep the mnemonic and its exact BIP39 passphrase (called the mnemonic extension
+in legacy JoinMarket). The passphrase selects a different wallet and is not the
+same as the password that encrypts a local wallet file. Record the file-encryption
+password if you still need to open that file, but it does not derive keys.
 
 The seed does not restore local labels, frozen UTXOs, address reservations, or
 the original CoinJoin and send records. Preserve the original data directory and wallet files
