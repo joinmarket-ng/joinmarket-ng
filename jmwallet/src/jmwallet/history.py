@@ -2157,6 +2157,8 @@ def get_used_addresses(
 def get_address_history_types(
     data_dir: Path | None = None,
     wallet_fingerprint: str | None = None,
+    *,
+    preserve_flagged_roles: bool = False,
 ) -> dict[str, str]:
     """
     Get the history type for each address used in CoinJoin history.
@@ -2165,6 +2167,10 @@ def get_address_history_types(
     - "cj_out": CoinJoin output address (destination) - from successful CJ
     - "change": Change address - from successful CJ
     - "flagged": Address was shared but ALL transactions using it failed
+
+    Display callers can preserve unsuccessful addresses' intended roles as
+    "flagged_cj_out" / "flagged_change". These are transient classifications,
+    not evidence of confirmation or transaction provenance.
 
     Plain wallet spends (``role="send"``) are intentionally excluded: their
     destination and change addresses are ordinary deposits/change, not CoinJoin
@@ -2178,6 +2184,8 @@ def get_address_history_types(
         data_dir: Optional data directory (defaults to get_default_data_dir())
         wallet_fingerprint: If provided, only consider entries belonging to
             the given wallet (issue #473).
+        preserve_flagged_roles: Preserve destination/change roles for display,
+            without treating unsuccessful entries as successful.
 
     Returns:
         Dict mapping address -> type string
@@ -2205,7 +2213,9 @@ def get_address_history_types(
             else:
                 # Transaction failed - only mark as flagged if not already used successfully
                 if entry.destination_address not in address_types:
-                    address_types[entry.destination_address] = "flagged"
+                    address_types[entry.destination_address] = (
+                        "flagged_cj_out" if preserve_flagged_roles else "flagged"
+                    )
 
         if entry.change_address:
             # Change address
@@ -2215,7 +2225,9 @@ def get_address_history_types(
             else:
                 # Transaction failed - only mark as flagged if not already used successfully
                 if entry.change_address not in address_types:
-                    address_types[entry.change_address] = "flagged"
+                    address_types[entry.change_address] = (
+                        "flagged_change" if preserve_flagged_roles else "flagged"
+                    )
 
     return address_types
 

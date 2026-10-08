@@ -3058,6 +3058,107 @@ async def test_info_does_not_issue_addresses_or_change_reservations(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("destination_branch", [0, 1])
+@pytest.mark.parametrize("reused", [False, True])
+async def test_info_preserves_pending_taker_output_roles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], destination_branch: int, reused: bool
+) -> None:
+    """Taker output roles and reuse warnings survive the first confirmation."""
+    from dataclasses import replace
+
+    from jmwallet.backends.base import Transaction
+    from jmwallet.cli.wallet import _show_wallet_info
+    from jmwallet.history import (
+        append_history_entry,
+        create_taker_history_entry,
+        read_history,
+        update_transaction_confirmation,
+    )
+    from jmwallet.wallet.models import UTXOInfo
+    from jmwallet.wallet.service import WalletService
+
+    mnemonic = "abandon " * 11 + "about"
+    backend = _make_descriptor_info_mock_backend()
+    backend.can_get_confirmations_by_txid.return_value = True
+    settings = ResolvedBackendSettings(
+        network="regtest",
+        bitcoin_network="regtest",
+        backend_type="descriptor_wallet",
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        neutrino_url="",
+        neutrino_add_peers=[],
+        data_dir=tmp_path,
+    )
+    wallet = WalletService(mnemonic, backend, network="regtest", data_dir=tmp_path)
+    destination = wallet.get_address(1, destination_branch, 0)
+    change = wallet.get_address(0, 1, 0)
+    txid = "ab" * 32
+    backend.get_transaction = AsyncMock(
+        return_value=Transaction(txid=txid, raw="00", confirmations=0)
+    )
+    append_history_entry(
+        create_taker_history_entry(
+            maker_nicks=["J5maker"],
+            cj_amount=100_000,
+            total_maker_fees=100,
+            mining_fee=200,
+            destination=destination,
+            change_address=change,
+            source_mixdepth=0,
+            selected_utxos=[("cd" * 32, 0)],
+            txid=txid,
+            failure_reason="Pending confirmation",
+            network="regtest",
+            wallet_fingerprint=wallet.wallet_fingerprint,
+        ),
+        tmp_path,
+    )
+    wallet.utxo_cache = {md: [] for md in range(wallet.mixdepth_count)}
+    for md, address, value in ((1, destination, 100_000), (0, change, 40_000)):
+        wallet.utxo_cache[md] = [
+            UTXOInfo(
+                txid=txid,
+                vout=md,
+                value=value,
+                address=address,
+                confirmations=0,
+                scriptpubkey="0014" + "11" * 20,
+                path=f"{wallet.root_path}/{md}'/{destination_branch if md == 1 else 1}/0",
+                mixdepth=md,
+            )
+        ]
+    if reused:
+        wallet.utxo_cache[1].append(replace(wallet.utxo_cache[1][0], vout=2))
+
+    with (
+        patch(
+            "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+            _stub_backend_class(backend),
+        ),
+        patch("jmwallet.wallet.service.WalletService", return_value=wallet),
+        patch.object(wallet, "sync_with_registered_bonds", AsyncMock()),
+    ):
+        for confirmations in (0, 1):
+            if confirmations:
+                assert update_transaction_confirmation(
+                    txid, confirmations, tmp_path, wallet_fingerprint=wallet.wallet_fingerprint
+                )
+                for utxos in wallet.utxo_cache.values():
+                    for utxo in utxos:
+                        utxo.confirmations = confirmations
+            await _show_wallet_info(mnemonic, settings, extended=True, reconstruct_history=False)
+            lines = capsys.readouterr().out.splitlines()
+            destination_line = next(line for line in lines if destination in line)
+            change_line = next(line for line in lines if change in line)
+            assert "cj-out" in destination_line
+            assert ("(reused)" in destination_line) is reused
+            assert "cj-change" in change_line
+            assert read_history(tmp_path)[0].success is bool(confirmations)
+
+
+@pytest.mark.asyncio
 async def test_info_keeps_old_mempool_row_pending_and_repairs_later_confirmation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

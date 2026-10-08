@@ -1160,7 +1160,9 @@ async def _show_wallet_info(
         # Get history info for address status (scoped to active wallet, #473)
         used_addresses = get_used_addresses(data_dir, wallet_fingerprint=wallet.wallet_fingerprint)
         history_addresses = get_address_history_types(
-            data_dir, wallet_fingerprint=wallet.wallet_fingerprint
+            data_dir,
+            wallet_fingerprint=wallet.wallet_fingerprint,
+            preserve_flagged_roles=True,
         )
 
         if extended:

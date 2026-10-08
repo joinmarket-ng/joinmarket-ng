@@ -17,6 +17,7 @@ import pytest
 from jmwallet.history import (
     append_history_entry,
     create_taker_history_entry,
+    get_address_history_types,
     get_used_addresses,
     read_history,
 )
@@ -121,9 +122,11 @@ async def test_history_recording_mechanism(bitcoin_core_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.slow
+@pytest.mark.parametrize("destination_is_internal", [False, True])
 async def test_coinjoin_creates_history_entry(
     bitcoin_core_backend,
     fresh_docker_makers,
+    destination_is_internal: bool,
 ):
     """
     Test that a complete CoinJoin properly records history.
@@ -141,10 +144,14 @@ async def test_coinjoin_creates_history_entry(
     from jmcore.models import NetworkType
     from taker.config import TakerConfig
     from taker.taker import Taker
-    from tests.e2e.rpc_utils import mine_blocks
+    from tests.e2e.rpc_utils import mine_blocks, rpc_call
 
     # Check if Docker makers are running
-    from tests.e2e.docker_utils import docker_inspect_running, get_container_name
+    from tests.e2e.docker_utils import (
+        docker_inspect_running,
+        get_container_name,
+        run_compose_cmd,
+    )
 
     maker1_container = get_container_name("maker1")
     if not docker_inspect_running(maker1_container):
@@ -200,13 +207,23 @@ async def test_coinjoin_creates_history_entry(
 
         # Create taker
         taker = Taker(taker_wallet, bitcoin_core_backend, config)
+        miner_was_running = docker_inspect_running(get_container_name("miner"))
 
         try:
+            # CI runs an auto-miner. Stop it before broadcast so pending output
+            # assertions cannot race a block, and restore its original state below.
+            if miner_was_running:
+                run_compose_cmd(["stop", "miner"])
+
             # Start taker
             await taker.start()
 
             # Get destination address
-            dest_address = taker_wallet.get_receive_address(1, 0)
+            dest_address = (
+                "INTERNAL"
+                if destination_is_internal
+                else taker_wallet.get_receive_address(1, 0)
+            )
 
             # Perform CoinJoin. do_coinjoin fetches the orderbook internally;
             # a pre-check fetch is omitted to avoid triggering the maker's
@@ -244,8 +261,57 @@ async def test_coinjoin_creates_history_entry(
 
             print(f"CoinJoin successful! txid: {txid}")
 
+            async def assert_output_statuses(confirmed: bool) -> None:
+                await taker_wallet.sync_all()
+                entry = next(
+                    e for e in read_history(data_dir=data_dir) if e.txid == txid
+                )
+                assert entry.success is confirmed
+                assert entry.destination_address
+                assert entry.change_address
+                history_types = get_address_history_types(
+                    data_dir,
+                    wallet_fingerprint=taker_wallet.wallet_fingerprint,
+                    preserve_flagged_roles=True,
+                )
+                used_addresses = get_used_addresses(
+                    data_dir, wallet_fingerprint=taker_wallet.wallet_fingerprint
+                )
+                for address, expected_status in (
+                    (entry.destination_address, "cj-out"),
+                    (entry.change_address, "cj-change"),
+                ):
+                    mixdepth, branch, _index = taker_wallet.address_cache[address]
+                    if address == entry.destination_address:
+                        assert branch == int(destination_is_internal)
+                    infos = taker_wallet.get_address_info_for_mixdepth(
+                        mixdepth,
+                        branch,
+                        used_addresses=used_addresses,
+                        history_addresses=history_types,
+                    )
+                    info = next(info for info in infos if info.address == address)
+                    assert info.balance > 0
+                    assert (
+                        info.base_status if info.status == "reused" else info.status
+                    ) == expected_status
+                    matching_utxos = [utxo for utxo in info.utxos if utxo.txid == txid]
+                    assert matching_utxos
+                    assert all(
+                        utxo.confirmations > 0 if confirmed else utxo.confirmations == 0
+                        for utxo in matching_utxos
+                    )
+                    assert (
+                        taker_wallet.get_utxo_label_from_wallet(address)
+                        == expected_status
+                    )
+
+            assert await rpc_call("getmempoolentry", [txid])
+            await assert_output_statuses(confirmed=False)
+
             # Mine a block to confirm
-            await mine_blocks(1, dest_address)
+            # Keep the mining reward off the destination address under test.
+            await mine_blocks(1, addr)
 
             # Wait for history to be written
             await asyncio.sleep(2)
@@ -286,6 +352,7 @@ async def test_coinjoin_creates_history_entry(
             assert cj_entry.success is True, (
                 "CoinJoin should be marked successful after confirmation"
             )
+            await assert_output_statuses(confirmed=True)
 
             print("✓ Complete CoinJoin history recording verified:")
             print(f"  - TXID: {cj_entry.txid}")
@@ -299,8 +366,12 @@ async def test_coinjoin_creates_history_entry(
             print(f"  - Tracked addresses: {len(used)}")
 
         finally:
-            await taker.stop()
-            await taker_wallet.close()
+            try:
+                await taker.stop()
+                await taker_wallet.close()
+            finally:
+                if miner_was_running:
+                    run_compose_cmd(["start", "miner"])
 
 
 if __name__ == "__main__":

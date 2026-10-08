@@ -2984,6 +2984,26 @@ class TestProtocolCoinjoinOutputOutpoints:
             wallet_fingerprint="a1b2c3d4",
         )
 
+    def test_pending_output_roles_do_not_grant_protocol_provenance(
+        self, temp_data_dir: Path
+    ) -> None:
+        entry = self._entry(destination_vout=2)
+        entry.success = False
+        append_history_entry(entry, temp_data_dir)
+
+        assert get_address_history_types(temp_data_dir, preserve_flagged_roles=True) == {
+            entry.destination_address: "flagged_cj_out"
+        }
+        assert (
+            get_protocol_coinjoin_output_outpoints(
+                [self._utxo(2)],
+                network="regtest",
+                data_dir=temp_data_dir,
+                wallet_fingerprint="a1b2c3d4",
+            )
+            == set()
+        )
+
     def test_destination_vout_disambiguates_duplicate_wallet_outputs(
         self, temp_data_dir: Path
     ) -> None:
@@ -3521,6 +3541,77 @@ class TestAddressHistoryTypesAfterConfirmation:
     was created with success=False and get_address_history_types only returns
     'cj_out' for entries with success=True.
     """
+
+    @pytest.mark.parametrize("role", ["maker", "taker"])
+    @pytest.mark.parametrize(
+        "failure_reason", ["Awaiting transaction", "Pending confirmation", "Rejected", "Abandoned"]
+    )
+    def test_flagged_roles_are_opt_in(
+        self, temp_data_dir: Path, role: HistoryRole, failure_reason: str
+    ) -> None:
+        entry = TransactionHistoryEntry(
+            timestamp="2026-01-01T00:00:00",
+            role=role,
+            success=False,
+            failure_reason=failure_reason,
+            destination_address="bcrt1qdestination",
+            change_address="bcrt1qchange",
+            wallet_fingerprint="a1b2c3d4",
+            network="regtest",
+        )
+        append_history_entry(entry, temp_data_dir)
+
+        assert get_address_history_types(temp_data_dir) == {
+            entry.destination_address: "flagged",
+            entry.change_address: "flagged",
+        }
+        assert get_address_history_types(
+            temp_data_dir, wallet_fingerprint="a1b2c3d4", preserve_flagged_roles=True
+        ) == {entry.destination_address: "flagged_cj_out", entry.change_address: "flagged_change"}
+        assert (
+            get_address_history_types(
+                temp_data_dir, wallet_fingerprint="foreign", preserve_flagged_roles=True
+            )
+            == {}
+        )
+        assert read_history(temp_data_dir)[0].success is False
+
+    @pytest.mark.parametrize("confirmed_is_newer", [False, True])
+    def test_confirmed_roles_override_flagged_roles(
+        self, temp_data_dir: Path, confirmed_is_newer: bool
+    ) -> None:
+        for success in (False, True):
+            append_history_entry(
+                TransactionHistoryEntry(
+                    timestamp=f"2026-01-0{2 if success == confirmed_is_newer else 1}T00:00:00",
+                    success=success,
+                    destination_address="bcrt1qdestination",
+                    change_address="bcrt1qchange",
+                    network="regtest",
+                ),
+                temp_data_dir,
+            )
+        assert get_address_history_types(temp_data_dir, preserve_flagged_roles=True) == {
+            "bcrt1qdestination": "cj_out",
+            "bcrt1qchange": "change",
+        }
+
+    @pytest.mark.parametrize("role", ["send", "deposit"])
+    def test_role_preservation_excludes_non_coinjoin_history(
+        self, temp_data_dir: Path, role: HistoryRole
+    ) -> None:
+        append_history_entry(
+            TransactionHistoryEntry(
+                timestamp="2026-01-01T00:00:00",
+                role=role,
+                success=False,
+                destination_address="bcrt1qdestination",
+                change_address="bcrt1qchange",
+                network="regtest",
+            ),
+            temp_data_dir,
+        )
+        assert get_address_history_types(temp_data_dir, preserve_flagged_roles=True) == {}
 
     def test_maker_addresses_after_confirmation(self, temp_data_dir: Path) -> None:
         """Test that get_address_history_types returns correct types after confirmation.

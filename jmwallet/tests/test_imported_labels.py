@@ -19,7 +19,12 @@ import pytest
 from jmcore.bitcoin import TxInput, TxOutput, serialize_transaction
 
 from jmwallet.backends.base import Transaction
-from jmwallet.history import append_history_entry, create_maker_history_entry
+from jmwallet.history import (
+    append_history_entry,
+    create_maker_history_entry,
+    create_taker_history_entry,
+    update_transaction_confirmation,
+)
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.service import WalletService
 
@@ -387,6 +392,56 @@ class TestReconstructImportedLabels:
         assert not ws.metadata_store.is_address_used(pending_addr)
         assert not ws.metadata_store.is_address_used("bcrt1qexternal")
         assert not ws.metadata_store.is_address_used("bcrt1qforeignchange")
+
+    @pytest.mark.asyncio
+    async def test_pending_taker_display_does_not_persist_confirmed_origins(
+        self, tmp_path: Path, test_mnemonic: str, test_network: str
+    ) -> None:
+        backend = _make_backend({})
+        ws = _wallet(backend, tmp_path, test_mnemonic, test_network)
+        destination = ws.get_address(1, 1, 0)
+        change = ws.get_address(0, 1, 0)
+        txid = "ab" * 32
+        append_history_entry(
+            create_taker_history_entry(
+                maker_nicks=["J5maker"],
+                cj_amount=CJ_AMOUNT,
+                total_maker_fees=100,
+                mining_fee=200,
+                destination=destination,
+                change_address=change,
+                source_mixdepth=0,
+                selected_utxos=[("cd" * 32, 0)],
+                txid=txid,
+                failure_reason="Pending confirmation",
+                network=test_network,
+                wallet_fingerprint=ws.wallet_fingerprint,
+            ),
+            tmp_path,
+        )
+        destination_utxo = _utxo(txid=txid, value=CJ_AMOUNT, address=destination, mixdepth=1)
+        change_utxo = _utxo(txid=txid, value=7_001, address=change)
+        destination_utxo.confirmations = change_utxo.confirmations = 0
+        ws.utxo_cache = {0: [change_utxo], 1: [destination_utxo]}
+
+        assert ws.get_utxo_label_from_wallet(destination) == "cj-out"
+        assert ws.get_utxo_label_from_wallet(change) == "cj-change"
+        assert await ws.reconstruct_imported_labels() == 0
+        assert ws.metadata_store.get_address_origins(destination) == set()
+        assert ws.metadata_store.get_address_origins(change) == set()
+        assert not ws.metadata_store.is_address_used(destination)
+        assert not ws.metadata_store.is_address_used(change)
+        assert destination_utxo.coinjoin_output is False
+        assert change_utxo.coinjoin_output is False
+        backend.get_transaction.assert_not_awaited()
+
+        assert update_transaction_confirmation(
+            txid, 1, tmp_path, wallet_fingerprint=ws.wallet_fingerprint
+        )
+        destination_utxo.confirmations = change_utxo.confirmations = 1
+        await ws.reconstruct_imported_labels()
+        assert ws.metadata_store.get_address_origins(destination) == {"cj_out"}
+        assert ws.metadata_store.get_address_origins(change) == {"cj_change"}
 
     @pytest.mark.asyncio
     async def test_skips_already_classified_addresses(

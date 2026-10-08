@@ -105,7 +105,9 @@ async def wallet_display(
     # fall through to the "non-cj-change" default.
     used_addresses = get_used_addresses(state.data_dir, wallet_fingerprint=ws.wallet_fingerprint)
     history_addresses = get_address_history_types(
-        state.data_dir, wallet_fingerprint=ws.wallet_fingerprint
+        state.data_dir,
+        wallet_fingerprint=ws.wallet_fingerprint,
+        preserve_flagged_roles=True,
     )
 
     accounts: list[WalletDisplayAccount] = []

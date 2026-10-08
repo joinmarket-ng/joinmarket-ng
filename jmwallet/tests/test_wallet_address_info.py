@@ -158,6 +158,31 @@ class TestAddressStatusDetermination:
         )
         assert status == "cj-change"
 
+    @pytest.mark.parametrize("is_external", [False, True])
+    @pytest.mark.parametrize("balance", [0, 100_000])
+    @pytest.mark.parametrize(
+        ("history_type", "funded_status"),
+        [("flagged_cj_out", "cj-out"), ("flagged_change", "cj-change")],
+    )
+    def test_unsuccessful_roles_ignore_address_branch(
+        self,
+        wallet: WalletService,
+        is_external: bool,
+        balance: int,
+        history_type: str,
+        funded_status: str,
+    ) -> None:
+        """Funded roles are explicit, but empty shared addresses remain flagged."""
+        address = wallet.get_address(0, 0 if is_external else 1, 0)
+        status = wallet._determine_address_status(
+            address=address,
+            balance=balance,
+            is_external=is_external,
+            used_addresses={address},
+            history_addresses={address: history_type},
+        )
+        assert status == (funded_status if balance else "flagged")
+
     def test_determine_status_reused_multiple_utxos(self, wallet):
         """An address holding more than one UTXO has been paid to more than
         once and must be flagged 'reused' (legacy wallet parity), taking

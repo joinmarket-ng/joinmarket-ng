@@ -251,7 +251,7 @@ class WalletDisplayMixin:
                     return "used-empty"  # CJ output that was spent
                 elif history_type == "change":
                     return "used-empty"  # Change that was spent
-                elif history_type == "flagged":
+                elif history_type in ("flagged", "flagged_cj_out", "flagged_change"):
                     return "flagged"  # Shared but tx failed
                 else:
                     return "used-empty"
@@ -286,9 +286,9 @@ class WalletDisplayMixin:
             The funded status ignoring address reuse
         """
         history_type = history_addresses.get(address)
-        if history_type == "cj_out":
+        if history_type in ("cj_out", "flagged_cj_out"):
             return "cj-out"
-        elif history_type == "change":
+        elif history_type in ("change", "flagged_change"):
             # Change output from a CoinJoin transaction we created.
             # NOTE: unlike "cj-out" (an equal-amount output which can
             # plausibly belong to any participant), "cj-change" is
@@ -339,7 +339,9 @@ class WalletDisplayMixin:
             from jmwallet.history import get_address_history_types
 
             history_types = get_address_history_types(
-                self.data_dir, wallet_fingerprint=self.wallet_fingerprint
+                self.data_dir,
+                wallet_fingerprint=self.wallet_fingerprint,
+                preserve_flagged_roles=True,
             )
 
         merged_history_types = {**onchain_types, **history_types}

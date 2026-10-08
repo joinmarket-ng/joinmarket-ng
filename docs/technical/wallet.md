@@ -272,6 +272,13 @@ are derived primarily from the per-wallet CoinJoin history file, which records
 the output and change addresses of every CoinJoin this wallet performed as
 maker or taker.
 
+Funded pending addresses retain their recorded destination/change roles: an
+equal-amount output is `cj-out` even before confirmation, including on the
+internal address branch used by takers. Actual CoinJoin change is `cj-change`.
+Unfunded addresses shared in an unsuccessful or pending CoinJoin remain `flagged`.
+These display labels do not mark a pending transaction successful or persist its
+confirmed origin metadata.
+
 A funded address additionally carries a `reused` privacy warning when it has
 been paid to more than once: either it currently holds more than one UTXO, or
 it holds a single UTXO that the forced-address-reuse defense auto-froze (funds

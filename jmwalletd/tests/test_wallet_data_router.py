@@ -80,6 +80,29 @@ class TestWalletDisplay:
 class TestWalletDisplayWithHistory:
     """Verify that the display endpoint passes history data for address classification."""
 
+    @patch("jmwalletd.routers.wallet_data.get_address_history_types", return_value={})
+    def test_display_preserves_unsuccessful_output_roles(
+        self, mock_get_history: MagicMock, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.mixdepth_count = 1
+        ws.get_balance = AsyncMock(return_value=0)
+        ws.get_available_balance = AsyncMock(return_value=0)
+        ws.get_address_info_for_mixdepth = Mock(return_value=[])
+
+        response = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/display", headers=_auth_headers(token)
+        )
+
+        assert response.status_code == 200
+        mock_get_history.assert_called_once_with(
+            state.data_dir,
+            wallet_fingerprint=ws.wallet_fingerprint,
+            preserve_flagged_roles=True,
+        )
+
     @patch("jmwalletd.routers.wallet_data.get_address_history_types")
     @patch("jmwalletd.routers.wallet_data.get_used_addresses")
     def test_passes_history_data_to_address_info(
