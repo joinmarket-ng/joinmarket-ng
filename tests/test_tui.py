@@ -139,6 +139,85 @@ def test_tui_script_has_environment_detection() -> None:
     assert "bonus.joinmarket-ng.sh" in content
 
 
+@pytest.mark.parametrize("raspiblitz", [False, True])
+@pytest.mark.parametrize("maker_running", [False, True])
+@pytest.mark.parametrize("dialog_status", [0, 1, 255])
+def test_tui_main_menu_arguments_and_cancellation(
+    tmp_path: Path, raspiblitz: bool, maker_running: bool, dialog_status: int
+) -> None:
+    """Both menu variants preserve arguments and reset items on each rendering."""
+    content = SCRIPT_PATH.read_text().split("# Main Loop\n", 1)[1]
+    menu = content.split("while true; do\n", 1)[1].split("  case $CHOICE in", 1)[0]
+    script = (
+        """
+        RASPIBLITZ="$1"
+        MAKER_RUNNING="$2"
+        DIALOG_STATUS="$3"
+        ARGS_DIR="$4"
+        pgrep() { [ "$MAKER_RUNNING" = 1 ]; }
+        check_stale_wallet() { WALLET_INFO='active wallet'; }
+        exit_jm_ng() { echo EXIT_CALLED; exit 0; }
+        whiptail() {
+            printf '%s\\0' "$@" > "$ARGS_DIR/menu-$attempt.args"
+            printf 'W' >&2
+            return "$DIALOG_STATUS"
+        }
+        for attempt in 1 2; do
+        """
+        + menu
+        + '\nprintf "CHOICE=%s STATUS=%s\\n" "$CHOICE" "$exitstatus"\ndone\n'
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "bash",
+            str(int(raspiblitz)),
+            str(int(maker_running)),
+            str(dialog_status),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    expected = [
+        "--title",
+        " JoinMarket-NG Menu ",
+        "--menu",
+        f"\\nactive wallet | Maker Bot: {'RUNNING' if maker_running else 'STOPPED'}",
+        "21" if raspiblitz else "18",
+        "64",
+        "8" if raspiblitz else "7",
+        "S",
+        "Send Bitcoin",
+        "W",
+        "Wallet Management",
+        "M",
+        "Maker Bot Control",
+        "C",
+        "Config Center",
+        "U",
+        "Update JoinMarket-NG",
+        "I",
+        "Info / Documentation",
+    ]
+    if raspiblitz:
+        expected.extend(["B", "Exit to RaspiBlitz Menu"])
+    expected.extend(["X", "Exit to JoinMarket-NG CLI Shell"])
+    render_count = 1 if dialog_status else 2
+    for attempt in range(1, render_count + 1):
+        arguments = (tmp_path / f"menu-{attempt}.args").read_bytes().split(b"\0")[:-1]
+        assert [argument.decode() for argument in arguments] == expected
+    if dialog_status:
+        assert result.stdout == "EXIT_CALLED\n"
+        assert not (tmp_path / "menu-2.args").exists()
+    else:
+        assert result.stdout.splitlines() == ["CHOICE=W STATUS=0"] * 2
+
+
 def test_tui_prefers_its_virtual_environment() -> None:
     """A global appliance wrapper must not shadow the TUI's own CLI tools."""
     content = SCRIPT_PATH.read_text()
@@ -641,6 +720,107 @@ def test_tui_script_update_confirm_shows_current_and_target() -> None:
     # The final confirmation must default to "No" so pressing Enter
     # does not start the update unintentionally.
     assert "--defaultno" in confirm_block
+
+
+@pytest.mark.parametrize("raspiblitz", [False, True])
+@pytest.mark.parametrize(
+    ("maker_status", "cancel_at", "response"),
+    [
+        ("RUNNING", "warning", "enter"),
+        ("RUNNING", "warning", "escape"),
+        ("RUNNING", "confirm", "enter"),
+        ("RUNNING", "confirm", "escape"),
+        ("STOPPED", "confirm", "enter"),
+        ("STOPPED", "confirm", "escape"),
+        ("RUNNING", "", "yes"),
+        ("STOPPED", "", "yes"),
+    ],
+)
+def test_tui_update_confirmation_gates_installer(
+    tmp_path: Path, raspiblitz: bool, maker_status: str, cancel_at: str, response: str
+) -> None:
+    """Cancel returns to the picker without updating; deliberate Yes permits it."""
+    update_block = (
+        SCRIPT_PATH.read_text().split("    U)\n", 1)[1].split("\n    I)\n", 1)[0]
+    )
+    update_loop = update_block[update_block.index("      while true; do\n") :].rsplit(
+        "\n      ;;", 1
+    )[0]
+    installer = tmp_path / "install.sh"
+    installer.write_text('printf "INSTALLER\\n" >> "$TRACE"\n')
+    script = (
+        """
+        DATA_DIR="$1"
+        LOG_DIR="$DATA_DIR"
+        TRACE="$DATA_DIR/trace"
+        export TRACE
+        RASPIBLITZ="$2"
+        MAKER_STATUS="$3"
+        CANCEL_AT="$4"
+        RESPONSE="$5"
+        BONUS_SCRIPT="$DATA_DIR/install.sh"
+        CURRENT_VERSION=0.1.0
+        CURRENT_LABEL=v0.1.0
+        LATEST_STABLE=9.9.9
+        IS_DEV_BUILD=0
+        clear() { :; }
+        check_stale_wallet() { :; }
+        review_update_output() { :; }
+        pause() { :; }
+        sudo() { bash "$@"; }
+        curl() { echo UNEXPECTED_DOWNLOAD >> "$TRACE"; return 99; }
+        whiptail() {
+            local dialog
+            case "$2" in
+                *'Update JoinMarket-NG (current:'*)
+                    echo PICKER >> "$TRACE"
+                    if [ -f "$DATA_DIR/picked" ]; then
+                        echo BACK >&2
+                    else
+                        touch "$DATA_DIR/picked"
+                        echo STABLE >&2
+                    fi
+                    return 0 ;;
+                ' Warning ') dialog=warning ;;
+                ' Confirm Update ') dialog=confirm ;;
+                *) echo UNEXPECTED_DIALOG >> "$TRACE"; return 99 ;;
+            esac
+            echo "$dialog" >> "$TRACE"
+            if [ "$CANCEL_AT" = "$dialog" ]; then
+                [ "$RESPONSE" = escape ] && return 255
+                # Simulate Enter: without --defaultno it selects Yes.
+                [[ " $* " == *' --defaultno '* ]] && return 1
+            fi
+            return 0
+        }
+        """
+        + update_loop
+    )
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "bash",
+            str(tmp_path),
+            str(int(raspiblitz)),
+            maker_status,
+            cancel_at,
+            response,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    expected = ["PICKER"]
+    if maker_status == "RUNNING":
+        expected.append("warning")
+    if cancel_at != "warning":
+        expected.append("confirm")
+    expected.append("PICKER" if cancel_at else "INSTALLER")
+    assert (tmp_path / "trace").read_text().splitlines() == expected
+    assert bool(list(tmp_path.glob("update.log.*"))) == (not cancel_at)
 
 
 def test_tui_script_update_requires_unsigned_dev_acknowledgement() -> None:
