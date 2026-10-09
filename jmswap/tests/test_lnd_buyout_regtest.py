@@ -1658,6 +1658,13 @@ async def test_settlement_pays_over_second_private_channel(
             stack.mine(policy.buyer_settlement_depth)
             _wait_for_sync(stack, "alice")
             _wait_for_sync(stack, "bob")
+            # With the buyer monitor offline, polling must not start a real
+            # invoice's expiry even though the parent is deep enough to pay.
+            for _ in range(2):
+                await scenario.counterparty_settlement.poll(scenario.session_id)
+                data = scenario.counterparty_store.get(scenario.session_id).data
+                assert data.get("invoice_started") is None
+                assert not (stack.lncli("bob", "listinvoices") or {}).get("invoices")
             assert await scenario.buyer_settlement.poll(scenario.session_id) == "SETTLED"
             invoice = await scenario.counterparty_peer.invoice_status(
                 bytes.fromhex(scenario.terms.acceptance.payment_hash)
