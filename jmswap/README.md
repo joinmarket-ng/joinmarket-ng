@@ -159,8 +159,14 @@ own wallet. LND v0.21.3-beta skips its public-channel on-chain reserve check
 for **private** ring channels, even though an anchor-channel force close may
 still need spendable LND-wallet funds for CPFP fee bumping. As an advisory
 target, keep at least 100,000 sats confirmed in each ring node's LND wallet
-(`lncli newaddress p2tr`), from a source that does not link it to your
-JoinMarket mixdepths. Startup warns below this target. A higher confirmed
+(`lncli newaddress p2tr`). Startup warns below this target.
+
+Treat each ring node's on-chain LND wallet as part of its source mixdepth. An
+anchor fee bump spends wallet UTXOs together with the channel's anchor output,
+and closes pay the channel balance into this wallet, so any coin in it ends up
+linked to that mixdepth's channels. Fund it from the same source mixdepth (or
+from a source you accept being linked to it), and send its funds back only to
+that mixdepth. Never move them to another mixdepth or another ring node. A higher confirmed
 balance is **not** proof that fee-bump funds are available: LND's balance can
 include locked outputs and accounts other than its readily spendable default
 account. Monitor usable LND wallet UTXOs and fee conditions independently;

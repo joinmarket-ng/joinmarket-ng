@@ -24,7 +24,9 @@
 The `tr0` pit runs CoinJoins whose inputs and outputs are all P2TR. A wallet with
 `[wallet] address_type = "p2tr"` makes a maker advertise `tr0` offers; a taker
 also sets `preferred_offer_type` to a `tr0` offer. Pits never mix, so run one
-maker process per pit. P2WSH fidelity bonds are shared across pits.
+maker process per pit. P2WSH fidelity bonds are shared across pits, so a maker
+running both pits with one wallet publicly links its sw0 and tr0 nicks through
+the bond. Use a separate wallet with its own bond to keep them unlinked.
 
 ### Private Lightning Channel Rings (JMP-0014)
 
@@ -143,7 +145,10 @@ Use `--component taker` for the taker. Enrollment binds a node to one wallet
 mixdepth; it does not prove the node was never used elsewhere.
 
 Keep at least 100,000 confirmed sats in each ring node's on-chain LND wallet for
-anchor fee bumping, funded from a source unrelated to the mixdepth. After a ring
+anchor fee bumping. That wallet belongs to the node's source mixdepth: a fee
+bump spends it together with the channel's anchor output, and closes pay into
+it. Fund it from the same mixdepth and return its funds only to that mixdepth,
+never to another mixdepth or ring node. After a ring
 CoinJoin confirms, check in LND that each new channel is private, active,
 Taproot, and has an SCID alias.
 
