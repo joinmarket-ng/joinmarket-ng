@@ -69,6 +69,21 @@ class ChannelEscrowStub:
                 request_serializer=channelescrow__pb2.CancelRequest.SerializeToString,
                 response_deserializer=channelescrow__pb2.CancelResponse.FromString,
                 _registered_method=True)
+        self.PolicyInfo = channel.unary_unary(
+                '/channelescrowrpc.ChannelEscrow/PolicyInfo',
+                request_serializer=channelescrow__pb2.PolicyInfoRequest.SerializeToString,
+                response_deserializer=channelescrow__pb2.PolicyInfoResponse.FromString,
+                _registered_method=True)
+        self.AuthorizeChannel = channel.unary_unary(
+                '/channelescrowrpc.ChannelEscrow/AuthorizeChannel',
+                request_serializer=channelescrow__pb2.AuthorizeChannelRequest.SerializeToString,
+                response_deserializer=channelescrow__pb2.AuthorizeChannelResponse.FromString,
+                _registered_method=True)
+        self.RevokeChannel = channel.unary_unary(
+                '/channelescrowrpc.ChannelEscrow/RevokeChannel',
+                request_serializer=channelescrow__pb2.RevokeChannelRequest.SerializeToString,
+                response_deserializer=channelescrow__pb2.RevokeChannelResponse.FromString,
+                _registered_method=True)
 
 
 class ChannelEscrowServicer:
@@ -116,6 +131,30 @@ class ChannelEscrowServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PolicyInfo(self, request, context):
+        """PolicyInfo lists the authorization policies this node enforces. A node
+        that does not implement it signs without authorization.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AuthorizeChannel(self, request, context):
+        """AuthorizeChannel enrolls a channel for escrow under a BIP340 authorizer
+        key. It requires offchain write permission, not the escrow macaroon.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RevokeChannel(self, request, context):
+        """RevokeChannel removes a channel's enrollment while it has no escrow
+        record.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ChannelEscrowServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -153,6 +192,21 @@ def add_ChannelEscrowServicer_to_server(servicer, server):
                     servicer.Cancel,
                     request_deserializer=channelescrow__pb2.CancelRequest.FromString,
                     response_serializer=channelescrow__pb2.CancelResponse.SerializeToString,
+            ),
+            'PolicyInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.PolicyInfo,
+                    request_deserializer=channelescrow__pb2.PolicyInfoRequest.FromString,
+                    response_serializer=channelescrow__pb2.PolicyInfoResponse.SerializeToString,
+            ),
+            'AuthorizeChannel': grpc.unary_unary_rpc_method_handler(
+                    servicer.AuthorizeChannel,
+                    request_deserializer=channelescrow__pb2.AuthorizeChannelRequest.FromString,
+                    response_serializer=channelescrow__pb2.AuthorizeChannelResponse.SerializeToString,
+            ),
+            'RevokeChannel': grpc.unary_unary_rpc_method_handler(
+                    servicer.RevokeChannel,
+                    request_deserializer=channelescrow__pb2.RevokeChannelRequest.FromString,
+                    response_serializer=channelescrow__pb2.RevokeChannelResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -344,6 +398,87 @@ class ChannelEscrow:
             '/channelescrowrpc.ChannelEscrow/Cancel',
             channelescrow__pb2.CancelRequest.SerializeToString,
             channelescrow__pb2.CancelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PolicyInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/channelescrowrpc.ChannelEscrow/PolicyInfo',
+            channelescrow__pb2.PolicyInfoRequest.SerializeToString,
+            channelescrow__pb2.PolicyInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AuthorizeChannel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/channelescrowrpc.ChannelEscrow/AuthorizeChannel',
+            channelescrow__pb2.AuthorizeChannelRequest.SerializeToString,
+            channelescrow__pb2.AuthorizeChannelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RevokeChannel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/channelescrowrpc.ChannelEscrow/RevokeChannel',
+            channelescrow__pb2.RevokeChannelRequest.SerializeToString,
+            channelescrow__pb2.RevokeChannelResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -40,6 +40,7 @@ an image is missing they fail with an explicit error.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import secrets
@@ -54,6 +55,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+import grpc
 import pytest
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
@@ -66,6 +68,7 @@ from jmcore.bitcoin import (
     serialize_transaction,
     taproot_tweak_pubkey,
 )
+from jmcore.escrow_authorizer import EscrowAuthorizer
 from jmcore.musig2 import nonce_agg, sign_partial
 
 from jmswap.bitcoin_escrow import (
@@ -94,6 +97,7 @@ from jmswap.lnd_escrow import (
     FrozenChannel,
     LndEscrowClient,
     LndEscrowRpcError,
+    ParentAuthorizer,
 )
 from jmswap.lnd_peer import InvoiceState, LndPeerClient
 
@@ -618,8 +622,64 @@ def _open_channel_rpc(stack: BuyoutRegtest, opener: str, peer: str, *args: str) 
     raise AssertionError("unreachable")
 
 
+# Each node's operator wallet (BIP39 test vectors). Its escrow authorizer is the
+# key every buyout channel is enrolled under, as the ring process does at open.
+NODE_MNEMONICS = {
+    "alice": "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+    "abandon abandon about",
+    "bob": "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    "carol": "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+}
+
+
+def _authorizer(stack: BuyoutRegtest, node: str) -> ParentAuthorizer:
+    """The parent authorizer of ``node``'s operator wallet."""
+    key = EscrowAuthorizer.from_mnemonic(NODE_MNEMONICS[node], "", "regtest")
+    return ParentAuthorizer(key, "regtest", stack.node_ids[node])
+
+
+def _authorize(
+    stack: BuyoutRegtest, node: str, point: Outpoint, session: bytes, parent: Any
+) -> bytes:
+    """``node``'s authorization of its partial over a parent built by the test."""
+    return _authorizer(stack, node).authorize(
+        point, session, parent.raw, list(parent.prevouts), parent.channel_input_index
+    )
+
+
+@asynccontextmanager
+async def enrollment_client(stack: BuyoutRegtest, node: str) -> AsyncIterator[LndEscrowClient]:
+    """A ChannelEscrow client with the node's admin macaroon (offchain:write)."""
+    certificate, _ = stack.credentials(node)
+    macaroon = (stack.secrets_dir / node / "admin.macaroon").read_bytes()
+    async with (
+        grpc_endpoint(stack, node) as endpoint,
+        LndEscrowClient(endpoint, certificate, macaroon, timeout=ESCROW_RPC_TIMEOUT) as client,
+    ):
+        yield client
+
+
+def _enroll(stack: BuyoutRegtest, point: Outpoint, nodes: Sequence[str]) -> None:
+    """Enroll a channel on its endpoints, on a private loop (callers are synchronous)."""
+
+    async def enroll() -> None:
+        for node in nodes:
+            async with enrollment_client(stack, node) as client:
+                await client.authorize_channel(
+                    point, _authorizer(stack, node).authorizer.public_key
+                )
+
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        pool.submit(asyncio.run, enroll()).result()
+
+
 def _open_private_taproot_channel(
-    stack: BuyoutRegtest, opener: str = "alice", peer: str = "bob", *, push_sat: int = CHANNEL_PUSH
+    stack: BuyoutRegtest,
+    opener: str = "alice",
+    peer: str = "bob",
+    *,
+    push_sat: int = CHANNEL_PUSH,
+    enroll: bool = True,
 ) -> Outpoint:
     """Open a private channel, including a route-less first hop when settlement must fail without hints."""
     opened = _open_channel_rpc(
@@ -656,7 +716,10 @@ def _open_private_taproot_channel(
             # lncli renders the SIMPLE_TAPROOT commitment type as "TAPROOT".
             assert str(channel["commitment_type"]).endswith("TAPROOT")
             point = str(channel["channel_point"]).split(":")
-            return Outpoint(txid=point[0], vout=int(point[1]))
+            opened_point = Outpoint(txid=point[0], vout=int(point[1]))
+            if enroll:
+                _enroll(stack, opened_point, (opener, peer))
+            return opened_point
         if time.monotonic() >= deadline:
             raise RegtestError(f"channel {funding_txid} did not become active on both endpoints")
         stack.mine(1)
@@ -959,9 +1022,38 @@ async def test_channel_input_pays_the_escrow_with_the_split_held_first(
 
             # Only now does the counterparty sign the channel input.
             attempts = await asyncio.gather(*(client.begin(point, session) for client in clients))
+
+            # The node signs only for its enrolled authorizer, and the escrow
+            # macaroon cannot replace that key.
+            assert await bob_client.policy_versions() == frozenset({1})
+            with pytest.raises(LndEscrowRpcError):
+                await bob_client.authorize_channel(
+                    point, _authorizer(stack, "carol").authorizer.public_key
+                )
+            with pytest.raises(LndEscrowRpcError) as denied:
+                await bob_client.sign(
+                    point,
+                    session,
+                    attempts[1],
+                    attempts[0].public_nonce,
+                    _authorize(stack, "alice", point, session, parent),
+                )
+            assert denied.value.code is grpc.StatusCode.PERMISSION_DENIED
             partials = await asyncio.gather(
-                alice_client.sign(point, session, attempts[0], attempts[1].public_nonce),
-                bob_client.sign(point, session, attempts[1], attempts[0].public_nonce),
+                alice_client.sign(
+                    point,
+                    session,
+                    attempts[0],
+                    attempts[1].public_nonce,
+                    _authorize(stack, "alice", point, session, parent),
+                ),
+                bob_client.sign(
+                    point,
+                    session,
+                    attempts[1],
+                    attempts[0].public_nonce,
+                    _authorize(stack, "bob", point, session, parent),
+                ),
             )
             finalized = await asyncio.gather(
                 alice_client.finalize(point, session, attempts[0], partials[1]),
@@ -1010,6 +1102,42 @@ async def test_channel_input_pays_the_escrow_with_the_split_held_first(
         split_txid = str(stack.bitcoin("sendrawtransaction", signed_split.hex()))
         stack.mine_and_confirm(split_txid)
         assert stack.bitcoin("gettxout", parent.txid, "0") == ""
+    except BaseException:
+        print(stack.logs())
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# Enrollment
+# --------------------------------------------------------------------------- #
+
+
+async def test_unenrolled_channel_cannot_be_frozen(stack: BuyoutRegtest) -> None:
+    """Escrow starts only after the channel's owner enrolls an authorizer."""
+    try:
+        point = _open_private_taproot_channel(stack, enroll=False)
+        session = secrets.token_bytes(32)
+        async with escrow_client(stack, "alice") as client:
+            with pytest.raises(LndEscrowRpcError) as refused:
+                await client.freeze(point, session)
+            assert refused.value.code is grpc.StatusCode.FAILED_PRECONDITION
+            # The link was never quiesced: a later enrollment can freeze it.
+            async with enrollment_client(stack, "alice") as owner:
+                key = _authorizer(stack, "alice").authorizer.public_key
+                await owner.authorize_channel(point, key)
+                await owner.authorize_channel(point, key)
+                frozen = await client.freeze(point, session)
+                assert frozen.point == point
+                # The key is fixed while escrow state exists.
+                with pytest.raises(LndEscrowRpcError) as locked:
+                    await owner.authorize_channel(
+                        point, _authorizer(stack, "carol").authorizer.public_key
+                    )
+                assert locked.value.code is grpc.StatusCode.FAILED_PRECONDITION
+                with pytest.raises(LndEscrowRpcError):
+                    await owner.revoke_channel(point)
+                assert await client.cancel(point, session)
+                await owner.revoke_channel(point)
     except BaseException:
         print(stack.logs())
         raise
@@ -1082,8 +1210,20 @@ async def test_cancel_is_refused_once_signed_and_survives_a_restart(
             )
             attempts = await asyncio.gather(*(client.begin(point, session) for client in clients))
             await asyncio.gather(
-                alice_client.sign(point, session, attempts[0], attempts[1].public_nonce),
-                bob_client.sign(point, session, attempts[1], attempts[0].public_nonce),
+                alice_client.sign(
+                    point,
+                    session,
+                    attempts[0],
+                    attempts[1].public_nonce,
+                    _authorize(stack, "alice", point, session, parent),
+                ),
+                bob_client.sign(
+                    point,
+                    session,
+                    attempts[1],
+                    attempts[0].public_nonce,
+                    _authorize(stack, "bob", point, session, parent),
+                ),
             )
 
             # Cancelling is refused from here on, and the record is untouched.
@@ -1145,7 +1285,15 @@ async def test_private_signing_runtime_and_durable_replay(stack: BuyoutRegtest) 
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
         payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
         policy = BuyoutPolicy()
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
+        counterparty = CounterpartySigner(
+            cp_store,
+            bob,
+            bob_peer,
+            height,
+            policy,
+            payouts,
+            parent_authorizer=_authorizer(stack, "bob"),
+        )
         parent_received, release_parent = asyncio.Event(), asyncio.Event()
 
         async def handle(peer: str, message: Any) -> Any:
@@ -1162,7 +1310,15 @@ async def test_private_signing_runtime_and_durable_replay(stack: BuyoutRegtest) 
         )
         request = transport.request
 
-        buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
+        buyer = BuyoutBuyer(
+            buyer_store,
+            alice,
+            alice_peer,
+            request,
+            height,
+            policy,
+            parent_authorizer=_authorizer(stack, "alice"),
+        )
         session_id = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         terms = buyer.terms(session_id)
         assert terms.claim_sat == CHANNEL_PUSH
@@ -1202,8 +1358,24 @@ async def test_private_signing_runtime_and_durable_replay(stack: BuyoutRegtest) 
             == buyer_store.get(session_id).data["split_tx"]
         )
         # Drop process-local escrow nonces and replay only durable signatures.
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
-        buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
+        counterparty = CounterpartySigner(
+            cp_store,
+            bob,
+            bob_peer,
+            height,
+            policy,
+            payouts,
+            parent_authorizer=_authorizer(stack, "bob"),
+        )
+        buyer = BuyoutBuyer(
+            buyer_store,
+            alice,
+            alice_peer,
+            request,
+            height,
+            policy,
+            parent_authorizer=_authorizer(stack, "alice"),
+        )
 
         async def disconnected(peer: str, message: Any) -> Any:
             raise AssertionError("durable replay must not depend on the counterparty")
@@ -1244,7 +1416,15 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
         payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
         policy = BuyoutPolicy()
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
+        counterparty = CounterpartySigner(
+            cp_store,
+            bob,
+            bob_peer,
+            height,
+            policy,
+            payouts,
+            parent_authorizer=_authorizer(stack, "bob"),
+        )
 
         async def request(peer: str, message: Any) -> Any:
             response = await counterparty.handle(stack.node_ids["alice"], message)
@@ -1252,7 +1432,15 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
                 raise TimeoutError("lost nonce reply")
             return response
 
-        buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
+        buyer = BuyoutBuyer(
+            buyer_store,
+            alice,
+            alice_peer,
+            request,
+            height,
+            policy,
+            parent_authorizer=_authorizer(stack, "alice"),
+        )
         sid = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         terms = buyer.terms(sid)
         inputs = [TxInput.from_hex(point.txid, point.vout), ordinary]
@@ -1274,8 +1462,24 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
         assert cp_store.get(sid).state == "NONCES"
         assert not buyer_store.get(sid).parent_signing_started
         assert not cp_store.get(sid).parent_signing_started
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
-        buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
+        counterparty = CounterpartySigner(
+            cp_store,
+            bob,
+            bob_peer,
+            height,
+            policy,
+            payouts,
+            parent_authorizer=_authorizer(stack, "bob"),
+        )
+        buyer = BuyoutBuyer(
+            buyer_store,
+            alice,
+            alice_peer,
+            request,
+            height,
+            policy,
+            parent_authorizer=_authorizer(stack, "alice"),
+        )
         cancel = bob.cancel
 
         async def interrupted_cancel(point: Outpoint, session_id: bytes) -> bool:
@@ -1288,8 +1492,24 @@ async def test_runtime_recovers_nonce_loss_and_interrupted_cancellation(
         assert buyer_store.get(sid).state == "CANCELING"
         assert cp_store.get(sid).state == "CANCELING"
         monkeypatch.setattr(bob, "cancel", cancel)
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
-        buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
+        counterparty = CounterpartySigner(
+            cp_store,
+            bob,
+            bob_peer,
+            height,
+            policy,
+            payouts,
+            parent_authorizer=_authorizer(stack, "bob"),
+        )
+        buyer = BuyoutBuyer(
+            buyer_store,
+            alice,
+            alice_peer,
+            request,
+            height,
+            policy,
+            parent_authorizer=_authorizer(stack, "alice"),
+        )
         await buyer.cancel(sid)
         assert buyer_store.get(sid).state == "CANCELED"
         assert cp_store.get(sid).state == "CANCELED"
@@ -1346,12 +1566,28 @@ async def test_taker_builds_and_signs_channel_funded_coinjoin(
         policy = BuyoutPolicy(settlement_enabled=True)
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
         payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
-        counterparty = CounterpartySigner(cp_store, bob, bob_peer, height, policy, payouts)
+        counterparty = CounterpartySigner(
+            cp_store,
+            bob,
+            bob_peer,
+            height,
+            policy,
+            payouts,
+            parent_authorizer=_authorizer(stack, "bob"),
+        )
 
         async def request(peer: str, message: Any) -> Any:
             return await counterparty.handle(stack.node_ids["alice"], message)
 
-        buyer = BuyoutBuyer(buyer_store, alice, alice_peer, request, height, policy)
+        buyer = BuyoutBuyer(
+            buyer_store,
+            alice,
+            alice_peer,
+            request,
+            height,
+            policy,
+            parent_authorizer=_authorizer(stack, "alice"),
+        )
         sid = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         buyout = ChannelBuyout(buyer, sid)
         buyout.begin_round()
@@ -1580,7 +1816,13 @@ async def _confirmed_settlement(
         payout = _p2tr_script(secrets.token_bytes(32)).hex()
         payouts = (payout, _p2tr_script(secrets.token_bytes(32)).hex())
         counterparty = CounterpartySigner(
-            counterparty_store, bob, bob_peer, height, policy, payouts
+            counterparty_store,
+            bob,
+            bob_peer,
+            height,
+            policy,
+            payouts,
+            parent_authorizer=_authorizer(stack, "bob"),
         )
 
         async def request(peer: str, message: Any) -> Any:
@@ -1588,7 +1830,14 @@ async def _confirmed_settlement(
             return await counterparty.handle(stack.node_ids["alice"], message)
 
         buyer = BuyoutBuyer(
-            buyer_store, alice, alice_peer, request, height, policy, recovery_authorized=True
+            buyer_store,
+            alice,
+            alice_peer,
+            request,
+            height,
+            policy,
+            recovery_authorized=True,
+            parent_authorizer=_authorizer(stack, "alice"),
         )
         session_id = await buyer.prepare(stack.node_ids["bob"], [point], payouts)
         terms = buyer.terms(session_id)
@@ -1678,6 +1927,11 @@ def _deadline_settings(
     }
     if wallet_fingerprint is not None:
         values["wallet_fingerprint"] = wallet_fingerprint
+    journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mnemonic_file = journal_dir / "wallet.mnemonic"
+    mnemonic_file.write_text(NODE_MNEMONICS[node] + "\n")
+    mnemonic_file.chmod(0o600)
+    values["mnemonic_file"] = mnemonic_file
     return BuyoutSettings.model_validate(values)
 
 
@@ -1855,7 +2109,8 @@ async def test_failed_settlement_broadcasts_the_presigned_split(
     )
     purchased = _open_private_taproot_channel(stack)
     stack.lncli("alice", "connect", f"{stack.node_ids['carol']}@carol:9735")
-    _open_private_taproot_channel(stack, "alice", "carol", push_sat=0)
+    # A routing channel only; it is never bought out, so it is not enrolled.
+    _open_private_taproot_channel(stack, "alice", "carol", push_sat=0, enroll=False)
     try:
         async with _confirmed_settlement(stack, purchased, policy) as scenario:
             pay = scenario.buyer_peer.pay

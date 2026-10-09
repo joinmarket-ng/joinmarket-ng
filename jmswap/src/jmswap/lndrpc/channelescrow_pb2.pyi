@@ -89,16 +89,20 @@ class BeginSigningResponse(_message.Message):
     def __init__(self, attempt_id: _Optional[bytes] = ..., local_public_nonce: _Optional[bytes] = ...) -> None: ...
 
 class SignParentRequest(_message.Message):
-    __slots__ = ("channel_point", "session_id", "attempt_id", "remote_public_nonce")
+    __slots__ = ("channel_point", "session_id", "attempt_id", "remote_public_nonce", "authorizer_signature", "policy_version")
     CHANNEL_POINT_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
     REMOTE_PUBLIC_NONCE_FIELD_NUMBER: _ClassVar[int]
+    AUTHORIZER_SIGNATURE_FIELD_NUMBER: _ClassVar[int]
+    POLICY_VERSION_FIELD_NUMBER: _ClassVar[int]
     channel_point: ChannelPoint
     session_id: bytes
     attempt_id: bytes
     remote_public_nonce: bytes
-    def __init__(self, channel_point: _Optional[_Union[ChannelPoint, _Mapping]] = ..., session_id: _Optional[bytes] = ..., attempt_id: _Optional[bytes] = ..., remote_public_nonce: _Optional[bytes] = ...) -> None: ...
+    authorizer_signature: bytes
+    policy_version: int
+    def __init__(self, channel_point: _Optional[_Union[ChannelPoint, _Mapping]] = ..., session_id: _Optional[bytes] = ..., attempt_id: _Optional[bytes] = ..., remote_public_nonce: _Optional[bytes] = ..., authorizer_signature: _Optional[bytes] = ..., policy_version: _Optional[int] = ...) -> None: ...
 
 class SignParentResponse(_message.Message):
     __slots__ = ("local_partial_signature",)
@@ -169,3 +173,35 @@ class CancelResponse(_message.Message):
     LINK_RESUMED_FIELD_NUMBER: _ClassVar[int]
     link_resumed: bool
     def __init__(self, link_resumed: _Optional[bool] = ...) -> None: ...
+
+class PolicyInfoRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class PolicyInfoResponse(_message.Message):
+    __slots__ = ("supported_policy_versions",)
+    SUPPORTED_POLICY_VERSIONS_FIELD_NUMBER: _ClassVar[int]
+    supported_policy_versions: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, supported_policy_versions: _Optional[_Iterable[int]] = ...) -> None: ...
+
+class AuthorizeChannelRequest(_message.Message):
+    __slots__ = ("channel_point", "authorizer_pubkey")
+    CHANNEL_POINT_FIELD_NUMBER: _ClassVar[int]
+    AUTHORIZER_PUBKEY_FIELD_NUMBER: _ClassVar[int]
+    channel_point: ChannelPoint
+    authorizer_pubkey: bytes
+    def __init__(self, channel_point: _Optional[_Union[ChannelPoint, _Mapping]] = ..., authorizer_pubkey: _Optional[bytes] = ...) -> None: ...
+
+class AuthorizeChannelResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class RevokeChannelRequest(_message.Message):
+    __slots__ = ("channel_point",)
+    CHANNEL_POINT_FIELD_NUMBER: _ClassVar[int]
+    channel_point: ChannelPoint
+    def __init__(self, channel_point: _Optional[_Union[ChannelPoint, _Mapping]] = ...) -> None: ...
+
+class RevokeChannelResponse(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...

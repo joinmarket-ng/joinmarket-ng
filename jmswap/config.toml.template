@@ -56,6 +56,11 @@ lnd_peer_macaroon = "lnd/buyout-peer.macaroon"
 
 # Macaroon for the channel-escrow service (freeze, prepare, sign, finalize).
 # Keep it separate from the peer macaroon. Required when enabled.
+# The node cosigns only a parent authorized by the channel's enrolled escrow
+# authorizer (see mnemonic_file), so this macaroon alone cannot move funds. It
+# is still sensitive: keep it readable only by this service. admin.macaroon
+# cannot use the escrow service, but it can enroll a channel (offchain:write),
+# so whoever holds both it and this macaroon can authorize spends.
 lnd_escrow_macaroon = "lnd/buyout-escrow.macaroon"
 
 # Optional route hints this node pays buyout invoices through, used only when
@@ -114,6 +119,15 @@ mixdepth = 0
 # JoinMarket wallet fingerprint (8 lowercase hex characters) that the buyer side
 # must use. Optional here; the buyer integration requires it.
 # wallet_fingerprint = "0a1b2c3d"
+
+# Mnemonic of the JoinMarket wallet whose escrow authorizer this LND node has
+# enrolled for its ring channels (the ring maker or taker enrolls them when
+# they open; see `jm-maker authorize-ring-channels` for older channels).
+# Required to freeze a channel or release a new escrow signature; recovery and
+# finalization of an already signed session work without it. An encrypted
+# file is opened with the MNEMONIC_PASSWORD environment variable and a BIP39
+# passphrase is read from BIP39_PASSPHRASE. Only the derived key is kept.
+# mnemonic_file = "~/.joinmarket-ng/wallets/default.mnemonic"
 
 # Seconds between settlement polls. Positive and finite. Default: 5.
 poll_interval_seconds = 5

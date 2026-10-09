@@ -37,6 +37,12 @@ from typing import Any, Final
 
 import grpc
 from bitcointx.core.key import CPubKey
+from jmcore.constants import GENESIS_BLOCK_HASHES
+from jmcore.escrow_authorizer import (
+    ESCROW_AUTHORIZATION_POLICY,
+    EscrowAuthorizer,
+    authorization_digest,
+)
 
 from jmswap.buyout_messages import MAX_MONEY, Outpoint, Prevout
 from jmswap.lndrpc import channelescrow_pb2 as pb
@@ -50,6 +56,8 @@ ATTEMPT_ID_LENGTH: Final = 32
 PUBLIC_NONCE_LENGTH: Final = 66
 PARTIAL_SIGNATURE_LENGTH: Final = 32
 TXID_LENGTH: Final = 32
+AUTHORIZATION_SIGNATURE_LENGTH: Final = 64
+XONLY_PUBKEY_LENGTH: Final = 32
 
 _COMPRESSED_PUBKEY_LENGTH: Final = 33
 _P2TR_SCRIPT_LENGTH: Final = 34
@@ -417,8 +425,13 @@ class LndEscrowClient:
         session_id: bytes,
         attempt: SigningAttempt,
         peer_nonce: bytes,
+        authorization: bytes,
     ) -> bytes:
-        """Return the backend's partial signature over the prepared parent."""
+        """Return the backend's partial signature over the prepared parent.
+
+        ``authorization`` is the enrolled authorizer's signature from
+        :meth:`ParentAuthorizer.authorize`; a hardened backend refuses without it.
+        """
         response = await self._call(
             "SignParent",
             pb.SignParentRequest(
@@ -426,6 +439,10 @@ class LndEscrowClient:
                 session_id=_session_id(session_id),
                 attempt_id=_attempt(attempt).attempt_id,
                 remote_public_nonce=_require_public_nonce(peer_nonce, "peer nonce", ValueError),
+                authorizer_signature=_require_argument_bytes(
+                    authorization, AUTHORIZATION_SIGNATURE_LENGTH, "authorization"
+                ),
+                policy_version=ESCROW_AUTHORIZATION_POLICY,
             ),
         )
         return _require_response_bytes(
@@ -471,6 +488,34 @@ class LndEscrowClient:
         )
         return _escrow_status(response)
 
+    async def policy_versions(self) -> frozenset[int]:
+        """Return the authorization policies the backend enforces.
+
+        A backend without the RPC (stock LND, or an escrow patch from before
+        authorization) fails with ``UNIMPLEMENTED``; it must be treated as
+        unhardened, never retried as if it were hardened.
+        """
+        response = await self._call("PolicyInfo", pb.PolicyInfoRequest())
+        return frozenset(int(version) for version in response.supported_policy_versions)
+
+    async def authorize_channel(self, point: Outpoint, authorizer_pubkey: bytes) -> None:
+        """Enroll a channel under an x-only authorizer key (needs offchain:write)."""
+        await self._call(
+            "AuthorizeChannel",
+            pb.AuthorizeChannelRequest(
+                channel_point=_channel_point(point),
+                authorizer_pubkey=_require_argument_bytes(
+                    authorizer_pubkey, XONLY_PUBKEY_LENGTH, "authorizer public key"
+                ),
+            ),
+        )
+
+    async def revoke_channel(self, point: Outpoint) -> None:
+        """Remove a channel's enrollment; refused while it has escrow state."""
+        await self._call(
+            "RevokeChannel", pb.RevokeChannelRequest(channel_point=_channel_point(point))
+        )
+
     async def cancel(self, point: Outpoint, session_id: bytes) -> bool:
         """Release the freeze; ``True`` if the channel link was resumed."""
         response = await self._call(
@@ -480,6 +525,49 @@ class LndEscrowClient:
             ),
         )
         return bool(response.link_resumed)
+
+
+@dataclass(frozen=True)
+class ParentAuthorizer:
+    """Authorizes this node's escrow partial signatures (policy 1).
+
+    ``node_pubkey`` is the hex identity of the LND node that signs; the
+    hardened node binds every authorization to its own identity and network.
+    """
+
+    authorizer: EscrowAuthorizer
+    network: str
+    node_pubkey: str
+
+    def authorize(
+        self,
+        point: Outpoint,
+        session_id: bytes,
+        parent: bytes,
+        prevouts: Sequence[Prevout],
+        input_index: int,
+    ) -> bytes:
+        """Sign the policy digest of a parent the caller has validated itself.
+
+        Every input is local: the authorization covers what this process
+        checked, never what the backend reports.
+        """
+        genesis = GENESIS_BLOCK_HASHES.get(self.network)
+        if genesis is None:
+            raise ValueError("unsupported network")
+        if not isinstance(point, Outpoint):
+            raise ValueError("channel point must be an Outpoint")
+        digest = authorization_digest(
+            chain_hash=bytes.fromhex(genesis)[::-1],
+            node_pubkey=bytes.fromhex(self.node_pubkey),
+            funding_txid=bytes.fromhex(point.txid)[::-1],
+            output_index=point.vout,
+            session_id=_session_id(session_id),
+            parent_tx=_parent_bytes(parent),
+            prevouts=[(item.value, bytes.fromhex(item.script_pubkey)) for item in prevouts],
+            channel_input_index=_input_index(input_index, len(prevouts)),
+        )
+        return self.authorizer.sign(digest)
 
 
 def _parent_bytes(parent: bytes) -> bytes:

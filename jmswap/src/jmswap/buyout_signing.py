@@ -16,8 +16,10 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, cast
 
+import grpc
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import parse_transaction_bytes, serialize_transaction
+from jmcore.escrow_authorizer import ESCROW_AUTHORIZATION_POLICY
 from jmcore.musig2 import SecNonce, nonce_agg, sign_partial
 from jmcore.taproot import TaprootTx, TxIn, TxOut, taproot_sighash, verify_schnorr
 
@@ -47,7 +49,13 @@ from jmswap.buyout_terms import (
     frozen_state_hash,
     validate_parent,
 )
-from jmswap.lnd_escrow import FrozenChannel, LndEscrowClient, SigningAttempt
+from jmswap.lnd_escrow import (
+    FrozenChannel,
+    LndEscrowClient,
+    LndEscrowRpcError,
+    ParentAuthorizer,
+    SigningAttempt,
+)
 from jmswap.lnd_peer import LndPeerClient
 
 Request = Callable[[str, BuyoutMessage], Awaitable[BuyoutMessage]]
@@ -200,7 +208,34 @@ async def _eligible(
             raise ProtocolError("channel is not eligible for private buyout")
 
 
-async def _freeze(backend: LndEscrowClient, proposal: BuyoutPropose) -> tuple[FrozenChannel, ...]:
+async def _require_hardened(
+    backend: LndEscrowClient, authorizer: ParentAuthorizer | None
+) -> ParentAuthorizer:
+    """Refuse a freeze or fresh partial unless this node will require authorization.
+
+    A node without ``PolicyInfo`` is stock LND or an escrow patch from before
+    authorization; either signs for whoever holds the escrow macaroon. Only an
+    affirmative answer counts: any other failure propagates unchanged.
+    """
+    if authorizer is None:
+        raise ProtocolError("escrow authorizer unavailable; configure the wallet mnemonic_file")
+    try:
+        versions = await backend.policy_versions()
+    except LndEscrowRpcError as exc:
+        if exc.code is grpc.StatusCode.UNIMPLEMENTED:
+            raise ProtocolError(
+                "LND escrow does not enforce authorization; upgrade the patched LND"
+            ) from None
+        raise
+    if ESCROW_AUTHORIZATION_POLICY not in versions:
+        raise ProtocolError("LND escrow does not support the required authorization policy")
+    return authorizer
+
+
+async def _freeze(
+    backend: LndEscrowClient, proposal: BuyoutPropose, authorizer: ParentAuthorizer | None
+) -> tuple[FrozenChannel, ...]:
+    await _require_hardened(backend, authorizer)
     async with asyncio.TaskGroup() as group:
         tasks = [
             group.create_task(backend.freeze(point, bytes.fromhex(proposal.epoch_id)))
@@ -226,10 +261,14 @@ async def _prepare(
 
 async def _funding_partial(
     backend: LndEscrowClient,
+    authorizer: ParentAuthorizer | None,
     point: Outpoint,
     session: bytes,
     attempt: SigningAttempt,
     remote_nonce: bytes,
+    parent: ValidatedParent,
+    prevouts: Sequence[Prevout],
+    index: int,
 ) -> bytes:
     status = await backend.status(point, session)
     if status.durable_local_partial:
@@ -241,7 +280,13 @@ async def _funding_partial(
         return status.durable_local_partial
     if status.active_attempt is None or status.active_attempt.attempt_id != attempt.attempt_id:
         raise ProtocolError("native signing nonce unavailable; recovery required")
-    return await backend.sign(point, session, attempt, remote_nonce)
+    # A durable partial above needs no authorizer, so recovery of a signed
+    # session never depends on the wallet; a fresh partial always does, and
+    # only from a node that enforces it (a session prepared before upgrading
+    # may otherwise reach an unhardened node here without a new freeze).
+    authorizer = await _require_hardened(backend, authorizer)
+    authorization = authorizer.authorize(point, session, parent.raw, prevouts, index)
+    return await backend.sign(point, session, attempt, remote_nonce, authorization)
 
 
 def channel_signature(
@@ -284,6 +329,7 @@ class CounterpartySigner:
         runtime_binding: dict[str, str | int] | None = None,
         recovery_authorized: bool = False,
         force_close_authorized: bool = False,
+        parent_authorizer: ParentAuthorizer | None = None,
     ) -> None:
         self.store, self.escrow, self.peer = store, escrow, peer
         self.height, self.policy = height, policy
@@ -292,6 +338,7 @@ class CounterpartySigner:
         self.runtime_binding = dict(runtime_binding or {})
         self.recovery_authorized = recovery_authorized
         self.force_close_authorized = force_close_authorized
+        self.parent_authorizer = parent_authorizer
         self._locks: dict[str, asyncio.Lock] = {}
         self._nonces: dict[str, SecNonce] = {}
 
@@ -451,7 +498,7 @@ class CounterpartySigner:
         if not isinstance(record.data.get(PAYOUT_SCRIPT_KEY), str):
             # Recorded before per-session payouts; refuse before freezing anything.
             raise ProtocolError("session has no recorded payout script; it cannot be accepted")
-        channels = await _freeze(self.escrow, proposal)
+        channels = await _freeze(self.escrow, proposal, self.parent_authorizer)
         record = self.store.get(proposal.epoch_id)
         data = cast(dict[str, Any], record.data)
         acceptance = BuyoutAccept(
@@ -573,17 +620,25 @@ class CounterpartySigner:
             raise ProtocolError("conflicting split partial")
         record = _save(self.store, record.session_id, "PARENT_SIGNING", irreversible=True)
         partials = []
-        for point, attempt, funding_nonce_b in zip(
-            terms.proposal.channel_points, _attempts(record), request.parent_nonces_B, strict=True
+        for point, index, attempt, funding_nonce_b in zip(
+            terms.proposal.channel_points,
+            request.channel_input_indices,
+            _attempts(record),
+            request.parent_nonces_B,
+            strict=True,
         ):
             partials.append(
                 (
                     await _funding_partial(
                         self.escrow,
+                        self.parent_authorizer,
                         point,
                         bytes.fromhex(record.session_id),
                         attempt,
                         bytes.fromhex(funding_nonce_b),
+                        parent,
+                        request.prevouts,
+                        index,
                     )
                 ).hex()
             )
@@ -616,12 +671,14 @@ class BuyoutBuyer:
         runtime_binding: dict[str, str | int] | None = None,
         recovery_authorized: bool = False,
         force_close_authorized: bool = False,
+        parent_authorizer: ParentAuthorizer | None = None,
     ) -> None:
         self.store, self.escrow, self.peer = store, escrow, peer
         self.request, self.height, self.policy = request, height, policy
         self.runtime_binding = dict(runtime_binding or {})
         self.recovery_authorized = recovery_authorized
         self.force_close_authorized = force_close_authorized
+        self.parent_authorizer = parent_authorizer
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def prepare(
@@ -705,7 +762,7 @@ class BuyoutBuyer:
             return await self.request(record.peer_pubkey, proposal)
 
         async with asyncio.TaskGroup() as group:
-            freezing = group.create_task(_freeze(self.escrow, proposal))
+            freezing = group.create_task(_freeze(self.escrow, proposal, self.parent_authorizer))
             negotiating = group.create_task(negotiate())
         channels, response = freezing.result(), negotiating.result()
         if not isinstance(response, BuyoutAccept):
@@ -942,10 +999,14 @@ class BuyoutBuyer:
         ):
             await _funding_partial(
                 self.escrow,
+                self.parent_authorizer,
                 point,
                 bytes.fromhex(record.session_id),
                 attempt,
                 bytes.fromhex(nonce_c),
+                parent,
+                message.prevouts,
+                index,
             )
             final = await self.escrow.finalize(
                 point, bytes.fromhex(record.session_id), attempt, bytes.fromhex(partial_c)

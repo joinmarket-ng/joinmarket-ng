@@ -115,7 +115,13 @@ _ENDPOINT_SHAPE = re.compile(
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\]):(\d{1,5})"
 )
 
-_PATH_FIELDS = ("journal", "lnd_tls_cert", "lnd_peer_macaroon", "lnd_escrow_macaroon")
+_PATH_FIELDS = (
+    "journal",
+    "lnd_tls_cert",
+    "lnd_peer_macaroon",
+    "lnd_escrow_macaroon",
+    "mnemonic_file",
+)
 
 _REQUIRED_WHEN_ENABLED = (
     "network",
@@ -324,6 +330,14 @@ class BuyoutSettings(_ConfigModel):
     payout_addresses: list[str] | None = None
     mixdepth: Annotated[int, Field(ge=0)] | None = None
     wallet_fingerprint: WalletFingerprint | None = None
+    mnemonic_file: Path | None = None
+    """Wallet mnemonic whose escrow authorizer the LND node has enrolled.
+
+    Required to freeze or newly sign a buyout; status, recovery and
+    finalization of an already signed session work without it. An encrypted
+    file is opened with ``MNEMONIC_PASSWORD``; a BIP39 passphrase comes from
+    ``BIP39_PASSPHRASE``. Only the derived authorizer key is kept.
+    """
     poll_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 5.0
     policy: BuyoutSigningOverrides = BuyoutSigningOverrides()
     settlement: BuyoutSettlementOverrides = BuyoutSettlementOverrides()

@@ -12,6 +12,19 @@ service ChannelEscrow {
     rpc FinalizeParent (FinalizeParentRequest) returns (FinalizeParentResponse);
     rpc Status (StatusRequest) returns (StatusResponse);
     rpc Cancel (CancelRequest) returns (CancelResponse);
+
+    // PolicyInfo lists the authorization policies this node enforces. A node
+    // that does not implement it signs without authorization.
+    rpc PolicyInfo (PolicyInfoRequest) returns (PolicyInfoResponse);
+
+    // AuthorizeChannel enrolls a channel for escrow under a BIP340 authorizer
+    // key. It requires offchain write permission, not the escrow macaroon.
+    rpc AuthorizeChannel (AuthorizeChannelRequest)
+        returns (AuthorizeChannelResponse);
+
+    // RevokeChannel removes a channel's enrollment while it has no escrow
+    // record.
+    rpc RevokeChannel (RevokeChannelRequest) returns (RevokeChannelResponse);
 }
 
 message ChannelPoint {
@@ -68,6 +81,11 @@ message SignParentRequest {
     bytes session_id = 2;
     bytes attempt_id = 3;
     bytes remote_public_nonce = 4;
+
+    // BIP340 signature by the channel's enrolled authorizer over the policy
+    // digest of the prepared parent.
+    bytes authorizer_signature = 5;
+    uint32 policy_version = 6;
 }
 
 message SignParentResponse {
@@ -110,4 +128,28 @@ message CancelRequest {
 
 message CancelResponse {
     bool link_resumed = 1;
+}
+
+message PolicyInfoRequest {
+}
+
+message PolicyInfoResponse {
+    repeated uint32 supported_policy_versions = 1;
+}
+
+message AuthorizeChannelRequest {
+    ChannelPoint channel_point = 1;
+
+    // 32-byte BIP340 x-only public key.
+    bytes authorizer_pubkey = 2;
+}
+
+message AuthorizeChannelResponse {
+}
+
+message RevokeChannelRequest {
+    ChannelPoint channel_point = 1;
+}
+
+message RevokeChannelResponse {
 }

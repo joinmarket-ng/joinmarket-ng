@@ -55,11 +55,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Sequence
 from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 from typing import NotRequired, Self, TypedDict, TypeVar
 
+from jmcore.cli_common import load_mnemonic_from_file
+from jmcore.escrow_authorizer import EscrowAuthorizer
 from pydantic import ValidationError
 
 from jmswap.buyout_chain import BuyoutChain, ChainError
@@ -84,7 +87,7 @@ from jmswap.buyout_store import (
 )
 from jmswap.buyout_terms import ProtocolError
 from jmswap.buyout_transport import BuyoutTransport, PrivateTransportError
-from jmswap.lnd_escrow import LndEscrowClient, LndEscrowError
+from jmswap.lnd_escrow import LndEscrowClient, LndEscrowError, ParentAuthorizer
 from jmswap.lnd_peer import LndPeerClient, LndPeerError, PaymentRouteHop
 
 
@@ -180,6 +183,7 @@ class BuyoutRuntime:
         self._rpc_user = _required(settings.bitcoin_rpc_user, "bitcoin_rpc_user")
         self._rpc_password = _required(settings.bitcoin_rpc_password, "bitcoin_rpc_password")
         self._mixdepth = _required(settings.mixdepth, "mixdepth")
+        self._mnemonic_file = settings.mnemonic_file
         self._allowed_peers = frozenset(settings.allowed_peers)
         if not self._allowed_peers:
             raise BuyoutRuntimeError("an enabled buyout service requires at least one allowed peer")
@@ -284,6 +288,7 @@ class BuyoutRuntime:
         stack.push_async_exit(chain)
         _check_core_network(await chain.check_ready(), self._network)
         certificate = _read_file(self._tls_cert, "lnd_tls_cert")
+        parent_authorizer = self._parent_authorizer()
         # An unconfigured deployment builds the peer client exactly as before:
         # the route hint argument is only named when the operator supplied one.
         hints: _RouteHintArgs = (
@@ -320,6 +325,7 @@ class BuyoutRuntime:
                 runtime_binding=self._binding,
                 recovery_authorized=True,
                 force_close_authorized=self.settings.automatic_force_close,
+                parent_authorizer=parent_authorizer,
             )
         self._settlement = BuyoutSettlement(
             store,
@@ -339,12 +345,35 @@ class BuyoutRuntime:
             runtime_binding=self._binding,
             recovery_authorized=True,
             force_close_authorized=self.settings.automatic_force_close,
+            parent_authorizer=parent_authorizer,
         )
         self._recovery = BuyoutRecovery(store, escrow, peer, chain, runtime_binding=self._binding)
         self._transport = BuyoutTransport(
             peer, self._allowed_peers, self._dispatch if self.counterparty else None
         )
         await stack.enter_async_context(self._transport)
+
+    def _parent_authorizer(self) -> ParentAuthorizer | None:
+        """Derive the escrow authorizer from the configured mnemonic, if any.
+
+        Without one the runtime still recovers and finalizes signed sessions,
+        but refuses to freeze or newly sign. The mnemonic is not retained.
+        """
+        if self._mnemonic_file is None:
+            return None
+        try:
+            mnemonic = load_mnemonic_from_file(
+                self._mnemonic_file,
+                password=os.environ.get("MNEMONIC_PASSWORD"),
+                auto_prompt=False,
+            )
+            authorizer = EscrowAuthorizer.from_mnemonic(
+                mnemonic, os.environ.get("BIP39_PASSPHRASE", ""), self._network
+            )
+        except Exception:
+            # The cause can quote the file or the words; report only the setting.
+            raise BuyoutRuntimeError("mnemonic_file could not be loaded") from None
+        return ParentAuthorizer(authorizer, self._network, self._identity)
 
     async def _check_node(self, peer: LndPeerClient) -> None:
         info = await peer.node_info()

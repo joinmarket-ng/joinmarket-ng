@@ -793,3 +793,32 @@ class TestRunLoop:
         assert harness.transports[0].closed is True
         with pytest.raises(BuyoutRuntimeError, match="not open"):
             _ = runtime.transport
+
+
+class TestEscrowAuthorizer:
+    MNEMONIC = "abandon " * 11 + "about"
+
+    def test_without_mnemonic_file_no_authorizer_is_derived(self, tmp_path: Path) -> None:
+        assert BuyoutRuntime(_settings(tmp_path))._parent_authorizer() is None
+
+    def test_mnemonic_file_derives_the_wallet_authorizer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from jmcore.escrow_authorizer import EscrowAuthorizer
+
+        (tmp_path / "wallet.mnemonic").write_text(self.MNEMONIC + "\n")
+        monkeypatch.setenv("BIP39_PASSPHRASE", "extra")
+        settings = _settings(tmp_path, mnemonic_file=tmp_path / "wallet.mnemonic")
+        authorizer = BuyoutRuntime(settings)._parent_authorizer()
+        assert authorizer is not None
+        expected = EscrowAuthorizer.from_mnemonic(self.MNEMONIC, "extra", "regtest")
+        assert authorizer.authorizer.public_key == expected.public_key
+        assert (authorizer.network, authorizer.node_pubkey) == ("regtest", IDENTITY)
+
+    def test_unreadable_mnemonic_file_reports_only_the_setting(self, tmp_path: Path) -> None:
+        (tmp_path / "wallet.mnemonic").write_text("not a secret phrase at all\n")
+        settings = _settings(tmp_path, mnemonic_file=tmp_path / "wallet.mnemonic")
+        with pytest.raises(BuyoutRuntimeError) as raised:
+            BuyoutRuntime(settings)._parent_authorizer()
+        assert str(raised.value) == "mnemonic_file could not be loaded"
+        assert raised.value.__cause__ is None

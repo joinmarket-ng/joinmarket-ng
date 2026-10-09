@@ -17,6 +17,7 @@ from jmcore.bitcoin import (
     parse_transaction_bytes,
     serialize_transaction,
 )
+from jmcore.escrow_authorizer import ESCROW_AUTHORIZATION_POLICY, EscrowAuthorizer
 from jmcore.musig2 import nonce_agg, sign_partial
 
 from jmswap.bitcoin_escrow import (
@@ -42,7 +43,7 @@ from jmswap.buyout_settlement import BuyoutSettlement, SettlementPolicy
 from jmswap.buyout_signing import BuyoutBuyer, BuyoutPolicy, CounterpartySigner
 from jmswap.buyout_store import BuyoutStore, ConflictError
 from jmswap.buyout_terms import SPLIT_SAFETY_MARGIN_BLOCKS, ProtocolError, validate_parent
-from jmswap.lnd_escrow import FrozenChannel, LndEscrowClient
+from jmswap.lnd_escrow import FrozenChannel, LndEscrowClient, ParentAuthorizer
 from jmswap.lnd_peer import (
     InvoiceInfo,
     InvoiceState,
@@ -54,6 +55,12 @@ from jmswap.lnd_peer import (
 
 BUYER_KEY = bytes(CKey(b"\x11" * 32).pub)
 COUNTERPARTY_KEY = bytes(CKey(b"\x22" * 32).pub)
+BUYER_AUTHORIZER = ParentAuthorizer(
+    EscrowAuthorizer(b"\x01" * 64, "regtest"), "regtest", BUYER_KEY.hex()
+)
+COUNTERPARTY_AUTHORIZER = ParentAuthorizer(
+    EscrowAuthorizer(b"\x02" * 64, "regtest"), "regtest", COUNTERPARTY_KEY.hex()
+)
 POINT = Outpoint(txid="33" * 32, vout=0)
 SCRIPT = b"\x51\x20" + bytes(CKey(b"\x44" * 32).xonly_pub)
 # Fresh payout scripts; every session takes the first unused one.
@@ -92,9 +99,23 @@ class Runtime:
     def restart(self) -> None:
         b, c = self.buyer, self.counterparty
         self.counterparty = CounterpartySigner(
-            c.store, c.escrow, c.peer, height, c.policy, c.payout_scripts
+            c.store,
+            c.escrow,
+            c.peer,
+            height,
+            c.policy,
+            c.payout_scripts,
+            parent_authorizer=c.parent_authorizer,
         )
-        self.buyer = BuyoutBuyer(b.store, b.escrow, b.peer, self.request, height, b.policy)
+        self.buyer = BuyoutBuyer(
+            b.store,
+            b.escrow,
+            b.peer,
+            self.request,
+            height,
+            b.policy,
+            parent_authorizer=b.parent_authorizer,
+        )
 
 
 @pytest.fixture
@@ -105,6 +126,7 @@ def runtime(tmp_path: Path) -> Iterator[Runtime]:
         (COUNTERPARTY_KEY, BUYER_KEY, 300_000),
     ]:
         backend = create_autospec(LndEscrowClient, instance=True)
+        backend.policy_versions.return_value = frozenset({ESCROW_AUTHORIZATION_POLICY})
         backend.freeze.return_value = FrozenChannel(
             point=POINT,
             capacity_sat=1_000_000,
@@ -134,8 +156,24 @@ def runtime(tmp_path: Path) -> Iterator[Runtime]:
         BuyoutStore(tmp_path / "buyer" / "sessions.sqlite") as buyer_store,
         BuyoutStore(tmp_path / "counterparty" / "sessions.sqlite") as cp_store,
     ):
-        counterparty = CounterpartySigner(cp_store, backends[1], peers[1], height, policy, SCRIPTS)
-        buyer = BuyoutBuyer(buyer_store, backends[0], peers[0], AsyncMock(), height, policy)
+        counterparty = CounterpartySigner(
+            cp_store,
+            backends[1],
+            peers[1],
+            height,
+            policy,
+            SCRIPTS,
+            parent_authorizer=COUNTERPARTY_AUTHORIZER,
+        )
+        buyer = BuyoutBuyer(
+            buyer_store,
+            backends[0],
+            peers[0],
+            AsyncMock(),
+            height,
+            policy,
+            parent_authorizer=BUYER_AUTHORIZER,
+        )
         result = Runtime(buyer, counterparty, *backends)
         buyer.request = result.request
         yield result

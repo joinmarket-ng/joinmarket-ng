@@ -41,6 +41,7 @@ MACAROON = bytes(range(64))
 SESSION_ID = bytes([0x11]) * SESSION_ID_LENGTH
 ATTEMPT_ID = bytes([0x22]) * 32
 PARTIAL = bytes([0x33]) * PARTIAL_SIGNATURE_LENGTH
+AUTHORIZATION = bytes([0x55]) * 64
 
 # A display-order txid and the internal little-endian hash LND carries. Both
 # txids here are deliberately not palindromic, so a missing reversal shows up.
@@ -337,18 +338,20 @@ class TestSigning:
         )
         attempt = SigningAttempt(attempt_id=ATTEMPT_ID, public_nonce=LOCAL_NONCE)
         async with escrow_client(stub) as client:
-            partial = await client.sign(POINT, SESSION_ID, attempt, REMOTE_NONCE)
+            partial = await client.sign(POINT, SESSION_ID, attempt, REMOTE_NONCE, AUTHORIZATION)
         assert partial == PARTIAL
         request = stub.last.request
         assert request.attempt_id == ATTEMPT_ID
         assert request.remote_public_nonce == REMOTE_NONCE
+        assert request.authorizer_signature == AUTHORIZATION
+        assert request.policy_version == 1
 
     async def test_sign_rejects_a_malformed_peer_nonce(self) -> None:
         stub = RecordingStub(SignParent=pb.SignParentResponse(local_partial_signature=PARTIAL))
         attempt = SigningAttempt(attempt_id=ATTEMPT_ID, public_nonce=LOCAL_NONCE)
         async with escrow_client(stub) as client:
             with pytest.raises(ValueError, match="peer nonce"):
-                await client.sign(POINT, SESSION_ID, attempt, REMOTE_NONCE[:60])
+                await client.sign(POINT, SESSION_ID, attempt, REMOTE_NONCE[:60], AUTHORIZATION)
         assert stub.calls == []
 
     async def test_sign_rejects_a_malformed_partial(self) -> None:
@@ -356,13 +359,13 @@ class TestSigning:
         attempt = SigningAttempt(attempt_id=ATTEMPT_ID, public_nonce=LOCAL_NONCE)
         async with escrow_client(stub) as client:
             with pytest.raises(LndEscrowResponseError, match="partial signature"):
-                await client.sign(POINT, SESSION_ID, attempt, REMOTE_NONCE)
+                await client.sign(POINT, SESSION_ID, attempt, REMOTE_NONCE, AUTHORIZATION)
 
     async def test_sign_requires_a_signing_attempt(self) -> None:
         stub = RecordingStub(SignParent=pb.SignParentResponse(local_partial_signature=PARTIAL))
         async with escrow_client(stub) as client:
             with pytest.raises(ValueError, match="SigningAttempt"):
-                await client.sign(POINT, SESSION_ID, ATTEMPT_ID, REMOTE_NONCE)
+                await client.sign(POINT, SESSION_ID, ATTEMPT_ID, REMOTE_NONCE, AUTHORIZATION)
 
 
 class TestFinalize:

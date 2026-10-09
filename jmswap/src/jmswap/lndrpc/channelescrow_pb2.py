@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13\x63hannelescrow.proto\x12\x10\x63hannelescrowrpc\":\n\x0c\x43hannelPoint\x12\x14\n\x0c\x66unding_txid\x18\x01 \x01(\x0c\x12\x14\n\x0coutput_index\x18\x02 \x01(\r\"/\n\x07PrevOut\x12\x11\n\tvalue_sat\x18\x01 \x01(\x03\x12\x11\n\tpk_script\x18\x02 \x01(\x0c\"a\n\x14\x46reezeChannelRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\"\x84\x02\n\x15\x46reezeChannelResponse\x12\x14\n\x0c\x63\x61pacity_sat\x18\x01 \x01(\x03\x12\x17\n\x0flocal_claim_sat\x18\x02 \x01(\x03\x12\x18\n\x10remote_claim_sat\x18\x03 \x01(\x03\x12\x13\n\x0bpeer_pubkey\x18\x04 \x01(\x0c\x12\x38\n\x10\x66unding_outpoint\x18\x05 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x16\n\x0e\x66unding_script\x18\x06 \x01(\x0c\x12\x1c\n\x14local_funding_pubkey\x18\x07 \x01(\x0c\x12\x1d\n\x15remote_funding_pubkey\x18\x08 \x01(\x0c\"\xc3\x01\n\x14PrepareParentRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x15\n\rraw_parent_tx\x18\x03 \x01(\x0c\x12,\n\tprev_outs\x18\x04 \x03(\x0b\x32\x19.channelescrowrpc.PrevOut\x12\x1b\n\x13\x63hannel_input_index\x18\x05 \x01(\r\"%\n\x15PrepareParentResponse\x12\x0c\n\x04txid\x18\x01 \x01(\x0c\"y\n\x13\x42\x65ginSigningRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x17\n\x0frestart_attempt\x18\x03 \x01(\x08\"F\n\x14\x42\x65ginSigningResponse\x12\x12\n\nattempt_id\x18\x01 \x01(\x0c\x12\x1a\n\x12local_public_nonce\x18\x02 \x01(\x0c\"\x8f\x01\n\x11SignParentRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x12\n\nattempt_id\x18\x03 \x01(\x0c\x12\x1b\n\x13remote_public_nonce\x18\x04 \x01(\x0c\"5\n\x12SignParentResponse\x12\x1f\n\x17local_partial_signature\x18\x01 \x01(\x0c\"\x98\x01\n\x15\x46inalizeParentRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x12\n\nattempt_id\x18\x03 \x01(\x0c\x12 \n\x18remote_partial_signature\x18\x04 \x01(\x0c\"6\n\x16\x46inalizeParentResponse\x12\x0e\n\x06raw_tx\x18\x01 \x01(\x0c\x12\x0c\n\x04txid\x18\x02 \x01(\x0c\"Z\n\rStatusRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\"\x94\x02\n\x0eStatusResponse\x12\r\n\x05stage\x18\x01 \x01(\r\x12\x13\n\x0bparent_txid\x18\x02 \x01(\x0c\x12\x11\n\tfinalized\x18\x03 \x01(\x08\x12\"\n\x1a\x64urable_local_public_nonce\x18\x04 \x01(\x0c\x12#\n\x1b\x64urable_remote_public_nonce\x18\x05 \x01(\x0c\x12\'\n\x1f\x64urable_local_partial_signature\x18\x06 \x01(\x0c\x12\x1b\n\x13\x66inalized_parent_tx\x18\x07 \x01(\x0c\x12\x19\n\x11\x61\x63tive_attempt_id\x18\x08 \x01(\x0c\x12!\n\x19\x61\x63tive_local_public_nonce\x18\t \x01(\x0c\"Z\n\rCancelRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\"&\n\x0e\x43\x61ncelResponse\x12\x14\n\x0clink_resumed\x18\x01 \x01(\x08\x32\x8a\x05\n\rChannelEscrow\x12`\n\rFreezeChannel\x12&.channelescrowrpc.FreezeChannelRequest\x1a\'.channelescrowrpc.FreezeChannelResponse\x12`\n\rPrepareParent\x12&.channelescrowrpc.PrepareParentRequest\x1a\'.channelescrowrpc.PrepareParentResponse\x12]\n\x0c\x42\x65ginSigning\x12%.channelescrowrpc.BeginSigningRequest\x1a&.channelescrowrpc.BeginSigningResponse\x12W\n\nSignParent\x12#.channelescrowrpc.SignParentRequest\x1a$.channelescrowrpc.SignParentResponse\x12\x63\n\x0e\x46inalizeParent\x12\'.channelescrowrpc.FinalizeParentRequest\x1a(.channelescrowrpc.FinalizeParentResponse\x12K\n\x06Status\x12\x1f.channelescrowrpc.StatusRequest\x1a .channelescrowrpc.StatusResponse\x12K\n\x06\x43\x61ncel\x12\x1f.channelescrowrpc.CancelRequest\x1a .channelescrowrpc.CancelResponseB8Z6github.com/lightningnetwork/lnd/lnrpc/channelescrowrpcb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13\x63hannelescrow.proto\x12\x10\x63hannelescrowrpc\":\n\x0c\x43hannelPoint\x12\x14\n\x0c\x66unding_txid\x18\x01 \x01(\x0c\x12\x14\n\x0coutput_index\x18\x02 \x01(\r\"/\n\x07PrevOut\x12\x11\n\tvalue_sat\x18\x01 \x01(\x03\x12\x11\n\tpk_script\x18\x02 \x01(\x0c\"a\n\x14\x46reezeChannelRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\"\x84\x02\n\x15\x46reezeChannelResponse\x12\x14\n\x0c\x63\x61pacity_sat\x18\x01 \x01(\x03\x12\x17\n\x0flocal_claim_sat\x18\x02 \x01(\x03\x12\x18\n\x10remote_claim_sat\x18\x03 \x01(\x03\x12\x13\n\x0bpeer_pubkey\x18\x04 \x01(\x0c\x12\x38\n\x10\x66unding_outpoint\x18\x05 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x16\n\x0e\x66unding_script\x18\x06 \x01(\x0c\x12\x1c\n\x14local_funding_pubkey\x18\x07 \x01(\x0c\x12\x1d\n\x15remote_funding_pubkey\x18\x08 \x01(\x0c\"\xc3\x01\n\x14PrepareParentRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x15\n\rraw_parent_tx\x18\x03 \x01(\x0c\x12,\n\tprev_outs\x18\x04 \x03(\x0b\x32\x19.channelescrowrpc.PrevOut\x12\x1b\n\x13\x63hannel_input_index\x18\x05 \x01(\r\"%\n\x15PrepareParentResponse\x12\x0c\n\x04txid\x18\x01 \x01(\x0c\"y\n\x13\x42\x65ginSigningRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x17\n\x0frestart_attempt\x18\x03 \x01(\x08\"F\n\x14\x42\x65ginSigningResponse\x12\x12\n\nattempt_id\x18\x01 \x01(\x0c\x12\x1a\n\x12local_public_nonce\x18\x02 \x01(\x0c\"\xc5\x01\n\x11SignParentRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x12\n\nattempt_id\x18\x03 \x01(\x0c\x12\x1b\n\x13remote_public_nonce\x18\x04 \x01(\x0c\x12\x1c\n\x14\x61uthorizer_signature\x18\x05 \x01(\x0c\x12\x16\n\x0epolicy_version\x18\x06 \x01(\r\"5\n\x12SignParentResponse\x12\x1f\n\x17local_partial_signature\x18\x01 \x01(\x0c\"\x98\x01\n\x15\x46inalizeParentRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x12\n\nattempt_id\x18\x03 \x01(\x0c\x12 \n\x18remote_partial_signature\x18\x04 \x01(\x0c\"6\n\x16\x46inalizeParentResponse\x12\x0e\n\x06raw_tx\x18\x01 \x01(\x0c\x12\x0c\n\x04txid\x18\x02 \x01(\x0c\"Z\n\rStatusRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\"\x94\x02\n\x0eStatusResponse\x12\r\n\x05stage\x18\x01 \x01(\r\x12\x13\n\x0bparent_txid\x18\x02 \x01(\x0c\x12\x11\n\tfinalized\x18\x03 \x01(\x08\x12\"\n\x1a\x64urable_local_public_nonce\x18\x04 \x01(\x0c\x12#\n\x1b\x64urable_remote_public_nonce\x18\x05 \x01(\x0c\x12\'\n\x1f\x64urable_local_partial_signature\x18\x06 \x01(\x0c\x12\x1b\n\x13\x66inalized_parent_tx\x18\x07 \x01(\x0c\x12\x19\n\x11\x61\x63tive_attempt_id\x18\x08 \x01(\x0c\x12!\n\x19\x61\x63tive_local_public_nonce\x18\t \x01(\x0c\"Z\n\rCancelRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\"&\n\x0e\x43\x61ncelResponse\x12\x14\n\x0clink_resumed\x18\x01 \x01(\x08\"\x13\n\x11PolicyInfoRequest\"7\n\x12PolicyInfoResponse\x12!\n\x19supported_policy_versions\x18\x01 \x03(\r\"k\n\x17\x41uthorizeChannelRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\x12\x19\n\x11\x61uthorizer_pubkey\x18\x02 \x01(\x0c\"\x1a\n\x18\x41uthorizeChannelResponse\"M\n\x14RevokeChannelRequest\x12\x35\n\rchannel_point\x18\x01 \x01(\x0b\x32\x1e.channelescrowrpc.ChannelPoint\"\x17\n\x15RevokeChannelResponse2\xb0\x07\n\rChannelEscrow\x12`\n\rFreezeChannel\x12&.channelescrowrpc.FreezeChannelRequest\x1a\'.channelescrowrpc.FreezeChannelResponse\x12`\n\rPrepareParent\x12&.channelescrowrpc.PrepareParentRequest\x1a\'.channelescrowrpc.PrepareParentResponse\x12]\n\x0c\x42\x65ginSigning\x12%.channelescrowrpc.BeginSigningRequest\x1a&.channelescrowrpc.BeginSigningResponse\x12W\n\nSignParent\x12#.channelescrowrpc.SignParentRequest\x1a$.channelescrowrpc.SignParentResponse\x12\x63\n\x0e\x46inalizeParent\x12\'.channelescrowrpc.FinalizeParentRequest\x1a(.channelescrowrpc.FinalizeParentResponse\x12K\n\x06Status\x12\x1f.channelescrowrpc.StatusRequest\x1a .channelescrowrpc.StatusResponse\x12K\n\x06\x43\x61ncel\x12\x1f.channelescrowrpc.CancelRequest\x1a .channelescrowrpc.CancelResponse\x12W\n\nPolicyInfo\x12#.channelescrowrpc.PolicyInfoRequest\x1a$.channelescrowrpc.PolicyInfoResponse\x12i\n\x10\x41uthorizeChannel\x12).channelescrowrpc.AuthorizeChannelRequest\x1a*.channelescrowrpc.AuthorizeChannelResponse\x12`\n\rRevokeChannel\x12&.channelescrowrpc.RevokeChannelRequest\x1a\'.channelescrowrpc.RevokeChannelResponseB8Z6github.com/lightningnetwork/lnd/lnrpc/channelescrowrpcb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -49,21 +49,33 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_BEGINSIGNINGRESPONSE']._serialized_start=872
   _globals['_BEGINSIGNINGRESPONSE']._serialized_end=942
   _globals['_SIGNPARENTREQUEST']._serialized_start=945
-  _globals['_SIGNPARENTREQUEST']._serialized_end=1088
-  _globals['_SIGNPARENTRESPONSE']._serialized_start=1090
-  _globals['_SIGNPARENTRESPONSE']._serialized_end=1143
-  _globals['_FINALIZEPARENTREQUEST']._serialized_start=1146
-  _globals['_FINALIZEPARENTREQUEST']._serialized_end=1298
-  _globals['_FINALIZEPARENTRESPONSE']._serialized_start=1300
-  _globals['_FINALIZEPARENTRESPONSE']._serialized_end=1354
-  _globals['_STATUSREQUEST']._serialized_start=1356
-  _globals['_STATUSREQUEST']._serialized_end=1446
-  _globals['_STATUSRESPONSE']._serialized_start=1449
-  _globals['_STATUSRESPONSE']._serialized_end=1725
-  _globals['_CANCELREQUEST']._serialized_start=1727
-  _globals['_CANCELREQUEST']._serialized_end=1817
-  _globals['_CANCELRESPONSE']._serialized_start=1819
-  _globals['_CANCELRESPONSE']._serialized_end=1857
-  _globals['_CHANNELESCROW']._serialized_start=1860
-  _globals['_CHANNELESCROW']._serialized_end=2510
+  _globals['_SIGNPARENTREQUEST']._serialized_end=1142
+  _globals['_SIGNPARENTRESPONSE']._serialized_start=1144
+  _globals['_SIGNPARENTRESPONSE']._serialized_end=1197
+  _globals['_FINALIZEPARENTREQUEST']._serialized_start=1200
+  _globals['_FINALIZEPARENTREQUEST']._serialized_end=1352
+  _globals['_FINALIZEPARENTRESPONSE']._serialized_start=1354
+  _globals['_FINALIZEPARENTRESPONSE']._serialized_end=1408
+  _globals['_STATUSREQUEST']._serialized_start=1410
+  _globals['_STATUSREQUEST']._serialized_end=1500
+  _globals['_STATUSRESPONSE']._serialized_start=1503
+  _globals['_STATUSRESPONSE']._serialized_end=1779
+  _globals['_CANCELREQUEST']._serialized_start=1781
+  _globals['_CANCELREQUEST']._serialized_end=1871
+  _globals['_CANCELRESPONSE']._serialized_start=1873
+  _globals['_CANCELRESPONSE']._serialized_end=1911
+  _globals['_POLICYINFOREQUEST']._serialized_start=1913
+  _globals['_POLICYINFOREQUEST']._serialized_end=1932
+  _globals['_POLICYINFORESPONSE']._serialized_start=1934
+  _globals['_POLICYINFORESPONSE']._serialized_end=1989
+  _globals['_AUTHORIZECHANNELREQUEST']._serialized_start=1991
+  _globals['_AUTHORIZECHANNELREQUEST']._serialized_end=2098
+  _globals['_AUTHORIZECHANNELRESPONSE']._serialized_start=2100
+  _globals['_AUTHORIZECHANNELRESPONSE']._serialized_end=2126
+  _globals['_REVOKECHANNELREQUEST']._serialized_start=2128
+  _globals['_REVOKECHANNELREQUEST']._serialized_end=2205
+  _globals['_REVOKECHANNELRESPONSE']._serialized_start=2207
+  _globals['_REVOKECHANNELRESPONSE']._serialized_end=2230
+  _globals['_CHANNELESCROW']._serialized_start=2233
+  _globals['_CHANNELESCROW']._serialized_end=3177
 # @@protoc_insertion_point(module_scope)
