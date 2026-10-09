@@ -37,6 +37,7 @@ from jmwallet.wallet.service import WalletService
 from pydantic import SecretStr
 
 from taker.buyout import ChannelBuyout
+from jmswap.channel_ring import wallet_escrow_authorizer_pubkey
 from taker.channel_ring import reconcile_taker_ring_records
 from taker.config import BroadcastPolicy, MaxCjFee, TakerConfig
 from taker.podle_manager import PoDLEManager
@@ -78,6 +79,8 @@ RING_MAKER_MNEMONICS = {
     "lnd-maker2": MAKER2_MNEMONIC,
     "lnd-maker3": MAKER3_MNEMONIC,
 }
+# The wallet whose escrow authorizer enrolled each ring node's channels.
+RING_NODE_MNEMONICS = {**RING_MAKER_MNEMONICS, "lnd-taker": TAKER_MNEMONIC}
 LND_PORTS = {
     "lnd-maker1": os.getenv("RING_E2E_MAKER1_GRPC_PORT", "21009"),
     "lnd-maker2": os.getenv("RING_E2E_MAKER2_GRPC_PORT", "22009"),
@@ -1414,6 +1417,12 @@ def buyout_settings(
     }
     if wallet_fingerprint is not None:
         values["wallet_fingerprint"] = wallet_fingerprint
+    # The ring process enrolled the channel under this wallet's authorizer.
+    journal.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mnemonic_file = journal.with_suffix(".mnemonic")
+    mnemonic_file.write_text(RING_NODE_MNEMONICS[service] + "\n", encoding="ascii")
+    mnemonic_file.chmod(0o600)
+    values["mnemonic_file"] = mnemonic_file
     return BuyoutSettings.model_validate(values)
 
 
@@ -2717,8 +2726,13 @@ async def test_rejected_revision_then_complete_mixed_five_party_ring() -> None:
 
         assert taker._channel_ring_store is not None
         assert taker._channel_ring_nodes is not None
+        # As the taker's own reconciliation does, enrolling the ring channels
+        # for later buyouts under this wallet's escrow authorizer.
         await reconcile_taker_ring_records(
-            taker._channel_ring_store, taker._channel_ring_nodes, backend
+            taker._channel_ring_store,
+            taker._channel_ring_nodes,
+            backend,
+            escrow_authorizer_pubkey=wallet_escrow_authorizer_pubkey(wallet),
         )
         assert coordinator._record().state is RingLifecycleState.CONFIRMED_OPEN
 

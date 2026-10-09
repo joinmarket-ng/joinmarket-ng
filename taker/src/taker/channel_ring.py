@@ -76,6 +76,7 @@ from jmcore.cofunded_ring import (
 )
 from jmcore.constants import DUST_THRESHOLD, GENESIS_BLOCK_HASHES
 from jmcore.models import is_taproot_offer_type
+from jmswap.channel_ring import enroll_confirmed_ring_channels
 from jmswap.channel_ring_nodes import BoundChannelRingNode, ChannelRingNodePool
 from jmswap.lnd import (
     AcceptorBounds,
@@ -1669,6 +1670,7 @@ async def reconcile_taker_ring_records(
     *,
     acceptor_timeout_seconds: float = 600.0,
     active_session_identities: frozenset[str] = frozenset(),
+    escrow_authorizer_pubkey: bytes | None = None,
 ) -> None:
     """Resume retained taker channels and rebroadcast only exact durable final transactions.
 
@@ -1817,6 +1819,9 @@ async def reconcile_taker_ring_records(
                                 checked_at=time.time(),
                             )
                         },
+                    )
+                    await enroll_confirmed_ring_channels(
+                        initialized_backend.backend, record, escrow_authorizer_pubkey
                     )
                     continue
                 missing_input = False

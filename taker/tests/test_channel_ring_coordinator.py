@@ -1063,6 +1063,46 @@ async def test_stranded_negotiation_escalates_only_without_a_live_round(tmp_path
     assert "cannot be resumed" in escalated.retry.last_error
 
 
+async def test_confirmation_enrolls_the_ring_channels_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import taker.channel_ring as taker_ring
+
+    enrolled: list[tuple[object, object, object]] = []
+
+    async def record_enrollment(backend: object, record: object, key: object) -> None:
+        enrolled.append((backend, record, key))
+
+    monkeypatch.setattr(taker_ring, "enroll_confirmed_ring_channels", record_enrollment)
+    coordinator = _harness(tmp_path)
+    assert await coordinator.prepare(_address(300), 0)
+    coordinator.mark_local_signature_creation()
+    coordinator.mark_local_signatures([{"txid": "01" * 32, "vout": 0, "witness": ["11" * 64]}])
+    unsigned = coordinator.session.unsigned_tx.hex()
+    coordinator.persist_final_transaction(unsigned)
+    record = coordinator._record()
+    chain = cast(FakeChain, coordinator.chain_backend)
+    assert record.manifest is not None
+    chain.transactions[record.manifest.unsigned_txid] = Transaction(
+        txid=record.manifest.unsigned_txid,
+        raw=unsigned,
+        confirmations=1,
+        block_height=100,
+    )
+    for _ in range(2):
+        await reconcile_taker_ring_records(
+            coordinator.store,
+            FakeNodePool(coordinator.initialized_backend),
+            cast(Any, chain),
+            escrow_authorizer_pubkey=b"\x07" * 32,
+        )
+    assert coordinator._record().state is RingLifecycleState.CONFIRMED_OPEN
+    [(backend, confirmed, key)] = enrolled
+    assert backend is coordinator.initialized_backend.backend
+    assert getattr(confirmed, "key", None) == record.key
+    assert key == b"\x07" * 32
+
+
 async def test_restart_rebroadcasts_and_confirms_exact_final_transaction(tmp_path: Path) -> None:
     coordinator = _harness(tmp_path)
     assert await coordinator.prepare(_address(300), 0)

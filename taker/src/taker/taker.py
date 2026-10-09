@@ -625,6 +625,8 @@ class Taker(TakerMonitoringMixin):
             # Validate ownership and all field states before any LND recovery or
             # funding action. Unknown coordinator evidence is never ignored.
             coordinator_records = self._channel_ring_coordinator_store.load_all()
+            from jmswap.channel_ring import wallet_escrow_authorizer_pubkey
+
             from taker.channel_ring import reconcile_taker_ring_records
 
             await reconcile_taker_ring_records(
@@ -633,6 +635,7 @@ class Taker(TakerMonitoringMixin):
                 self.backend,
                 self._channel_ring_recovery_tasks,
                 acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                escrow_authorizer_pubkey=wallet_escrow_authorizer_pubkey(self.wallet),
             )
             if not self._renew_channel_ring_input_locks():
                 raise RuntimeError("could not restore an active channel-ring input reservation")
@@ -1303,6 +1306,8 @@ class Taker(TakerMonitoringMixin):
         logger.info("Taker stopped")
 
     async def _periodic_channel_ring_reconciliation(self) -> None:
+        from jmswap.channel_ring import wallet_escrow_authorizer_pubkey
+
         from taker.channel_ring import reconcile_taker_ring_records
 
         while self.running:
@@ -1314,6 +1319,7 @@ class Taker(TakerMonitoringMixin):
                 self.backend,
                 self._channel_ring_recovery_tasks,
                 acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                escrow_authorizer_pubkey=wallet_escrow_authorizer_pubkey(self.wallet),
                 active_session_identities=self._active_ring_session_identities(),
             )
             if not self._renew_channel_ring_input_locks():
