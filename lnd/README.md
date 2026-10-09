@@ -23,8 +23,11 @@ Patches in `patches/`, applied in file name order:
    force-close exception for escrow-locked channels.
 2. `0002-fix-htlcswitch-resolve-late-local-quiescence-request.patch`: an
    independent quiescence fix the buyout flow depends on.
+3. `0003-feat-channelescrowrpc-require-an-enrolled-authorizer.patch`: per
+   channel escrow authorizers (see below), plus `PolicyInfo`,
+   `AuthorizeChannel` and `RevokeChannel`.
 
-Both are `git format-patch` output. The image applies them with `git apply`.
+All are `git format-patch` output. The image applies them with `git apply`.
 
 ## Build and verify
 
@@ -54,8 +57,8 @@ built binary reports `v0.21.3-beta-dirty`.
   support: `PrepareParent` binds a session to a single raw parent and its input
   index, and a different parent requires `Cancel` plus a new session.
 - The RPC surface (`FreezeChannel`, `PrepareParent`, `BeginSigning`,
-  `SignParent`, `FinalizeParent`, `Status`, `Cancel`) is the signing backend
-  only. The buyout lifecycle (peer negotiation, funding, CoinJoin
+  `SignParent`, `FinalizeParent`, `Status`, `Cancel`, plus the authorization
+  RPCs below) is the signing backend only. The buyout lifecycle (peer negotiation, funding, CoinJoin
   construction, payout, abort handling) lives outside this directory and is not
   described here.
 - Experimental. The patches are not upstream, the wire and database formats can
@@ -77,3 +80,51 @@ built binary reports `v0.21.3-beta-dirty`.
   to release a signed session. The force close spends the funding output through
   LND's normal commitment recovery; it does not broadcast the escrow parent.
   Upgrading does not initiate any closes or alter existing escrow records.
+
+
+## Escrow authorization
+
+`PrepareParent` checks that the parent spends the channel input it was given,
+but not where the parent's outputs pay. Without patch 3, anyone holding
+`channelescrow.macaroon` could therefore cosign, together with the channel
+peer, a parent that takes the local balance of any Taproot channel.
+
+Patch 3 closes that gap with a per channel authorizer:
+
+- `AuthorizeChannel(channel_point, authorizer_pubkey)` enrolls a BIP340 x-only
+  key for one channel. It needs `offchain:write`, the permission that already
+  opens and closes channels, and not a `channelescrow` permission. The escrow
+  macaroon alone cannot enroll a key.
+- `FreezeChannel` refuses a channel without an enrolled key, before quiescing
+  it. `SignParent` releases a new partial signature only with a valid
+  `authorizer_signature` over the exact parent, its prevouts, the channel input
+  index, the session, the funding outpoint, the node identity and the chain.
+  A partial that is already durable is returned without one, so recovery of a
+  signed session never needs the authorizer.
+- Re-enrolling the same key is idempotent. Changing or revoking it is refused
+  while any escrow record exists for the channel.
+- `PolicyInfo` (`channelescrow:read`) reports policy version 1. Clients refuse
+  to freeze against a node that does not report it.
+
+In JoinMarket NG the authorizer is derived from the wallet seed (one key per
+wallet and network, never a spending key). The ring maker and taker enroll
+each ring channel when its funding confirms. Channels confirmed by an older
+release are enrolled with `jm-maker authorize-ring-channels`.
+
+Macaroons:
+
+- `channelescrow.macaroon` can freeze, prepare, sign and finalize, but cannot
+  enroll a key, so it can no longer move funds on its own. Keep it private all
+  the same.
+- `admin.macaroon` has no `channelescrow` permissions, so it cannot sign, but
+  it can enroll a key. Whoever holds both it and the escrow macaroon (or a
+  custom macaroon with `offchain:write` and the escrow permissions) can enroll
+  their own key and authorize spends, together with the channel peer. Treat
+  that combination like a spending key.
+
+Upgrading from patches 1 and 2: existing channels start with no enrolled key,
+so no new escrow starts on them until they are enrolled. Escrow records
+written by the older build keep working: a signed session finishes or recovers
+as before, and an unsigned one can sign once its channel is enrolled. Records written by patch 3 use a new record version, which patches
+1 and 2 reject as unknown rather than signing without authorization: finish or
+cancel escrow sessions before downgrading.

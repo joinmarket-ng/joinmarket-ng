@@ -1,0 +1,1969 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JoinMarket NG <dev@joinmarket-ng.local>
+Date: Fri, 9 Oct 2026 12:00:00 +0200
+Subject: [PATCH 3/3] feat(channelescrowrpc): require an enrolled authorizer
+ per signature
+
+The escrow macaroon alone could cosign any parent that spends a channel's
+funding output, so whoever held it together with the channel peer could
+take the local balance. A channel must now be enrolled with a BIP340
+authorizer key (AuthorizeChannel, offchain:write, outside the escrow
+macaroon) before it can be frozen, and every SignParent needs that key's
+signature over a tagged digest of the network, node, channel, session,
+exact parent bytes, ordered spent outputs and input index.
+
+Escrow records are written as version 2 with the policy that admitted the
+partial; version 1 records still decode as policy 0 and never grant a
+signature by themselves. Status and finalization of already signed
+sessions are unchanged. The authorizer cannot change while an escrow
+record exists, except for the first enrollment of a legacy session.
+---
+ channeldb/channel_escrow.go                   | 130 +++-
+ channeldb/channel_escrow_test.go              | 149 +++-
+ lnrpc/channelescrowrpc/authorization.go       | 170 +++++
+ lnrpc/channelescrowrpc/authorization_test.go  | 167 +++++
+ lnrpc/channelescrowrpc/channelescrow.pb.go    | 705 ++++++++++++++----
+ lnrpc/channelescrowrpc/channelescrow.proto    |  42 ++
+ .../channelescrow.swagger.json                |  18 +
+ .../channelescrowrpc/channelescrow_grpc.pb.go | 120 +++
+ lnrpc/channelescrowrpc/config_active.go       |   7 +
+ lnrpc/channelescrowrpc/server.go              |  28 +-
+ subrpcserver_config.go                        |   8 +
+ 11 files changed, 1391 insertions(+), 153 deletions(-)
+ create mode 100644 lnrpc/channelescrowrpc/authorization.go
+ create mode 100644 lnrpc/channelescrowrpc/authorization_test.go
+
+diff --git a/channeldb/channel_escrow.go b/channeldb/channel_escrow.go
+index fc6f08e..e7ac7c5 100644
+--- a/channeldb/channel_escrow.go
++++ b/channeldb/channel_escrow.go
+@@ -26,15 +26,33 @@ var (
+ 	// ErrEscrowAlreadySigned is returned when an operation would unlock or
+ 	// mutate an escrow after releasing a local partial signature.
+ 	ErrEscrowAlreadySigned = errors.New("escrow has released a local signature")
++
++	// ErrNoEscrowAuthorizer is returned when a channel has not been enrolled
++	// for escrow with an authorizer key.
++	ErrNoEscrowAuthorizer = errors.New("channel has no escrow authorizer")
++
++	// ErrEscrowAuthorizerLocked is returned when an enrolled authorizer
++	// would change while escrow state exists for the channel.
++	ErrEscrowAuthorizerLocked = errors.New("escrow authorizer cannot change " +
++		"while an escrow record exists")
+ )
+ 
+ var escrowRecordKey = []byte("channel-escrow-v1")
+ var escrowCancellationKey = []byte("channel-escrow-canceled-v1")
+ 
++// escrowAuthorizerKey stores the BIP340 x-only key whose signature is
++// required for every new escrow partial signature of the channel.
++var escrowAuthorizerKey = []byte("channel-escrow-auth-v1")
++
+ const (
+-	escrowEncodingVersion byte = 1
+-	maxEscrowBlobSize          = 4 * 1024 * 1024
+-	maxEscrowRecordSize        = 8 * 1024 * 1024
++	// Records are written as version 2, which adds the authorization policy
++	// under which the local partial signature was released. Version 1
++	// records (written before authorization existed) read as policy 0.
++	escrowEncodingVersionV1 byte = 1
++	escrowEncodingVersion   byte = 2
++	escrowAuthorizerVersion byte = 1
++	maxEscrowBlobSize            = 4 * 1024 * 1024
++	maxEscrowRecordSize          = 8 * 1024 * 1024
+ )
+ 
+ // EscrowStage describes the durable part of the escrow protocol.
+@@ -80,6 +98,11 @@ type EscrowRecord struct {
+ 	RemotePubNonce    []byte
+ 	LocalPartialSig   []byte
+ 	FinalTx           []byte
++
++	// PolicyVersion is the authorization policy that admitted the latest
++	// local partial signature. Zero means none: a legacy record, or one
++	// that has not been signed under an authorizer yet.
++	PolicyVersion uint32
+ }
+ 
+ // EscrowRecord returns a copy of the channel's durable escrow authorization.
+@@ -130,6 +153,9 @@ func (c *OpenChannel) LockEscrow(record *EscrowRecord) error {
+ 		if channel.chanStatus != ChanStatusDefault {
+ 			return fmt.Errorf("channel is not in default state: %v", channel.chanStatus)
+ 		}
++		if _, err := escrowAuthorizerFromBucket(bucket); err != nil {
++			return err
++		}
+ 		encoded, err := encodeEscrowRecord(record)
+ 		if err != nil {
+ 			return err
+@@ -171,19 +197,33 @@ func (c *OpenChannel) PrepareEscrowParent(sessionID [32]byte, parent []byte,
+ 
+ // StoreEscrowPartial atomically records the public signing evidence before a
+ // local partial signature is returned to a caller.
+-func (c *OpenChannel) StoreEscrowPartial(sessionID [32]byte, localNonce,
+-	remoteNonce, localPartial []byte) error {
++//
++// The authorizer is the key the caller verified the authorization against; it
++// must still be the channel's enrolled key, so the check and the release of
++// the partial cannot straddle an enrollment change.
++func (c *OpenChannel) StoreEscrowPartial(sessionID [32]byte, authorizer [32]byte,
++	policyVersion uint32, localNonce, remoteNonce, localPartial []byte) error {
+ 	if len(localNonce) != 66 || len(remoteNonce) != 66 ||
+ 		len(localPartial) != 32 {
+ 
+ 		return errors.New("invalid escrow signing evidence length")
+ 	}
++	if policyVersion == 0 {
++		return errors.New("escrow partial requires an authorization policy")
++	}
+ 
+ 	return c.updateEscrow(func(channel *OpenChannel, bucket kvdb.RwBucket) error {
+ 		record, err := escrowRecordForSession(bucket, sessionID)
+ 		if err != nil {
+ 			return err
+ 		}
++		enrolled, err := escrowAuthorizerFromBucket(bucket)
++		if err != nil {
++			return err
++		}
++		if enrolled != authorizer {
++			return ErrEscrowAuthorizerLocked
++		}
+ 		if record.Stage == EscrowFinalized {
+ 			return nil
+ 		}
+@@ -194,6 +234,7 @@ func (c *OpenChannel) StoreEscrowPartial(sessionID [32]byte, localNonce,
+ 			record.LocalPubNonce = bytes.Clone(localNonce)
+ 			record.RemotePubNonce = bytes.Clone(remoteNonce)
+ 			record.LocalPartialSig = bytes.Clone(localPartial)
++			record.PolicyVersion = policyVersion
+ 			return putEscrowRecord(bucket, record)
+ 		}
+ 		if record.Stage != EscrowParentPrepared {
+@@ -203,6 +244,7 @@ func (c *OpenChannel) StoreEscrowPartial(sessionID [32]byte, localNonce,
+ 		record.LocalPubNonce = bytes.Clone(localNonce)
+ 		record.RemotePubNonce = bytes.Clone(remoteNonce)
+ 		record.LocalPartialSig = bytes.Clone(localPartial)
++		record.PolicyVersion = policyVersion
+ 		return putEscrowRecord(bucket, record)
+ 	})
+ }
+@@ -275,6 +317,74 @@ func (c *OpenChannel) FinalizeEscrowInput(sessionID [32]byte, closeTx *wire.MsgT
+ 	})
+ }
+ 
++// EscrowAuthorizer returns the channel's enrolled BIP340 x-only authorizer.
++func (c *OpenChannel) EscrowAuthorizer() ([32]byte, error) {
++	var key [32]byte
++	err := kvdb.View(c.Db.backend, func(tx kvdb.RTx) error {
++		bucket, err := fetchChanBucket(
++			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
++		)
++		if err != nil {
++			return err
++		}
++		key, err = escrowAuthorizerFromBucket(bucket)
++		return err
++	}, func() { key = [32]byte{} })
++	return key, err
++}
++
++// AuthorizeEscrow enrolls the channel for escrow under an authorizer key.
++// Re-enrolling the same key is idempotent at any time. A channel without an
++// authorizer may be enrolled even while it has an escrow record, so a session
++// begun before enrollment existed can continue. Any other change is refused
++// while an escrow record exists.
++func (c *OpenChannel) AuthorizeEscrow(authorizer [32]byte) error {
++	return c.updateEscrow(func(channel *OpenChannel, bucket kvdb.RwBucket) error {
++		current, err := escrowAuthorizerFromBucket(bucket)
++		switch {
++		case err == nil && current == authorizer:
++			return nil
++		case err == nil:
++			if bucket.Get(escrowRecordKey) != nil {
++				return ErrEscrowAuthorizerLocked
++			}
++		case !errors.Is(err, ErrNoEscrowAuthorizer):
++			return err
++		}
++		encoded := make([]byte, 0, 33)
++		encoded = append(encoded, escrowAuthorizerVersion)
++		encoded = append(encoded, authorizer[:]...)
++		return bucket.Put(escrowAuthorizerKey, encoded)
++	})
++}
++
++// RevokeEscrowAuthorizer removes the channel's enrollment. It is refused while
++// an escrow record exists and is idempotent otherwise.
++func (c *OpenChannel) RevokeEscrowAuthorizer() error {
++	return c.updateEscrow(func(channel *OpenChannel, bucket kvdb.RwBucket) error {
++		if bucket.Get(escrowRecordKey) != nil {
++			return ErrEscrowAuthorizerLocked
++		}
++		if bucket.Get(escrowAuthorizerKey) == nil {
++			return nil
++		}
++		return bucket.Delete(escrowAuthorizerKey)
++	})
++}
++
++func escrowAuthorizerFromBucket(bucket kvdb.RBucket) ([32]byte, error) {
++	var key [32]byte
++	data := bucket.Get(escrowAuthorizerKey)
++	if data == nil {
++		return key, ErrNoEscrowAuthorizer
++	}
++	if len(data) != 33 || data[0] != escrowAuthorizerVersion {
++		return key, errors.New("unknown escrow authorizer record")
++	}
++	copy(key[:], data[1:])
++	return key, nil
++}
++
+ func (c *OpenChannel) updateEscrow(f func(*OpenChannel, kvdb.RwBucket) error) error {
+ 	c.Lock()
+ 	defer c.Unlock()
+@@ -329,6 +439,9 @@ func encodeEscrowRecord(record *EscrowRecord) ([]byte, error) {
+ 	}
+ 	var buf bytes.Buffer
+ 	buf.WriteByte(escrowEncodingVersion)
++	if err := binary.Write(&buf, binary.BigEndian, record.PolicyVersion); err != nil {
++		return nil, err
++	}
+ 	buf.Write(record.SessionID[:])
+ 	buf.WriteByte(byte(record.Stage))
+ 	if err := binary.Write(&buf, binary.BigEndian, record.Snapshot.Capacity); err != nil {
+@@ -384,10 +497,15 @@ func decodeEscrowRecord(data []byte) (*EscrowRecord, error) {
+ 	}
+ 	r := bytes.NewReader(data)
+ 	version, err := r.ReadByte()
+-	if err != nil || version != escrowEncodingVersion {
++	if err != nil || (version != escrowEncodingVersion && version != escrowEncodingVersionV1) {
+ 		return nil, errors.New("unknown escrow record version")
+ 	}
+ 	record := &EscrowRecord{}
++	if version == escrowEncodingVersion {
++		if err := binary.Read(r, binary.BigEndian, &record.PolicyVersion); err != nil {
++			return nil, err
++		}
++	}
+ 	if _, err := io.ReadFull(r, record.SessionID[:]); err != nil {
+ 		return nil, err
+ 	}
+diff --git a/channeldb/channel_escrow_test.go b/channeldb/channel_escrow_test.go
+index 0fae3be..040ed87 100644
+--- a/channeldb/channel_escrow_test.go
++++ b/channeldb/channel_escrow_test.go
+@@ -8,9 +8,14 @@ import (
+ 
+ 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+ 	"github.com/btcsuite/btcd/wire"
++	"github.com/lightningnetwork/lnd/kvdb"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++// testAuthorizer is an arbitrary enrolled key; channeldb does not verify
++// signatures, the RPC server does.
++var testAuthorizer = [32]byte{7, 7, 7}
++
+ func testEscrowRecord() *EscrowRecord {
+ 	var sessionID [32]byte
+ 	copy(sessionID[:], bytes.Repeat([]byte{1}, len(sessionID)))
+@@ -112,6 +117,7 @@ func TestEscrowRecordDurableTransitions(t *testing.T) {
+ 	fullDB, err := MakeTestDB(t)
+ 	require.NoError(t, err)
+ 	channel := createTestChannel(t, fullDB.ChannelStateDB())
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
+ 
+ 	record := testLockedEscrowRecord()
+ 	require.NoError(t, channel.LockEscrow(record))
+@@ -151,7 +157,7 @@ func TestEscrowRecordDurableTransitions(t *testing.T) {
+ 	remoteNonce := bytes.Repeat([]byte{2}, 66)
+ 	partial := bytes.Repeat([]byte{3}, 32)
+ 	require.NoError(t, reloaded.StoreEscrowPartial(
+-		prepared.SessionID, localNonce, remoteNonce, partial,
++		prepared.SessionID, testAuthorizer, 1, localNonce, remoteNonce, partial,
+ 	))
+ 	require.ErrorIs(t, reloaded.CancelEscrow(prepared.SessionID), ErrEscrowAlreadySigned)
+ 
+@@ -159,7 +165,8 @@ func TestEscrowRecordDurableTransitions(t *testing.T) {
+ 	freshRemoteNonce := bytes.Repeat([]byte{5}, 66)
+ 	freshPartial := bytes.Repeat([]byte{6}, 32)
+ 	require.NoError(t, reloaded.StoreEscrowPartial(
+-		prepared.SessionID, freshLocalNonce, freshRemoteNonce, freshPartial,
++		prepared.SessionID, testAuthorizer, 1, freshLocalNonce, freshRemoteNonce,
++		freshPartial,
+ 	))
+ 	persisted, err = reloaded.EscrowRecord()
+ 	require.NoError(t, err)
+@@ -188,6 +195,7 @@ func TestEscrowCancelAndStatusString(t *testing.T) {
+ 	fullDB, err := MakeTestDB(t)
+ 	require.NoError(t, err)
+ 	channel := createTestChannel(t, fullDB.ChannelStateDB())
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
+ 	record := testLockedEscrowRecord()
+ 	require.NoError(t, channel.LockEscrow(record))
+ 	require.Contains(t, channel.ChanStatus().String(), "ChanStatusEscrowLocked")
+@@ -203,6 +211,7 @@ func TestEscrowCancellationReceipt(t *testing.T) {
+ 	fullDB, err := MakeTestDB(t)
+ 	require.NoError(t, err)
+ 	channel := createTestChannel(t, fullDB.ChannelStateDB())
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
+ 	record := testLockedEscrowRecord()
+ 	// Absence alone is never a cancellation receipt.
+ 	require.ErrorIs(t, channel.CancelEscrow(record.SessionID), ErrNoEscrowRecord)
+@@ -227,3 +236,139 @@ func TestEscrowCancellationReceipt(t *testing.T) {
+ 	// A receipt for a different epoch is not affirmative evidence.
+ 	require.ErrorIs(t, reloaded.CancelEscrow(record.SessionID), ErrNoEscrowRecord)
+ }
++
++func TestEscrowAuthorizerEnrollment(t *testing.T) {
++	t.Parallel()
++
++	fullDB, err := MakeTestDB(t)
++	require.NoError(t, err)
++	channel := createTestChannel(t, fullDB.ChannelStateDB())
++	record := testLockedEscrowRecord()
++
++	// An unenrolled channel cannot be locked.
++	_, err = channel.EscrowAuthorizer()
++	require.ErrorIs(t, err, ErrNoEscrowAuthorizer)
++	require.ErrorIs(t, channel.LockEscrow(record), ErrNoEscrowAuthorizer)
++	require.False(t, channel.HasChanStatus(ChanStatusEscrowLocked))
++
++	other := [32]byte{8}
++	require.NoError(t, channel.AuthorizeEscrow(other))
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
++	require.NoError(t, channel.LockEscrow(record))
++
++	// While a record exists only the same key may be enrolled again.
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
++	require.ErrorIs(t, channel.AuthorizeEscrow(other), ErrEscrowAuthorizerLocked)
++	require.ErrorIs(t, channel.RevokeEscrowAuthorizer(), ErrEscrowAuthorizerLocked)
++	key, err := channel.EscrowAuthorizer()
++	require.NoError(t, err)
++	require.Equal(t, testAuthorizer, key)
++
++	require.NoError(t, channel.CancelEscrow(record.SessionID))
++	require.NoError(t, channel.RevokeEscrowAuthorizer())
++	require.NoError(t, channel.RevokeEscrowAuthorizer())
++	_, err = channel.EscrowAuthorizer()
++	require.ErrorIs(t, err, ErrNoEscrowAuthorizer)
++
++	// A malformed enrollment is never read as a key.
++	require.NoError(t, channel.updateEscrow(func(_ *OpenChannel, bucket kvdb.RwBucket) error {
++		return bucket.Put(escrowAuthorizerKey, append([]byte{2}, testAuthorizer[:]...))
++	}))
++	_, err = channel.EscrowAuthorizer()
++	require.Error(t, err)
++	require.NotErrorIs(t, err, ErrNoEscrowAuthorizer)
++}
++
++func TestEscrowPartialBindsEnrolledAuthorizer(t *testing.T) {
++	t.Parallel()
++
++	fullDB, err := MakeTestDB(t)
++	require.NoError(t, err)
++	channel := createTestChannel(t, fullDB.ChannelStateDB())
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
++	prepared := testEscrowRecord()
++	require.NoError(t, channel.LockEscrow(testLockedEscrowRecord()))
++	require.NoError(t, channel.PrepareEscrowParent(
++		prepared.SessionID, prepared.ParentTx, prepared.PrevOuts,
++		prepared.ChannelInputIndex, prepared.ParentTxID,
++	))
++	nonce := bytes.Repeat([]byte{1}, 66)
++	partial := bytes.Repeat([]byte{3}, 32)
++
++	require.Error(t, channel.StoreEscrowPartial(
++		prepared.SessionID, testAuthorizer, 0, nonce, nonce, partial,
++	))
++	require.ErrorIs(t, channel.StoreEscrowPartial(
++		prepared.SessionID, [32]byte{8}, 1, nonce, nonce, partial,
++	), ErrEscrowAuthorizerLocked)
++	persisted, err := channel.EscrowRecord()
++	require.NoError(t, err)
++	require.Equal(t, EscrowParentPrepared, persisted.Stage)
++
++	require.NoError(t, channel.StoreEscrowPartial(
++		prepared.SessionID, testAuthorizer, 1, nonce, nonce, partial,
++	))
++	persisted, err = channel.EscrowRecord()
++	require.NoError(t, err)
++	require.Equal(t, EscrowParentSigned, persisted.Stage)
++	require.Equal(t, uint32(1), persisted.PolicyVersion)
++}
++
++// encodeEscrowRecordV1 reproduces the encoding written before authorization.
++func encodeEscrowRecordV1(t *testing.T, record *EscrowRecord) []byte {
++	encoded, err := encodeEscrowRecord(record)
++	require.NoError(t, err)
++	return append([]byte{escrowEncodingVersionV1}, encoded[5:]...)
++}
++
++func TestEscrowLegacyV1Record(t *testing.T) {
++	t.Parallel()
++
++	record := testEscrowRecord()
++	record.PolicyVersion = 1
++	decoded, err := decodeEscrowRecord(encodeEscrowRecordV1(t, record))
++	require.NoError(t, err)
++	require.Equal(t, uint32(0), decoded.PolicyVersion)
++	decoded.PolicyVersion = 1
++	require.Equal(t, record, decoded)
++
++	for _, version := range []byte{0, 3, 0xff} {
++		encoded, err := encodeEscrowRecord(record)
++		require.NoError(t, err)
++		encoded[0] = version
++		_, err = decodeEscrowRecord(encoded)
++		require.Error(t, err)
++	}
++
++	// A session locked before enrollment existed: the first enrollment is
++	// allowed so it can continue, and the record upgrades on its next write.
++	fullDB, err := MakeTestDB(t)
++	require.NoError(t, err)
++	channel := createTestChannel(t, fullDB.ChannelStateDB())
++	locked := testLockedEscrowRecord()
++	require.NoError(t, channel.updateEscrow(func(c *OpenChannel, bucket kvdb.RwBucket) error {
++		c.chanStatus |= ChanStatusEscrowLocked
++		if err := putOpenChannel(bucket, c); err != nil {
++			return err
++		}
++		return bucket.Put(escrowRecordKey, encodeEscrowRecordV1(t, locked))
++	}))
++	persisted, err := channel.EscrowRecord()
++	require.NoError(t, err)
++	require.Equal(t, uint32(0), persisted.PolicyVersion)
++	require.NoError(t, channel.AuthorizeEscrow(testAuthorizer))
++	require.ErrorIs(t, channel.AuthorizeEscrow([32]byte{8}), ErrEscrowAuthorizerLocked)
++
++	prepared := testEscrowRecord()
++	require.NoError(t, channel.PrepareEscrowParent(
++		prepared.SessionID, prepared.ParentTx, prepared.PrevOuts,
++		prepared.ChannelInputIndex, prepared.ParentTxID,
++	))
++	require.NoError(t, channel.updateEscrow(func(_ *OpenChannel, bucket kvdb.RwBucket) error {
++		require.Equal(t, escrowEncodingVersion, bucket.Get(escrowRecordKey)[0])
++		return nil
++	}))
++	// Cancellation of a legacy unsigned session stays available.
++	require.NoError(t, channel.CancelEscrow(prepared.SessionID))
++}
+diff --git a/lnrpc/channelescrowrpc/authorization.go b/lnrpc/channelescrowrpc/authorization.go
+new file mode 100644
+index 0000000..41bfcc0
+--- /dev/null
++++ b/lnrpc/channelescrowrpc/authorization.go
+@@ -0,0 +1,170 @@
++//go:build channelescrowrpc
++// +build channelescrowrpc
++
++package channelescrowrpc
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
++	"github.com/btcsuite/btcd/chaincfg/chainhash"
++	"github.com/btcsuite/btcd/wire"
++	"github.com/lightningnetwork/lnd/channeldb"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++// AuthorizationPolicyV1 requires a BIP340 signature by the channel's enrolled
++// authorizer over authorizationDigest for every released partial signature.
++const AuthorizationPolicyV1 uint32 = 1
++
++// authorizationTag domain-separates the authorization digest.
++var authorizationTag = []byte("JoinMarketNG/channel-escrow-auth/v1")
++
++// authorizationDigest commits to everything the local partial signature
++// authorizes: the policy, network, node, channel, session, the exact stored
++// parent bytes, its ordered spent outputs and the channel input index.
++// Integers are little-endian; hashes and txids are in internal byte order.
++func authorizationDigest(policy uint32, chain chainhash.Hash, node [33]byte,
++	op wire.OutPoint, record *channeldb.EscrowRecord) *chainhash.Hash {
++
++	var msg bytes.Buffer
++	var u32 [4]byte
++	var u64 [8]byte
++	binary.LittleEndian.PutUint32(u32[:], policy)
++	msg.Write(u32[:])
++	msg.Write(chain[:])
++	msg.Write(node[:])
++	msg.Write(op.Hash[:])
++	binary.LittleEndian.PutUint32(u32[:], op.Index)
++	msg.Write(u32[:])
++	msg.Write(record.SessionID[:])
++	parentHash := sha256.Sum256(record.ParentTx)
++	msg.Write(parentHash[:])
++	binary.LittleEndian.PutUint32(u32[:], uint32(len(record.PrevOuts)))
++	msg.Write(u32[:])
++	for _, prevOut := range record.PrevOuts {
++		binary.LittleEndian.PutUint64(u64[:], uint64(prevOut.Value))
++		msg.Write(u64[:])
++		binary.LittleEndian.PutUint32(u32[:], uint32(len(prevOut.PkScript)))
++		msg.Write(u32[:])
++		msg.Write(prevOut.PkScript)
++	}
++	binary.LittleEndian.PutUint32(u32[:], record.ChannelInputIndex)
++	msg.Write(u32[:])
++	return chainhash.TaggedHash(authorizationTag, msg.Bytes())
++}
++
++// verifyAuthorization checks a SignParent authorization against the enrolled
++// key and the persisted parent, returning the key it was verified against.
++func (s *Server) verifyAuthorization(channel *channeldb.OpenChannel, op wire.OutPoint,
++	record *channeldb.EscrowRecord, policy uint32, signature []byte) ([32]byte, error) {
++
++	var authorizer [32]byte
++	if policy != AuthorizationPolicyV1 {
++		return authorizer, status.Error(codes.InvalidArgument,
++			"unsupported escrow authorization policy")
++	}
++	if record.Stage < channeldb.EscrowParentPrepared || len(record.ParentTx) == 0 {
++		return authorizer, status.Error(codes.FailedPrecondition,
++			"prepared escrow parent required")
++	}
++	if len(signature) != schnorr.SignatureSize {
++		return authorizer, status.Error(codes.PermissionDenied,
++			"escrow authorization signature required")
++	}
++	authorizer, err := channel.EscrowAuthorizer()
++	if err != nil {
++		return authorizer, authorizerError(err)
++	}
++	digest := authorizationDigest(policy, s.cfg.ChainHash, s.cfg.LocalNodeKey(), op, record)
++	return authorizer, checkAuthorization(authorizer, digest, signature)
++}
++
++// checkAuthorization verifies a BIP340 signature by the enrolled key.
++func checkAuthorization(authorizer [32]byte, digest *chainhash.Hash, signature []byte) error {
++	pubKey, err := schnorr.ParsePubKey(authorizer[:])
++	if err != nil {
++		return status.Error(codes.FailedPrecondition, "invalid enrolled escrow authorizer")
++	}
++	sig, err := schnorr.ParseSignature(signature)
++	if err != nil || !sig.Verify(digest[:], pubKey) {
++		return status.Error(codes.PermissionDenied, "invalid escrow authorization signature")
++	}
++	return nil
++}
++
++func authorizerError(err error) error {
++	switch {
++	case errors.Is(err, channeldb.ErrNoEscrowAuthorizer):
++		return status.Error(codes.FailedPrecondition, err.Error())
++	case errors.Is(err, channeldb.ErrEscrowAuthorizerLocked):
++		return status.Error(codes.FailedPrecondition, err.Error())
++	}
++	return err
++}
++
++// PolicyInfo lists the authorization policies enforced by this node.
++func (s *Server) PolicyInfo(context.Context, *PolicyInfoRequest) (*PolicyInfoResponse, error) {
++	return &PolicyInfoResponse{SupportedPolicyVersions: []uint32{AuthorizationPolicyV1}}, nil
++}
++
++// AuthorizeChannel enrolls a SIMPLE_TAPROOT channel for escrow.
++func (s *Server) AuthorizeChannel(_ context.Context, req *AuthorizeChannelRequest) (
++	*AuthorizeChannelResponse, error) {
++
++	op, err := parseChannelPoint(req.GetChannelPoint())
++	if err != nil {
++		return nil, err
++	}
++	var authorizer [32]byte
++	if len(req.GetAuthorizerPubkey()) != len(authorizer) {
++		return nil, status.Error(codes.InvalidArgument, "32-byte x-only authorizer required")
++	}
++	if _, err := schnorr.ParsePubKey(req.GetAuthorizerPubkey()); err != nil {
++		return nil, status.Error(codes.InvalidArgument, "invalid authorizer public key")
++	}
++	copy(authorizer[:], req.GetAuthorizerPubkey())
++	channel, err := s.cfg.ChanStateDB.FetchChannel(*op)
++	if err != nil {
++		return nil, err
++	}
++	if !channel.ChanType.IsTaproot() {
++		return nil, status.Error(codes.FailedPrecondition, "channel is not SIMPLE_TAPROOT")
++	}
++	if err := channel.AuthorizeEscrow(authorizer); err != nil {
++		return nil, authorizerError(err)
++	}
++	return &AuthorizeChannelResponse{}, nil
++}
++
++// RevokeChannel removes a channel's escrow enrollment.
++func (s *Server) RevokeChannel(_ context.Context, req *RevokeChannelRequest) (
++	*RevokeChannelResponse, error) {
++
++	op, err := parseChannelPoint(req.GetChannelPoint())
++	if err != nil {
++		return nil, err
++	}
++	channel, err := s.cfg.ChanStateDB.FetchChannel(*op)
++	if err != nil {
++		return nil, err
++	}
++	if err := channel.RevokeEscrowAuthorizer(); err != nil {
++		return nil, authorizerError(err)
++	}
++	return &RevokeChannelResponse{}, nil
++}
++
++func parseChannelPoint(point *ChannelPoint) (*wire.OutPoint, error) {
++	if point == nil || len(point.GetFundingTxid()) != chainhash.HashSize {
++		return nil, status.Error(codes.InvalidArgument, "channel point is required")
++	}
++	var hash chainhash.Hash
++	copy(hash[:], point.GetFundingTxid())
++	return wire.NewOutPoint(&hash, point.GetOutputIndex()), nil
++}
+diff --git a/lnrpc/channelescrowrpc/authorization_test.go b/lnrpc/channelescrowrpc/authorization_test.go
+new file mode 100644
+index 0000000..54cd63a
+--- /dev/null
++++ b/lnrpc/channelescrowrpc/authorization_test.go
+@@ -0,0 +1,167 @@
++//go:build channelescrowrpc
++// +build channelescrowrpc
++
++package channelescrowrpc
++
++import (
++	"bytes"
++	"encoding/hex"
++	"testing"
++
++	"github.com/btcsuite/btcd/btcec/v2"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
++	"github.com/btcsuite/btcd/chaincfg"
++	"github.com/btcsuite/btcd/chaincfg/chainhash"
++	"github.com/btcsuite/btcd/wire"
++	"github.com/lightningnetwork/lnd/channeldb"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++// authorizationVector is shared with the Python authorizer tests
++// (jmcore/tests/test_escrow_authorizer.py); both must produce vectorDigest.
++type authorizationVector struct {
++	chain  chainhash.Hash
++	node   [33]byte
++	op     wire.OutPoint
++	record *channeldb.EscrowRecord
++}
++
++const vectorDigest = "bb38a59c038d846870187ec7a70c97dd8f676daff2cb857aa3bf748a573a7c29"
++
++func testAuthorizationVector() authorizationVector {
++	var node [33]byte
++	node[0] = 2
++	copy(node[1:], bytes.Repeat([]byte{0x11}, 32))
++	var opHash chainhash.Hash
++	copy(opHash[:], bytes.Repeat([]byte{0x33}, 32))
++	var session [32]byte
++	copy(session[:], bytes.Repeat([]byte{0x44}, 32))
++	return authorizationVector{
++		chain: *chaincfg.RegressionNetParams.GenesisHash,
++		node:  node,
++		op:    wire.OutPoint{Hash: opHash, Index: 1},
++		record: &channeldb.EscrowRecord{
++			SessionID: session,
++			Stage:     channeldb.EscrowParentPrepared,
++			ParentTx:  []byte("exact parent transaction bytes"),
++			PrevOuts: []channeldb.EscrowPrevOut{
++				{Value: 1_000, PkScript: append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0x55}, 20)...)},
++				{Value: 2_000, PkScript: append([]byte{0x51, 0x20}, bytes.Repeat([]byte{0x66}, 32)...)},
++			},
++			ChannelInputIndex: 1,
++		},
++	}
++}
++
++func (v authorizationVector) digest() *chainhash.Hash {
++	return authorizationDigest(AuthorizationPolicyV1, v.chain, v.node, v.op, v.record)
++}
++
++func TestAuthorizationDigestVector(t *testing.T) {
++	t.Parallel()
++
++	require.Equal(t, vectorDigest, hex.EncodeToString(testAuthorizationVector().digest()[:]))
++}
++
++func TestAuthorizationDigestCommitsToEveryField(t *testing.T) {
++	t.Parallel()
++
++	base := testAuthorizationVector().digest()
++	mutations := map[string]func(*authorizationVector){
++		"chain": func(v *authorizationVector) { v.chain = *chaincfg.TestNet3Params.GenesisHash },
++		"node":  func(v *authorizationVector) { v.node[1] ^= 1 },
++		"txid":  func(v *authorizationVector) { v.op.Hash[0] ^= 1 },
++		"vout":  func(v *authorizationVector) { v.op.Index++ },
++		"session": func(v *authorizationVector) {
++			v.record.SessionID[0] ^= 1
++		},
++		"parent": func(v *authorizationVector) {
++			v.record.ParentTx = append(bytes.Clone(v.record.ParentTx), 0)
++		},
++		"prevout value": func(v *authorizationVector) { v.record.PrevOuts[0].Value++ },
++		"prevout script": func(v *authorizationVector) {
++			v.record.PrevOuts[1].PkScript = append(bytes.Clone(v.record.PrevOuts[1].PkScript), 0)
++		},
++		"prevout order": func(v *authorizationVector) {
++			p := v.record.PrevOuts
++			v.record.PrevOuts = []channeldb.EscrowPrevOut{p[1], p[0]}
++		},
++		"input index": func(v *authorizationVector) { v.record.ChannelInputIndex = 0 },
++	}
++	for name, mutate := range mutations {
++		v := testAuthorizationVector()
++		mutate(&v)
++		require.NotEqual(t, base, v.digest(), name)
++	}
++	v := testAuthorizationVector()
++	require.NotEqual(t, base, authorizationDigest(2, v.chain, v.node, v.op, v.record))
++}
++
++func TestCheckAuthorization(t *testing.T) {
++	t.Parallel()
++
++	priv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{1}, 32))
++	var authorizer [32]byte
++	copy(authorizer[:], schnorr.SerializePubKey(priv.PubKey()))
++	digest := testAuthorizationVector().digest()
++	sig, err := schnorr.Sign(priv, digest[:])
++	require.NoError(t, err)
++
++	require.NoError(t, checkAuthorization(authorizer, digest, sig.Serialize()))
++
++	denied := func(err error) {
++		t.Helper()
++		require.Equal(t, codes.PermissionDenied, status.Code(err))
++	}
++	other := testAuthorizationVector()
++	other.record.ChannelInputIndex = 0
++	denied(checkAuthorization(authorizer, other.digest(), sig.Serialize()))
++	denied(checkAuthorization(authorizer, digest, sig.Serialize()[:63]))
++	denied(checkAuthorization(authorizer, digest, nil))
++	otherPriv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{2}, 32))
++	var otherKey [32]byte
++	copy(otherKey[:], schnorr.SerializePubKey(otherPriv.PubKey()))
++	denied(checkAuthorization(otherKey, digest, sig.Serialize()))
++}
++
++func TestVerifyAuthorizationRejectsBeforeKeyLookup(t *testing.T) {
++	t.Parallel()
++
++	// These checks run before the enrolled key is read, so a channel with no
++	// database is enough.
++	server := &Server{cfg: &Config{LocalNodeKey: func() [33]byte { return [33]byte{2} }}}
++	v := testAuthorizationVector()
++	sig := bytes.Repeat([]byte{1}, schnorr.SignatureSize)
++
++	_, err := server.verifyAuthorization(nil, v.op, v.record, 0, sig)
++	require.Equal(t, codes.InvalidArgument, status.Code(err))
++	_, err = server.verifyAuthorization(nil, v.op, v.record, 2, sig)
++	require.Equal(t, codes.InvalidArgument, status.Code(err))
++
++	locked := *v.record
++	locked.Stage = channeldb.EscrowLocked
++	_, err = server.verifyAuthorization(nil, v.op, &locked, AuthorizationPolicyV1, sig)
++	require.Equal(t, codes.FailedPrecondition, status.Code(err))
++
++	_, err = server.verifyAuthorization(nil, v.op, v.record, AuthorizationPolicyV1, sig[:10])
++	require.Equal(t, codes.PermissionDenied, status.Code(err))
++}
++
++func TestEnrollmentNeedsOffchainWrite(t *testing.T) {
++	t.Parallel()
++
++	for _, method := range []string{"AuthorizeChannel", "RevokeChannel"} {
++		ops := macPermissions["/channelescrowrpc.ChannelEscrow/"+method]
++		require.Len(t, ops, 1, method)
++		require.Equal(t, "offchain", ops[0].Entity, method)
++		require.Equal(t, "write", ops[0].Action, method)
++	}
++	// The escrow macaroon itself must not carry enrollment authority.
++	for _, op := range macaroonOps {
++		require.Equal(t, "channelescrow", op.Entity)
++	}
++	require.Equal(t, "read",
++		macPermissions["/channelescrowrpc.ChannelEscrow/PolicyInfo"][0].Action)
++}
+diff --git a/lnrpc/channelescrowrpc/channelescrow.pb.go b/lnrpc/channelescrowrpc/channelescrow.pb.go
+index 1535bf4..cff01d0 100644
+--- a/lnrpc/channelescrowrpc/channelescrow.pb.go
++++ b/lnrpc/channelescrowrpc/channelescrow.pb.go
+@@ -541,6 +541,10 @@ type SignParentRequest struct {
+ 	SessionId         []byte        `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+ 	AttemptId         []byte        `protobuf:"bytes,3,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+ 	RemotePublicNonce []byte        `protobuf:"bytes,4,opt,name=remote_public_nonce,json=remotePublicNonce,proto3" json:"remote_public_nonce,omitempty"`
++	// BIP340 signature by the channel's enrolled authorizer over the policy
++	// digest of the prepared parent.
++	AuthorizerSignature []byte `protobuf:"bytes,5,opt,name=authorizer_signature,json=authorizerSignature,proto3" json:"authorizer_signature,omitempty"`
++	PolicyVersion       uint32 `protobuf:"varint,6,opt,name=policy_version,json=policyVersion,proto3" json:"policy_version,omitempty"`
+ }
+ 
+ func (x *SignParentRequest) Reset() {
+@@ -603,6 +607,20 @@ func (x *SignParentRequest) GetRemotePublicNonce() []byte {
+ 	return nil
+ }
+ 
++func (x *SignParentRequest) GetAuthorizerSignature() []byte {
++	if x != nil {
++		return x.AuthorizerSignature
++	}
++	return nil
++}
++
++func (x *SignParentRequest) GetPolicyVersion() uint32 {
++	if x != nil {
++		return x.PolicyVersion
++	}
++	return 0
++}
++
+ type SignParentResponse struct {
+ 	state         protoimpl.MessageState
+ 	sizeCache     protoimpl.SizeCache
+@@ -1044,6 +1062,270 @@ func (x *CancelResponse) GetLinkResumed() bool {
+ 	return false
+ }
+ 
++type PolicyInfoRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *PolicyInfoRequest) Reset() {
++	*x = PolicyInfoRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[16]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *PolicyInfoRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*PolicyInfoRequest) ProtoMessage() {}
++
++func (x *PolicyInfoRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[16]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use PolicyInfoRequest.ProtoReflect.Descriptor instead.
++func (*PolicyInfoRequest) Descriptor() ([]byte, []int) {
++	return file_channelescrowrpc_channelescrow_proto_rawDescGZIP(), []int{16}
++}
++
++type PolicyInfoResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	SupportedPolicyVersions []uint32 `protobuf:"varint,1,rep,packed,name=supported_policy_versions,json=supportedPolicyVersions,proto3" json:"supported_policy_versions,omitempty"`
++}
++
++func (x *PolicyInfoResponse) Reset() {
++	*x = PolicyInfoResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[17]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *PolicyInfoResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*PolicyInfoResponse) ProtoMessage() {}
++
++func (x *PolicyInfoResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[17]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use PolicyInfoResponse.ProtoReflect.Descriptor instead.
++func (*PolicyInfoResponse) Descriptor() ([]byte, []int) {
++	return file_channelescrowrpc_channelescrow_proto_rawDescGZIP(), []int{17}
++}
++
++func (x *PolicyInfoResponse) GetSupportedPolicyVersions() []uint32 {
++	if x != nil {
++		return x.SupportedPolicyVersions
++	}
++	return nil
++}
++
++type AuthorizeChannelRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	ChannelPoint *ChannelPoint `protobuf:"bytes,1,opt,name=channel_point,json=channelPoint,proto3" json:"channel_point,omitempty"`
++	// 32-byte BIP340 x-only public key.
++	AuthorizerPubkey []byte `protobuf:"bytes,2,opt,name=authorizer_pubkey,json=authorizerPubkey,proto3" json:"authorizer_pubkey,omitempty"`
++}
++
++func (x *AuthorizeChannelRequest) Reset() {
++	*x = AuthorizeChannelRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[18]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AuthorizeChannelRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AuthorizeChannelRequest) ProtoMessage() {}
++
++func (x *AuthorizeChannelRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[18]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AuthorizeChannelRequest.ProtoReflect.Descriptor instead.
++func (*AuthorizeChannelRequest) Descriptor() ([]byte, []int) {
++	return file_channelescrowrpc_channelescrow_proto_rawDescGZIP(), []int{18}
++}
++
++func (x *AuthorizeChannelRequest) GetChannelPoint() *ChannelPoint {
++	if x != nil {
++		return x.ChannelPoint
++	}
++	return nil
++}
++
++func (x *AuthorizeChannelRequest) GetAuthorizerPubkey() []byte {
++	if x != nil {
++		return x.AuthorizerPubkey
++	}
++	return nil
++}
++
++type AuthorizeChannelResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *AuthorizeChannelResponse) Reset() {
++	*x = AuthorizeChannelResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[19]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AuthorizeChannelResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AuthorizeChannelResponse) ProtoMessage() {}
++
++func (x *AuthorizeChannelResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[19]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AuthorizeChannelResponse.ProtoReflect.Descriptor instead.
++func (*AuthorizeChannelResponse) Descriptor() ([]byte, []int) {
++	return file_channelescrowrpc_channelescrow_proto_rawDescGZIP(), []int{19}
++}
++
++type RevokeChannelRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	ChannelPoint *ChannelPoint `protobuf:"bytes,1,opt,name=channel_point,json=channelPoint,proto3" json:"channel_point,omitempty"`
++}
++
++func (x *RevokeChannelRequest) Reset() {
++	*x = RevokeChannelRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[20]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RevokeChannelRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RevokeChannelRequest) ProtoMessage() {}
++
++func (x *RevokeChannelRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[20]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RevokeChannelRequest.ProtoReflect.Descriptor instead.
++func (*RevokeChannelRequest) Descriptor() ([]byte, []int) {
++	return file_channelescrowrpc_channelescrow_proto_rawDescGZIP(), []int{20}
++}
++
++func (x *RevokeChannelRequest) GetChannelPoint() *ChannelPoint {
++	if x != nil {
++		return x.ChannelPoint
++	}
++	return nil
++}
++
++type RevokeChannelResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *RevokeChannelResponse) Reset() {
++	*x = RevokeChannelResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[21]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RevokeChannelResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RevokeChannelResponse) ProtoMessage() {}
++
++func (x *RevokeChannelResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_channelescrowrpc_channelescrow_proto_msgTypes[21]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RevokeChannelResponse.ProtoReflect.Descriptor instead.
++func (*RevokeChannelResponse) Descriptor() ([]byte, []int) {
++	return file_channelescrowrpc_channelescrow_proto_rawDescGZIP(), []int{21}
++}
++
+ var File_channelescrowrpc_channelescrow_proto protoreflect.FileDescriptor
+ 
+ var file_channelescrowrpc_channelescrow_proto_rawDesc = []byte{
+@@ -1128,7 +1410,7 @@ var file_channelescrowrpc_channelescrow_proto_rawDesc = []byte{
+ 	0x61, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x49, 0x64, 0x12, 0x2c, 0x0a, 0x12, 0x6c, 0x6f, 0x63,
+ 	0x61, 0x6c, 0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x18,
+ 	0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x10, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x50, 0x75, 0x62, 0x6c,
+-	0x69, 0x63, 0x4e, 0x6f, 0x6e, 0x63, 0x65, 0x22, 0xc6, 0x01, 0x0a, 0x11, 0x53, 0x69, 0x67, 0x6e,
++	0x69, 0x63, 0x4e, 0x6f, 0x6e, 0x63, 0x65, 0x22, 0xa0, 0x02, 0x0a, 0x11, 0x53, 0x69, 0x67, 0x6e,
+ 	0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x43, 0x0a,
+ 	0x0d, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x5f, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18, 0x01,
+ 	0x20, 0x01, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73,
+@@ -1141,120 +1423,169 @@ var file_channelescrowrpc_channelescrow_proto_rawDesc = []byte{
+ 	0x12, 0x2e, 0x0a, 0x13, 0x72, 0x65, 0x6d, 0x6f, 0x74, 0x65, 0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69,
+ 	0x63, 0x5f, 0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x11, 0x72,
+ 	0x65, 0x6d, 0x6f, 0x74, 0x65, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4e, 0x6f, 0x6e, 0x63, 0x65,
+-	0x22, 0x4c, 0x0a, 0x12, 0x53, 0x69, 0x67, 0x6e, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65,
+-	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x36, 0x0a, 0x17, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x5f,
+-	0x70, 0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x5f, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72,
+-	0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x15, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x50, 0x61,
+-	0x72, 0x74, 0x69, 0x61, 0x6c, 0x53, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x22, 0xd4,
+-	0x01, 0x0a, 0x15, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e,
+-	0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x43, 0x0a, 0x0d, 0x63, 0x68, 0x61, 0x6e,
+-	0x6e, 0x65, 0x6c, 0x5f, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32,
+-	0x1e, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72,
+-	0x70, 0x63, 0x2e, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x52,
+-	0x0c, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x12, 0x1d, 0x0a,
+-	0x0a, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28,
+-	0x0c, 0x52, 0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a,
+-	0x61, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c,
+-	0x52, 0x09, 0x61, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x49, 0x64, 0x12, 0x38, 0x0a, 0x18, 0x72,
+-	0x65, 0x6d, 0x6f, 0x74, 0x65, 0x5f, 0x70, 0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x5f, 0x73, 0x69,
+-	0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x16, 0x72,
+-	0x65, 0x6d, 0x6f, 0x74, 0x65, 0x50, 0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x53, 0x69, 0x67, 0x6e,
+-	0x61, 0x74, 0x75, 0x72, 0x65, 0x22, 0x43, 0x0a, 0x16, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a,
+-	0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12,
+-	0x15, 0x0a, 0x06, 0x72, 0x61, 0x77, 0x5f, 0x74, 0x78, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52,
+-	0x05, 0x72, 0x61, 0x77, 0x54, 0x78, 0x12, 0x12, 0x0a, 0x04, 0x74, 0x78, 0x69, 0x64, 0x18, 0x02,
+-	0x20, 0x01, 0x28, 0x0c, 0x52, 0x04, 0x74, 0x78, 0x69, 0x64, 0x22, 0x73, 0x0a, 0x0d, 0x53, 0x74,
+-	0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x43, 0x0a, 0x0d, 0x63,
+-	0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x5f, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01,
+-	0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72,
+-	0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69,
+-	0x6e, 0x74, 0x52, 0x0c, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74,
+-	0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02,
+-	0x20, 0x01, 0x28, 0x0c, 0x52, 0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22,
+-	0xbf, 0x03, 0x0a, 0x0e, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
+-	0x73, 0x65, 0x12, 0x14, 0x0a, 0x05, 0x73, 0x74, 0x61, 0x67, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28,
+-	0x0d, 0x52, 0x05, 0x73, 0x74, 0x61, 0x67, 0x65, 0x12, 0x1f, 0x0a, 0x0b, 0x70, 0x61, 0x72, 0x65,
+-	0x6e, 0x74, 0x5f, 0x74, 0x78, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0a, 0x70,
+-	0x61, 0x72, 0x65, 0x6e, 0x74, 0x54, 0x78, 0x69, 0x64, 0x12, 0x1c, 0x0a, 0x09, 0x66, 0x69, 0x6e,
+-	0x61, 0x6c, 0x69, 0x7a, 0x65, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x09, 0x66, 0x69,
+-	0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x64, 0x12, 0x3b, 0x0a, 0x1a, 0x64, 0x75, 0x72, 0x61, 0x62,
+-	0x6c, 0x65, 0x5f, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f,
+-	0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x17, 0x64, 0x75, 0x72,
+-	0x61, 0x62, 0x6c, 0x65, 0x4c, 0x6f, 0x63, 0x61, 0x6c, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4e,
+-	0x6f, 0x6e, 0x63, 0x65, 0x12, 0x3d, 0x0a, 0x1b, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x5f,
+-	0x72, 0x65, 0x6d, 0x6f, 0x74, 0x65, 0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6e, 0x6f,
+-	0x6e, 0x63, 0x65, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x18, 0x64, 0x75, 0x72, 0x61, 0x62,
+-	0x6c, 0x65, 0x52, 0x65, 0x6d, 0x6f, 0x74, 0x65, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4e, 0x6f,
+-	0x6e, 0x63, 0x65, 0x12, 0x45, 0x0a, 0x1f, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x5f, 0x6c,
+-	0x6f, 0x63, 0x61, 0x6c, 0x5f, 0x70, 0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x5f, 0x73, 0x69, 0x67,
+-	0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x1c, 0x64, 0x75,
+-	0x72, 0x61, 0x62, 0x6c, 0x65, 0x4c, 0x6f, 0x63, 0x61, 0x6c, 0x50, 0x61, 0x72, 0x74, 0x69, 0x61,
+-	0x6c, 0x53, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x12, 0x2e, 0x0a, 0x13, 0x66, 0x69,
+-	0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x64, 0x5f, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x5f, 0x74,
+-	0x78, 0x18, 0x07, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x11, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a,
+-	0x65, 0x64, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x54, 0x78, 0x12, 0x2a, 0x0a, 0x11, 0x61, 0x63,
+-	0x74, 0x69, 0x76, 0x65, 0x5f, 0x61, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x5f, 0x69, 0x64, 0x18,
+-	0x08, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0f, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0x41, 0x74, 0x74,
+-	0x65, 0x6d, 0x70, 0x74, 0x49, 0x64, 0x12, 0x39, 0x0a, 0x19, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65,
+-	0x5f, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6e, 0x6f,
+-	0x6e, 0x63, 0x65, 0x18, 0x09, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x16, 0x61, 0x63, 0x74, 0x69, 0x76,
+-	0x65, 0x4c, 0x6f, 0x63, 0x61, 0x6c, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4e, 0x6f, 0x6e, 0x63,
+-	0x65, 0x22, 0x73, 0x0a, 0x0d, 0x43, 0x61, 0x6e, 0x63, 0x65, 0x6c, 0x52, 0x65, 0x71, 0x75, 0x65,
++	0x12, 0x31, 0x0a, 0x14, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x72, 0x5f, 0x73,
++	0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x13,
++	0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x72, 0x53, 0x69, 0x67, 0x6e, 0x61, 0x74,
++	0x75, 0x72, 0x65, 0x12, 0x25, 0x0a, 0x0e, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x5f, 0x76, 0x65,
++	0x72, 0x73, 0x69, 0x6f, 0x6e, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x0d, 0x70, 0x6f, 0x6c,
++	0x69, 0x63, 0x79, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x22, 0x4c, 0x0a, 0x12, 0x53, 0x69,
++	0x67, 0x6e, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
++	0x12, 0x36, 0x0a, 0x17, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x5f, 0x70, 0x61, 0x72, 0x74, 0x69, 0x61,
++	0x6c, 0x5f, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x0c, 0x52, 0x15, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x50, 0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x53,
++	0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x22, 0xd4, 0x01, 0x0a, 0x15, 0x46, 0x69, 0x6e,
++	0x61, 0x6c, 0x69, 0x7a, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65,
+ 	0x73, 0x74, 0x12, 0x43, 0x0a, 0x0d, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x5f, 0x70, 0x6f,
+ 	0x69, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x63, 0x68, 0x61, 0x6e,
+ 	0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x43, 0x68, 0x61,
+ 	0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x52, 0x0c, 0x63, 0x68, 0x61, 0x6e, 0x6e,
+ 	0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73, 0x69,
+ 	0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x09, 0x73, 0x65, 0x73,
+-	0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0x33, 0x0a, 0x0e, 0x43, 0x61, 0x6e, 0x63, 0x65, 0x6c,
+-	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x21, 0x0a, 0x0c, 0x6c, 0x69, 0x6e, 0x6b,
+-	0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x08, 0x52, 0x0b,
+-	0x6c, 0x69, 0x6e, 0x6b, 0x52, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x64, 0x32, 0x8a, 0x05, 0x0a, 0x0d,
+-	0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x45, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x12, 0x60, 0x0a,
+-	0x0d, 0x46, 0x72, 0x65, 0x65, 0x7a, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x12, 0x26,
+-	0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70,
+-	0x63, 0x2e, 0x46, 0x72, 0x65, 0x65, 0x7a, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52,
+-	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x27, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
+-	0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x46, 0x72, 0x65, 0x65, 0x7a, 0x65,
+-	0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12,
+-	0x60, 0x0a, 0x0d, 0x50, 0x72, 0x65, 0x70, 0x61, 0x72, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74,
+-	0x12, 0x26, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77,
+-	0x72, 0x70, 0x63, 0x2e, 0x50, 0x72, 0x65, 0x70, 0x61, 0x72, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e,
+-	0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x27, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e,
+-	0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x50, 0x72, 0x65, 0x70,
+-	0x61, 0x72, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
+-	0x65, 0x12, 0x5d, 0x0a, 0x0c, 0x42, 0x65, 0x67, 0x69, 0x6e, 0x53, 0x69, 0x67, 0x6e, 0x69, 0x6e,
+-	0x67, 0x12, 0x25, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f,
+-	0x77, 0x72, 0x70, 0x63, 0x2e, 0x42, 0x65, 0x67, 0x69, 0x6e, 0x53, 0x69, 0x67, 0x6e, 0x69, 0x6e,
+-	0x67, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x26, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e,
+-	0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x42, 0x65, 0x67, 0x69,
+-	0x6e, 0x53, 0x69, 0x67, 0x6e, 0x69, 0x6e, 0x67, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
+-	0x12, 0x57, 0x0a, 0x0a, 0x53, 0x69, 0x67, 0x6e, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x12, 0x23,
+-	0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70,
+-	0x63, 0x2e, 0x53, 0x69, 0x67, 0x6e, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x71, 0x75,
+-	0x65, 0x73, 0x74, 0x1a, 0x24, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63,
+-	0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x53, 0x69, 0x67, 0x6e, 0x50, 0x61, 0x72, 0x65, 0x6e,
+-	0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x63, 0x0a, 0x0e, 0x46, 0x69, 0x6e,
+-	0x61, 0x6c, 0x69, 0x7a, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x12, 0x27, 0x2e, 0x63, 0x68,
+-	0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x46,
+-	0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x71,
+-	0x75, 0x65, 0x73, 0x74, 0x1a, 0x28, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73,
+-	0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65,
+-	0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4b,
+-	0x0a, 0x06, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x12, 0x1f, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e,
+-	0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x53, 0x74, 0x61, 0x74,
+-	0x75, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x20, 0x2e, 0x63, 0x68, 0x61, 0x6e,
++	0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x61, 0x74, 0x74, 0x65, 0x6d, 0x70,
++	0x74, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x09, 0x61, 0x74, 0x74, 0x65,
++	0x6d, 0x70, 0x74, 0x49, 0x64, 0x12, 0x38, 0x0a, 0x18, 0x72, 0x65, 0x6d, 0x6f, 0x74, 0x65, 0x5f,
++	0x70, 0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x5f, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72,
++	0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x16, 0x72, 0x65, 0x6d, 0x6f, 0x74, 0x65, 0x50,
++	0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x53, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x22,
++	0x43, 0x0a, 0x16, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e,
++	0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x15, 0x0a, 0x06, 0x72, 0x61, 0x77,
++	0x5f, 0x74, 0x78, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x05, 0x72, 0x61, 0x77, 0x54, 0x78,
++	0x12, 0x12, 0x0a, 0x04, 0x74, 0x78, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x04,
++	0x74, 0x78, 0x69, 0x64, 0x22, 0x73, 0x0a, 0x0d, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65,
++	0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x43, 0x0a, 0x0d, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
++	0x5f, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x63,
++	0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e,
++	0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x52, 0x0c, 0x63, 0x68,
++	0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65,
++	0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x09,
++	0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0xbf, 0x03, 0x0a, 0x0e, 0x53, 0x74,
++	0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x14, 0x0a, 0x05,
++	0x73, 0x74, 0x61, 0x67, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x05, 0x73, 0x74, 0x61,
++	0x67, 0x65, 0x12, 0x1f, 0x0a, 0x0b, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x5f, 0x74, 0x78, 0x69,
++	0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0a, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x54,
++	0x78, 0x69, 0x64, 0x12, 0x1c, 0x0a, 0x09, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x64,
++	0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x09, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65,
++	0x64, 0x12, 0x3b, 0x0a, 0x1a, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x5f, 0x6c, 0x6f, 0x63,
++	0x61, 0x6c, 0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x18,
++	0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x17, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x4c, 0x6f,
++	0x63, 0x61, 0x6c, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4e, 0x6f, 0x6e, 0x63, 0x65, 0x12, 0x3d,
++	0x0a, 0x1b, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x74, 0x65,
++	0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x18, 0x05, 0x20,
++	0x01, 0x28, 0x0c, 0x52, 0x18, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x52, 0x65, 0x6d, 0x6f,
++	0x74, 0x65, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4e, 0x6f, 0x6e, 0x63, 0x65, 0x12, 0x45, 0x0a,
++	0x1f, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x5f, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x5f, 0x70,
++	0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x5f, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65,
++	0x18, 0x06, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x1c, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6c, 0x65, 0x4c,
++	0x6f, 0x63, 0x61, 0x6c, 0x50, 0x61, 0x72, 0x74, 0x69, 0x61, 0x6c, 0x53, 0x69, 0x67, 0x6e, 0x61,
++	0x74, 0x75, 0x72, 0x65, 0x12, 0x2e, 0x0a, 0x13, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65,
++	0x64, 0x5f, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x5f, 0x74, 0x78, 0x18, 0x07, 0x20, 0x01, 0x28,
++	0x0c, 0x52, 0x11, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x64, 0x50, 0x61, 0x72, 0x65,
++	0x6e, 0x74, 0x54, 0x78, 0x12, 0x2a, 0x0a, 0x11, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0x5f, 0x61,
++	0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x5f, 0x69, 0x64, 0x18, 0x08, 0x20, 0x01, 0x28, 0x0c, 0x52,
++	0x0f, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0x41, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x49, 0x64,
++	0x12, 0x39, 0x0a, 0x19, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0x5f, 0x6c, 0x6f, 0x63, 0x61, 0x6c,
++	0x5f, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x18, 0x09, 0x20,
++	0x01, 0x28, 0x0c, 0x52, 0x16, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0x4c, 0x6f, 0x63, 0x61, 0x6c,
++	0x50, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4e, 0x6f, 0x6e, 0x63, 0x65, 0x22, 0x73, 0x0a, 0x0d, 0x43,
++	0x61, 0x6e, 0x63, 0x65, 0x6c, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x43, 0x0a, 0x0d,
++	0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x5f, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18, 0x01, 0x20,
++	0x01, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63,
++	0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f,
++	0x69, 0x6e, 0x74, 0x52, 0x0c, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e,
++	0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18,
++	0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x09, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64,
++	0x22, 0x33, 0x0a, 0x0e, 0x43, 0x61, 0x6e, 0x63, 0x65, 0x6c, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x12, 0x21, 0x0a, 0x0c, 0x6c, 0x69, 0x6e, 0x6b, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d,
++	0x65, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x08, 0x52, 0x0b, 0x6c, 0x69, 0x6e, 0x6b, 0x52, 0x65,
++	0x73, 0x75, 0x6d, 0x65, 0x64, 0x22, 0x13, 0x0a, 0x11, 0x50, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x49,
++	0x6e, 0x66, 0x6f, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x22, 0x50, 0x0a, 0x12, 0x50, 0x6f,
++	0x6c, 0x69, 0x63, 0x79, 0x49, 0x6e, 0x66, 0x6f, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
++	0x12, 0x3a, 0x0a, 0x19, 0x73, 0x75, 0x70, 0x70, 0x6f, 0x72, 0x74, 0x65, 0x64, 0x5f, 0x70, 0x6f,
++	0x6c, 0x69, 0x63, 0x79, 0x5f, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x18, 0x01, 0x20,
++	0x03, 0x28, 0x0d, 0x52, 0x17, 0x73, 0x75, 0x70, 0x70, 0x6f, 0x72, 0x74, 0x65, 0x64, 0x50, 0x6f,
++	0x6c, 0x69, 0x63, 0x79, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x22, 0x8b, 0x01, 0x0a,
++	0x17, 0x41, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65,
++	0x6c, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x43, 0x0a, 0x0d, 0x63, 0x68, 0x61, 0x6e,
++	0x6e, 0x65, 0x6c, 0x5f, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32,
++	0x1e, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72,
++	0x70, 0x63, 0x2e, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x52,
++	0x0c, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f, 0x69, 0x6e, 0x74, 0x12, 0x2b, 0x0a,
++	0x11, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x72, 0x5f, 0x70, 0x75, 0x62, 0x6b,
++	0x65, 0x79, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x10, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72,
++	0x69, 0x7a, 0x65, 0x72, 0x50, 0x75, 0x62, 0x6b, 0x65, 0x79, 0x22, 0x1a, 0x0a, 0x18, 0x41, 0x75,
++	0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65,
++	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x5b, 0x0a, 0x14, 0x52, 0x65, 0x76, 0x6f, 0x6b, 0x65,
++	0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x43,
++	0x0a, 0x0d, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x5f, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x18,
++	0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65,
++	0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
++	0x50, 0x6f, 0x69, 0x6e, 0x74, 0x52, 0x0c, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x50, 0x6f,
++	0x69, 0x6e, 0x74, 0x22, 0x17, 0x0a, 0x15, 0x52, 0x65, 0x76, 0x6f, 0x6b, 0x65, 0x43, 0x68, 0x61,
++	0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x32, 0xb0, 0x07, 0x0a,
++	0x0d, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x45, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x12, 0x60,
++	0x0a, 0x0d, 0x46, 0x72, 0x65, 0x65, 0x7a, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x12,
++	0x26, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72,
++	0x70, 0x63, 0x2e, 0x46, 0x72, 0x65, 0x65, 0x7a, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x27, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65,
++	0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x46, 0x72, 0x65, 0x65, 0x7a,
++	0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
++	0x12, 0x60, 0x0a, 0x0d, 0x50, 0x72, 0x65, 0x70, 0x61, 0x72, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e,
++	0x74, 0x12, 0x26, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f,
++	0x77, 0x72, 0x70, 0x63, 0x2e, 0x50, 0x72, 0x65, 0x70, 0x61, 0x72, 0x65, 0x50, 0x61, 0x72, 0x65,
++	0x6e, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x27, 0x2e, 0x63, 0x68, 0x61, 0x6e,
++	0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x50, 0x72, 0x65,
++	0x70, 0x61, 0x72, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x12, 0x5d, 0x0a, 0x0c, 0x42, 0x65, 0x67, 0x69, 0x6e, 0x53, 0x69, 0x67, 0x6e, 0x69,
++	0x6e, 0x67, 0x12, 0x25, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72,
++	0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x42, 0x65, 0x67, 0x69, 0x6e, 0x53, 0x69, 0x67, 0x6e, 0x69,
++	0x6e, 0x67, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x26, 0x2e, 0x63, 0x68, 0x61, 0x6e,
++	0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x42, 0x65, 0x67,
++	0x69, 0x6e, 0x53, 0x69, 0x67, 0x6e, 0x69, 0x6e, 0x67, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x12, 0x57, 0x0a, 0x0a, 0x53, 0x69, 0x67, 0x6e, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x12,
++	0x23, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72,
++	0x70, 0x63, 0x2e, 0x53, 0x69, 0x67, 0x6e, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x1a, 0x24, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73,
++	0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x53, 0x69, 0x67, 0x6e, 0x50, 0x61, 0x72, 0x65,
++	0x6e, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x63, 0x0a, 0x0e, 0x46, 0x69,
++	0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x12, 0x27, 0x2e, 0x63,
++	0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e,
++	0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65,
++	0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x28, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65,
++	0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a,
++	0x65, 0x50, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12,
++	0x4b, 0x0a, 0x06, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x12, 0x1f, 0x2e, 0x63, 0x68, 0x61, 0x6e,
+ 	0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x53, 0x74, 0x61,
+-	0x74, 0x75, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4b, 0x0a, 0x06, 0x43,
+-	0x61, 0x6e, 0x63, 0x65, 0x6c, 0x12, 0x1f, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65,
+-	0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x43, 0x61, 0x6e, 0x63, 0x65, 0x6c, 0x52,
+-	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x20, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
++	0x74, 0x75, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x20, 0x2e, 0x63, 0x68, 0x61,
++	0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x53, 0x74,
++	0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4b, 0x0a, 0x06,
++	0x43, 0x61, 0x6e, 0x63, 0x65, 0x6c, 0x12, 0x1f, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
+ 	0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x43, 0x61, 0x6e, 0x63, 0x65, 0x6c,
+-	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42, 0x38, 0x5a, 0x36, 0x67, 0x69, 0x74, 0x68,
+-	0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x6e, 0x69, 0x6e, 0x67,
+-	0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x2f, 0x6c, 0x6e, 0x64, 0x2f, 0x6c, 0x6e, 0x72, 0x70,
+-	0x63, 0x2f, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72,
+-	0x70, 0x63, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x20, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65,
++	0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x43, 0x61, 0x6e, 0x63, 0x65,
++	0x6c, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x57, 0x0a, 0x0a, 0x50, 0x6f, 0x6c,
++	0x69, 0x63, 0x79, 0x49, 0x6e, 0x66, 0x6f, 0x12, 0x23, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65,
++	0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x50, 0x6f, 0x6c, 0x69, 0x63,
++	0x79, 0x49, 0x6e, 0x66, 0x6f, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x24, 0x2e, 0x63,
++	0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e,
++	0x50, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x49, 0x6e, 0x66, 0x6f, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x12, 0x69, 0x0a, 0x10, 0x41, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x43,
++	0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x12, 0x29, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
++	0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x41, 0x75, 0x74, 0x68, 0x6f, 0x72,
++	0x69, 0x7a, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x1a, 0x2a, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f,
++	0x77, 0x72, 0x70, 0x63, 0x2e, 0x41, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x43, 0x68,
++	0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x60, 0x0a,
++	0x0d, 0x52, 0x65, 0x76, 0x6f, 0x6b, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x12, 0x26,
++	0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70,
++	0x63, 0x2e, 0x52, 0x65, 0x76, 0x6f, 0x6b, 0x65, 0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52,
++	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x27, 0x2e, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
++	0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x2e, 0x52, 0x65, 0x76, 0x6f, 0x6b, 0x65,
++	0x43, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42,
++	0x38, 0x5a, 0x36, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x6c, 0x69,
++	0x67, 0x68, 0x74, 0x6e, 0x69, 0x6e, 0x67, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x2f, 0x6c,
++	0x6e, 0x64, 0x2f, 0x6c, 0x6e, 0x72, 0x70, 0x63, 0x2f, 0x63, 0x68, 0x61, 0x6e, 0x6e, 0x65, 0x6c,
++	0x65, 0x73, 0x63, 0x72, 0x6f, 0x77, 0x72, 0x70, 0x63, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x33,
+ }
+ 
+ var (
+@@ -1269,24 +1600,30 @@ func file_channelescrowrpc_channelescrow_proto_rawDescGZIP() []byte {
+ 	return file_channelescrowrpc_channelescrow_proto_rawDescData
+ }
+ 
+-var file_channelescrowrpc_channelescrow_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
++var file_channelescrowrpc_channelescrow_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+ var file_channelescrowrpc_channelescrow_proto_goTypes = []interface{}{
+-	(*ChannelPoint)(nil),           // 0: channelescrowrpc.ChannelPoint
+-	(*PrevOut)(nil),                // 1: channelescrowrpc.PrevOut
+-	(*FreezeChannelRequest)(nil),   // 2: channelescrowrpc.FreezeChannelRequest
+-	(*FreezeChannelResponse)(nil),  // 3: channelescrowrpc.FreezeChannelResponse
+-	(*PrepareParentRequest)(nil),   // 4: channelescrowrpc.PrepareParentRequest
+-	(*PrepareParentResponse)(nil),  // 5: channelescrowrpc.PrepareParentResponse
+-	(*BeginSigningRequest)(nil),    // 6: channelescrowrpc.BeginSigningRequest
+-	(*BeginSigningResponse)(nil),   // 7: channelescrowrpc.BeginSigningResponse
+-	(*SignParentRequest)(nil),      // 8: channelescrowrpc.SignParentRequest
+-	(*SignParentResponse)(nil),     // 9: channelescrowrpc.SignParentResponse
+-	(*FinalizeParentRequest)(nil),  // 10: channelescrowrpc.FinalizeParentRequest
+-	(*FinalizeParentResponse)(nil), // 11: channelescrowrpc.FinalizeParentResponse
+-	(*StatusRequest)(nil),          // 12: channelescrowrpc.StatusRequest
+-	(*StatusResponse)(nil),         // 13: channelescrowrpc.StatusResponse
+-	(*CancelRequest)(nil),          // 14: channelescrowrpc.CancelRequest
+-	(*CancelResponse)(nil),         // 15: channelescrowrpc.CancelResponse
++	(*ChannelPoint)(nil),             // 0: channelescrowrpc.ChannelPoint
++	(*PrevOut)(nil),                  // 1: channelescrowrpc.PrevOut
++	(*FreezeChannelRequest)(nil),     // 2: channelescrowrpc.FreezeChannelRequest
++	(*FreezeChannelResponse)(nil),    // 3: channelescrowrpc.FreezeChannelResponse
++	(*PrepareParentRequest)(nil),     // 4: channelescrowrpc.PrepareParentRequest
++	(*PrepareParentResponse)(nil),    // 5: channelescrowrpc.PrepareParentResponse
++	(*BeginSigningRequest)(nil),      // 6: channelescrowrpc.BeginSigningRequest
++	(*BeginSigningResponse)(nil),     // 7: channelescrowrpc.BeginSigningResponse
++	(*SignParentRequest)(nil),        // 8: channelescrowrpc.SignParentRequest
++	(*SignParentResponse)(nil),       // 9: channelescrowrpc.SignParentResponse
++	(*FinalizeParentRequest)(nil),    // 10: channelescrowrpc.FinalizeParentRequest
++	(*FinalizeParentResponse)(nil),   // 11: channelescrowrpc.FinalizeParentResponse
++	(*StatusRequest)(nil),            // 12: channelescrowrpc.StatusRequest
++	(*StatusResponse)(nil),           // 13: channelescrowrpc.StatusResponse
++	(*CancelRequest)(nil),            // 14: channelescrowrpc.CancelRequest
++	(*CancelResponse)(nil),           // 15: channelescrowrpc.CancelResponse
++	(*PolicyInfoRequest)(nil),        // 16: channelescrowrpc.PolicyInfoRequest
++	(*PolicyInfoResponse)(nil),       // 17: channelescrowrpc.PolicyInfoResponse
++	(*AuthorizeChannelRequest)(nil),  // 18: channelescrowrpc.AuthorizeChannelRequest
++	(*AuthorizeChannelResponse)(nil), // 19: channelescrowrpc.AuthorizeChannelResponse
++	(*RevokeChannelRequest)(nil),     // 20: channelescrowrpc.RevokeChannelRequest
++	(*RevokeChannelResponse)(nil),    // 21: channelescrowrpc.RevokeChannelResponse
+ }
+ var file_channelescrowrpc_channelescrow_proto_depIdxs = []int32{
+ 	0,  // 0: channelescrowrpc.FreezeChannelRequest.channel_point:type_name -> channelescrowrpc.ChannelPoint
+@@ -1298,25 +1635,33 @@ var file_channelescrowrpc_channelescrow_proto_depIdxs = []int32{
+ 	0,  // 6: channelescrowrpc.FinalizeParentRequest.channel_point:type_name -> channelescrowrpc.ChannelPoint
+ 	0,  // 7: channelescrowrpc.StatusRequest.channel_point:type_name -> channelescrowrpc.ChannelPoint
+ 	0,  // 8: channelescrowrpc.CancelRequest.channel_point:type_name -> channelescrowrpc.ChannelPoint
+-	2,  // 9: channelescrowrpc.ChannelEscrow.FreezeChannel:input_type -> channelescrowrpc.FreezeChannelRequest
+-	4,  // 10: channelescrowrpc.ChannelEscrow.PrepareParent:input_type -> channelescrowrpc.PrepareParentRequest
+-	6,  // 11: channelescrowrpc.ChannelEscrow.BeginSigning:input_type -> channelescrowrpc.BeginSigningRequest
+-	8,  // 12: channelescrowrpc.ChannelEscrow.SignParent:input_type -> channelescrowrpc.SignParentRequest
+-	10, // 13: channelescrowrpc.ChannelEscrow.FinalizeParent:input_type -> channelescrowrpc.FinalizeParentRequest
+-	12, // 14: channelescrowrpc.ChannelEscrow.Status:input_type -> channelescrowrpc.StatusRequest
+-	14, // 15: channelescrowrpc.ChannelEscrow.Cancel:input_type -> channelescrowrpc.CancelRequest
+-	3,  // 16: channelescrowrpc.ChannelEscrow.FreezeChannel:output_type -> channelescrowrpc.FreezeChannelResponse
+-	5,  // 17: channelescrowrpc.ChannelEscrow.PrepareParent:output_type -> channelescrowrpc.PrepareParentResponse
+-	7,  // 18: channelescrowrpc.ChannelEscrow.BeginSigning:output_type -> channelescrowrpc.BeginSigningResponse
+-	9,  // 19: channelescrowrpc.ChannelEscrow.SignParent:output_type -> channelescrowrpc.SignParentResponse
+-	11, // 20: channelescrowrpc.ChannelEscrow.FinalizeParent:output_type -> channelescrowrpc.FinalizeParentResponse
+-	13, // 21: channelescrowrpc.ChannelEscrow.Status:output_type -> channelescrowrpc.StatusResponse
+-	15, // 22: channelescrowrpc.ChannelEscrow.Cancel:output_type -> channelescrowrpc.CancelResponse
+-	16, // [16:23] is the sub-list for method output_type
+-	9,  // [9:16] is the sub-list for method input_type
+-	9,  // [9:9] is the sub-list for extension type_name
+-	9,  // [9:9] is the sub-list for extension extendee
+-	0,  // [0:9] is the sub-list for field type_name
++	0,  // 9: channelescrowrpc.AuthorizeChannelRequest.channel_point:type_name -> channelescrowrpc.ChannelPoint
++	0,  // 10: channelescrowrpc.RevokeChannelRequest.channel_point:type_name -> channelescrowrpc.ChannelPoint
++	2,  // 11: channelescrowrpc.ChannelEscrow.FreezeChannel:input_type -> channelescrowrpc.FreezeChannelRequest
++	4,  // 12: channelescrowrpc.ChannelEscrow.PrepareParent:input_type -> channelescrowrpc.PrepareParentRequest
++	6,  // 13: channelescrowrpc.ChannelEscrow.BeginSigning:input_type -> channelescrowrpc.BeginSigningRequest
++	8,  // 14: channelescrowrpc.ChannelEscrow.SignParent:input_type -> channelescrowrpc.SignParentRequest
++	10, // 15: channelescrowrpc.ChannelEscrow.FinalizeParent:input_type -> channelescrowrpc.FinalizeParentRequest
++	12, // 16: channelescrowrpc.ChannelEscrow.Status:input_type -> channelescrowrpc.StatusRequest
++	14, // 17: channelescrowrpc.ChannelEscrow.Cancel:input_type -> channelescrowrpc.CancelRequest
++	16, // 18: channelescrowrpc.ChannelEscrow.PolicyInfo:input_type -> channelescrowrpc.PolicyInfoRequest
++	18, // 19: channelescrowrpc.ChannelEscrow.AuthorizeChannel:input_type -> channelescrowrpc.AuthorizeChannelRequest
++	20, // 20: channelescrowrpc.ChannelEscrow.RevokeChannel:input_type -> channelescrowrpc.RevokeChannelRequest
++	3,  // 21: channelescrowrpc.ChannelEscrow.FreezeChannel:output_type -> channelescrowrpc.FreezeChannelResponse
++	5,  // 22: channelescrowrpc.ChannelEscrow.PrepareParent:output_type -> channelescrowrpc.PrepareParentResponse
++	7,  // 23: channelescrowrpc.ChannelEscrow.BeginSigning:output_type -> channelescrowrpc.BeginSigningResponse
++	9,  // 24: channelescrowrpc.ChannelEscrow.SignParent:output_type -> channelescrowrpc.SignParentResponse
++	11, // 25: channelescrowrpc.ChannelEscrow.FinalizeParent:output_type -> channelescrowrpc.FinalizeParentResponse
++	13, // 26: channelescrowrpc.ChannelEscrow.Status:output_type -> channelescrowrpc.StatusResponse
++	15, // 27: channelescrowrpc.ChannelEscrow.Cancel:output_type -> channelescrowrpc.CancelResponse
++	17, // 28: channelescrowrpc.ChannelEscrow.PolicyInfo:output_type -> channelescrowrpc.PolicyInfoResponse
++	19, // 29: channelescrowrpc.ChannelEscrow.AuthorizeChannel:output_type -> channelescrowrpc.AuthorizeChannelResponse
++	21, // 30: channelescrowrpc.ChannelEscrow.RevokeChannel:output_type -> channelescrowrpc.RevokeChannelResponse
++	21, // [21:31] is the sub-list for method output_type
++	11, // [11:21] is the sub-list for method input_type
++	11, // [11:11] is the sub-list for extension type_name
++	11, // [11:11] is the sub-list for extension extendee
++	0,  // [0:11] is the sub-list for field type_name
+ }
+ 
+ func init() { file_channelescrowrpc_channelescrow_proto_init() }
+@@ -1517,6 +1862,78 @@ func file_channelescrowrpc_channelescrow_proto_init() {
+ 				return nil
+ 			}
+ 		}
++		file_channelescrowrpc_channelescrow_proto_msgTypes[16].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*PolicyInfoRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_channelescrowrpc_channelescrow_proto_msgTypes[17].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*PolicyInfoResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_channelescrowrpc_channelescrow_proto_msgTypes[18].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AuthorizeChannelRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_channelescrowrpc_channelescrow_proto_msgTypes[19].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AuthorizeChannelResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_channelescrowrpc_channelescrow_proto_msgTypes[20].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RevokeChannelRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_channelescrowrpc_channelescrow_proto_msgTypes[21].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RevokeChannelResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
+ 	}
+ 	type x struct{}
+ 	out := protoimpl.TypeBuilder{
+@@ -1524,7 +1941,7 @@ func file_channelescrowrpc_channelescrow_proto_init() {
+ 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+ 			RawDescriptor: file_channelescrowrpc_channelescrow_proto_rawDesc,
+ 			NumEnums:      0,
+-			NumMessages:   16,
++			NumMessages:   22,
+ 			NumExtensions: 0,
+ 			NumServices:   1,
+ 		},
+diff --git a/lnrpc/channelescrowrpc/channelescrow.proto b/lnrpc/channelescrowrpc/channelescrow.proto
+index 6bf11a5..fc63a13 100644
+--- a/lnrpc/channelescrowrpc/channelescrow.proto
++++ b/lnrpc/channelescrowrpc/channelescrow.proto
+@@ -12,6 +12,19 @@ service ChannelEscrow {
+     rpc FinalizeParent (FinalizeParentRequest) returns (FinalizeParentResponse);
+     rpc Status (StatusRequest) returns (StatusResponse);
+     rpc Cancel (CancelRequest) returns (CancelResponse);
++
++    // PolicyInfo lists the authorization policies this node enforces. A node
++    // that does not implement it signs without authorization.
++    rpc PolicyInfo (PolicyInfoRequest) returns (PolicyInfoResponse);
++
++    // AuthorizeChannel enrolls a channel for escrow under a BIP340 authorizer
++    // key. It requires offchain write permission, not the escrow macaroon.
++    rpc AuthorizeChannel (AuthorizeChannelRequest)
++        returns (AuthorizeChannelResponse);
++
++    // RevokeChannel removes a channel's enrollment while it has no escrow
++    // record.
++    rpc RevokeChannel (RevokeChannelRequest) returns (RevokeChannelResponse);
+ }
+ 
+ message ChannelPoint {
+@@ -68,6 +81,11 @@ message SignParentRequest {
+     bytes session_id = 2;
+     bytes attempt_id = 3;
+     bytes remote_public_nonce = 4;
++
++    // BIP340 signature by the channel's enrolled authorizer over the policy
++    // digest of the prepared parent.
++    bytes authorizer_signature = 5;
++    uint32 policy_version = 6;
+ }
+ 
+ message SignParentResponse {
+@@ -111,3 +129,27 @@ message CancelRequest {
+ message CancelResponse {
+     bool link_resumed = 1;
+ }
++
++message PolicyInfoRequest {
++}
++
++message PolicyInfoResponse {
++    repeated uint32 supported_policy_versions = 1;
++}
++
++message AuthorizeChannelRequest {
++    ChannelPoint channel_point = 1;
++
++    // 32-byte BIP340 x-only public key.
++    bytes authorizer_pubkey = 2;
++}
++
++message AuthorizeChannelResponse {
++}
++
++message RevokeChannelRequest {
++    ChannelPoint channel_point = 1;
++}
++
++message RevokeChannelResponse {
++}
+diff --git a/lnrpc/channelescrowrpc/channelescrow.swagger.json b/lnrpc/channelescrowrpc/channelescrow.swagger.json
+index 6150c12..32443dd 100644
+--- a/lnrpc/channelescrowrpc/channelescrow.swagger.json
++++ b/lnrpc/channelescrowrpc/channelescrow.swagger.json
+@@ -17,6 +17,9 @@
+   ],
+   "paths": {},
+   "definitions": {
++    "channelescrowrpcAuthorizeChannelResponse": {
++      "type": "object"
++    },
+     "channelescrowrpcBeginSigningResponse": {
+       "type": "object",
+       "properties": {
+@@ -100,6 +103,18 @@
+         }
+       }
+     },
++    "channelescrowrpcPolicyInfoResponse": {
++      "type": "object",
++      "properties": {
++        "supported_policy_versions": {
++          "type": "array",
++          "items": {
++            "type": "integer",
++            "format": "int64"
++          }
++        }
++      }
++    },
+     "channelescrowrpcPrepareParentResponse": {
+       "type": "object",
+       "properties": {
+@@ -122,6 +137,9 @@
+         }
+       }
+     },
++    "channelescrowrpcRevokeChannelResponse": {
++      "type": "object"
++    },
+     "channelescrowrpcSignParentResponse": {
+       "type": "object",
+       "properties": {
+diff --git a/lnrpc/channelescrowrpc/channelescrow_grpc.pb.go b/lnrpc/channelescrowrpc/channelescrow_grpc.pb.go
+index 574a20f..b63b25e 100644
+--- a/lnrpc/channelescrowrpc/channelescrow_grpc.pb.go
++++ b/lnrpc/channelescrowrpc/channelescrow_grpc.pb.go
+@@ -25,6 +25,15 @@ type ChannelEscrowClient interface {
+ 	FinalizeParent(ctx context.Context, in *FinalizeParentRequest, opts ...grpc.CallOption) (*FinalizeParentResponse, error)
+ 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+ 	Cancel(ctx context.Context, in *CancelRequest, opts ...grpc.CallOption) (*CancelResponse, error)
++	// PolicyInfo lists the authorization policies this node enforces. A node
++	// that does not implement it signs without authorization.
++	PolicyInfo(ctx context.Context, in *PolicyInfoRequest, opts ...grpc.CallOption) (*PolicyInfoResponse, error)
++	// AuthorizeChannel enrolls a channel for escrow under a BIP340 authorizer
++	// key. It requires offchain write permission, not the escrow macaroon.
++	AuthorizeChannel(ctx context.Context, in *AuthorizeChannelRequest, opts ...grpc.CallOption) (*AuthorizeChannelResponse, error)
++	// RevokeChannel removes a channel's enrollment while it has no escrow
++	// record.
++	RevokeChannel(ctx context.Context, in *RevokeChannelRequest, opts ...grpc.CallOption) (*RevokeChannelResponse, error)
+ }
+ 
+ type channelEscrowClient struct {
+@@ -98,6 +107,33 @@ func (c *channelEscrowClient) Cancel(ctx context.Context, in *CancelRequest, opt
+ 	return out, nil
+ }
+ 
++func (c *channelEscrowClient) PolicyInfo(ctx context.Context, in *PolicyInfoRequest, opts ...grpc.CallOption) (*PolicyInfoResponse, error) {
++	out := new(PolicyInfoResponse)
++	err := c.cc.Invoke(ctx, "/channelescrowrpc.ChannelEscrow/PolicyInfo", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *channelEscrowClient) AuthorizeChannel(ctx context.Context, in *AuthorizeChannelRequest, opts ...grpc.CallOption) (*AuthorizeChannelResponse, error) {
++	out := new(AuthorizeChannelResponse)
++	err := c.cc.Invoke(ctx, "/channelescrowrpc.ChannelEscrow/AuthorizeChannel", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *channelEscrowClient) RevokeChannel(ctx context.Context, in *RevokeChannelRequest, opts ...grpc.CallOption) (*RevokeChannelResponse, error) {
++	out := new(RevokeChannelResponse)
++	err := c.cc.Invoke(ctx, "/channelescrowrpc.ChannelEscrow/RevokeChannel", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ // ChannelEscrowServer is the server API for ChannelEscrow service.
+ // All implementations must embed UnimplementedChannelEscrowServer
+ // for forward compatibility
+@@ -109,6 +145,15 @@ type ChannelEscrowServer interface {
+ 	FinalizeParent(context.Context, *FinalizeParentRequest) (*FinalizeParentResponse, error)
+ 	Status(context.Context, *StatusRequest) (*StatusResponse, error)
+ 	Cancel(context.Context, *CancelRequest) (*CancelResponse, error)
++	// PolicyInfo lists the authorization policies this node enforces. A node
++	// that does not implement it signs without authorization.
++	PolicyInfo(context.Context, *PolicyInfoRequest) (*PolicyInfoResponse, error)
++	// AuthorizeChannel enrolls a channel for escrow under a BIP340 authorizer
++	// key. It requires offchain write permission, not the escrow macaroon.
++	AuthorizeChannel(context.Context, *AuthorizeChannelRequest) (*AuthorizeChannelResponse, error)
++	// RevokeChannel removes a channel's enrollment while it has no escrow
++	// record.
++	RevokeChannel(context.Context, *RevokeChannelRequest) (*RevokeChannelResponse, error)
+ 	mustEmbedUnimplementedChannelEscrowServer()
+ }
+ 
+@@ -137,6 +182,15 @@ func (UnimplementedChannelEscrowServer) Status(context.Context, *StatusRequest)
+ func (UnimplementedChannelEscrowServer) Cancel(context.Context, *CancelRequest) (*CancelResponse, error) {
+ 	return nil, status.Errorf(codes.Unimplemented, "method Cancel not implemented")
+ }
++func (UnimplementedChannelEscrowServer) PolicyInfo(context.Context, *PolicyInfoRequest) (*PolicyInfoResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method PolicyInfo not implemented")
++}
++func (UnimplementedChannelEscrowServer) AuthorizeChannel(context.Context, *AuthorizeChannelRequest) (*AuthorizeChannelResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method AuthorizeChannel not implemented")
++}
++func (UnimplementedChannelEscrowServer) RevokeChannel(context.Context, *RevokeChannelRequest) (*RevokeChannelResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method RevokeChannel not implemented")
++}
+ func (UnimplementedChannelEscrowServer) mustEmbedUnimplementedChannelEscrowServer() {}
+ 
+ // UnsafeChannelEscrowServer may be embedded to opt out of forward compatibility for this service.
+@@ -276,6 +330,60 @@ func _ChannelEscrow_Cancel_Handler(srv interface{}, ctx context.Context, dec fun
+ 	return interceptor(ctx, in, info, handler)
+ }
+ 
++func _ChannelEscrow_PolicyInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(PolicyInfoRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(ChannelEscrowServer).PolicyInfo(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/channelescrowrpc.ChannelEscrow/PolicyInfo",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(ChannelEscrowServer).PolicyInfo(ctx, req.(*PolicyInfoRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _ChannelEscrow_AuthorizeChannel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(AuthorizeChannelRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(ChannelEscrowServer).AuthorizeChannel(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/channelescrowrpc.ChannelEscrow/AuthorizeChannel",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(ChannelEscrowServer).AuthorizeChannel(ctx, req.(*AuthorizeChannelRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _ChannelEscrow_RevokeChannel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RevokeChannelRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(ChannelEscrowServer).RevokeChannel(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/channelescrowrpc.ChannelEscrow/RevokeChannel",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(ChannelEscrowServer).RevokeChannel(ctx, req.(*RevokeChannelRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
+ // ChannelEscrow_ServiceDesc is the grpc.ServiceDesc for ChannelEscrow service.
+ // It's only intended for direct use with grpc.RegisterService,
+ // and not to be introspected or modified (even as a copy)
+@@ -311,6 +419,18 @@ var ChannelEscrow_ServiceDesc = grpc.ServiceDesc{
+ 			MethodName: "Cancel",
+ 			Handler:    _ChannelEscrow_Cancel_Handler,
+ 		},
++		{
++			MethodName: "PolicyInfo",
++			Handler:    _ChannelEscrow_PolicyInfo_Handler,
++		},
++		{
++			MethodName: "AuthorizeChannel",
++			Handler:    _ChannelEscrow_AuthorizeChannel_Handler,
++		},
++		{
++			MethodName: "RevokeChannel",
++			Handler:    _ChannelEscrow_RevokeChannel_Handler,
++		},
+ 	},
+ 	Streams:  []grpc.StreamDesc{},
+ 	Metadata: "channelescrowrpc/channelescrow.proto",
+diff --git a/lnrpc/channelescrowrpc/config_active.go b/lnrpc/channelescrowrpc/config_active.go
+index 526ab97..7f68b35 100644
+--- a/lnrpc/channelescrowrpc/config_active.go
++++ b/lnrpc/channelescrowrpc/config_active.go
+@@ -4,6 +4,7 @@
+ package channelescrowrpc
+ 
+ import (
++	"github.com/btcsuite/btcd/chaincfg/chainhash"
+ 	"github.com/btcsuite/btcd/wire"
+ 	"github.com/lightningnetwork/lnd/channeldb"
+ 	"github.com/lightningnetwork/lnd/htlcswitch"
+@@ -27,4 +28,10 @@ type Config struct {
+ 	ChanStateDB          *channeldb.ChannelStateDB
+ 	Switch               ChannelSwitch
+ 	PublishTransaction   func(*wire.MsgTx, string) error
++
++	// ChainHash is the active network's genesis block hash and
++	// LocalNodeKey returns this node's identity key. Both come from LND's
++	// own configuration and bind authorizations to this node and network.
++	ChainHash    chainhash.Hash
++	LocalNodeKey func() [33]byte
+ }
+diff --git a/lnrpc/channelescrowrpc/server.go b/lnrpc/channelescrowrpc/server.go
+index 548c453..650c985 100644
+--- a/lnrpc/channelescrowrpc/server.go
++++ b/lnrpc/channelescrowrpc/server.go
+@@ -68,6 +68,18 @@ var (
+ 		"/channelescrowrpc.ChannelEscrow/Cancel": {
+ 			{Entity: "channelescrow", Action: "write"},
+ 		},
++		"/channelescrowrpc.ChannelEscrow/PolicyInfo": {
++			{Entity: "channelescrow", Action: "read"},
++		},
++		// Enrollment chooses who may authorize escrow signatures, so it is
++		// deliberately outside the escrow macaroon: a holder of that macaroon
++		// alone cannot install its own authorizer.
++		"/channelescrowrpc.ChannelEscrow/AuthorizeChannel": {
++			{Entity: "offchain", Action: "write"},
++		},
++		"/channelescrowrpc.ChannelEscrow/RevokeChannel": {
++			{Entity: "offchain", Action: "write"},
++		},
+ 	}
+ )
+ 
+@@ -100,6 +112,9 @@ var _ ChannelEscrowServer = (*Server)(nil)
+ 
+ // New initializes the server and its dedicated macaroon.
+ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
++	if cfg.LocalNodeKey == nil || cfg.ChainHash == (chainhash.Hash{}) {
++		return nil, nil, errors.New("channel escrow requires the chain and node identity")
++	}
+ 	if cfg.ChannelEscrowMacPath == "" {
+ 		cfg.ChannelEscrowMacPath = filepath.Join(cfg.NetworkDir, defaultMacName)
+ 	}
+@@ -197,6 +212,9 @@ func (s *Server) FreezeChannel(ctx context.Context, req *FreezeChannelRequest) (
+ 	if channel.ChanStatus() != channeldb.ChanStatusDefault || !channel.ChanType.IsTaproot() {
+ 		return nil, fmt.Errorf("channel is not an unlocked SIMPLE_TAPROOT channel")
+ 	}
++	if _, err := channel.EscrowAuthorizer(); err != nil {
++		return nil, authorizerError(err)
++	}
+ 
+ 	link, err := s.cfg.Switch.GetLink(lnwire.NewChanIDFromOutPoint(*op))
+ 	if err != nil {
+@@ -347,6 +365,13 @@ func (s *Server) SignParent(_ context.Context, req *SignParentRequest) (*SignPar
+ 	if err != nil || record.SessionID != sessionID {
+ 		return nil, channeldb.ErrEscrowSessionMismatch
+ 	}
++	// Every partial, including a cached one, requires the enrolled
++	// authorizer's signature over this exact prepared parent.
++	authorizer, err := s.verifyAuthorization(channel, *op, record,
++		req.GetPolicyVersion(), req.GetAuthorizerSignature())
++	if err != nil {
++		return nil, err
++	}
+ 	key := attemptKey(*op, sessionID)
+ 	s.mu.Lock()
+ 	attempt := s.attempts[key]
+@@ -402,7 +427,8 @@ func (s *Server) SignParent(_ context.Context, req *SignParentRequest) (*SignPar
+ 		return nil, err
+ 	}
+ 	// Persist while holding the attempt lock, before making the partial public.
+-	if err := channel.StoreEscrowPartial(sessionID, attempt.localNonce[:], remoteNonce[:], encoded[:]); err != nil {
++	if err := channel.StoreEscrowPartial(sessionID, authorizer, req.GetPolicyVersion(),
++		attempt.localNonce[:], remoteNonce[:], encoded[:]); err != nil {
+ 		s.cleanupAttemptLocked(key)
+ 		s.mu.Unlock()
+ 		return nil, err
+diff --git a/subrpcserver_config.go b/subrpcserver_config.go
+index b4e3595..1bfbc57 100644
+--- a/subrpcserver_config.go
++++ b/subrpcserver_config.go
+@@ -181,6 +181,14 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
+ 			subCfgValue.FieldByName("PublishTransaction").Set(
+ 				reflect.ValueOf(cc.Wallet.PublishTransaction),
+ 			)
++			subCfgValue.FieldByName("ChainHash").Set(
++				reflect.ValueOf(*activeNetParams.GenesisHash),
++			)
++			subCfgValue.FieldByName("LocalNodeKey").Set(
++				reflect.ValueOf(func() [33]byte {
++					return getNodeAnnouncement().NodeID
++				}),
++			)
+ 
+ 		case *signrpc.Config:
+ 			subCfgValue := extractReflectValue(subCfg)
+-- 
+2.56.0
+
