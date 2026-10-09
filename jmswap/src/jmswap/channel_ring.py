@@ -112,7 +112,8 @@ async def _warn_on_low_onchain_reserve(backend: LndBackend, timeout_seconds: flo
         logger.warning(
             "Ring LND has %d sat confirmed on chain, below the %d sat advisory"
             " wallet target for anchor force-close fee bumps; this balance does"
-            " not prove readily spendable UTXOs are available",
+            " not prove readily spendable UTXOs are available. Fund it only from"
+            " this node's source mixdepth",
             balance,
             RECOMMENDED_ONCHAIN_RESERVE_SAT,
         )
