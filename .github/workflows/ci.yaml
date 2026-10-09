@@ -180,12 +180,13 @@ jobs:
           pytest -c pytest.ini jmswap/tests/test_bitcoin_escrow_regtest.py \
             -m docker --no-cov --fail-on-skip -v
 
-      - name: Check private buyout signing and settlement against LND
+      - name: Check private buyout signing, settlement, and hold invoices against LND
         # The pinned image runs focused backend tests at build time.
         if: matrix.python-version == '3.14'
         run: |
           docker build -t jm-buyout-lnd:v0.21.3-beta lnd
           pytest -c pytest.ini jmswap/tests/test_lnd_buyout_regtest.py \
+            jmswap/tests/test_lnd_invoices_regtest.py \
             -m docker --no-cov --fail-on-skip -v
 
       - name: Run repo-root tests
