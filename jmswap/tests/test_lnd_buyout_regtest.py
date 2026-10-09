@@ -156,7 +156,7 @@ class BuyoutRegtest:
 
     # -- Compose ------------------------------------------------------------ #
 
-    def compose(self, *args: str, timeout: int = COMPOSE_TIMEOUT) -> str:
+    def compose(self, *args: str, timeout: float = COMPOSE_TIMEOUT) -> str:
         files = ["-f", str(COMPOSE_FILE)]
         if self.compose_override_file:
             files.extend(("-f", self.compose_override_file))
@@ -191,7 +191,7 @@ class BuyoutRegtest:
 
     # -- Bitcoin Core ------------------------------------------------------- #
 
-    def bitcoin(self, *args: str, wallet: bool = False) -> Any:
+    def bitcoin(self, *args: str, wallet: bool = False, timeout: float | None = None) -> Any:
         command = [
             "exec",
             "-T",
@@ -203,7 +203,8 @@ class BuyoutRegtest:
         ]
         if wallet:
             command.append(f"-rpcwallet={WALLET}")
-        return _decode(self.compose(*command, *args))
+        options = {} if timeout is None else {"timeout": timeout}
+        return _decode(self.compose(*command, *args, **options))
 
     def mine(self, count: int) -> None:
         address = self.bitcoin("getnewaddress", "mining", "bech32m", wallet=True)
@@ -218,9 +219,12 @@ class BuyoutRegtest:
 
     # -- LND ---------------------------------------------------------------- #
 
-    def lncli(self, node: str, *args: str) -> Any:
+    def lncli(self, node: str, *args: str, timeout: float | None = None) -> Any:
+        options = {} if timeout is None else {"timeout": timeout}
         return _decode(
-            self.compose("exec", "-T", node, "lncli", "--lnddir=/lnd", "--network=regtest", *args)
+            self.compose(
+                "exec", "-T", node, "lncli", "--lnddir=/lnd", "--network=regtest", *args, **options
+            )
         )
 
     def container(self, node: str) -> str:
@@ -418,6 +422,97 @@ def _wait_for_sync(stack: BuyoutRegtest, node: str) -> str:
             last = "not synced to chain"
         time.sleep(0.5)
     raise RegtestError(f"{node} was not ready within {READY_TIMEOUT}s: {last}")
+
+
+async def _wait_for_post_restart_catchup(
+    stack: BuyoutRegtest,
+    *,
+    timeout: float = READY_TIMEOUT,
+    max_probe_blocks: int = 3,
+) -> None:
+    """Catch up disposable ZMQ clients after a deliberate Core restart.
+
+    Reconnecting ZMQ does not replay missed notifications. A later block lets
+    btcwallet backfill the gap, so issue a bounded number of spaced probes only
+    here, after the test has proved parent loss and rebroadcast. Do not add
+    automatic mining to normal readiness checks or production recovery.
+
+    The caller must restore at least the pre-invalidation maximum height first,
+    with no concurrent mining or further invalidations during this barrier.
+    Otherwise a stale wallet could still be numerically ahead of the new tip.
+    """
+    if timeout <= 0 or max_probe_blocks <= 0:
+        raise ValueError("restart catch-up bounds must be positive")
+    deadline = time.monotonic() + timeout
+    probe_interval = timeout / (max_probe_blocks + 1)
+    next_probe = time.monotonic()
+    probes = 0
+    initial_height: int | None = None
+    address: str | None = None
+    last = "no observation"
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise RegtestError("restart catch-up deadline elapsed")
+        return left
+
+    while time.monotonic() < deadline:
+        try:
+            core = stack.bitcoin("getblockchaininfo", timeout=remaining())
+            tip = (core["blocks"], core["bestblockhash"])
+            if initial_height is None:
+                initial_height = tip[0]
+            observations = {}
+            for node in NODES:
+                info = stack.lncli(node, "getinfo", timeout=remaining())
+                observations[node] = {
+                    key: info.get(key)
+                    for key in (
+                        "block_height",
+                        "block_hash",
+                        "wallet_synced",
+                        "synced_to_chain",
+                        "synced_to_graph",
+                    )
+                }
+            last = f"Core tip={tip}, nodes={observations}"
+            current = stack.bitcoin("getblockchaininfo", timeout=remaining())
+            # GetInfo's tip is the backend's, not the persisted wallet's. On
+            # a same-height reorg, old readiness can look valid until a new
+            # notification arrives. Require a confirmed height advance too.
+            if (
+                tip[0] > initial_height
+                and tip == (current["blocks"], current["bestblockhash"])
+                and all(
+                    info["wallet_synced"] is True
+                    and info["synced_to_chain"] is True
+                    and (info["block_height"], info["block_hash"]) == tip
+                    for info in observations.values()
+                )
+            ):
+                return
+            now = time.monotonic()
+            if probes < max_probe_blocks and now >= next_probe:
+                # Count intent before mining: an RPC timeout could lose a reply
+                # even though the block was generated.
+                probes += 1
+                next_probe = now + probe_interval
+                if address is None:
+                    address = str(
+                        stack.bitcoin(
+                            "getnewaddress", "mining", "bech32m", wallet=True, timeout=remaining()
+                        )
+                    )
+                stack.bitcoin("generatetoaddress", "1", address, wallet=True, timeout=remaining())
+        except (RegtestError, subprocess.SubprocessError) as exc:
+            last = f"{last}; RPC error={type(exc).__name__}"
+        left = deadline - time.monotonic()
+        if left > 0:
+            await asyncio.sleep(min(0.5, left))
+    raise RegtestError(
+        f"restart catch-up failed within {timeout}s, probes={probes}/{max_probe_blocks}: {last}"
+    )
 
 
 def _isolated_stack(*, maker_stack: bool = False) -> Iterator[BuyoutRegtest]:
@@ -2409,7 +2504,10 @@ async def test_maker_funds_its_own_coinjoin_from_a_live_channel(
                 assert buyer.store.get(session_id).data["settlement_preimage"] == paid_preimage
                 stack.bitcoin("loadwallet", WALLET)
                 stack.mine_and_confirm(txid)
-                _mine_to(stack, int(stack.bitcoin("getblockcount")) + depth)
+                # Restore the original confirmation depth before checking LND's
+                # graph/blockbeat readiness, which can retain the pre-reorg tip.
+                stack.mine(depth)
+                await _wait_for_post_restart_catchup(stack)
             assert (await buyer.poll_once())[session_id] == "SPEND_BROADCAST"
             spend = buyer.store.get(session_id).data["spends"][-1]
             assert spend["kind"] == "cooperative"
