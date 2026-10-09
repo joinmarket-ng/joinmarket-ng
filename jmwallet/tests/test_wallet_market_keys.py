@@ -81,3 +81,16 @@ def test_revoked_wallet_cannot_activate_market_ledger(tmp_path: Path) -> None:
     with pytest.raises(MarketKeysClosedError):
         wallet.activate_market_ledger(history_confirmed=True)
     assert not get_market_store_path(tmp_path).exists()
+
+
+def test_wallet_exposes_the_seed_escrow_authorizer(tmp_path: Path) -> None:
+    from jmcore.escrow_authorizer import EscrowAuthorizer
+
+    backend = AsyncMock(spec=BlockchainBackend)
+    wallet = WalletService(MNEMONIC, backend, network="regtest", data_dir=tmp_path)
+    expected = EscrowAuthorizer(mnemonic_to_seed(MNEMONIC), "regtest")
+    assert wallet.escrow_authorizer.public_key == expected.public_key
+    other = WalletService(
+        MNEMONIC, backend, network="regtest", data_dir=tmp_path, passphrase="synthetic"
+    )
+    assert other.escrow_authorizer.public_key != expected.public_key

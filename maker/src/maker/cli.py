@@ -1190,6 +1190,99 @@ def enroll_ring_nodes(
 
 
 @app.command()
+def authorize_ring_channels(
+    component: Annotated[
+        str, typer.Option(help="Ring settings whose channels to enroll: maker or taker")
+    ] = "maker",
+    config_file: Annotated[Path | None, typer.Option(help="Configuration file")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="JoinMarket data directory")] = None,
+    mnemonic_file: Annotated[Path | None, typer.Option(help="Wallet mnemonic file")] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool, typer.Option(help="Prompt for the wallet's BIP39 passphrase")
+    ] = False,
+) -> None:
+    """Enroll confirmed ring channels for buyouts under this wallet's escrow authorizer.
+
+    Channels are enrolled automatically when their funding confirms; run this for
+    channels confirmed by an older release or after a failed enrollment. It is
+    idempotent and does not sync the wallet, change channels, or edit journals.
+    """
+    import json
+
+    from jmcore.channel_ring import ChannelRingConfig
+    from jmcore.channel_ring_store import RingParticipantStore, RingStoreError
+    from jmcore.escrow_authorizer import EscrowAuthorizer
+    from jmcore.process_hardening import harden_current_process
+    from jmswap.channel_ring import (
+        EscrowEnrollment,
+        RingAuthorizationError,
+        authorize_recorded_ring_channels,
+    )
+    from jmswap.channel_ring_nodes import channel_ring_wallet_identity
+    from jmwallet.wallet.bip32 import HDKey, mnemonic_to_seed
+
+    if component not in {"maker", "taker"}:
+        raise typer.BadParameter("choose maker or taker")
+    harden_current_process()
+    settings = setup_cli(None, data_dir=data_dir, config_file=config_file)
+    ring_settings = (
+        settings.maker.channel_ring if component == "maker" else settings.taker.channel_ring
+    )
+    try:
+        config = ChannelRingConfig.from_settings(ring_settings)
+        effective_data_dir = data_dir if data_dir is not None else settings.get_data_dir()
+        directory = config.persistence_path(effective_data_dir)
+        records = (
+            RingParticipantStore(
+                directory,
+                max_active_sessions=config.max_active_sessions,
+                max_verified_sessions=config.max_verified_sessions,
+            )
+            .load_all()
+            .records
+            if directory.is_dir()
+            else ()
+        )
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+        if resolved is None:
+            raise ValueError("channel authorization requires the wallet mnemonic")
+        network = settings.network_config.network.value
+        seed = mnemonic_to_seed(resolved.mnemonic, resolved.bip39_passphrase)
+        authorizer = EscrowAuthorizer(seed, network)
+        outcomes = run_async(
+            authorize_recorded_ring_channels(
+                config,
+                records,
+                network=network,
+                wallet_identity=channel_ring_wallet_identity(
+                    HDKey.from_seed(seed).get_public_key_bytes()
+                ),
+                authorizer_pubkey=authorizer.public_key,
+            )
+        )
+        authorizer.close()
+    except (ValueError, OSError, RingStoreError, RingAuthorizationError) as exc:
+        logger.error("Ring channel authorization failed: {}", exc)
+        raise typer.Exit(1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "channels": [
+                    {"channel_point": f"{txid}:{vout}", "result": result.value}
+                    for (txid, vout), result in sorted(outcomes.items())
+                ]
+            }
+        )
+    )
+    if EscrowEnrollment.FAILED in outcomes.values():
+        raise typer.Exit(1)
+
+
+@app.command()
 def ring_records(
     component: Annotated[
         str, typer.Option(help="Ring settings to inspect: maker or taker")

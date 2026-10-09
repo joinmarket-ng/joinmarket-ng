@@ -258,6 +258,33 @@ the earlier library-only runtime. Changing the node, network, mixdepth, or walle
 fingerprint does not adopt existing sessions. Keep the original configuration
 available for pending sessions and use a separate journal for another deployment.
 
+### Escrow authorization
+
+The patched LND cosigns a channel's escrow parent only with a signature from
+the escrow authorizer enrolled for that channel (patch 3, see
+[lnd/README.md](../lnd/README.md)). Without it, whoever held the escrow
+macaroon could cosign, together with the channel peer, a parent paying
+anywhere. The authorizer is a key derived from the JoinMarket wallet seed, one
+per wallet and network. The ring maker and taker enroll their channels with it
+when the funding confirms, using the ring node's `admin.macaroon`
+(`offchain:write`). Channels confirmed by an older release, or whose
+enrollment failed, are enrolled with:
+
+```sh
+jm-maker authorize-ring-channels --component maker  # or --component taker
+```
+
+The command is idempotent and prints one result per channel (`enrolled`,
+`unsupported` for an unpatched node, or `failed`).
+
+Both buyout endpoints set `mnemonic_file` to that wallet's mnemonic; the
+service keeps only the derived key. Freezing a channel or releasing a new
+signature needs it, and a node that does not report authorization policy 1 is
+refused before any channel is frozen. Recovery, status and finalization of an
+already signed session work without it. The escrow macaroon cannot enroll a
+key, but `admin.macaroon` can: keep the two apart, since together they can
+authorize spends.
+
 Run the counterparty endpoint continuously:
 
 ```sh

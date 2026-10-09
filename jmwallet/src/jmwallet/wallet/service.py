@@ -31,6 +31,7 @@ from jmcore.credential_market import (
     verify_authorization,
 )
 from jmcore.crypto import bitcoin_message_hash_bytes, get_cert_msg
+from jmcore.escrow_authorizer import EscrowAuthorizer
 from jmcore.external_podle import ExternalPoDLEOutpoint
 from jmcore.market_keys import BoundMarketKeys, MarketKeyError, MarketKeyScope, WalletMarketKeys
 from jmcore.market_store import MarketStore
@@ -127,6 +128,7 @@ class WalletService(
         seed = mnemonic_to_seed(mnemonic, passphrase)
         self.master_key = HDKey.from_seed(seed)
         self._market_keys = WalletMarketKeys(seed, network)
+        self._escrow_authorizer = EscrowAuthorizer(seed, network)
 
         coin_type = 0 if network == "mainnet" else 1
         if address_type not in ("p2wpkh", "p2tr"):
@@ -1127,6 +1129,11 @@ class WalletService(
         return self._market_keys
 
     @property
+    def escrow_authorizer(self) -> EscrowAuthorizer:
+        """Return the non-exporting key that authorizes this wallet's channel escrows."""
+        return self._escrow_authorizer
+
+    @property
     def market_wallet_id(self) -> str:
         """Identify this wallet in private ledger state, across roles and networks."""
         return self._market_keys.ledger_identity()
@@ -1309,6 +1316,7 @@ class WalletService(
     async def close(self) -> None:
         """Close backend connection"""
         self._market_keys.close()
+        self._escrow_authorizer.close()
         await self.backend.close()
 
     # -- UTXO metadata (Group J) -------------------------------------------

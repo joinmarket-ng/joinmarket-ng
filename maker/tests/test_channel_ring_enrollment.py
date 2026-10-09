@@ -131,3 +131,54 @@ def test_duplicate_expected_names_are_not_silently_overwritten(
     assert result.exit_code != 0
     assert "unique" in result.output
     setup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "exit_code"),
+    [("enrolled", 0), ("unsupported", 0), ("failed", 1)],
+)
+def test_channel_authorization_uses_the_wallet_authorizer_without_starting_runtime(
+    outcome: str, exit_code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from jmcore.escrow_authorizer import EscrowAuthorizer
+    from jmswap.channel_ring import EscrowEnrollment
+    from jmwallet.wallet.bip32 import mnemonic_to_seed
+
+    configured = settings(tmp_path)
+    monkeypatch.setattr(cli, "setup_cli", lambda *args, **kwargs: configured)
+    monkeypatch.setattr("jmcore.process_hardening.harden_current_process", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "resolve_mnemonic",
+        lambda *args, **kwargs: SimpleNamespace(mnemonic=MNEMONIC, bip39_passphrase=""),
+    )
+    monkeypatch.setattr(cli, "MakerBot", Mock(side_effect=AssertionError("no maker")))
+    monkeypatch.setattr(cli, "create_wallet_service", Mock(side_effect=AssertionError("no sync")))
+    authorize = AsyncMock(return_value={("ab" * 32, 1): EscrowEnrollment(outcome)})
+    monkeypatch.setattr("jmswap.channel_ring.authorize_recorded_ring_channels", authorize)
+
+    result = CliRunner().invoke(cli.app, ["authorize-ring-channels", "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == exit_code, result.output
+    report = json.loads(result.stdout[result.stdout.index("{") :])
+    assert report == {"channels": [{"channel_point": f"{'ab' * 32}:1", "result": outcome}]}
+    args, kwargs = authorize.call_args
+    assert args[0].mixdepth_nodes == {0: "local"}
+    assert args[1] == ()
+    expected = EscrowAuthorizer(mnemonic_to_seed(MNEMONIC), "regtest")
+    assert kwargs["authorizer_pubkey"] == expected.public_key
+    assert kwargs["network"] == "regtest"
+    assert len(kwargs["wallet_identity"]) == 64
+    assert MNEMONIC.split()[0] not in result.output
+
+
+def test_channel_authorization_rejects_an_unknown_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = Mock(side_effect=AssertionError("must reject before loading settings"))
+    monkeypatch.setattr(cli, "setup_cli", setup)
+    result = CliRunner().invoke(cli.app, ["authorize-ring-channels", "--component", "other"])
+    assert result.exit_code != 0
+    setup.assert_not_called()

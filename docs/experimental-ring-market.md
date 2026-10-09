@@ -176,7 +176,17 @@ allowed_peers = ["<COUNTERPARTY_LND_PUBKEY>"]
 payout_addresses = ["<FRESH_P2TR_ADDRESS>"]
 mixdepth = 0
 wallet_fingerprint = "<WALLET_FINGERPRINT>"
+mnemonic_file = "/secure/jm/wallets/buyer.mnemonic"
 ```
+
+`mnemonic_file` is the wallet whose escrow authorizer the node enrolled for its
+ring channels. The patched LND cosigns an escrow parent only with that key's
+authorization, so the escrow macaroon alone can no longer move channel funds.
+The ring maker and taker enroll channels when their funding confirms; run
+`jm-maker authorize-ring-channels --component maker` (or `taker`) for channels
+from an older release. `admin.macaroon` can enroll a key, so never give it to
+the same holder as the escrow macaroon. See
+[lnd/README.md](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/lnd/README.md#escrow-authorization).
 
 Reserve one fresh payout address per intended session with
 `jm-wallet address new 0 --label buyout`.

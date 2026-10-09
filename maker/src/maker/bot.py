@@ -1416,6 +1416,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     data_directory=self.config.data_dir or get_default_data_dir(),
                 )
                 self._channel_ring_store = self._channel_ring_nodes.store
+                from jmswap.channel_ring import wallet_escrow_authorizer_pubkey
+
                 from maker.channel_ring import reconcile_ring_records
 
                 retired_records = await reconcile_ring_records(
@@ -1424,6 +1426,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     self.backend,
                     self._channel_ring_recovery_tasks,
                     acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                    escrow_authorizer_pubkey=wallet_escrow_authorizer_pubkey(self.wallet),
                 )
                 report = self._channel_ring_store.load_all()
                 if not self._renew_channel_ring_input_locks():
@@ -1678,6 +1681,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 listener_task.cancel()
 
     async def _periodic_channel_ring_reconciliation(self) -> None:
+        from jmswap.channel_ring import wallet_escrow_authorizer_pubkey
+
         from maker.channel_ring import reconcile_ring_records
 
         while self.running:
@@ -1694,6 +1699,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     self.backend,
                     self._channel_ring_recovery_tasks,
                     acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                    escrow_authorizer_pubkey=wallet_escrow_authorizer_pubkey(self.wallet),
                     active_session_identities=active_identities,
                 )
                 if not self._renew_channel_ring_input_locks():

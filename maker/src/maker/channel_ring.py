@@ -70,6 +70,7 @@ from jmcore.cofunded_ring import (
 from jmcore.constants import GENESIS_BLOCK_HASHES
 from jmcore.fee_policy import fee_rate_meets_minimum, format_low_fee_error
 from jmcore.models import calculate_cj_fee, is_taproot_offer_type
+from jmswap.channel_ring import enroll_confirmed_ring_channels
 from jmswap.lnd import (
     AcceptorBounds,
     AcceptorObservation,
@@ -1290,6 +1291,7 @@ async def reconcile_ring_records(
     *,
     acceptor_timeout_seconds: float = 600.0,
     active_session_identities: frozenset[str] = frozenset(),
+    escrow_authorizer_pubkey: bytes | None = None,
 ) -> tuple[RingParticipantRecord, ...]:
     """Inspect retained participant records without deleting unresolved evidence.
 
@@ -1385,6 +1387,9 @@ async def reconcile_ring_records(
                         record.key,
                         RingLifecycleState.CONFIRMED_OPEN,
                         updates={"chain_status": status},
+                    )
+                    await enroll_confirmed_ring_channels(
+                        initialized_backend.backend, record, escrow_authorizer_pubkey
                     )
                     continue
                 if record.manifest is not None:

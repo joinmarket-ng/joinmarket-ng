@@ -1656,6 +1656,56 @@ async def test_restart_rehydrates_prepared_and_rebroadcasts_exact_final_tx(
     assert harness.chain.broadcasts == [unsigned.unsigned_tx]
 
 
+async def test_confirmation_enrolls_the_ring_channels_once(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import maker.channel_ring as maker_ring
+
+    enrolled: list[tuple[object, object, object]] = []
+
+    async def record_enrollment(backend: object, record: object, key: object) -> None:
+        enrolled.append((backend, record, key))
+
+    monkeypatch.setattr(maker_ring, "enroll_confirmed_ring_channels", record_enrollment)
+    await harness.through_open()
+    unsigned = await harness.unsigned()
+    await harness.machine.handle(unsigned)
+    await harness.machine.handle(harness.ready_set(unsigned.manifest))
+    await harness.machine.handle(
+        harness.signed(
+            RingSignPayload(
+                round_nonce="aa" * 32,
+                revision=0,
+                signer_key=harness.taker_key,
+                manifest_hash=manifest_hash(unsigned.manifest).hex(),
+                unsigned_tx_hash=unsigned.manifest.unsigned_tx_hash,
+            )
+        )
+    )
+    harness.machine.prepare_coinjoin_signing(unsigned.unsigned_tx)
+    harness.machine.mark_signatures_sent(["signature"])
+    await harness.machine.observe_final_transaction(unsigned.unsigned_tx)
+    harness.chain.transactions[unsigned.manifest.unsigned_txid] = Transaction(
+        txid=unsigned.manifest.unsigned_txid,
+        raw=unsigned.unsigned_tx,
+        confirmations=1,
+        block_height=100,
+    )
+    for _ in range(2):
+        await reconcile_ring_records(
+            harness.store,
+            harness.nodes,
+            harness.chain,  # type: ignore[arg-type]
+            {},
+            escrow_authorizer_pubkey=b"\x07" * 32,
+        )
+    assert harness.record().state is RingLifecycleState.CONFIRMED_OPEN
+    [(backend, record, key)] = enrolled
+    assert backend is harness.nodes.for_binding(harness.record().node_binding).backend
+    assert getattr(record, "key", None) == harness.record().key
+    assert key == b"\x07" * 32
+
+
 async def test_reconcile_escalation_skips_live_sessions(harness: Harness) -> None:
     await harness.through_open()
     unsigned = await harness.unsigned()
