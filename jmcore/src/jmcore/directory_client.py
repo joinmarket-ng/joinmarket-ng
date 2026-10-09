@@ -32,7 +32,7 @@ from jmcore.credential_market import (
     decode_document,
 )
 from jmcore.crypto import NickIdentity, verify_fidelity_bond_proof, verify_signed_privmsg
-from jmcore.models import FidelityBond, Offer, OfferType
+from jmcore.models import FidelityBond, Offer, OfferType, is_taproot_offer_type
 from jmcore.network import (
     ONION_HOSTID,
     TCPConnection,
@@ -150,11 +150,20 @@ MAX_LOCATION_UTF8_BYTES = 300
 MAX_FEATURE_UTF8_BYTES = 128
 
 
-def _fidelity_bond_claim_key(bond_data: dict[str, Any]) -> str:
-    return (
+def _fidelity_bond_claim_key(bond_data: dict[str, Any], offer_type: OfferType | None = None) -> str:
+    """Return the cache key for one bond claim within one CoinJoin pit.
+
+    A maker may back its sw0 and tr0 nicks with the same bond. Pits never share
+    a CoinJoin, so bond-based deduplication must only compare offers of the same
+    pit. The sw0 key keeps its historical format.
+    """
+    key = (
         f"{bond_data['utxo_txid']}:{bond_data['utxo_vout']}:"
         f"{bond_data['locktime']}:{bond_data['utxo_pub']}"
     )
+    if offer_type is not None and is_taproot_offer_type(offer_type):
+        return f"{key}:p2tr"
+    return key
 
 
 def parse_fidelity_bond_proof(
@@ -1601,7 +1610,7 @@ class DirectoryClient:
                     offers.append(offer)
 
                     if bond_data:
-                        claim_key = _fidelity_bond_claim_key(bond_data)
+                        claim_key = _fidelity_bond_claim_key(bond_data, offer.ordertype)
                         if claim_key not in bond_claim_set:
                             bond_claim_set.add(claim_key)
                             bond = FidelityBond(
@@ -2007,7 +2016,7 @@ class DirectoryClient:
         # Offers can arrive before a peerlist update. Retain their empty feature
         # entry only after applying the same peer cap as peerlist processing.
         self._merge_peer_features(from_nick, {})
-        bond_claim_key = _fidelity_bond_claim_key(bond_data) if bond_data else None
+        bond_claim_key = _fidelity_bond_claim_key(bond_data, offer.ordertype) if bond_data else None
         if not self._store_offer((from_nick, offer.oid), offer, bond_claim_key):
             return False
 
@@ -2216,7 +2225,8 @@ class DirectoryClient:
                     self._bond_to_offers.pop(old_bond_key, None)
                     self.bonds.pop(old_bond_key, None)
 
-        # Remove old offers only when they use the same complete script claim.
+        # Remove old offers only when they use the same complete script claim in
+        # the same pit (the key carries the pit, see _fidelity_bond_claim_key).
         if bond_utxo_key:
             # Get all offer keys that previously used this bond
             old_offer_keys = self._bond_to_offers.get(bond_utxo_key, set()).copy()
