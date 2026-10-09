@@ -41,6 +41,7 @@ jobs:
         requirements:
           - directory_server/requirements.txt
           - jmcore/requirements.txt
+          - jmswap/requirements.txt
           - jmwallet/requirements.txt
           - jmwalletd/requirements.txt
           - maker/requirements.txt
@@ -92,6 +93,7 @@ jobs:
           "$RUNNER_TEMP/joinmarket-target/bin/python" -m pip install \
             -e ./jmcore \
             -e ./jmwallet \
+            -e ./jmswap \
             -e ./directory_server \
             -e ./orderbook_watcher \
             -e ./maker \

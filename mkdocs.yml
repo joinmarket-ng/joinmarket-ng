@@ -109,6 +109,8 @@ nav:
       - reference.md
       - Configuration: technical/configuration.md
       - Fidelity bonds: fidelity-bond-operations.md
+      - Experimental Ring Market: experimental-ring-market.md
+      - Credential Market Reference: credential-market.md
       - Unattended makers: maker-service.md
       - Advanced installation: install-advanced.md
       - Experimental JAM NG Flatpak: flatpak.md

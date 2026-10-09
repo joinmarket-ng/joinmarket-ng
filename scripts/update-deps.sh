@@ -33,7 +33,7 @@ run_pip_compile() {
     fi
 }
 
-PACKAGES="${JMNG_PACKAGES:-jmcore directory_server orderbook_watcher jmwallet maker taker tumbler jmwalletd}"
+PACKAGES="${JMNG_PACKAGES:-jmcore directory_server orderbook_watcher jmwallet maker taker tumbler jmwalletd jmswap}"
 UPDATE_PROD=true
 UPDATE_DEV=true
 

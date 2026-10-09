@@ -83,6 +83,8 @@ class WalletSyncMixin:
     backend: BlockchainBackend
     master_key: HDKey
     root_path: str
+    address_type: str
+    descriptor_function: str
     network: str
     mixdepth_count: int
     gap_limit: int
@@ -131,6 +133,9 @@ class WalletSyncMixin:
         raise NotImplementedError
 
     def get_fidelity_bond_key(self, index: int, locktime: int) -> HDKey:
+        raise NotImplementedError
+
+    def get_fidelity_bond_path(self, index: int) -> str:
         raise NotImplementedError
 
     def get_fidelity_bond_script(self, index: int, locktime: int) -> bytes:
@@ -828,7 +833,7 @@ class WalletSyncMixin:
                 locktime, timenumber = address_to_info[address_lower]
                 self._record_history_address(address)
                 for utxo in addr_utxos:
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}:{locktime}"
+                    path = f"{self.get_fidelity_bond_path(timenumber)}:{locktime}"
                     utxo_info = _make_utxo_info(
                         txid=utxo.txid,
                         vout=utxo.vout,
@@ -1009,7 +1014,7 @@ class WalletSyncMixin:
                 locktime, idx = address_to_locktime[address_lower]
                 self.address_cache[address_lower] = (0, FIDELITY_BOND_BRANCH, idx)
                 self.fidelity_bond_locktime_cache[address_lower] = locktime
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{idx}:{locktime}"
+                path = f"{self.get_fidelity_bond_path(idx)}:{locktime}"
 
                 utxo_info = _make_utxo_info(
                     txid=utxo.txid,
@@ -1177,8 +1182,8 @@ class WalletSyncMixin:
                 expected_bases: set[str] = set()
                 for mixdepth in range(self.mixdepth_count):
                     xpub = self.get_account_xpub(mixdepth)
-                    expected_bases.add(f"wpkh({xpub}/0/*)")
-                    expected_bases.add(f"wpkh({xpub}/1/*)")
+                    expected_bases.add(f"{self.descriptor_function}({xpub}/0/*)")
+                    expected_bases.add(f"{self.descriptor_function}({xpub}/1/*)")
                 descriptors = await self.backend.list_descriptors()
                 actual_bases = {str(item.get("desc", "")).split("#", 1)[0] for item in descriptors}
                 if not expected_bases.issubset(actual_bases):
@@ -1613,7 +1618,7 @@ class WalletSyncMixin:
                 key = self.get_fidelity_bond_key(timenumber, locktime)
                 pubkey_hex = key.get_public_key_bytes(compressed=True).hex()
                 witness_script = self.get_fidelity_bond_script(timenumber, locktime)
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+                path = self.get_fidelity_bond_path(timenumber)
                 bond_info = create_bond_info(
                     address=address,
                     locktime=locktime,
@@ -1691,12 +1696,12 @@ class WalletSyncMixin:
             xpub = self.get_account_xpub(mixdepth)
 
             # External (receive) addresses: .../0/*
-            desc_ext = f"wpkh({xpub}/0/*)"
+            desc_ext = f"{self.descriptor_function}({xpub}/0/*)"
             descriptors.append({"desc": desc_ext, "range": [0, scan_range - 1]})
             desc_to_path[desc_ext] = (mixdepth, 0)
 
             # Internal (change) addresses: .../1/*
-            desc_int = f"wpkh({xpub}/1/*)"
+            desc_int = f"{self.descriptor_function}({xpub}/1/*)"
             descriptors.append({"desc": desc_int, "range": [0, scan_range - 1]})
             desc_to_path[desc_int] = (mixdepth, 1)
 
@@ -1777,7 +1782,7 @@ class WalletSyncMixin:
                         confirmations = max(0, tip_height - utxo_height + 1)
 
                     # Path format for fidelity bonds: m/84'/0'/0'/2/index:locktime
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{locktime}"
+                    path = f"{self.get_fidelity_bond_path(index)}:{locktime}"
 
                     utxo_info = _make_utxo_info(
                         txid=utxo_data["txid"],
@@ -1837,7 +1842,7 @@ class WalletSyncMixin:
                     )
                     continue
                 locktime, bond_index = bond_info
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{bond_index}:{locktime}"
+                path = f"{self.get_fidelity_bond_path(bond_index)}:{locktime}"
                 self._record_history_address(source_address)
                 fidelity_bond_utxos.append(
                     _make_utxo_info(
@@ -2198,7 +2203,7 @@ class WalletSyncMixin:
             # External (receive) addresses: .../0/*
             descriptors.append(
                 {
-                    "desc": f"wpkh({xpub}/0/*)",
+                    "desc": f"{self.descriptor_function}({xpub}/0/*)",
                     "range": [0, scan_range - 1],
                     "internal": False,
                 }
@@ -2207,7 +2212,7 @@ class WalletSyncMixin:
             # Internal (change) addresses: .../1/*
             descriptors.append(
                 {
-                    "desc": f"wpkh({xpub}/1/*)",
+                    "desc": f"{self.descriptor_function}({xpub}/1/*)",
                     "range": [0, scan_range - 1],
                     "internal": True,
                 }
@@ -2297,7 +2302,7 @@ class WalletSyncMixin:
             # Check if this is a fidelity bond
             if address in bond_address_to_info:
                 locktime, index = bond_address_to_info[address]
-                path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{locktime}"
+                path = f"{self.get_fidelity_bond_path(index)}:{locktime}"
                 # Track that this address has had UTXOs
                 self._record_history_address(address)
                 utxo_info = _make_utxo_info(
@@ -2336,9 +2341,7 @@ class WalletSyncMixin:
                         # Get index from address_cache (should have been set during import)
                         cached = self.address_cache.get(address)
                         index = cached[2] if cached else -1
-                        path = (
-                            f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{cached_locktime}"
-                        )
+                        path = f"{self.get_fidelity_bond_path(index)}:{cached_locktime}"
                         self._record_history_address(address)
                         utxo_info = _make_utxo_info(
                             txid=utxo.txid,
@@ -2376,8 +2379,7 @@ class WalletSyncMixin:
                         )
                         self.fidelity_bond_locktime_cache[address] = canonical_locktime
                         path = (
-                            f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/"
-                            f"{canonical_index}:{canonical_locktime}"
+                            f"{self.get_fidelity_bond_path(canonical_index)}:{canonical_locktime}"
                         )
                         self._record_history_address(address)
                         utxo_info = _make_utxo_info(
@@ -2419,7 +2421,7 @@ class WalletSyncMixin:
                 bond_locktime = self.fidelity_bond_locktime_cache.get(address)
 
                 if bond_locktime is not None:
-                    path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}:{bond_locktime}"
+                    path = f"{self.get_fidelity_bond_path(index)}:{bond_locktime}"
                     self._record_history_address(address)
                     utxo_info = _make_utxo_info(
                         txid=utxo.txid,
@@ -2978,18 +2980,22 @@ class WalletSyncMixin:
 
     def _resolve_descriptor_path(self, desc: str) -> tuple[int, int, int] | None:
         """
-        Parse a ``wpkh`` descriptor and resolve ``(mixdepth, change, index)``.
+        Resolve a configured ``wpkh`` or ``tr`` descriptor to its wallet path.
 
         Used to translate Bitcoin Core's ``getaddressinfo`` descriptor for an
         address into a wallet path without scanning derivations. Verifies the
         descriptor's pubkey against this wallet's master key. Returns ``None``
-        if the descriptor is not a ranged ``wpkh`` (e.g., an ``addr(...)``
+        if the descriptor does not use this wallet's function (e.g., an ``addr(...)``
         import for a fidelity bond) or if no mixdepth derives the same pubkey
-        — in either case the address has no BIP32 path here for us to record.
+        (in either case the address has no BIP32 path here for us to record).
         """
         if "#" in desc:
             desc = desc.split("#")[0]
-        match = re.search(r"wpkh\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc, re.I)
+        match = re.fullmatch(
+            rf"{re.escape(self.descriptor_function)}\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)",
+            desc,
+            re.I,
+        )
         if not match:
             return None
         change_from_desc = int(match.group(1))
@@ -3001,6 +3007,10 @@ class WalletSyncMixin:
             except Exception:
                 continue
             derived_pubkey = derived_key.get_public_key_bytes(compressed=True).hex().lower()
+            if self.address_type == "p2tr" and len(pubkey) == 64:
+                # BIP386 tr(KEY) contains the internal key, not the tweaked
+                # output key. Core uses rawtr(KEY) for the latter.
+                derived_pubkey = derived_pubkey[2:]
             if derived_pubkey == pubkey:
                 return (mixdepth, change_from_desc, index)
         return None
@@ -3026,33 +3036,7 @@ class WalletSyncMixin:
         Returns:
             Tuple of (mixdepth, change, index) or None if parsing fails
         """
-        # Remove checksum
-        if "#" in desc:
-            desc_base = desc.split("#")[0]
-        else:
-            desc_base = desc
-
-        # Extract the relative path [fingerprint/change/index] and pubkey
-        # Pattern: wpkh([fingerprint/change/index]pubkey)
-        match = re.search(r"wpkh\(\[[\da-f]+/(\d+)/(\d+)\]([\da-f]+)\)", desc_base, re.I)
-        if not match:
+        resolved = self._resolve_descriptor_path(desc)
+        if resolved is None or resolved[:2] not in desc_to_path.values():
             return None
-
-        change_from_desc = int(match.group(1))
-        index = int(match.group(2))
-        pubkey = match.group(3)
-
-        # Find which descriptor this matches by checking all our descriptors
-        # We need to derive the key and check if it matches the pubkey
-        for base_desc, (mixdepth, change) in desc_to_path.items():
-            if change == change_from_desc:
-                # Verify by deriving the key and comparing pubkeys
-                try:
-                    derived_key = self._derive_key(mixdepth, change, index)
-                    derived_pubkey = derived_key.get_public_key_bytes(compressed=True).hex()
-                    if derived_pubkey == pubkey:
-                        return (mixdepth, change, index)
-                except Exception:
-                    continue
-
-        return None
+        return resolved

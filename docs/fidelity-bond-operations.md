@@ -321,6 +321,10 @@ jm-maker start --mnemonic-file <hot-wallet.mnemonic>
 The maker loads the delegated certificate from the registry. The external bond
 key is not needed for normal maker operation.
 
+For the experimental credential market, a separate owner-signed authorization
+can delegate a market signing key without placing the bond spending key on the
+provider. See [Experimental Credential Market](credential-market.md).
+
 ## Renew A Certificate
 
 Certificate expiry does not spend or unlock the bond. Renew before expiry to

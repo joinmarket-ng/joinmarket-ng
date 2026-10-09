@@ -94,13 +94,14 @@ modules:
       - -DSECP256K1_ENABLE_MODULE_RECOVERY=ON
       - -DSECP256K1_ENABLE_MODULE_ECDH=ON
       - -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON
+      - -DSECP256K1_ENABLE_MODULE_MUSIG=ON
       - -DSECP256K1_BUILD_BENCHMARK=OFF
       - -DSECP256K1_BUILD_TESTS=OFF
       - -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF
     sources:
       - type: git
         url: https://github.com/bitcoin-core/secp256k1.git
-        commit: e3a885d42a7800c1ccebad94ad1e2b82c4df5c65
+        commit: 6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d # v0.8.0
 
   # =========================================================================
   # Module 5: neutrino-api (pre-built Go binary)
@@ -151,9 +152,12 @@ modules:
       - mkdir -p /app/share/jmwalletd/jam
       - 'if [ -d dist ]; then cp -r dist/* /app/share/jmwalletd/jam/; elif [ -d build ]; then cp -r build/* /app/share/jmwalletd/jam/; else echo "ERROR: no frontend build output (expected dist/ or build/)"; exit 1; fi'
     sources:
-      - type: git
-        url: https://github.com/joinmarket-webui/jam.git
-        commit: 88be5a49b1cf7532f05c1a4cb33046ab5af99e35
+      # Preserve the selected frontend commit; flatpak-builder cannot fetch
+      # its unreferenced Git tree reliably, but the checksum-pinned archive can.
+      - type: archive
+        url: https://codeload.github.com/joinmarket-webui/jam/tar.gz/88be5a49b1cf7532f05c1a4cb33046ab5af99e35
+        archive-type: tar-gzip
+        sha256: 01383ed2744bcff0eb8f2eb6a94631c6c48f996f29f8e7d0e2b7cc596de48026
 
   # =========================================================================
   # Module 7: Python application

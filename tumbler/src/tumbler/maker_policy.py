@@ -6,7 +6,7 @@ to diversify the role/timing of the funded wallet's CoinJoin participation.
 Two policies must be enforced for *those* maker sessions, regardless of how
 the user has configured the standalone ``maker`` bot:
 
-1. **Zero absolute fee, sw0absoffer.** The session is short-lived and
+1. **Zero absolute fee in the wallet's pit.** The session is short-lived and
    bondless (see #2), so the offer would otherwise be ignored by takers
    filtering on fees and bonds. A 0-sat absolute offer is the cheapest
    way to be picked. Absolute offers only advertise/use ``cjfee_a``;
@@ -18,6 +18,10 @@ the user has configured the standalone ``maker`` bot:
    tumble. The session re-announces under a fresh nick anyway, but the
    bond itself is the strongest cross-phase fingerprint and must be
    suppressed explicitly.
+
+3. **No new channel rings.** Reusing an LND identity across transient maker
+   phases would correlate their wallet inputs. Keep the node mappings and
+   journal paths for recovery of any already-open rounds.
 
 Multi-offer (``offer_configs``) is also cleared so the absolute-fee policy
 is not silently overridden by ``MakerConfig.get_effective_offers``.
@@ -39,13 +43,19 @@ def apply_tumbler_maker_policy(config: MakerConfig) -> MakerConfig:
     Mutates and returns ``config`` for convenience. The function is
     idempotent: re-applying it has no effect.
     """
-    config.offer_type = OfferType.SW0_ABSOLUTE
+    config.offer_type = (
+        OfferType.TR0_ABSOLUTE if config.address_type == "p2tr" else OfferType.SW0_ABSOLUTE
+    )
     config.cj_fee_absolute = 0
     # Absolute offers ignore cj_fee_relative, but pin it to a harmless
     # default instead of carrying through an operator-specific value into
     # a tumbler-controlled session and then mentioning that value in docs.
     config.cj_fee_relative = "0.001"
     config.no_fidelity_bond = True
+    # Disabling only new funding preserves configured nodes and paths: maker
+    # startup still quarantines unresolved ring journals and renews their input
+    # locks. Clearing the topology would skip that recovery entirely.
+    config.channel_ring = config.channel_ring.model_copy(update={"enabled": False})
     # Multi-offer takes precedence over the single-offer fields when
     # non-empty (see ``MakerConfig.get_effective_offers``); a non-empty
     # list would silently re-introduce the user's relative-fee or

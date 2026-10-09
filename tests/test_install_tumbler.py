@@ -25,6 +25,9 @@ def _run_packages(
     taker: bool,
     tumbler_installed: bool = False,
     pinned_deps: bool = False,
+    old_target: bool = False,
+    missing_swap_lock: bool = False,
+    missing_swap_source: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run an installer package path with all external operations stubbed."""
 
@@ -46,6 +49,26 @@ python3() {{ return 0; }}
 RELEASE_FILE_LOG="$(mktemp)"
 prepare_verified_source() {{ return 0; }}
 read_release_file() {{
+    if [[ "$1" == "jmswap/pyproject.toml" \
+        && "{str(missing_swap_source).lower()}" == true ]]; then
+        return 1
+    fi
+    if [[ "$1" == "jmswap/requirements.txt" && "{str(missing_swap_lock).lower()}" == true ]]; then
+        printf '%s\n' "$1" >> "$RELEASE_FILE_LOG"
+        return 1
+    fi
+    if [[ "$1" == maker/pyproject.toml || "$1" == taker/pyproject.toml ]] \
+        && [[ "{str(old_target).lower()}" == true ]]; then
+        printf '[project]\ndependencies = ["jmcore", "jmwallet"]\n'
+        return
+    fi
+    if [[ "$1" == jmswap/* && "{str(old_target).lower()}" == true ]]; then
+        return 1
+    fi
+    if [[ "$1" == */pyproject.toml ]]; then
+        cat "{REPO_ROOT}/$1"
+        return
+    fi
     printf '%s\n' "$1" >> "$RELEASE_FILE_LOG"
     printf 'idna==3.10\n'
 }}
@@ -100,13 +123,16 @@ def test_complete_profile_installs_tumbler_after_maker_and_taker() -> None:
     maker_index = next(
         i for i, line in enumerate(packages) if "subdirectory=maker" in line
     )
+    swap_index = next(
+        i for i, line in enumerate(packages) if "subdirectory=jmswap" in line
+    )
     taker_index = next(
         i for i, line in enumerate(packages) if "subdirectory=taker" in line
     )
     tumbler_index = next(
         i for i, line in enumerate(packages) if "subdirectory=tumbler" in line
     )
-    assert maker_index < taker_index < tumbler_index
+    assert swap_index < maker_index < taker_index < tumbler_index
 
 
 @pytest.mark.parametrize(("maker", "taker"), [(True, False), (False, True)])
@@ -147,9 +173,38 @@ def test_complete_profile_fetches_tumbler_lock_for_hash_verification() -> None:
     assert _release_file_paths(result) == [
         "jmcore/requirements.txt",
         "jmwallet/requirements.txt",
+        "jmswap/requirements.txt",
         "maker/requirements.txt",
         "taker/requirements.txt",
         "tumbler/requirements.txt",
         "jmwalletd/requirements.txt",
     ]
     assert any("--require-hashes" in line for line in _pip_lines(result))
+
+
+@pytest.mark.parametrize("mode", ["install", "update"])
+def test_older_target_does_not_request_nonexistent_swap(mode: str) -> None:
+    result = _run_packages(
+        mode=mode, maker=True, taker=True, pinned_deps=True, old_target=True
+    )
+    assert "EXIT:0" in result.stdout, result.stdout + result.stderr
+    assert "jmswap/requirements.txt" not in _release_file_paths(result)
+    assert not any("subdirectory=jmswap" in line for line in _pip_lines(result))
+
+
+def test_missing_required_swap_lock_aborts_before_installing() -> None:
+    result = _run_packages(
+        mode="install", maker=True, taker=True, pinned_deps=True, missing_swap_lock=True
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Could not fetch jmswap/requirements.txt" in result.stdout
+    assert not _pip_lines(result)
+
+
+def test_missing_required_swap_source_aborts_before_installing() -> None:
+    result = _run_packages(
+        mode="install", maker=True, taker=True, missing_swap_source=True
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "requires jmswap, but its source is unavailable" in result.stdout
+    assert not _pip_lines(result)

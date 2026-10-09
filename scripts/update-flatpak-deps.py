@@ -41,7 +41,16 @@ NEUTRINO_ARM64_RE = re.compile(
     r"(?ms)(url:\s*)(https://github\.com/m0wer/neutrino-api/releases/download/\S+/"
     r"neutrinod-linux-arm64)(\s*\n\s*sha256:\s*)([a-f0-9]+)"
 )
-JAM_COMMIT_RE = re.compile(r"(?ms)(- name: jam-frontend\b.*?commit:\s*)([a-f0-9]+)")
+JAM_FRONTEND_MODULE_RE = re.compile(
+    r"(?ms)^  - name: jam-frontend[ \t]*\n.*?(?=^  - name: |\Z)"
+)
+JAM_ARCHIVE_RE = re.compile(
+    r"(?m)(^      - type: archive[ \t]*\n"
+    r"        url: https://codeload\.github\.com/joinmarket-webui/jam/tar\.gz/)"
+    r"([a-f0-9]{40})"
+    r"([ \t]*\n        archive-type: tar-gzip[ \t]*\n        sha256: )"
+    r"([a-f0-9]{64})([ \t]*$)"
+)
 JAM_PLAYWRIGHT_BASE_SERVICE_RE = re.compile(
     r"(?ms)^  jam-playwright-base:\s*\n.*?(?=^  [A-Za-z0-9][A-Za-z0-9_-]*:\s*$|\Z)"
 )
@@ -272,21 +281,32 @@ def replace_url_sha(
     return updated
 
 
-def extract_jam_commit(text: str) -> str:
-    match = JAM_COMMIT_RE.search(text)
-    if not match:
-        raise UpdateError("Could not find jam-frontend commit in Flatpak manifest")
-    return match.group(2)
+def _jam_archive_source(text: str) -> tuple[re.Match[str], re.Match[str]]:
+    modules = list(JAM_FRONTEND_MODULE_RE.finditer(text))
+    if len(modules) != 1:
+        raise UpdateError(f"Expected one jam-frontend module, found {len(modules)}")
+    module_text = modules[0].group(0)
+    source_count = len(re.findall(r"(?m)^      - type:", module_text))
+    matches = list(JAM_ARCHIVE_RE.finditer(module_text))
+    if source_count != 1 or len(matches) != 1:
+        raise UpdateError("Expected one checksum-pinned jam-frontend archive source")
+    return modules[0], matches[0]
 
 
-def replace_jam_commit(text: str, commit: str) -> str:
-    def _replacement(match: re.Match[str]) -> str:
-        return f"{match.group(1)}{commit}"
+def extract_jam_archive(text: str) -> tuple[str, str]:
+    _, source = _jam_archive_source(text)
+    return source.group(2), source.group(4)
 
-    updated, count = JAM_COMMIT_RE.subn(_replacement, text, count=1)
-    if count != 1:
-        raise UpdateError("Failed to update jam-frontend commit in Flatpak manifest")
-    return updated
+
+def replace_jam_archive(text: str, commit: str, sha256: str) -> str:
+    _validate_commit(commit, "JAM Flatpak source")
+    if re.fullmatch(r"[a-f0-9]{64}", sha256) is None:
+        raise UpdateError("Unexpected JAM Flatpak archive SHA256 format")
+    module, source = _jam_archive_source(text)
+    replacement = f"{source.group(1)}{commit}{source.group(3)}{sha256}{source.group(5)}"
+    start = module.start() + source.start()
+    end = module.start() + source.end()
+    return f"{text[:start]}{replacement}{text[end:]}"
 
 
 def extract_jam_compose_pins(text: str) -> tuple[str, str]:
@@ -392,17 +412,6 @@ def report_url_sha(
     return changed
 
 
-def report_commit(name: str, current: str, latest: str) -> bool:
-    changed = current != latest
-    if changed:
-        print(f"[UPDATE] {name}")
-        print(f"  Commit: {current}")
-        print(f"  New:    {latest}")
-    else:
-        print(f"[OK] {name} is up to date")
-    return changed
-
-
 def report_jam_docker_pins(compose_commit: str, test_commit: str, latest: str) -> bool:
     changed = compose_commit != latest or test_commit != latest
     if changed:
@@ -459,6 +468,14 @@ def main() -> int:
         help="Only check for updates without modifying files",
     )
     parser.add_argument(
+        "--jam-frontend-commit",
+        metavar="SHA",
+        help=(
+            "Explicitly select a JAM Flatpak frontend commit and pin its archive checksum "
+            "(otherwise retain the current frontend)"
+        ),
+    )
+    parser.add_argument(
         "--manifest",
         type=Path,
         default=default_manifest_path,
@@ -512,10 +529,32 @@ def main() -> int:
         manifest_text,
         "neutrino-api (arm64)",
     )
-    current_jam_commit = extract_jam_commit(manifest_text)
+    current_jam_commit, current_jam_sha = extract_jam_archive(manifest_text)
     current_jam_ref, current_jam_docker_commit = extract_jam_compose_pins(compose_text)
     current_jam_test_ref = extract_jam_test_ref(jam_pin_test_text)
     current_jam_test_commit = extract_jam_test_commit(jam_pin_test_text)
+
+    # A newer tag alone says nothing about whether it retains the features in
+    # the selected Flatpak frontend. Only an explicit commit opts into replacing it.
+    jam_commit = (
+        _validate_commit(args.jam_frontend_commit, "JAM Flatpak source")
+        if args.jam_frontend_commit is not None
+        else current_jam_commit
+    )
+    jam_url = f"https://codeload.github.com/joinmarket-webui/jam/tar.gz/{jam_commit}"
+    jam_sha = (
+        sha256_url(jam_url) if args.jam_frontend_commit is not None else current_jam_sha
+    )
+    if args.jam_frontend_commit is None:
+        print(
+            "[INFO] Keeping the independently pinned JAM Flatpak frontend "
+            f"at {current_jam_commit} (use --jam-frontend-commit to change it)"
+        )
+    elif jam_commit != current_jam_commit or jam_sha != current_jam_sha:
+        print(
+            "[ACTION] Review the new frontend and update the exact pin expectations "
+            "in tests/test_flatpak_manifest.py before merging"
+        )
 
     libevent_release = latest_release("libevent/libevent")
     latest_libevent_url = pick_asset_url(
@@ -547,7 +586,7 @@ def main() -> int:
     latest_neutrino_amd64_sha = sha256_url(latest_neutrino_amd64_url)
     latest_neutrino_arm64_sha = sha256_url(latest_neutrino_arm64_url)
 
-    latest_jam_ref, latest_jam_commit = latest_jam_release()
+    latest_jam_ref, _ = latest_jam_release()
     latest_jam_docker = latest_jam_docker_commit()
 
     changed = [
@@ -587,7 +626,13 @@ def main() -> int:
             current_jam_test_ref,
             latest_jam_ref,
         ),
-        report_commit("JAM Flatpak source", current_jam_commit, latest_jam_commit),
+        report_url_sha(
+            "JAM Flatpak source",
+            f"https://codeload.github.com/joinmarket-webui/jam/tar.gz/{current_jam_commit}",
+            current_jam_sha,
+            jam_url,
+            jam_sha,
+        ),
         report_jam_docker_pins(
             current_jam_docker_commit,
             current_jam_test_commit,
@@ -639,7 +684,7 @@ def main() -> int:
         latest_neutrino_arm64_sha,
         "neutrino-api (arm64)",
     )
-    updated_manifest = replace_jam_commit(updated_manifest, latest_jam_commit)
+    updated_manifest = replace_jam_archive(updated_manifest, jam_commit, jam_sha)
     updated_compose = replace_jam_compose_pins(
         compose_text,
         latest_jam_ref,

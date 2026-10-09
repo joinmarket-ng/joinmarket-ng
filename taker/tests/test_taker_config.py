@@ -4,7 +4,10 @@ Tests for taker configuration module.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
+from jmcore.models import OfferType
 from pydantic import ValidationError
 
 from taker.config import (
@@ -16,6 +19,23 @@ from taker.config import (
     TakerConfig,
     resolve_counterparty_count,
 )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_market_fault_exclusion_settings_round_trip(sample_mnemonic: str, enabled: bool) -> None:
+    from jmcore.settings import JoinMarketSettings, TakerSettings
+
+    from taker.cli import build_taker_config
+    from taker.config_builder import build_taker_config_kwargs
+
+    settings = JoinMarketSettings(taker=TakerSettings(market_fault_exclusion=enabled))
+    assert TakerSettings().market_fault_exclusion is False
+    cli_config = build_taker_config(settings, mnemonic=sample_mnemonic, passphrase="")
+    daemon_config = TakerConfig(
+        **build_taker_config_kwargs(settings, mnemonic=sample_mnemonic, passphrase="")
+    )
+    assert cli_config.market_fault_exclusion is enabled
+    assert daemon_config.market_fault_exclusion is enabled
 
 
 class TestResolveCounterpartyCount:
@@ -124,6 +144,11 @@ class TestTakerConfig:
         assert config.bondless_makers_allowance == 0.05
         assert config.bondless_makers_allowance_require_zero_fee is True
         assert config.initial_confirmation_timeout_sec == 300
+        assert config.external_podle_mode == "disabled"
+
+    def test_external_podle_mode_only_is_explicit(self, sample_mnemonic: str) -> None:
+        config = TakerConfig(mnemonic=sample_mnemonic, external_podle_mode="only")
+        assert config.external_podle_mode == "only"
 
     def test_direct_config_rejects_production_clearnet_directory(
         self, sample_mnemonic: str
@@ -150,6 +175,44 @@ class TestTakerConfig:
                 mnemonic=sample_mnemonic,
                 min_fee_rate_sat_vb=2.0,
                 max_fee_rate_sat_vb=1.0,
+            )
+
+    @pytest.mark.parametrize(
+        ("address_type", "preferred_offer_type"),
+        [
+            ("p2wpkh", OfferType.SW0_RELATIVE),
+            ("p2wpkh", OfferType.SW0_ABSOLUTE),
+            ("p2tr", OfferType.TR0_RELATIVE),
+            ("p2tr", OfferType.TR0_ABSOLUTE),
+        ],
+    )
+    def test_preferred_offer_family_matches_wallet_address_type(
+        self,
+        sample_mnemonic: str,
+        address_type: Literal["p2wpkh", "p2tr"],
+        preferred_offer_type: OfferType,
+    ) -> None:
+        config = TakerConfig(
+            mnemonic=sample_mnemonic,
+            address_type=address_type,
+            preferred_offer_type=preferred_offer_type,
+        )
+        assert config.preferred_offer_type == preferred_offer_type
+
+    def test_taproot_pit_on_segwit_wallet_is_rejected(self, sample_mnemonic: str) -> None:
+        with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+            TakerConfig(
+                mnemonic=sample_mnemonic,
+                address_type="p2wpkh",
+                preferred_offer_type=OfferType.TR0_RELATIVE,
+            )
+
+    def test_segwit_pit_on_taproot_wallet_is_rejected(self, sample_mnemonic: str) -> None:
+        with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+            TakerConfig(
+                mnemonic=sample_mnemonic,
+                address_type="p2tr",
+                preferred_offer_type=OfferType.SW0_RELATIVE,
             )
 
     @pytest.mark.parametrize(
@@ -552,3 +615,226 @@ class TestSchedule:
         schedule.advance()
         assert schedule.is_complete()
         assert schedule.current_entry() is None
+
+
+class TestPreferredOfferTypeRoundTrip:
+    """Settings-to-config wiring for the rigid pit offer family."""
+
+    def test_preferred_offer_type_propagates_to_taker_config(self, sample_mnemonic: str) -> None:
+        from jmcore.models import OfferType
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic, address_type="p2tr"),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(preferred_offer_type=OfferType.TR0_RELATIVE),
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
+
+        assert config.preferred_offer_type == OfferType.TR0_RELATIVE
+
+    def test_preferred_offer_type_defaults_to_sw0(self, sample_mnemonic: str) -> None:
+        from jmcore.models import OfferType
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(),
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
+
+        assert config.preferred_offer_type == OfferType.SW0_RELATIVE
+
+    def test_taproot_absolute_pit_propagates_to_taker_config(self, sample_mnemonic: str) -> None:
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic, address_type="p2tr"),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(preferred_offer_type=OfferType.TR0_ABSOLUTE),
+        )
+
+        config = build_taker_config(
+            settings=settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            mixdepth=0,
+            amount=100_000,
+            destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
+
+        assert config.preferred_offer_type == OfferType.TR0_ABSOLUTE
+        assert config.address_type == "p2tr"
+
+    def test_mismatched_pit_and_wallet_fails_before_start(self, sample_mnemonic: str) -> None:
+        """A tr0 pit on a p2wpkh wallet must be rejected while building the config."""
+        from jmcore.settings import (
+            JoinMarketSettings,
+            NetworkSettings,
+            TakerSettings,
+            WalletSettings,
+        )
+
+        from taker.cli import build_taker_config
+
+        settings = JoinMarketSettings(
+            wallet=WalletSettings(mnemonic=sample_mnemonic),
+            network=NetworkSettings(network="regtest"),
+            taker=TakerSettings(preferred_offer_type=OfferType.TR0_RELATIVE),
+        )
+
+        with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+            build_taker_config(
+                settings=settings,
+                mnemonic=sample_mnemonic,
+                passphrase="",
+                mixdepth=0,
+                amount=100_000,
+                destination="bcrt1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            )
+
+
+def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
+    tmp_path, sample_mnemonic: str
+) -> None:
+    from jmcore.channel_ring import (
+        ChannelRingNodeSettings,
+        ChannelRingSettings,
+        TakerChannelRingSettings,
+    )
+    from jmcore.models import OfferType
+    from jmcore.settings import JoinMarketSettings, TakerSettings, WalletSettings
+
+    from taker.config_builder import build_taker_config
+
+    ring = ChannelRingSettings(
+        enabled=True,
+        nodes={
+            "local": ChannelRingNodeSettings(
+                lnd_grpc_url="https://localhost:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint="b" * 56 + ".onion:9735",
+            )
+        },
+        mixdepth_nodes={0: "local"},
+        node_binding_directory=tmp_path / "node-bindings",
+        confirmation_depth=6,
+    )
+    settings = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.TR0_RELATIVE,
+            channel_ring=ring,
+        ),
+    )
+    config = build_taker_config(settings, mnemonic=sample_mnemonic, passphrase="")
+    assert config.channel_ring.enabled
+    assert config.channel_ring.confirmation_depth == 6
+    assert config.channel_ring.nodes["local"].onion_endpoint == "b" * 56 + ".onion:9735"
+    assert config.channel_ring.mixdepth_nodes == {0: "local"}
+    assert config.channel_ring.node_binding_directory == tmp_path / "node-bindings"
+    assert config.channel_ring.taker_joins
+
+    opted_out = build_taker_config(
+        settings.model_copy(
+            update={
+                "taker": settings.taker.model_copy(
+                    update={
+                        "channel_ring": TakerChannelRingSettings(
+                            **ring.model_dump(), taker_participates=False
+                        )
+                    }
+                )
+            }
+        ),
+        mnemonic=sample_mnemonic,
+        passphrase="",
+    )
+    assert opted_out.channel_ring.enabled
+    assert not opted_out.channel_ring.taker_joins
+    assert opted_out.channel_ring.mixdepth_nodes == {0: "local"}
+
+    no_lnd = build_taker_config(
+        JoinMarketSettings(
+            wallet=WalletSettings(address_type="p2tr"),
+            taker=TakerSettings(
+                preferred_offer_type=OfferType.TR0_RELATIVE,
+                channel_ring=ChannelRingSettings(enabled=True),
+            ),
+        ),
+        mnemonic=sample_mnemonic,
+        passphrase="",
+    )
+    assert no_lnd.channel_ring.enabled
+    assert no_lnd.channel_ring.nodes == {}
+    assert not no_lnd.channel_ring.taker_joins
+
+    incompatible = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2wpkh"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.TR0_RELATIVE,
+            channel_ring=ring,
+        ),
+    )
+    with pytest.raises(ValueError, match="p2tr wallet"):
+        build_taker_config(incompatible, mnemonic=sample_mnemonic, passphrase="")
+
+    wrong_offer = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        taker=TakerSettings(
+            preferred_offer_type=OfferType.SW0_RELATIVE,
+            channel_ring=ring,
+        ),
+    )
+    with pytest.raises(ValueError, match="tr0 preferred offer"):
+        build_taker_config(wrong_offer, mnemonic=sample_mnemonic, passphrase="")
+
+
+def test_disabled_channel_ring_round_trip_preserves_default_behavior(sample_mnemonic: str) -> None:
+    from jmcore.settings import JoinMarketSettings
+
+    from taker.config_builder import build_taker_config
+
+    config = build_taker_config(JoinMarketSettings(), mnemonic=sample_mnemonic, passphrase="")
+    assert config.channel_ring.enabled is False
+    assert config.channel_ring.nodes == {}
+    assert config.channel_ring.mixdepth_nodes == {}

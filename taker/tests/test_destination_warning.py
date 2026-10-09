@@ -14,6 +14,7 @@ from collections.abc import Iterator
 import base58 as b58
 import bech32 as bech32_lib
 import pytest
+from bitcointx.segwit_addr import encode
 from loguru import logger
 
 from taker.taker import warn_if_destination_script_mismatch
@@ -38,7 +39,7 @@ def _make_p2wpkh() -> str:
 
 
 def _make_p2tr() -> str:
-    addr = bech32_lib.encode("bcrt", 1, b"\xcd" * 32)
+    addr = encode("bcrt", 1, b"\xcd" * 32)
     assert addr is not None
     return addr
 

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 
 def _load_update_flatpak_deps_module():
@@ -38,21 +42,254 @@ def test_replace_url_sha_updates_tor_entry() -> None:
     assert f"sha256: {new_sha}" in updated_text
 
 
-def test_replace_jam_commit_updates_commit() -> None:
+def test_replace_jam_archive_updates_commit_and_checksum() -> None:
     module = _load_update_flatpak_deps_module()
     manifest_path = (
         Path(__file__).resolve().parents[1] / "flatpak" / "org.joinmarketng.JamNG.yml"
     )
     manifest_text = manifest_path.read_text(encoding="utf-8")
 
-    current_commit = module.extract_jam_commit(manifest_text)
+    current_commit, current_sha = module.extract_jam_archive(manifest_text)
     assert len(current_commit) == 40
+    assert len(current_sha) == 64
 
     new_commit = "f" * 40
-    updated_text = module.replace_jam_commit(manifest_text, new_commit)
+    new_sha = "a" * 64
+    updated_text = module.replace_jam_archive(manifest_text, new_commit, new_sha)
 
-    assert f"commit: {new_commit}" in updated_text
-    assert f"commit: {current_commit}" not in updated_text
+    assert module.extract_jam_archive(updated_text) == (new_commit, new_sha)
+    assert f"/tar.gz/{current_commit}" not in updated_text
+    assert f"sha256: {current_sha}" not in updated_text
+    assert (
+        module.replace_jam_archive(updated_text, current_commit, current_sha)
+        == manifest_text
+    )
+
+
+@pytest.mark.parametrize("malformed", ["missing-sha", "bad-commit", "duplicate-source"])
+def test_jam_archive_rejects_incomplete_or_duplicate_sources(malformed: str) -> None:
+    module = _load_update_flatpak_deps_module()
+    manifest = (
+        Path(__file__).resolve().parents[1] / "flatpak" / "org.joinmarketng.JamNG.yml"
+    ).read_text(encoding="utf-8")
+    commit, sha = module.extract_jam_archive(manifest)
+    if malformed == "missing-sha":
+        manifest = manifest.replace(f"sha256: {sha}", "sha256: missing", 1)
+    elif malformed == "bad-commit":
+        manifest = manifest.replace(f"/tar.gz/{commit}", "/tar.gz/invalid", 1)
+    else:
+        manifest = manifest.replace(
+            "      - type: archive\n        url: https://codeload.github.com/joinmarket-webui/jam",
+            "      - type: archive\n      - type: archive\n"
+            "        url: https://codeload.github.com/joinmarket-webui/jam",
+            1,
+        )
+
+    with pytest.raises(
+        module.UpdateError, match="one checksum-pinned jam-frontend archive"
+    ):
+        module.extract_jam_archive(manifest)
+
+
+def _mock_updater_inputs(
+    module: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, Path, Path, dict[str, str]]:
+    root = Path(__file__).resolve().parents[1]
+    manifest_path = tmp_path / "org.joinmarketng.JamNG.yml"
+    compose_path = tmp_path / "docker-compose.yml"
+    pin_test_path = tmp_path / "test_jmwalletd_dockerfile.py"
+    paths = (manifest_path, compose_path, pin_test_path)
+    for source, target in zip(
+        (
+            root / "flatpak" / paths[0].name,
+            root / paths[1].name,
+            root / "tests" / paths[2].name,
+        ),
+        paths,
+        strict=True,
+    ):
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    manifest = paths[0].read_text(encoding="utf-8")
+    sources = {
+        repo: [module.extract_url_sha(pattern, manifest, name)]
+        for repo, pattern, name in (
+            ("libevent/libevent", module.LIBEVENT_RE, "libevent"),
+            ("jedisct1/libsodium", module.LIBSODIUM_RE, "libsodium"),
+            ("neutrino", module.NEUTRINO_AMD64_RE, "neutrino amd64"),
+        )
+    }
+    sources["neutrino"].append(
+        module.extract_url_sha(module.NEUTRINO_ARM64_RE, manifest, "neutrino arm64")
+    )
+    tor_url, tor_sha = module.extract_url_sha(module.TOR_RE, manifest, "tor")
+    hashes = {url: sha for assets in sources.values() for url, sha in assets}
+    hashes[tor_url] = tor_sha
+
+    def latest_release(repo: str) -> dict[str, Any]:
+        assets = sources[repo] if repo in sources else sources["neutrino"]
+        if repo not in sources:
+            assert repo.endswith("/neutrino-api")
+        return {
+            "assets": [
+                {"name": url.rsplit("/", 1)[-1], "browser_download_url": url}
+                for url, _sha in assets
+            ]
+        }
+
+    monkeypatch.setattr(module, "latest_release", latest_release)
+    monkeypatch.setattr(
+        module,
+        "latest_tor_version",
+        lambda: tor_url.rsplit("tor-", 1)[-1].removesuffix(".tar.gz"),
+    )
+    current_jam_ref, current_docker_commit = module.extract_jam_compose_pins(
+        paths[1].read_text(encoding="utf-8")
+    )
+    monkeypatch.setattr(
+        module, "latest_jam_release", lambda: (current_jam_ref, "d" * 40)
+    )
+    monkeypatch.setattr(
+        module, "latest_jam_docker_commit", lambda: current_docker_commit
+    )
+    monkeypatch.setattr(module, "sha256_url", lambda url: hashes[url])
+    return manifest_path, compose_path, pin_test_path, hashes
+
+
+def _run_updater(
+    module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    paths: tuple[Path, Path, Path],
+    *args: str,
+) -> int:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "update-flatpak-deps.py",
+            "--manifest",
+            str(paths[0]),
+            "--compose",
+            str(paths[1]),
+            "--jam-pin-test",
+            str(paths[2]),
+            *args,
+        ],
+    )
+    return module.main()
+
+
+def test_updater_keeps_selected_archive_when_latest_release_is_older(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_update_flatpak_deps_module()
+    manifest_path, compose_path, pin_test_path, _ = _mock_updater_inputs(
+        module, monkeypatch, tmp_path
+    )
+    paths = (manifest_path, compose_path, pin_test_path)
+    before = [path.read_bytes() for path in paths]
+
+    assert _run_updater(module, monkeypatch, paths, "--check") == 0
+    assert _run_updater(module, monkeypatch, paths) == 0
+    assert [path.read_bytes() for path in paths] == before
+
+
+def test_new_jam_release_updates_playwright_without_replacing_flatpak_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_update_flatpak_deps_module()
+    manifest_path, compose_path, pin_test_path, _ = _mock_updater_inputs(
+        module, monkeypatch, tmp_path
+    )
+    paths = (manifest_path, compose_path, pin_test_path)
+    manifest_before = paths[0].read_bytes()
+    monkeypatch.setattr(
+        module, "latest_jam_release", lambda: ("v2.0.0-beta.5", "e" * 40)
+    )
+
+    assert _run_updater(module, monkeypatch, paths, "--check") == 1
+    assert paths[0].read_bytes() == manifest_before
+    assert _run_updater(module, monkeypatch, paths) == 0
+    assert paths[0].read_bytes() == manifest_before
+    assert module.extract_jam_compose_pins(paths[1].read_text(encoding="utf-8"))[0] == (
+        "v2.0.0-beta.5"
+    )
+    assert module.extract_jam_test_ref(paths[2].read_text(encoding="utf-8")) == (
+        "v2.0.0-beta.5"
+    )
+
+
+def test_updater_explicit_archive_change_updates_both_pins_and_is_repeatable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_update_flatpak_deps_module()
+    manifest_path, compose_path, pin_test_path, hashes = _mock_updater_inputs(
+        module, monkeypatch, tmp_path
+    )
+    paths = (manifest_path, compose_path, pin_test_path)
+    commit = "f" * 40
+    sha = "a" * 64
+    hashes[f"https://codeload.github.com/joinmarket-webui/jam/tar.gz/{commit}"] = sha
+    original = [path.read_bytes() for path in paths]
+
+    assert (
+        _run_updater(
+            module, monkeypatch, paths, "--check", "--jam-frontend-commit", commit
+        )
+        == 1
+    )
+    assert [path.read_bytes() for path in paths] == original
+    assert (
+        _run_updater(module, monkeypatch, paths, "--jam-frontend-commit", commit) == 0
+    )
+    assert "update the exact pin expectations in tests/test_flatpak_manifest.py" in (
+        capsys.readouterr().out
+    )
+    assert module.extract_jam_archive(paths[0].read_text(encoding="utf-8")) == (
+        commit,
+        sha,
+    )
+    assert [path.read_bytes() for path in paths[1:]] == original[1:]
+    updated = [path.read_bytes() for path in paths]
+    assert (
+        _run_updater(module, monkeypatch, paths, "--jam-frontend-commit", commit) == 0
+    )
+    assert [path.read_bytes() for path in paths] == updated
+
+
+def test_updater_archive_download_failure_leaves_all_pins_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_update_flatpak_deps_module()
+    manifest_path, compose_path, pin_test_path, _ = _mock_updater_inputs(
+        module, monkeypatch, tmp_path
+    )
+    paths = (manifest_path, compose_path, pin_test_path)
+    before = [path.read_bytes() for path in paths]
+
+    with pytest.raises(KeyError):
+        _run_updater(module, monkeypatch, paths, "--jam-frontend-commit", "f" * 40)
+    assert [path.read_bytes() for path in paths] == before
+
+
+def test_updater_rejects_partial_archive_before_writing_other_pins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_update_flatpak_deps_module()
+    manifest_path, compose_path, pin_test_path, _ = _mock_updater_inputs(
+        module, monkeypatch, tmp_path
+    )
+    paths = (manifest_path, compose_path, pin_test_path)
+    manifest = paths[0].read_text(encoding="utf-8")
+    _, sha = module.extract_jam_archive(manifest)
+    paths[0].write_text(manifest.replace(f"sha256: {sha}", "sha256: missing", 1))
+    before = [path.read_bytes() for path in paths]
+
+    with pytest.raises(
+        module.UpdateError, match="one checksum-pinned jam-frontend archive"
+    ):
+        _run_updater(module, monkeypatch, paths)
+    assert [path.read_bytes() for path in paths] == before
 
 
 def test_replace_jam_compose_pins_updates_both_dependencies() -> None:

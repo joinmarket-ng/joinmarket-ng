@@ -37,9 +37,26 @@ def test_manifest_builds_recovery_enabled_libsecp256k1() -> None:
 
     assert secp_module["buildsystem"] == "cmake-ninja"
     assert "-DSECP256K1_ENABLE_MODULE_RECOVERY=ON" in secp_module["config-opts"]
+    assert "-DSECP256K1_ENABLE_MODULE_MUSIG=ON" in secp_module["config-opts"]
     source = secp_module["sources"][0]
     assert source["type"] == "git"
-    assert source["commit"] == "e3a885d42a7800c1ccebad94ad1e2b82c4df5c65"
+    assert source["commit"] == "6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d"
+
+
+def test_frontend_uses_checksum_pinned_archive() -> None:
+    manifest = _manifest()
+    frontend = next(
+        module for module in manifest["modules"] if module["name"] == "jam-frontend"
+    )
+    source = frontend["sources"][0]
+
+    assert source["type"] == "archive"
+    assert source["archive-type"] == "tar-gzip"
+    assert source["url"].endswith("/88be5a49b1cf7532f05c1a4cb33046ab5af99e35")
+    assert (
+        source["sha256"]
+        == "01383ed2744bcff0eb8f2eb6a94631c6c48f996f29f8e7d0e2b7cc596de48026"
+    )
 
 
 def test_latest_appstream_release_matches_project_version() -> None:

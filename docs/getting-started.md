@@ -68,6 +68,9 @@ may still be too young. For missing funds, [check sync first](troubleshooting.md
 - [Run a maker](README-maker.md) to offer liquidity while you keep the wallet online.
 - [Run the tumbler](README-tumbler.md) to schedule a longer sequence with several
   destinations. Learn the single-transaction workflow before leaving it unattended.
+- [Experimental Ring Market](experimental-ring-market.md): opt-in Taproot pit,
+  Lightning channel rings, channel buyouts, and the PoDLE and fidelity bond
+  credential market. Practice on signet first.
 
 A mixdepth is a privacy compartment, not a privacy score. Before spending the
 result, read [how change and later payments affect privacy](technical/best-practices.md).

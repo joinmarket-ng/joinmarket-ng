@@ -142,7 +142,10 @@ jobs:
   # ==========================================================================
   test-unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Includes the live LND buyout regtest suite, which now also covers the
+    # three settlement routing scenarios (second private channel, announced
+    # public channels, failed payment followed by the split broadcast).
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
@@ -160,16 +163,30 @@ jobs:
       - uses: ./.github/actions/setup-python-deps
         with:
           python-version: ${{ matrix.python-version }}
-          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmwalletd,tumbler,jmswap
           install-dev: 'true'
 
       - name: Run unit tests
         run: |
-          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler \
+          pytest -c pytest.ini jmcore jmwallet directory_server orderbook_watcher maker taker jmwalletd tumbler jmswap \
             --junitxml=junit/unit-tests.xml \
-            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler \
+            --cov=jmcore --cov=jmwallet --cov=directory_server --cov=orderbook_watcher --cov=maker --cov=taker --cov=jmwalletd --cov=tumbler --cov=jmswap \
             --cov-report=term-missing --cov-report=xml --cov-report=html \
             -v --fail-on-skip
+
+      - name: Check escrow transactions against Bitcoin Core
+        if: matrix.python-version == '3.14'
+        run: |
+          pytest -c pytest.ini jmswap/tests/test_bitcoin_escrow_regtest.py \
+            -m docker --no-cov --fail-on-skip -v
+
+      - name: Check private buyout signing and settlement against LND
+        # The pinned image runs focused backend tests at build time.
+        if: matrix.python-version == '3.14'
+        run: |
+          docker build -t jm-buyout-lnd:v0.21.3-beta lnd
+          pytest -c pytest.ini jmswap/tests/test_lnd_buyout_regtest.py \
+            -m docker --no-cov --fail-on-skip -v
 
       - name: Run repo-root tests
         # Tests under the top-level tests/ directory (TUI, release scripts,
@@ -201,6 +218,33 @@ jobs:
             coverage-root.xml
             htmlcov/
         if: always()
+
+  # ==========================================================================
+  # Private ring integration needs its own Tor/LND stack, not the legacy e2e profile.
+  test-private-ring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - uses: ./.github/actions/setup-python-deps
+        with:
+          python-version: '3.14'
+          components: jmcore,jmwallet,directory_server,orderbook_watcher,maker,taker,jmswap
+          install-dev: 'true'
+      - name: Build the pinned escrow backend
+        run: docker build -t jm-buyout-lnd:v0.21.3-beta lnd
+      - name: Exercise external funding and mixed ring lifecycle
+        run: scripts/run-ring-e2e.sh all
+        # Do not upload the retained wallet, LND, or buyout journals as artifacts.
+      - name: Exercise maker-only ring without taker LND
+        run: RING_E2E_NO_BUILD=1 scripts/run-ring-e2e.sh ring-no-taker
 
   # ==========================================================================
   # Stage 2b: install.sh smoke tests across operating systems
@@ -372,12 +416,14 @@ jobs:
           $build = Join-Path $source "build"
           git init $source
           git -C $source remote add origin https://github.com/bitcoin-core/secp256k1.git
-          git -C $source fetch --depth 1 origin e3a885d42a7800c1ccebad94ad1e2b82c4df5c65
+          git -C $source fetch --depth 1 origin 6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d
           git -C $source checkout --detach FETCH_HEAD
           cmake -S $source -B $build `
             -DBUILD_SHARED_LIBS=ON `
             -DSECP256K1_ENABLE_MODULE_RECOVERY=ON `
             -DSECP256K1_ENABLE_MODULE_ECDH=ON `
+            -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON `
+            -DSECP256K1_ENABLE_MODULE_MUSIG=ON `
             -DSECP256K1_BUILD_TESTS=OFF `
             -DSECP256K1_BUILD_BENCHMARK=OFF `
             -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF
@@ -396,7 +442,12 @@ jobs:
           python -m pip install --upgrade pip
           # Install from source in editable mode mirrors the documented
           # Windows quick start.
-          pip install ./jmcore ./taker ./jmwallet
+          # pull_request_target runs this workflow from main against the PR
+          # checkout. Older main revisions do not have the local jmswap package.
+          $projects = @("./jmcore", "./jmwallet", "./taker")
+          if (Test-Path ./jmswap/pyproject.toml) { $projects += "./jmswap" }
+          pip install @projects
+          python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig'
       - name: Install Tor, start it, and fetch the signet orderbook
         shell: pwsh
         # Chocolatey's tor package is unreliable across runner images, so
@@ -1894,31 +1945,41 @@ jobs:
             sleep 2
           done
 
-          echo "Waiting for JAM makers..."
-          for i in {1..30}; do
-            if docker compose exec -T jam-maker1 sh -c "timeout 5 bash -c '</dev/tcp/127.0.0.1/80'" 2>/dev/null; then
-              echo "JAM maker1 ready"
-              break
+          echo "Waiting for both JAM makers..."
+          for maker in jam-maker1 jam-maker2; do
+            maker_ready=0
+            for i in {1..30}; do
+              if docker compose exec -T "$maker" sh -c "timeout 5 bash -c '</dev/tcp/127.0.0.1/80'" 2>/dev/null; then
+                echo "$maker ready"
+                maker_ready=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "$maker_ready" -ne 1 ]; then
+              echo "$maker never became ready"
+              exit 1
             fi
-            sleep 5
           done
 
-          echo "Verifying the directory onion is reachable from jam-maker1..."
           ONION=$(docker compose exec -T tor sh -c "tr -d '[:space:]' < /var/lib/tor/directory/hostname")
-          onion_ready=0
-          for i in {1..60}; do
-            if docker compose exec -T jam-maker1 check-directory-onion "$ONION" --timeout 20; then
-              echo "Directory onion reachable: $ONION"
-              onion_ready=1
-              break
+          for maker in jam-maker1 jam-maker2; do
+            echo "Verifying the directory onion is reachable from $maker..."
+            onion_ready=0
+            for i in {1..60}; do
+              if docker compose exec -T "$maker" check-directory-onion "$ONION" --timeout 20; then
+                echo "Directory onion reachable from $maker: $ONION"
+                onion_ready=1
+                break
+              fi
+              echo "Attempt $i/60: onion not reachable from $maker yet..."
+              sleep 5
+            done
+            if [ "$onion_ready" -ne 1 ]; then
+              echo "Directory onion never became reachable from $maker"
+              exit 1
             fi
-            echo "Attempt $i/60: onion $ONION not reachable yet..."
-            sleep 5
           done
-          if [ "$onion_ready" -ne 1 ]; then
-            echo "Directory onion $ONION never became reachable from jam-maker1"
-            exit 1
-          fi
 
           echo "Waiting for reference makers to connect..."
           sleep 30
@@ -2197,6 +2258,7 @@ jobs:
     needs:
       # Unit tests (combined in single job)
       - test-unit
+      - test-private-ring
       # Component integration tests (run docker-marked tests only)
       - test-jmwallet
       # Integration tests (depend on build-images)
