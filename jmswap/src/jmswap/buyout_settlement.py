@@ -36,7 +36,6 @@ from jmswap.buyout_messages import (
     BuyoutSweep,
     BuyoutSweepPartial,
     accept_hash,
-    encode_buyout_payload,
     object_hash,
 )
 from jmswap.buyout_signing import Request, _save, require_runtime_binding, session_terms
@@ -159,7 +158,10 @@ class BuyoutSettlement:
         observed = await self._observe(parent)
         if (
             observed is None
-            or observed.confirmations < terms.acceptance.settlement_depth
+            # Only the authenticated buyer's request starts the invoice lifetime,
+            # once both sides can verify the agreed payment depth. Issuing earlier
+            # can expire the invoice while the buyer waits for slow confirmations.
+            or observed.confirmations < terms.proposal.buyer_settlement_depth
             or observed.height is None
             or await self.chain.height() + terms.proposal.cltv_limit
             > observed.height + terms.proposal.csv_delay - SPLIT_SAFETY_MARGIN_BLOCKS
@@ -371,16 +373,9 @@ class BuyoutSettlement:
         observed: ChainTransaction,
         height: int,
     ) -> None:
-        if (
-            not record.data.get("invoice")
-            and observed.confirmations >= terms.acceptance.settlement_depth
-        ):
-            response = await self._invoice(record, terms, parent)
-            if isinstance(response, BuyoutInvoice):
-                await self.peer.send(
-                    bytes.fromhex(record.peer_pubkey), encode_buyout_payload(response)
-                )
-            record = self.store.get(record.session_id)
+        # Do not create invoices proactively, even at the buyer's depth: an
+        # offline buyer could outlive their expiry. The authenticated status
+        # request creates or recovers the one invoice for the committed hash.
         if observed.height is None or height + 1 < observed.height + terms.proposal.csv_delay:
             return
         if record.data.get("invoice_started"):

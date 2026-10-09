@@ -197,6 +197,15 @@ jm-buyout --config "$BUYER_BUYOUT_CONFIG" serve
 `status` reads only the local journal. Confirm chain and LND state independently.
 Buyout and ring change cannot fund the same round.
 
+The counterparty creates the settlement invoice only on an authenticated buyer
+request after the agreed buyer confirmation depth (six blocks by default), not
+while polling for confirmations. This keeps slow blocks or an offline buyer from
+consuming the invoice's lifetime before the buyer requests it. Keep both monitors
+running: interruptions after invoice creation can still outlast its expiry.
+Upgrading preserves already-issued invoices and interrupted payment attempts;
+expired invoices are not replaced, and unpaid sessions retain their existing
+timeout-split recovery path.
+
 ### 4. Buy a PoDLE or Rent a Bond
 
 A taker that must use purchased openings sets:

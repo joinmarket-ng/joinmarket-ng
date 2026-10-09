@@ -29,6 +29,7 @@ from jmswap.bitcoin_escrow import (
 )
 from jmswap.buyout_chain import BuyoutChain, ChainTransaction
 from jmswap.buyout_messages import (
+    BuyoutInvoice,
     BuyoutMessage,
     BuyoutParent,
     BuyoutPropose,
@@ -579,11 +580,14 @@ async def test_invalid_invoice_never_starts_payment(
 
 async def test_lost_payment_reply_only_tracks_existing_payment(
     settlement: SettlementRuntime,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h = settlement
     h.signing.buyer.peer.pay.side_effect = TimeoutError("lost payment reply")
     with pytest.raises(TimeoutError):
         await h.buyer.poll(h.sid)
+    # Invoice expiry after an uncertain submission must not permit a new payment.
+    monkeypatch.setattr("jmswap.buyout_settlement.time.time", lambda: h.invoice.created_at + 7200)
     h.signing.buyer.peer.track_payment.return_value = None
     h.buyer = BuyoutSettlement(
         h.signing.buyer.store, h.signing.buyer.peer, h.chain, request=h.request
@@ -664,8 +668,8 @@ async def test_parent_observation_does_not_downgrade_existing_invoice(
 ) -> None:
     h = settlement
     parent = h.transactions[h.parent.txid]
-    h.transactions[h.parent.txid] = replace(parent, confirmations=3)
-    assert await h.counterparty.poll(h.sid) == "INVOICE_READY"
+    # The buyer requests the invoice at its payment depth, before a reorg.
+    assert isinstance(await h.request(BUYER_KEY.hex(), settlement_status(h)), BuyoutInvoice)
     h.transactions[h.parent.txid] = replace(parent, confirmations=2)
     assert await h.counterparty.poll(h.sid) == "INVOICE_READY"
     h.signing.counterparty.peer.create_invoice.assert_awaited_once()
@@ -686,7 +690,7 @@ async def test_depth_and_cltv_window_gate_payments(
 
 
 @pytest.mark.parametrize("settlement", ["three_block_payment"], indirect=True)
-async def test_opt_in_invoice_at_one_and_pay_at_three(
+async def test_opt_in_invoice_requested_and_paid_at_three(
     settlement: SettlementRuntime,
 ) -> None:
     h = settlement
@@ -698,8 +702,9 @@ async def test_opt_in_invoice_at_one_and_pay_at_three(
     h.signing.counterparty.peer.create_invoice.assert_not_awaited()
 
     h.transactions[h.parent.txid] = replace(h.transactions[h.parent.txid], confirmations=1)
-    assert await h.counterparty.poll(h.sid) == "INVOICE_READY"
-    h.signing.counterparty.peer.create_invoice.assert_awaited_once()
+    assert await h.counterparty.poll(h.sid) == "PARENT_OBSERVED"
+    h.signing.counterparty.peer.create_invoice.assert_not_awaited()
+    assert isinstance(await h.request(BUYER_KEY.hex(), settlement_status(h)), BuyoutStatus)
 
     h.transactions[h.parent.txid] = replace(h.transactions[h.parent.txid], confirmations=2)
     await h.buyer.poll(h.sid)
@@ -707,7 +712,130 @@ async def test_opt_in_invoice_at_one_and_pay_at_three(
 
     h.transactions[h.parent.txid] = replace(h.transactions[h.parent.txid], confirmations=3)
     assert await h.buyer.poll(h.sid) == "SETTLED"
+    h.signing.counterparty.peer.create_invoice.assert_awaited_once()
     h.signing.buyer.peer.pay.assert_awaited_once()
+
+
+def settlement_status(h: SettlementRuntime) -> BuyoutStatus:
+    terms = h.signing.buyer.terms(h.sid)
+    return BuyoutStatus(
+        v=1,
+        type="buyout_status",
+        epoch_id=h.sid,
+        attempt=terms.proposal.attempt,
+        accept_hash=accept_hash(terms.acceptance),
+        stage="parent_signed",
+        parent_hash=h.parent.parent_hash,
+        txid=h.parent.txid,
+    )
+
+
+async def test_slow_confirmations_and_offline_buyer_do_not_age_invoice(
+    settlement: SettlementRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = settlement
+    parent = h.transactions[h.parent.txid]
+    now = h.invoice.created_at
+    clock = [float(now)]
+    monkeypatch.setattr("jmswap.buyout_settlement.time.time", lambda: clock[0])
+
+    async def create(preimage: bytes, amount: int, expiry: int, **kwargs: Any) -> str:
+        # LND starts the wall-clock lifetime when AddInvoice is called.
+        h.signing.buyer.peer.inspect_invoice.return_value = replace(
+            h.invoice, created_at=int(clock[0]), expiry_seconds=expiry
+        )
+        return "lnbcrt10u1pjtestinvoice"
+
+    h.signing.counterparty.peer.create_invoice.side_effect = create
+    for depth, elapsed in [(3, 0), (5, 3601), (6, 7200), (10, 86_400)]:
+        h.transactions[h.parent.txid] = replace(parent, confirmations=depth)
+        clock[0] = now + elapsed
+        await h.counterparty.poll(h.sid)
+    h.signing.counterparty.peer.create_invoice.assert_not_awaited()
+    h.signing.counterparty.peer.send.assert_not_awaited()
+    assert "invoice_started" not in h.signing.counterparty.store.get(h.sid).data
+
+    # Restart after a day with the buyer offline: first request still gets a fresh invoice.
+    h.counterparty = BuyoutSettlement(
+        h.signing.counterparty.store, h.signing.counterparty.peer, h.chain
+    )
+    assert await h.buyer.poll(h.sid) == "SETTLED"
+    h.signing.counterparty.peer.create_invoice.assert_awaited_once()
+    h.signing.buyer.peer.pay.assert_awaited_once()
+
+
+@pytest.mark.parametrize("depth", [0, 2, 3, 5])
+async def test_invoice_request_before_buyer_depth_has_no_creation_intent(
+    settlement: SettlementRuntime, depth: int
+) -> None:
+    h = settlement
+    h.transactions[h.parent.txid] = replace(h.transactions[h.parent.txid], confirmations=depth)
+    assert isinstance(await h.request(BUYER_KEY.hex(), settlement_status(h)), BuyoutStatus)
+    assert "invoice_started" not in h.signing.counterparty.store.get(h.sid).data
+    h.signing.counterparty.peer.create_invoice.assert_not_awaited()
+
+
+@pytest.mark.parametrize("blocked", ["missing_parent", "spent_escrow", "cltv_window"])
+async def test_invoice_request_preserves_chain_safety_gates(
+    settlement: SettlementRuntime, blocked: str
+) -> None:
+    h = settlement
+    if blocked == "missing_parent":
+        h.transactions.pop(h.parent.txid)
+    elif blocked == "spent_escrow":
+        h.chain.unspent.return_value = False
+    else:
+        h.chain.height.return_value = 600
+    assert isinstance(await h.request(BUYER_KEY.hex(), settlement_status(h)), BuyoutStatus)
+    assert "invoice_started" not in h.signing.counterparty.store.get(h.sid).data
+    h.signing.counterparty.peer.create_invoice.assert_not_awaited()
+
+
+@pytest.mark.parametrize("authorization", [None, False])
+async def test_legacy_counterparty_without_authorization_cannot_issue_invoice(
+    settlement: SettlementRuntime, authorization: bool | None
+) -> None:
+    h = settlement
+    store = h.signing.counterparty.store
+    record = store.get(h.sid)
+    data = dict(record.data)
+    data.pop("settlement_authorized")
+    if authorization is not None:
+        data["settlement_authorized"] = authorization
+    store.update(record, state=record.state, data=data)
+    assert await h.counterparty.poll(h.sid) == "PARENT_SIGNED"
+    with pytest.raises(ProtocolError, match="not authorized"):
+        await h.request(BUYER_KEY.hex(), settlement_status(h))
+    h.signing.counterparty.peer.create_invoice.assert_not_awaited()
+    assert store.get(h.sid).data == data
+
+
+@pytest.mark.parametrize("expired", [False, True])
+@pytest.mark.parametrize("intent", [False, True])
+async def test_legacy_invoice_is_preserved_after_restart(
+    settlement: SettlementRuntime, expired: bool, intent: bool
+) -> None:
+    h = settlement
+    store = h.signing.counterparty.store
+    record = store.get(h.sid)
+    data = {**record.data, "invoice": "lnbcrt10u1pjlegacyinvoice"}
+    if intent:
+        data["invoice_started"] = True
+    store.update(record, state="INVOICE_READY", data=data)
+    h.counterparty = BuyoutSettlement(store, h.signing.counterparty.peer, h.chain)
+    if expired:
+        h.signing.buyer.peer.inspect_invoice.return_value = replace(
+            h.invoice, created_at=h.invoice.created_at - 3601
+        )
+        with pytest.raises(ProtocolError, match="settlement bounds"):
+            await h.buyer.poll(h.sid)
+        h.signing.buyer.peer.pay.assert_not_awaited()
+    else:
+        assert await h.buyer.poll(h.sid) == "SETTLED"
+        h.signing.buyer.peer.pay.assert_awaited_once()
+    assert store.get(h.sid).data == data
+    h.signing.counterparty.peer.create_invoice.assert_not_awaited()
+    h.signing.counterparty.peer.invoice_request.assert_not_awaited()
 
 
 async def test_old_journal_without_settlement_authorization_has_no_side_effects(
@@ -735,6 +863,23 @@ async def test_interrupted_invoice_creation_recovers_without_recreating(
     assert await h.buyer.poll(h.sid) == "SETTLED"
     h.signing.counterparty.peer.create_invoice.assert_awaited_once()
     h.signing.counterparty.peer.invoice_request.assert_awaited_once()
+
+
+async def test_interrupted_invoice_without_lookup_result_is_not_recreated(
+    settlement: SettlementRuntime,
+) -> None:
+    h = settlement
+    store = h.signing.counterparty.store
+    record = store.get(h.sid)
+    store.update(record, state="INVOICE_CREATING", data={**record.data, "invoice_started": True})
+    h.counterparty = BuyoutSettlement(store, h.signing.counterparty.peer, h.chain)
+    h.signing.counterparty.peer.invoice_request.return_value = None
+    for _ in range(2):
+        await h.buyer.poll(h.sid)
+    h.signing.counterparty.peer.invoice_request.assert_awaited()
+    h.signing.counterparty.peer.create_invoice.assert_not_awaited()
+    h.signing.buyer.peer.pay.assert_not_awaited()
+    assert store.get(h.sid).state == "INVOICE_CREATING"
 
 
 async def test_claim_replacement_and_confirmation(settlement: SettlementRuntime) -> None:

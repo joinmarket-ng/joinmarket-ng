@@ -165,8 +165,9 @@ sweep_response_blocks = 1
 buyout_fee = 0
 timeout_compensation = 0
 
-# Confirmations the counterparty waits on the parent before it invoices.
-# Must not exceed buyer_settlement_depth.
+# Counterparty's negotiated minimum parent depth. Must not exceed
+# buyer_settlement_depth. Invoice creation also waits for buyer_settlement_depth
+# and an authenticated buyer request so expiry does not start during that wait.
 settlement_depth = 3
 
 # Blocks the counterparty promises to wait for the parent, and the longest
@@ -195,7 +196,8 @@ payment_timeout_seconds = 60
 
 # Lifetime of the invoice the counterparty issues, in seconds. Must be greater
 # than payment_timeout_seconds, otherwise a buyer with this same configuration
-# would refuse the invoice.
+# would refuse the invoice. Starts when the payment-ready buyer requests it;
+# interrupted creation recovers the same invoice, never a replacement.
 invoice_expiry_seconds = 3600
 
 # Most this node will spend on one escrow spend (cooperative sweep, claim or
