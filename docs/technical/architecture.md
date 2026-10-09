@@ -256,14 +256,15 @@ makers must also retain their inputs until setup completes. If the taker specifi
 exact input outpoints, both ring modes abort rather than silently select more
 wallet inputs when authenticated fees exceed the estimate.
 
-Ring makers currently cannot enforce their configured minimum *final* miner-fee
-rate before releasing signatures: the ring path verifies the manifest and
-chain-resolved prevouts but does not run the ordinary maker's estimated fee
-check. An unsigned P2TR or P2WSH input does not bound its eventual witness
-size, so adding a template estimate would not prove the signed transaction's
-fee rate. An honest taker checks actual signed vsize before broadcasting; that
-does not constrain a malicious taker holding maker signatures. Do not rely on
-the maker fee-floor setting as a ring-parent relayability guarantee.
+Ring makers apply the ordinary maker's estimated minimum fee-rate check to the
+ring transaction after resolving every prevout and before LND verifies the
+funding PSBT. Inputs of unknown script type count as a P2TR key-path spend, the
+smallest common witness, so the estimate only rejects clearly underpaying
+transactions. An unsigned P2TR or P2WSH input does not bound its eventual
+witness size, so the check cannot prove the signed transaction's fee rate. An
+honest taker checks actual signed vsize before broadcasting; that does not
+constrain a malicious taker holding maker signatures. Do not rely on the maker
+fee-floor setting as a ring-parent relayability guarantee.
 
 ### Testing
 

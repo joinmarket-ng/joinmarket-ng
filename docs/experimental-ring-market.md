@@ -299,8 +299,9 @@ a response was lost.
 
 ## Known Limitations
 
-- Ring makers do not apply the ordinary maker minimum fee rate to ring
-  transactions. Watch the actual fee rate.
+- Ring makers check an estimated fee rate against the ordinary maker minimum,
+  but the estimate cannot bound the final signed size. Watch the actual fee
+  rate.
 - In maker-only rings, ring makers can infer the taker's ordinary change.
 - Ring participants learn more than chain observers. Lightning nodes, route
   hints, and payments are not anonymous.

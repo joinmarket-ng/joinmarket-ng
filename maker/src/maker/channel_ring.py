@@ -10,7 +10,12 @@ import time
 from collections.abc import Awaitable, Sequence
 from typing import TYPE_CHECKING, TypeVar, cast
 
-from jmcore.bitcoin import address_to_scriptpubkey, get_txid, parse_transaction
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    estimate_vsize,
+    get_txid,
+    parse_transaction,
+)
 from jmcore.channel_ring import ChannelRingConfig
 from jmcore.channel_ring_store import (
     FundingEdgeRecord,
@@ -63,6 +68,7 @@ from jmcore.cofunded_ring import (
     verify_ready_set,
 )
 from jmcore.constants import GENESIS_BLOCK_HASHES
+from jmcore.fee_policy import fee_rate_meets_minimum, format_low_fee_error
 from jmcore.models import calculate_cj_fee, is_taproot_offer_type
 from jmswap.lnd import (
     AcceptorBounds,
@@ -93,6 +99,27 @@ if TYPE_CHECKING:
     from jmwallet.backends.base import BlockchainBackend
 
     from maker.maker_session import MakerSession
+
+
+def _vsize_input_type(script_pubkey: bytes) -> str:
+    """Map a prevout script to an estimate_vsize input type, never overestimating."""
+    if len(script_pubkey) == 22 and script_pubkey[:2] == b"\x00\x14":
+        return "p2wpkh"
+    return "p2tr"
+
+
+def _vsize_output_type(script_pubkey: bytes) -> str:
+    if len(script_pubkey) == 22 and script_pubkey[:2] == b"\x00\x14":
+        return "p2wpkh"
+    if len(script_pubkey) == 34 and script_pubkey[:2] == b"\x00\x20":
+        return "p2wsh"
+    if len(script_pubkey) == 34 and script_pubkey[:2] == b"\x51\x20":
+        return "p2tr"
+    if len(script_pubkey) == 25:
+        return "p2pkh"
+    if len(script_pubkey) == 23:
+        return "p2sh"
+    return "p2wpkh"
 
 
 class MakerRingError(Exception):
@@ -685,6 +712,32 @@ class MakerRingParticipant:
             result.append(WitnessUtxo(value_sat=value, script_pubkey=bytes.fromhex(script)))
         return result
 
+    def _check_minimum_fee_rate(self, unsigned_tx: str, witnesses: list[WitnessUtxo]) -> None:
+        """Reject a ring transaction whose estimated fee rate is below the maker floor.
+
+        This runs before LND verifies the funding PSBT and before any signature.
+        Inputs of unknown script type count as the smallest common witness (a
+        P2TR key-path spend), so only clearly underpaying transactions are
+        rejected. Like the ordinary maker check, it cannot bound the size of the
+        final signed transaction.
+        """
+        inner = getattr(self.session, "inner", self.session)
+        minimum_fee_rate = getattr(inner, "minimum_fee_rate_sat_vb", None)
+        if minimum_fee_rate is None:
+            return
+        transaction = parse_transaction(unsigned_tx)
+        fee = sum(item.value_sat for item in witnesses) - sum(
+            output.value for output in transaction.outputs
+        )
+        if fee < 0:
+            raise MakerRingError("ring transaction has a negative miner fee")
+        vsize = estimate_vsize(
+            [_vsize_input_type(item.script_pubkey) for item in witnesses],
+            [_vsize_output_type(output.script) for output in transaction.outputs],
+        )
+        if not fee_rate_meets_minimum(fee, vsize, minimum_fee_rate):
+            raise MakerRingError(format_low_fee_error(fee / vsize, minimum_fee_rate))
+
     def _pending_expectations(
         self, manifest: RingManifest, record: RingParticipantRecord
     ) -> tuple[PendingChannelExpectation, PendingChannelExpectation]:
@@ -800,6 +853,7 @@ class MakerRingParticipant:
             raise MakerRingError("ring PSBT prevouts or encoding differ from resolved transaction")
         if expected_txid != payload.manifest.unsigned_txid:
             raise MakerRingError("ring PSBT transaction ID differs from manifest")
+        self._check_minimum_fee_rate(payload.unsigned_tx, witnesses)
         outgoing_expected, incoming_expected = self._pending_expectations(payload.manifest, record)
         negotiation = _funding_negotiation(record)
         # LND can consume its funding shim before returning from PsbtVerify.

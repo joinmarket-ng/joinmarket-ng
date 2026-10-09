@@ -15,7 +15,9 @@ from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
+    estimate_vsize,
     get_txid,
+    parse_transaction,
     scriptpubkey_to_address,
     serialize_transaction,
 )
@@ -731,6 +733,50 @@ async def test_complete_participant_flow_and_signature_persistence(harness: Harn
     assert sent.state is RingLifecycleState.SIGNED
     assert sent.local_signatures == ("signature",)
     assert sent.local_input_signature_sent
+
+
+async def _prepare_for_unsigned(harness: Harness) -> RingUnsignedPayload:
+    await harness.machine.handle(harness.invite())
+    acknowledgments = await harness.machine.handle(harness.plan())
+    await harness.machine.handle(
+        harness.signed(
+            RingOpenPayload(
+                round_nonce="aa" * 32,
+                revision=0,
+                signer_key=harness.taker_key,
+                plan_hash=acknowledgments[0].plan_hash,
+            )
+        )
+    )
+    return await harness.unsigned()
+
+
+def _estimated_fee_rate(unsigned: RingUnsignedPayload, input_total: int) -> float:
+    transaction = parse_transaction(unsigned.unsigned_tx)
+    fee = input_total - sum(output.value for output in transaction.outputs)
+    vsize = estimate_vsize(["p2tr"] * len(transaction.inputs), ["p2tr"] * len(transaction.outputs))
+    return fee / vsize
+
+
+@pytest.mark.parametrize("above_floor", [False, True])
+async def test_ring_maker_enforces_estimated_minimum_fee_rate(
+    harness: Harness, above_floor: bool
+) -> None:
+    unsigned = await _prepare_for_unsigned(harness)
+    fee_rate = _estimated_fee_rate(unsigned, 8_001_000)
+    assert fee_rate > 0
+    harness.session.minimum_fee_rate_sat_vb = fee_rate if above_floor else fee_rate + 0.01
+
+    if above_floor:
+        await harness.machine.handle(unsigned)
+        assert harness.record().state is RingLifecycleState.READY
+        return
+    with pytest.raises(MakerRingError, match="miner fee rate .* is below required"):
+        await harness.machine.handle(unsigned)
+    # Rejection happens before LND verifies the funding PSBT, so the record
+    # still permits pre-verification shim cancellation.
+    assert harness.record().state is RingLifecycleState.PREPARED_NOT_VERIFIED
+    assert harness.lnd.verified is None
 
 
 async def test_order_signature_residual_and_replay_fail_closed(harness: Harness) -> None:

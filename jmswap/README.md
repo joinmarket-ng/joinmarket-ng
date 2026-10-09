@@ -166,12 +166,12 @@ include locked outputs and accounts other than its readily spendable default
 account. Monitor usable LND wallet UTXOs and fee conditions independently;
 the 100,000-sat target is not a safety guarantee.
 
-**Ring miner-fee policy limit:** Maker ring signing verifies the exact funding
-transaction and LND's PSBT checks, but does not apply the ordinary maker's
-configured `min_fee_rate_sat_vb` / `min_fee_block_target` floor. An authenticated
-taker can propose a valid ring parent below the maker's ordinary fee floor;
-pending channels and reserved inputs could then be delayed. Do not treat those
-settings as a guarantee for ring rounds. Monitor the actual parent feerate and
+**Ring miner-fee policy:** Before LND verifies the ring funding PSBT, a ring
+maker checks the transaction's estimated fee rate against the same floor as an
+ordinary maker (`min_fee_rate_sat_vb` / `min_fee_block_target`) and refuses the
+round if it is lower. Inputs of unknown script type count as the smallest
+common witness, so the check only rejects clearly underpaying transactions. It
+cannot bound the final signed size; monitor the actual parent fee rate and
 confirmation status, and retain the signed journals for recovery.
 
 **Upgrading from the previous single-node configuration:** replace the flat LND
