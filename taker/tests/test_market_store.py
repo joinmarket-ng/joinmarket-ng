@@ -11,6 +11,7 @@ from multiprocessing.queues import Queue
 from pathlib import Path
 
 import pytest
+from _taker_market_helpers import hold_quote, settle_quote
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import hash160
 from jmcore.credential_market import (
@@ -29,9 +30,12 @@ from jmcore.credential_market import (
 from jmcore.crypto import bitcoin_message_hash_bytes, get_cert_msg
 from jmcore.external_podle import ExternalPoDLEOutpoint
 from jmcore.market_store import (
+    HOLD_INVOICE_GRACE_SECONDS,
+    HoldReservation,
     MarketStore,
     MarketStoreConflictError,
     MarketStoreCorruptError,
+    MarketStoreError,
     MarketStoreExpiredError,
     MarketStoreUnavailableError,
 )
@@ -70,14 +74,6 @@ def _authorization(bond: BondReference | None = None):
     return sign_document(
         MarketAuthorization(bond=bond or _bond(), period=0, seller_pubkey=_pubkey(seller)),
         owner,
-    )
-
-
-def _payment(value: int) -> PaymentTerms:
-    return PaymentTerms(
-        rail="lightning",
-        request=f"regtest-payment-{value}",
-        amount_sats=1_000 + value,
     )
 
 
@@ -125,8 +121,8 @@ def _create_podle_quote(
     ttl: int = 300,
 ):
     store.add_inventory("podle", str(credential["commitment"]), credential)
-    store.add_payment(_payment(payment_number), f"payment-{payment_number}")
-    return store.create_quote(
+    return hold_quote(
+        store,
         _authorization(),
         _key(0x22),
         bytes((buyer or _buyer_key(0x33)).public_key).hex(),
@@ -150,7 +146,8 @@ def _concurrent_quote_creator(
     """Use a fresh process-local store connection for cross-process locking coverage."""
     store = MarketStore(Path(path))
     try:
-        quote = store.create_quote(
+        quote = hold_quote(
+            store,
             _authorization(),
             _key(0x22),
             bytes(_buyer_key(buyer_byte).public_key).hex(),
@@ -180,7 +177,8 @@ def test_quote_replay_persists_across_restart_and_uses_private_permissions(tmp_p
         request_number=1,
     )
 
-    repeated = store.create_quote(
+    repeated = hold_quote(
+        store,
         _authorization(),
         _key(0x22),
         bytes(_buyer_key(0x33).public_key).hex(),
@@ -200,7 +198,8 @@ def test_quote_replay_persists_across_restart_and_uses_private_permissions(tmp_p
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
     with pytest.raises(MarketStoreConflictError):
-        store.create_quote(
+        hold_quote(
+            store,
             _authorization(),
             _key(0x22),
             bytes(_buyer_key(0x34).public_key).hex(),
@@ -213,7 +212,8 @@ def test_quote_replay_persists_across_restart_and_uses_private_permissions(tmp_p
             request_id=_request_id(1),
         )
     with pytest.raises(MarketStoreConflictError):
-        store.create_quote(
+        hold_quote(
+            store,
             _authorization(),
             _key(0x22),
             bytes(_buyer_key(0x33).public_key).hex(),
@@ -233,19 +233,9 @@ def test_quote_replay_persists_across_restart_and_uses_private_permissions(tmp_p
     restarted.close()
 
 
-def test_expiry_releases_only_inventory_and_late_quote_cannot_finalize(tmp_path: Path) -> None:
-    store = MarketStore(tmp_path / "market.sqlite")
-    credential = _podle_credential(0x42)
-    first = _create_podle_quote(
+def _second_podle_quote(store: MarketStore, now: int):
+    return hold_quote(
         store,
-        credential=credential,
-        payment_number=1,
-        request_number=1,
-        ttl=1,
-    )
-    assert store.pending(101) == []
-    store.add_payment(_payment(2), "payment-2")
-    second = store.create_quote(
         _authorization(),
         _key(0x22),
         bytes(_buyer_key(0x34).public_key).hex(),
@@ -253,20 +243,168 @@ def test_expiry_releases_only_inventory_and_late_quote_cannot_finalize(tmp_path:
         None,
         "lightning",
         10_000,
-        101,
+        now,
         1,
         request_id=_request_id(2),
     )
-    assert first.body["resource"] == second.body["resource"]
 
-    with sqlite3.connect(store.path) as connection:
-        payments = dict(connection.execute("SELECT payment_id, quote_id FROM payments"))
-    assert payments["payment-1"] == first.body["quote_id"]
-    assert payments["payment-2"] == second.body["quote_id"]
+
+def test_expiry_keeps_inventory_until_hold_invoice_is_canceled(tmp_path: Path) -> None:
+    store = MarketStore(tmp_path / "market.sqlite")
+    first = _create_podle_quote(
+        store, credential=_podle_credential(0x42), payment_number=1, request_number=1, ttl=1
+    )
+    first_id = str(first.body["quote_id"])
+    invoice_expiry = 101 + HOLD_INVOICE_GRACE_SECONDS
+
+    # The hold invoice outlives the quote, so its inventory stays reserved.
+    assert store.pending(101) == [first]
+    with pytest.raises(MarketStoreUnavailableError, match="inventory"):
+        _second_podle_quote(store, 101)
+    assert store.pending(invoice_expiry) == []
+
+    store.begin_hold_cancel(first_id)
     with pytest.raises(MarketStoreExpiredError):
-        store.finalize(str(first.body["quote_id"]), _key(0x22), "late-payment", 101, 1)
-    assert store.get_package(str(first.body["quote_id"])) is None
+        store.finalize(first_id, _key(0x22), invoice_expiry, 1)
+    with pytest.raises(MarketStoreUnavailableError, match="inventory"):
+        _second_podle_quote(store, invoice_expiry)
+    store.complete_hold_cancel(first_id)
+    store.complete_hold_cancel(first_id)
+
+    second = _second_podle_quote(store, invoice_expiry)
+    assert first.body["resource"] == second.body["resource"]
+    with sqlite3.connect(store.path) as connection:
+        payments = dict(connection.execute("SELECT quote_id, payment_id FROM payments"))
+    assert payments[first_id] != payments[str(second.body["quote_id"])]
+    with pytest.raises(MarketStoreExpiredError):
+        store.finalize(first_id, _key(0x22), invoice_expiry, 1)
+    assert store.get_package(first_id) is None
     store.close()
+
+
+def test_payment_accepted_before_expiry_completes_after_quote_expiry(tmp_path: Path) -> None:
+    buyer = _buyer_key(0x33)
+    store = MarketStore(tmp_path / "market.sqlite")
+    quote = _create_podle_quote(
+        store, credential=_podle_credential(0x47), payment_number=1, request_number=1, ttl=1
+    )
+    quote_id = str(quote.body["quote_id"])
+
+    package = store.finalize(quote_id, _key(0x22), 101 + 60, 1)
+    # Nothing is exposed until LND confirms the settlement.
+    assert store.get_delivery(quote_id) is None
+    assert store.get_package(quote_id) is None
+    with pytest.raises(MarketStoreConflictError):
+        store.begin_hold_cancel(quote_id)
+    assert store.finalize(quote_id, _key(0x22), 101 + 60, 1) == package
+
+    store.complete_hold_settle(quote_id)
+    sealed = store.get_delivery(quote_id)
+    assert sealed is not None
+    plaintext = SealedBox(buyer).decrypt(base64.b64decode(sealed))
+    assert CredentialPackage.model_validate(decode_document(plaintext)) == package
+    assert store.hold_invoices(200) == []
+    store.close()
+
+
+def test_lost_payment_after_finalize_keeps_allocation_consumed_and_undelivered(
+    tmp_path: Path,
+) -> None:
+    store = MarketStore(tmp_path / "market.sqlite")
+    quote = _create_podle_quote(
+        store, credential=_podle_credential(0x48), payment_number=1, request_number=1
+    )
+    quote_id = str(quote.body["quote_id"])
+    store.finalize(quote_id, _key(0x22), 101, 1)
+    [hold] = store.hold_invoices(101)
+    assert (hold.state, hold.quote_state) == ("settling", "finalized")
+
+    # LND reports the accepted HTLC canceled, so settlement can never happen.
+    store.complete_hold_cancel(quote_id)
+    assert store.get_delivery(quote_id) is None
+    assert store.get_package(quote_id) is None
+    with pytest.raises(MarketStoreUnavailableError, match="inventory"):
+        _second_podle_quote(store, 102)
+    store.close()
+
+
+def test_hold_reservation_is_durable_before_the_invoice_exists(tmp_path: Path) -> None:
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path)
+    credential = _podle_credential(0x49)
+    store.add_inventory("podle", str(credential["commitment"]), credential)
+    arguments = (
+        _authorization(),
+        _key(0x22),
+        bytes(_buyer_key(0x33).public_key).hex(),
+        "podle",
+        None,
+        "lightning",
+        10_000,
+        1_500,
+        100,
+        1,
+    )
+    reservation = store.reserve_hold_quote(*arguments, request_id=_request_id(1))
+    assert isinstance(reservation, HoldReservation)
+    assert reservation.amount_sats == 1_500
+    assert reservation.invoice_expires_at == 400 + HOLD_INVOICE_GRACE_SECONDS
+    store.close()
+
+    restarted = MarketStore(path)
+    assert restarted.reserve_hold_quote(*arguments, request_id=_request_id(1)) == reservation
+    [hold] = restarted.hold_invoices(100)
+    assert (hold.state, hold.quote_state) == ("reserved", None)
+    assert hashlib.sha256(hold.preimage).digest() == reservation.payment_hash
+    with pytest.raises(MarketStoreUnavailableError, match="price"):
+        restarted.reserve_hold_quote(
+            *arguments[:6], 1_000, *arguments[7:], request_id=_request_id(2)
+        )
+
+    terms = PaymentTerms(rail="lightning", request="regtest-hold-other", amount_sats=1_500)
+    with pytest.raises(MarketStoreConflictError):
+        restarted.issue_hold_quote(reservation.quote_id, _key(0x22), terms, "ln:" + "00" * 32, 100)
+    payment_id = f"ln:{reservation.payment_hash.hex()}"
+    with pytest.raises(MarketStoreConflictError):
+        restarted.issue_hold_quote(
+            reservation.quote_id,
+            _key(0x22),
+            terms.model_copy(update={"amount_sats": 1_400}),
+            payment_id,
+            100,
+        )
+    with pytest.raises(MarketStoreExpiredError):
+        restarted.issue_hold_quote(reservation.quote_id, _key(0x22), terms, payment_id, 400)
+    quote = restarted.issue_hold_quote(reservation.quote_id, _key(0x22), terms, payment_id, 100)
+    assert (
+        restarted.issue_hold_quote(reservation.quote_id, _key(0x22), terms, payment_id, 100)
+        == quote
+    )
+    assert restarted.reserve_hold_quote(*arguments, request_id=_request_id(1)) == quote
+
+    # A canceled reservation that never got a quote cannot be replayed.
+    other = _podle_credential(0x4A)
+    restarted.add_inventory("podle", str(other["commitment"]), other)
+    abandoned = restarted.reserve_hold_quote(*arguments, request_id=_request_id(3))
+    assert isinstance(abandoned, HoldReservation)
+    restarted.begin_hold_cancel(abandoned.quote_id)
+    restarted.complete_hold_cancel(abandoned.quote_id)
+    with pytest.raises(MarketStoreUnavailableError):
+        restarted.reserve_hold_quote(*arguments, request_id=_request_id(3))
+    restarted.close()
+
+
+def test_one_seller_runtime_per_store(tmp_path: Path) -> None:
+    store = MarketStore(tmp_path / "market.sqlite")
+    other = MarketStore(tmp_path / "market.sqlite")
+    with store.seller_runtime():
+        with pytest.raises(MarketStoreError, match="another seller runtime"):
+            with other.seller_runtime():
+                pass
+    with other.seller_runtime():
+        pass
+    store.close()
+    other.close()
 
 
 def test_bond_attachment_filtering_and_final_delivery_are_irreversible(tmp_path: Path) -> None:
@@ -274,9 +412,9 @@ def test_bond_attachment_filtering_and_final_delivery_are_irreversible(tmp_path:
     bond = _bond()
     certificate = _key(0x44)
     store.add_inventory("bond", bond_resource(bond, 0), None)
-    store.add_payment(_payment(1), "payment-1")
     buyer = _buyer_key(0x33)
-    quote = store.create_quote(
+    quote = hold_quote(
+        store,
         _authorization(bond),
         _key(0x22),
         bytes(buyer.public_key).hex(),
@@ -295,7 +433,7 @@ def test_bond_attachment_filtering_and_final_delivery_are_irreversible(tmp_path:
     store.attach_credential(quote_id, _bond_credential(bond, certificate))
     store.attach_credential(quote_id, _bond_credential(bond, certificate))
 
-    package = store.finalize(quote_id, _key(0x22), "settlement-1", 101, 1)
+    package = settle_quote(store, quote_id, _key(0x22), 101, 1)
     assert package.verify() == BondCredential.model_validate(_bond_credential(bond, certificate))
     assert package.allocation.body["allocation_id"] == quote_id
     assert (
@@ -307,13 +445,13 @@ def test_bond_attachment_filtering_and_final_delivery_are_irreversible(tmp_path:
     assert CredentialPackage.model_validate(decode_document(plaintext)) == package
     assert store.get_delivery(quote_id) == sealed
     assert store.get_package(quote_id) == package
-    assert store.finalize(quote_id, _key(0x22), "settlement-1", 10_000, 2) == package
+    assert settle_quote(store, quote_id, _key(0x22), 10_000, 2) == package
     with pytest.raises(MarketStoreConflictError):
-        store.finalize(quote_id, _key(0x22), "different-settlement", 10_000, 2)
+        store.begin_hold_cancel(quote_id)
     store.close()
 
 
-def test_settlement_references_are_global_and_failed_quote_insert_rolls_back(
+def test_failed_quote_insert_keeps_reservation_and_settlements_are_per_invoice(
     tmp_path: Path,
 ) -> None:
     store = MarketStore(tmp_path / "market.sqlite")
@@ -321,8 +459,6 @@ def test_settlement_references_are_global_and_failed_quote_insert_rolls_back(
     second_credential = _podle_credential(0x44)
     store.add_inventory("podle", str(first_credential["commitment"]), first_credential)
     store.add_inventory("podle", str(second_credential["commitment"]), second_credential)
-    store.add_payment(_payment(1), "payment-1")
-    store.add_payment(_payment(2), "payment-2")
     store._connection.execute(
         """
         CREATE TRIGGER reject_quote_insert BEFORE INSERT ON quotes
@@ -330,7 +466,8 @@ def test_settlement_references_are_global_and_failed_quote_insert_rolls_back(
         """
     )
     with pytest.raises(sqlite3.IntegrityError):
-        store.create_quote(
+        hold_quote(
+            store,
             _authorization(),
             _key(0x22),
             bytes(_buyer_key(0x33).public_key).hex(),
@@ -343,7 +480,8 @@ def test_settlement_references_are_global_and_failed_quote_insert_rolls_back(
             request_id=_request_id(1),
         )
     store._connection.execute("DROP TRIGGER reject_quote_insert")
-    first = store.create_quote(
+    first = hold_quote(
+        store,
         _authorization(),
         _key(0x22),
         bytes(_buyer_key(0x33).public_key).hex(),
@@ -355,7 +493,8 @@ def test_settlement_references_are_global_and_failed_quote_insert_rolls_back(
         1,
         request_id=_request_id(1),
     )
-    second = store.create_quote(
+    second = hold_quote(
+        store,
         _authorization(),
         _key(0x22),
         bytes(_buyer_key(0x34).public_key).hex(),
@@ -367,10 +506,12 @@ def test_settlement_references_are_global_and_failed_quote_insert_rolls_back(
         1,
         request_id=_request_id(2),
     )
-    store.finalize(str(first.body["quote_id"]), _key(0x22), "shared-settlement", 101, 1)
-    with pytest.raises(MarketStoreConflictError):
-        store.finalize(str(second.body["quote_id"]), _key(0x22), "shared-settlement", 101, 1)
-    assert store.get_package(str(second.body["quote_id"])) is None
+    settle_quote(store, str(first.body["quote_id"]), _key(0x22), 101, 1)
+    settle_quote(store, str(second.body["quote_id"]), _key(0x22), 101, 1)
+    with sqlite3.connect(store.path) as connection:
+        references = [row[0] for row in connection.execute("SELECT settlement_ref FROM quotes")]
+    assert len(set(references)) == 2
+    assert all(reference.startswith("ln:") for reference in references)
     store.close()
 
 
@@ -380,9 +521,9 @@ def test_active_quote_capacity_is_bounded_but_expired_records_are_retained(tmp_p
     for value in range(1, 66):
         bond = _bond(value)
         store.add_inventory("bond", bond_resource(bond, 0), None)
-        store.add_payment(_payment(value), f"payment-{value}")
         if value <= 64:
-            store.create_quote(
+            hold_quote(
+                store,
                 _authorization(bond),
                 _key(0x22),
                 bytes(_buyer_key(0x33).public_key).hex(),
@@ -398,7 +539,8 @@ def test_active_quote_capacity_is_bounded_but_expired_records_are_retained(tmp_p
     assert len(store.pending(100)) == 64
     with pytest.raises(MarketStoreUnavailableError, match="capacity"):
         bond = _bond(65)
-        store.create_quote(
+        hold_quote(
+            store,
             _authorization(bond),
             _key(0x22),
             bytes(_buyer_key(0x33).public_key).hex(),
@@ -411,7 +553,7 @@ def test_active_quote_capacity_is_bounded_but_expired_records_are_retained(tmp_p
             ttl=1,
             request_id=_request_id(65),
         )
-    assert store.pending(101) == []
+    assert store.pending(101 + HOLD_INVOICE_GRACE_SECONDS) == []
     with sqlite3.connect(store.path) as connection:
         expired = connection.execute(
             "SELECT COUNT(*) FROM quotes WHERE state = 'expired'"
@@ -426,7 +568,6 @@ def test_cross_process_creators_have_exactly_one_reservation_winner(tmp_path: Pa
     store = MarketStore(path)
     credential = _podle_credential(0x46)
     store.add_inventory("podle", str(credential["commitment"]), credential)
-    store.add_payment(_payment(1), "payment-1")
     store.close()
 
     context = multiprocessing.get_context("spawn")
@@ -474,7 +615,8 @@ def test_lightning_hold_limit_bounds_every_quote(tmp_path: Path) -> None:
         with pytest.raises(ValueError):
             quote.check(network="regtest", height=1, now=1000, max_price_sats=10000)
         with pytest.raises(ValueError, match="ttl"):
-            store.create_quote(
+            hold_quote(
+                store,
                 _authorization(),
                 _key(0x22),
                 bytes(_buyer_key(0x44).public_key).hex(),

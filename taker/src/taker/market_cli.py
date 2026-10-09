@@ -36,7 +36,6 @@ from jmcore.credential_market import (
     MarketListing,
     MarketQuote,
     Network,
-    PaymentTerms,
     Product,
     SignedDocument,
     bond_resource,
@@ -52,7 +51,7 @@ from jmcore.crypto import NickIdentity
 from jmcore.experimental import warn_experimental
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_faults import MarketFaultCache
-from jmcore.market_store import MarketStore
+from jmcore.market_store import MarketStore, MarketStoreError
 from jmcore.models import Offer
 from jmcore.paths import get_market_store_path
 from jmcore.podle import generate_podle
@@ -68,8 +67,6 @@ from nacl.public import PrivateKey, SealedBox
 
 from taker.market_payments import (
     payment_uri,
-    validate_payment_terms,
-    verify_lightning_preimage,
 )
 from taker.market_service import (
     DeliveryRequest,
@@ -120,13 +117,6 @@ def _read_secret(path: Path, limit: int = _MAX_KEY_BYTES) -> bytes:
     if len(raw) > limit:
         raise MarketCLIError("private key file exceeds size limit")
     return raw
-
-
-def _read_preimage(path: Path) -> bytes:
-    raw = _read_secret(path, 128)
-    if len(raw) == 32:
-        return raw
-    return _secret_bytes_from_file(path, ("preimage",))
 
 
 def _document(path: Path) -> dict[str, Any]:
@@ -543,7 +533,11 @@ def _command_export_podle(args: argparse.Namespace) -> None:
 
 def _seller_store(settings: JoinMarketSettings, *, writable: bool = True) -> MarketStore:
     _market_dir(settings)
-    store = MarketStore(get_market_store_path(settings.get_data_dir()))
+    try:
+        store = MarketStore(get_market_store_path(settings.get_data_dir()))
+    except MarketStoreError as exc:
+        # Store messages are static (for example the format upgrade notice).
+        raise MarketCLIError(str(exc)) from exc
     try:
         if writable and store.is_wallet_ledger:
             raise MarketCLIError(
@@ -581,26 +575,6 @@ def _command_seller_add_inventory(args: argparse.Namespace) -> None:
         store.close()
 
 
-def _command_seller_add_payment(args: argparse.Namespace) -> None:
-    settings = _settings(args)
-    if not 1 <= args.ttl <= 900:
-        raise MarketCLIError("payment TTL is invalid")
-    try:
-        # PaymentTerms only validates Lightning terms, so any other rail is
-        # rejected here before it can reach the seller store.
-        terms = PaymentTerms.model_validate(_document(args.terms))
-        now = int(time.time())
-        payment_id = validate_payment_terms(terms, _network(settings), now, now + args.ttl)
-    except (ValueError, TypeError) as exc:
-        raise MarketCLIError("payment terms are invalid") from exc
-    store = _seller_store(settings)
-    try:
-        store.add_payment(terms, payment_id)
-    finally:
-        store.close()
-    _emit_or_write({"payment_id": payment_id}, args.output)
-
-
 def _command_seller_pending(args: argparse.Namespace) -> None:
     settings = _settings(args)
     store = _seller_store(settings, writable=False)
@@ -621,50 +595,6 @@ def _command_seller_attach(args: argparse.Namespace) -> None:
         store.close()
 
 
-async def _settle(args: argparse.Namespace, settings: JoinMarketSettings) -> CredentialPackage:
-    store = _seller_store(settings)
-    backend = _new_backend(settings)
-    try:
-        document = store.get_quote(args.quote_id)
-        # A quote only validates with Lightning payment terms, so a stored quote
-        # for any other rail cannot be settled through this command.
-        _, quote = _verified_quote(document)
-        now = int(time.time())
-        height = await backend.get_block_height()
-        quote.check(
-            network=_network(settings),
-            height=height,
-            now=now,
-            max_price_sats=_MAX_PRICE_SATS,
-        )
-        validate_payment_terms(quote.payment, _network(settings), now, quote.expires_at)
-        if not args.acknowledge_ln_settlement:
-            raise MarketCLIError("Lightning settlement acknowledgement is required")
-        settlement_ref = verify_lightning_preimage(
-            quote.payment,
-            _network(settings),
-            _read_preimage(args.preimage_file),
-            now,
-            quote.expires_at,
-        )
-        bundle = _key_bundle(args.keys)
-        return store.finalize(
-            args.quote_id,
-            _bundle_secp(bundle, "seller_signing_key"),
-            settlement_ref,
-            now,
-            height,
-        )
-    finally:
-        store.close()
-        await _close_backend(backend)
-
-
-def _command_seller_settle(args: argparse.Namespace) -> None:
-    package = asyncio.run(_settle(args, _settings(args)))
-    _write_output(args.output, _serialized(package.model_dump(mode="json")), idempotent=True)
-
-
 def _command_seller_export(args: argparse.Namespace) -> None:
     store = _seller_store(_settings(args), writable=False)
     try:
@@ -681,36 +611,52 @@ async def _serve(args: argparse.Namespace, settings: JoinMarketSettings) -> None
     if authority.bond.network != _network(settings):
         raise MarketCLIError("authorization network differs from configured network")
     bundle = _key_bundle(args.keys)
+    from taker.market_service import MarketService
+    from taker.market_settlement import MarketSettlement, seller_invoice_client
+
+    try:
+        invoices = seller_invoice_client(settings)
+    except MarketError as exc:
+        raise MarketCLIError(str(exc)) from exc
     store = _seller_store(settings)
     backend = _new_backend(settings)
     transport: MarketTransport | None = None
     fault_cache = MarketFaultCache(settings.get_data_dir())
+    signing_key = _bundle_secp(bundle, "seller_signing_key")
     try:
-        from taker.market_service import MarketService
-
-        service = MarketService(
-            store,
-            authorization,
-            _bundle_secp(bundle, "seller_signing_key"),
-            _bundle_encryption(bundle),
-            backend,
-            products=_parse_products(args.products),
-            price_sats=args.price_sats,
-            quote_ttl=args.quote_ttl,
-            fault_cache=fault_cache,
-        )
-        transport = _new_transport(
-            settings,
-            encryption_key=_bundle_encryption(bundle),
-            listing_callback=service.listing,
-            responder=service.respond,
-            direct_location=args.direct_location,
-            listen_host=args.listen_host,
-            listen_port=args.listen_port,
-            fault_cache=fault_cache,
-        )
-        await transport.start()
-        await asyncio.Event().wait()
+        with store.seller_runtime():
+            async with invoices:
+                service = MarketService(
+                    store,
+                    authorization,
+                    signing_key,
+                    _bundle_encryption(bundle),
+                    backend,
+                    invoices,
+                    products=_parse_products(args.products),
+                    price_sats=args.price_sats,
+                    quote_ttl=args.quote_ttl,
+                    fault_cache=fault_cache,
+                )
+                settlement = MarketSettlement(
+                    store, invoices, signing_key, backend.get_block_height
+                )
+                # Finish what an earlier run left (settle or refund) before serving.
+                await settlement.reconcile_once()
+                transport = _new_transport(
+                    settings,
+                    encryption_key=_bundle_encryption(bundle),
+                    listing_callback=service.listing,
+                    responder=service.respond,
+                    direct_location=args.direct_location,
+                    listen_host=args.listen_host,
+                    listen_port=args.listen_port,
+                    fault_cache=fault_cache,
+                )
+                await transport.start()
+                await settlement.run()
+    except MarketStoreError as exc:
+        raise MarketCLIError(str(exc)) from exc
     finally:
         if transport is not None:
             await transport.close()
@@ -971,7 +917,11 @@ async def _poll(args: argparse.Namespace, settings: JoinMarketSettings) -> Crede
         )
         encrypted = response.get("delivery")
         if not isinstance(encrypted, str):
-            raise MarketCLIError("seller has no delivery for this quote")
+            raise MarketCLIError(
+                "seller has no delivery for this quote yet; after you pay, the seller"
+                " settles the payment and releases the package automatically, so poll"
+                " again shortly. An unsettled payment is refunded when its invoice expires"
+            )
         try:
             ciphertext = base64.b64decode(encrypted, validate=True)
             if len(ciphertext) > _MAX_DELIVERY_BYTES:
@@ -1449,9 +1399,10 @@ holds the buyer key of that one purchase. Rerunning a step with the same
 
 Selling a credential:
   keygen and public create your key bundle; authorize and sign-bond produce
-  offline bond-owner signatures; seller add-inventory and seller add-payment
-  stock the local store; serve advertises listings and answers buyers; seller
-  settle releases a package once you confirmed the payment yourself.
+  offline bond-owner signatures; seller add-inventory stocks the local store;
+  serve advertises listings, answers buyers with one LND hold invoice per
+  quote, and settles each payment only once its package is ready (or cancels
+  it so the buyer is refunded). Configure the seller LND node under [market].
 
 When a seller misbehaves, proof build and proof broadcast publish signed
 fault evidence to the network. When the owner of a bond you rented also runs
@@ -1592,13 +1543,6 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_source.add_argument("--authorization", type=Path)
     add_inventory.set_defaults(handler=_command_seller_add_inventory)
 
-    add_payment = seller_commands.add_parser("add-payment")
-    _common_options(add_payment)
-    add_payment.add_argument("--terms", type=Path, required=True)
-    add_payment.add_argument("--ttl", type=int, default=300)
-    add_payment.add_argument("--output", type=Path)
-    add_payment.set_defaults(handler=_command_seller_add_payment)
-
     pending = seller_commands.add_parser("pending")
     _common_options(pending)
     pending.add_argument("--output", type=Path)
@@ -1609,15 +1553,6 @@ def build_parser() -> argparse.ArgumentParser:
     attach.add_argument("--quote-id", required=True)
     attach.add_argument("--credential", type=Path, required=True)
     attach.set_defaults(handler=_command_seller_attach)
-
-    settle = seller_commands.add_parser("settle")
-    _common_options(settle)
-    settle.add_argument("--quote-id", required=True)
-    settle.add_argument("--keys", type=Path, required=True)
-    settle.add_argument("--preimage-file", type=Path, required=True)
-    settle.add_argument("--acknowledge-ln-settlement", action="store_true")
-    settle.add_argument("--output", type=Path, required=True)
-    settle.set_defaults(handler=_command_seller_settle)
 
     export = seller_commands.add_parser("export", help="export one finalized credential package")
     _common_options(export)

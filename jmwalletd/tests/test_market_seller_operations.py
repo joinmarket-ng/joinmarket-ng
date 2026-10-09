@@ -12,13 +12,15 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 from bitcointx.core.key import CKey
+from jmswap.lnd_invoices import HoldInvoiceStatus
+from jmswap.lnd_peer import InvoiceState
 from nacl.public import PrivateKey
 
 import taker.wallet_market as wallet_market
-from jmcore.bitcoin import hash160, pubkey_to_p2wpkh_address
+from jmcore.bitcoin import hash160
 from jmcore.btc_script import derive_bond_address
 from jmcore.constants import GENESIS_BLOCK_HASHES
-from jmcore.credential_market import BondCredential, CredentialPackage, PaymentTerms, SignedDocument
+from jmcore.credential_market import BondCredential, SignedDocument
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_store import MarketStore, MarketStoreError
 from jmcore.models import NetworkType
@@ -111,6 +113,80 @@ class _SyntheticRegtestBackend:
         return self.onchain_utxos.get((txid, vout))
 
 
+class _FakeHoldInvoices:
+    """In-memory LND hold-invoice node; the seller never reaches a real one."""
+
+    def __init__(self) -> None:
+        self.invoices: dict[bytes, HoldInvoiceStatus] = {}
+
+    async def __aenter__(self) -> _FakeHoldInvoices:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def add_hold_invoice(
+        self, payment_hash: bytes, amount_sats: int, expiry_seconds: int
+    ) -> str:
+        existing = self.invoices.get(payment_hash)
+        if existing is not None:
+            return existing.payment_request
+        invoice = Bolt11(
+            currency="bcrt",
+            date=int(time.time()),
+            amount_msat=MilliSatoshi(amount_sats * 1_000),
+            tags=Tags(
+                [
+                    Tag(TagChar.payment_hash, payment_hash.hex()),
+                    Tag(TagChar.payment_secret, "22" * 32),
+                    Tag(TagChar.description, ""),
+                    Tag(TagChar.expire_time, expiry_seconds),
+                    Tag(TagChar.min_final_cltv_expiry, 18),
+                ]
+            ),
+        )
+        request = encode(invoice, private_key="11" * 32)
+        self.invoices[payment_hash] = HoldInvoiceStatus(InvoiceState.OPEN, request, 0, None)
+        return request
+
+    async def lookup(self, payment_hash: bytes) -> HoldInvoiceStatus | None:
+        return self.invoices.get(payment_hash)
+
+    async def settle(self, preimage: bytes) -> None:
+        payment_hash = hashlib.sha256(preimage).digest()
+        assert self.invoices[payment_hash].state is InvoiceState.ACCEPTED
+        self._set(payment_hash, InvoiceState.SETTLED)
+
+    async def cancel(self, payment_hash: bytes) -> None:
+        assert self.invoices[payment_hash].state is not InvoiceState.SETTLED
+        self._set(payment_hash, InvoiceState.CANCELED)
+
+    def pay(self, quote: SignedDocument, amount_sats: int = _PRICE_SATS) -> bytes:
+        """Accept the buyer HTLC for the quote's invoice and return its payment hash."""
+        request = str(quote.body["payment"]["request"])
+        [payment_hash] = [
+            key for key, value in self.invoices.items() if value.payment_request == request
+        ]
+        self.invoices[payment_hash] = HoldInvoiceStatus(
+            InvoiceState.ACCEPTED, request, amount_sats, _CHAIN_HEIGHT + 100
+        )
+        return payment_hash
+
+    def _set(self, payment_hash: bytes, state: InvoiceState) -> None:
+        status = self.invoices[payment_hash]
+        self.invoices[payment_hash] = HoldInvoiceStatus(
+            state, status.payment_request, status.amount_paid_sats, None
+        )
+
+
+_INVOICES: list[_FakeHoldInvoices] = []
+
+
+async def _settle_pass(seller: WalletMarketSeller) -> None:
+    assert seller._settlement is not None
+    await seller._settlement.reconcile_once()
+
+
 def _settings(data_dir: Path) -> JoinMarketSettings:
     """Use mainnet messaging with a regtest wallet and Bitcoin chain."""
     return JoinMarketSettings(
@@ -135,39 +211,6 @@ def _seller_options(outpoint: ExternalPoDLEOutpoint, products: list[str]) -> dic
         "price_sats": _PRICE_SATS,
         "quote_ttl": 120,
     }
-
-
-def _unsupported_rail_terms(index: int) -> PaymentTerms:
-    """Build terms for a rail this market does not serve, to check they are refused."""
-    payment_key = CKey(bytes([0x40 + index]) * 32)
-    return PaymentTerms.model_construct(
-        rail="onchain",
-        request=pubkey_to_p2wpkh_address(bytes(payment_key.pub), "regtest"),
-        amount_sats=_PRICE_SATS,
-    )
-
-
-def _lightning_terms(preimage: bytes) -> PaymentTerms:
-    now = int(time.time())
-    invoice = Bolt11(
-        currency="bcrt",
-        date=now - 1,
-        amount_msat=MilliSatoshi(_PRICE_SATS * 1_000),
-        tags=Tags(
-            [
-                Tag(TagChar.payment_hash, hashlib.sha256(preimage).hexdigest()),
-                Tag(TagChar.payment_secret, "22" * 32),
-                Tag(TagChar.description, "native seller operation test"),
-                Tag(TagChar.expire_time, 600),
-                Tag(TagChar.min_final_cltv_expiry, 18),
-            ]
-        ),
-    )
-    return PaymentTerms(
-        rail="lightning",
-        request=encode(invoice, private_key="11" * 32),
-        amount_sats=_PRICE_SATS,
-    )
 
 
 def _external_podle(index: int, *, network: str = "regtest") -> ExternalPoDLE:
@@ -312,6 +355,18 @@ async def _quote(
 def _mock_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     _MemoryTransport.instances.clear()
     monkeypatch.setattr(wallet_market, "MarketTransport", _MemoryTransport)
+    _INVOICES.clear()
+
+    def _invoice_client(_settings: JoinMarketSettings) -> _FakeHoldInvoices:
+        _INVOICES.append(_FakeHoldInvoices())
+        return _INVOICES[-1]
+
+    async def _manual_settlement(_self: object, interval: float = 0) -> None:
+        # Tests drive settlement passes explicitly through _settle_pass.
+        return None
+
+    monkeypatch.setattr(wallet_market, "seller_invoice_client", _invoice_client)
+    monkeypatch.setattr(wallet_market.MarketSettlement, "run", _manual_settlement)
 
 
 @pytest.mark.asyncio
@@ -324,9 +379,6 @@ async def test_authenticated_bond_sale_finalizes_and_persists_delivery(
     settings = _settings(tmp_path)
     monkeypatch.setattr("jmwalletd.routers.market.get_settings", lambda: settings)
     transport = _app(state)
-    preimage = bytes(range(32))
-    terms = _lightning_terms(preimage)
-    unsupported = _unsupported_rail_terms(1)
     buyer_key = PrivateKey.generate()
     renter_certificate = bytes(CKey(b"\x03" * 32).pub).hex()
 
@@ -339,21 +391,18 @@ async def test_authenticated_bond_sale_finalizes_and_persists_delivery(
             headers=_headers(token),
             json={"product": "bond"},
         )
-        payment = await client.post(
-            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/payments",
-            headers=_headers(token),
-            json=terms.model_dump(mode="json"),
-        )
-        assert inventory.json() == payment.json() == {"recorded": True}
+        assert inventory.json() == {"recorded": True}
 
-        # A non-Lightning rail is never queued and never quoted: the request body
-        # schema itself only admits Lightning terms, so it is refused as invalid.
-        refused_payment = await client.post(
-            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/payments",
-            headers=_headers(token),
-            json=unsupported.model_dump(mode="json"),
-        )
-        assert refused_payment.status_code == 422
+        # Manual payment queueing and settlement endpoints no longer exist.
+        for removed in ("payments", "settle/" + "01" * 32):
+            response = await client.post(
+                f"/api/v1/wallet/{_WALLET_NAME}/market/seller/{removed}",
+                headers=_headers(token),
+                json={},
+            )
+            assert response.status_code in (404, 405)
+
+        # A non-Lightning rail is never quoted.
         assert await _quote_response(
             seller,
             buyer_key,
@@ -378,23 +427,17 @@ async def test_authenticated_bond_sale_finalizes_and_persists_delivery(
         assert pending.status_code == 200
         assert [SignedDocument.model_validate(item) for item in pending.json()] == [quote_document]
 
-        # A settlement claim without a preimage is refused by the request schema.
-        refused_settlement = await client.post(
-            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/settle/{quote_id}",
-            headers=_headers(token),
-            json={"onchain_outpoint": "ab" * 32 + ":0"},
-        )
-        assert refused_settlement.status_code == 422
+        # Nothing is delivered before the buyer's payment is held and settled.
+        await _settle_pass(seller)
         assert seller._service is not None
         assert seller._service.store.get_delivery(quote_id) is None
 
-        settled = await client.post(
-            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/settle/{quote_id}",
-            headers=_headers(token),
-            json={"preimage": preimage.hex(), "acknowledge_ln_settlement": True},
-        )
-        assert settled.status_code == 200
-        package = CredentialPackage.model_validate(settled.json())
+        [invoices] = _INVOICES
+        payment_hash = invoices.pay(quote_document)
+        await _settle_pass(seller)
+        assert invoices.invoices[payment_hash].state is InvoiceState.SETTLED
+        package = seller._service.store.get_package(quote_id)
+        assert package is not None
         credential = package.verify()
         assert isinstance(credential, BondCredential)
         assert credential.cert_pubkey == renter_certificate
@@ -425,7 +468,7 @@ async def test_authenticated_bond_sale_finalizes_and_persists_delivery(
 
 
 @pytest.mark.asyncio
-async def test_lightning_settlement_needs_local_acknowledgement_and_matching_preimage(
+async def test_underpaid_hold_invoice_is_refunded_and_inventory_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wallet, backend, outpoint = _wallet(tmp_path)
@@ -434,20 +477,15 @@ async def test_lightning_settlement_needs_local_acknowledgement_and_matching_pre
     monkeypatch.setattr("jmwalletd.routers.market.get_settings", lambda: _settings(tmp_path))
     transport = _app(state)
     credential = _external_podle(1)
-    preimage = bytes(range(32))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         seller = await _start_seller(client, state, token, outpoint, ["podle"])
-        for endpoint, payload in (
-            ("inventory", {"product": "podle", "credential": credential.model_dump(mode="json")}),
-            ("payments", _lightning_terms(preimage).model_dump(mode="json")),
-        ):
-            recorded = await client.post(
-                f"/api/v1/wallet/{_WALLET_NAME}/market/seller/{endpoint}",
-                headers=_headers(token),
-                json=payload,
-            )
-            assert recorded.status_code == 200
+        recorded = await client.post(
+            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/inventory",
+            headers=_headers(token),
+            json={"product": "podle", "credential": credential.model_dump(mode="json")},
+        )
+        assert recorded.status_code == 200
         quote_document = await _quote(
             seller,
             PrivateKey.generate(),
@@ -456,21 +494,22 @@ async def test_lightning_settlement_needs_local_acknowledgement_and_matching_pre
             request_id="44" * 16,
         )
         quote_id = str(quote_document.body["quote_id"])
+        [invoices] = _INVOICES
+        payment_hash = invoices.pay(quote_document, _PRICE_SATS - 1)
 
-        no_ack = await client.post(
-            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/settle/{quote_id}",
-            headers=_headers(token),
-            json={"preimage": preimage.hex()},
-        )
-        wrong_preimage = await client.post(
-            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/settle/{quote_id}",
-            headers=_headers(token),
-            json={"preimage": (b"x" * 32).hex(), "acknowledge_ln_settlement": True},
-        )
-        assert no_ack.status_code == 422
-        assert wrong_preimage.status_code == 400
+        await _settle_pass(seller)
+        assert invoices.invoices[payment_hash].state is InvoiceState.CANCELED
         assert seller._service is not None
         assert seller._service.store.get_delivery(quote_id) is None
+        # The opening is for sale again (bypass the per-seller quote pacing).
+        seller._service._next_quote = 0
+        await _quote(
+            seller,
+            PrivateKey.generate(),
+            product="podle",
+            rail="lightning",
+            request_id="45" * 16,
+        )
         await _stop_seller(state)
 
     backend.close.assert_not_awaited()
@@ -551,8 +590,8 @@ async def test_runtime_checks_commitments_binding_and_effective_bitcoin_network(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("interruption", ["stop", "lock", "stale-token"])
-async def test_settlement_cannot_finalize_after_lifecycle_change_or_return_to_stale_session(
+@pytest.mark.parametrize("interruption", ["stop", "lock"])
+async def test_settlement_cannot_finalize_after_lifecycle_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interruption: str
 ) -> None:
     wallet, backend, outpoint = _wallet(tmp_path)
@@ -561,21 +600,15 @@ async def test_settlement_cannot_finalize_after_lifecycle_change_or_return_to_st
     state, token = _state(wallet)
     monkeypatch.setattr("jmwalletd.routers.market.get_settings", lambda: _settings(tmp_path))
     transport = _app(state)
-    preimage = bytes(range(32))
-    terms = _lightning_terms(preimage)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         seller = await _start_seller(client, state, token, outpoint, ["bond"])
-        for endpoint, payload in (
-            ("inventory", {"product": "bond"}),
-            ("payments", terms.model_dump(mode="json")),
-        ):
-            recorded = await client.post(
-                f"/api/v1/wallet/{_WALLET_NAME}/market/seller/{endpoint}",
-                headers=_headers(token),
-                json=payload,
-            )
-            assert recorded.status_code == 200
+        recorded = await client.post(
+            f"/api/v1/wallet/{_WALLET_NAME}/market/seller/inventory",
+            headers=_headers(token),
+            json={"product": "bond"},
+        )
+        assert recorded.status_code == 200
         quote_document = await _quote(
             seller,
             PrivateKey.generate(),
@@ -585,38 +618,28 @@ async def test_settlement_cannot_finalize_after_lifecycle_change_or_return_to_st
             certificate_pubkey=bytes(CKey(b"\x05" * 32).pub).hex(),
         )
         quote_id = str(quote_document.body["quote_id"])
+        [invoices] = _INVOICES
+        payment_hash = invoices.pay(quote_document)
         # Hold the first awaited chain read inside settlement, then interrupt.
         backend.chain_lookup_entered = asyncio.Event()
         backend.chain_lookup_release = asyncio.Event()
-        settle_task = asyncio.create_task(
-            client.post(
-                f"/api/v1/wallet/{_WALLET_NAME}/market/seller/settle/{quote_id}",
-                headers=_headers(token),
-                json={"preimage": preimage.hex(), "acknowledge_ln_settlement": True},
-            )
-        )
+        settle_task = asyncio.create_task(_settle_pass(seller))
         await backend.chain_lookup_entered.wait()
 
         if interruption == "stop":
             await _stop_seller(state)
-        elif interruption == "lock":
+        else:
             assert await state.lock_wallet() is False
-        else:
-            state.token_authority.reset()
         backend.chain_lookup_release.set()
-        response = await settle_task
+        await settle_task
 
-        if interruption == "stale-token":
-            assert response.status_code == 401
-            assert seller._store is not None
-            assert seller._store.get_delivery(quote_id) is not None
-            await _stop_seller(state)
-        else:
-            assert response.status_code == 400
-            with MarketStore(
-                get_market_store_path(tmp_path), wallet_id=wallet_id, create=False
-            ) as store:
-                assert store.get_delivery(quote_id) is None
+        # The payment stays held (a restarted seller can still settle or refund it).
+        assert invoices.invoices[payment_hash].state is InvoiceState.ACCEPTED
+        with MarketStore(
+            get_market_store_path(tmp_path), wallet_id=wallet_id, create=False
+        ) as store:
+            assert store.get_delivery(quote_id) is None
+            assert store.get_package(quote_id) is None
 
     backend.close.assert_not_awaited()
     backend.broadcast_transaction.assert_not_awaited()

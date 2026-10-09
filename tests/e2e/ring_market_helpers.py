@@ -22,6 +22,7 @@ exceptions and never written outside ``work_dir``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -62,7 +63,9 @@ from taker.market_cli import (
     _import_bond_credential,
     _verify_podle_chain,
 )
-from taker.market_payments import validate_payment_terms, verify_lightning_preimage
+from jmswap.lnd_invoices import HoldInvoiceStatus
+from jmswap.lnd_peer import InvoiceState
+from taker.market_payments import validate_payment_terms
 from taker.market_service import (
     DeliveryRequest,
     MarketService,
@@ -71,6 +74,7 @@ from taker.market_service import (
     make_bond_credential,
     open_delivery,
 )
+from taker.market_settlement import MarketSettlement
 from taker.market_transport import ListingCallback, MarketTransport, ResponderCallback
 from taker.podle_manager import PoDLEManager
 
@@ -83,7 +87,6 @@ RPC_PASSWORD = os.getenv("RING_E2E_BITCOIN_RPC_PASSWORD", "test")
 # any existing ring edge without disturbing the liquidity the ring test needs.
 PRICE_SATS = 1_000
 FEE_LIMIT_SATS = 100
-INVOICE_EXPIRY_SECONDS = 1_800
 QUOTE_TTL_SECONDS = 300
 
 BOND_VALUE_SATS = 1_000_000
@@ -94,6 +97,9 @@ FUNDING_CONFIRMATIONS = 6
 BOND_LOCKTIME_SECONDS = 365 * 24 * 60 * 60
 SETTLEMENT_POLL_SECONDS = 1.0
 SETTLEMENT_POLL_ATTEMPTS = 15
+# A multi-hop HTLC can take tens of seconds to reach the seller and, after the
+# seller settles, as long again for the preimage to travel back to the payer.
+PAYMENT_TIMEOUT_SECONDS = 150
 
 DISCOVER_TIMEOUT_SECONDS = 5.0
 DISCOVER_ATTEMPTS = 4
@@ -228,11 +234,8 @@ async def purchase_external_podle(
         )
         podle = _external_podle(podle_secret, podle_address, podle_output)
 
-        invoice = await _fresh_invoice(
+        invoices = _LncliHoldInvoices(
             lncli, seller_service, include_route_hints=include_route_hints
-        )
-        terms = PaymentTerms(
-            rail="lightning", request=invoice.payment_request, amount_sats=PRICE_SATS
         )
         # MarketStore creates its database owner-only and keeps this directory
         # at 0700, so the sold credential never becomes world readable.
@@ -241,13 +244,8 @@ async def purchase_external_podle(
         seller_transport: MarketTransport | None = None
         buyer_transport: MarketTransport | None = None
         try:
-            now = int(time.time())
             store.add_inventory(
                 "podle", podle.commitment, podle.model_dump(mode="json")
-            )
-            store.add_payment(
-                terms,
-                validate_payment_terms(terms, NETWORK, now, now + QUOTE_TTL_SECONDS),
             )
             # The transport seals requests to the very key the service signs and
             # decrypts with, so no plaintext market message exists on the wire.
@@ -258,9 +256,13 @@ async def purchase_external_podle(
                 seller_key,
                 seller_encryption_key,
                 backend,
+                invoices,
                 products=["podle"],
                 price_sats=PRICE_SATS,
                 quote_ttl=QUOTE_TTL_SECONDS,
+            )
+            settlement = MarketSettlement(
+                store, invoices, seller_key, backend.get_block_height
             )
             seller_transport = _market_transport(
                 directory_server,
@@ -300,19 +302,11 @@ async def purchase_external_podle(
                 quote_document, listing, request, backend, int(time.time())
             )
 
-            preimage = await _settle_quoted_invoice(
-                lncli, payer_service, seller_service, invoice, quote.payment.request
-            )
-            settlement_ref = verify_lightning_preimage(
-                quote.payment, NETWORK, preimage, int(time.time()), quote.expires_at
-            )
+            # The seller stocks the credential, then the buyer pays the hold
+            # invoice; the seller settles it only after the delivery is prepared.
             store.attach_credential(quote.quote_id, podle.model_dump(mode="json"))
-            store.finalize(
-                quote.quote_id,
-                seller_key,
-                settlement_ref,
-                int(time.time()),
-                await backend.get_block_height(),
+            await _pay_held_invoice(
+                lncli, payer_service, seller_service, settlement, quote.payment
             )
 
             delivery = await buyer_transport.request(
@@ -421,23 +415,15 @@ async def purchase_rented_bond(
             ),
             bond_key,
         )
-        invoice = await _fresh_invoice(
+        invoices = _LncliHoldInvoices(
             lncli, seller_service, include_route_hints=include_route_hints
-        )
-        terms = PaymentTerms(
-            rail="lightning", request=invoice.payment_request, amount_sats=PRICE_SATS
         )
         store = MarketStore(work_dir / "ring-bond-seller-market.sqlite")
         seller_transport: MarketTransport | None = None
         buyer_transport: MarketTransport | None = None
         try:
-            now = int(time.time())
             store.add_inventory(
                 "bond", bond_resource(bond_reference, period_at_height(height)), None
-            )
-            store.add_payment(
-                terms,
-                validate_payment_terms(terms, NETWORK, now, now + QUOTE_TTL_SECONDS),
             )
             seller_encryption_key = PrivateKey.generate()
             service = MarketService(
@@ -446,9 +432,13 @@ async def purchase_rented_bond(
                 seller_key,
                 seller_encryption_key,
                 backend,
+                invoices,
                 products=["bond"],
                 price_sats=PRICE_SATS,
                 quote_ttl=QUOTE_TTL_SECONDS,
+            )
+            settlement = MarketSettlement(
+                store, invoices, seller_key, backend.get_block_height
             )
             seller_transport = _market_transport(
                 directory_server,
@@ -488,22 +478,13 @@ async def purchase_rented_bond(
                 quote_document, listing, request, backend, int(time.time())
             )
 
-            preimage = await _settle_quoted_invoice(
-                lncli, payer_service, seller_service, invoice, quote.payment.request
-            )
-            settlement_ref = verify_lightning_preimage(
-                quote.payment, NETWORK, preimage, int(time.time()), quote.expires_at
-            )
+            # The bond owner signs the lease offline before the buyer pays.
             credential = make_bond_credential(
                 quote.authorization, certificate_pubkey, bond_key
             )
             store.attach_credential(quote.quote_id, credential.model_dump(mode="json"))
-            store.finalize(
-                quote.quote_id,
-                seller_key,
-                settlement_ref,
-                int(time.time()),
-                await backend.get_block_height(),
+            await _pay_held_invoice(
+                lncli, payer_service, seller_service, settlement, quote.payment
             )
 
             delivery = await buyer_transport.request(
@@ -548,12 +529,6 @@ async def purchase_rented_bond(
     finally:
         await backend.close()
         await client.aclose()
-
-
-@dataclass(frozen=True)
-class _Invoice:
-    payment_request: str
-    payment_hash: str
 
 
 def _market_transport(
@@ -736,80 +711,126 @@ async def _lncli(
         raise RingMarketError(f"lncli {args[0]} failed on {service}") from None
 
 
-async def _fresh_invoice(
-    lncli: Callable[..., dict[str, Any]],
-    seller_service: str,
-    *,
-    include_route_hints: bool = True,
-) -> _Invoice:
-    """Ask the seller node for a fresh market invoice at the market price."""
-    invoice_args = [
-        "addinvoice",
-        f"--amt={PRICE_SATS}",
-        f"--expiry={INVOICE_EXPIRY_SECONDS}",
-        f"--memo=external-podle-{secrets.token_hex(8)}",
-    ]
-    if include_route_hints:
-        invoice_args.append("--private")
-    created = await _lncli(
-        lncli,
-        seller_service,
-        *invoice_args,
-    )
-    payment_request = str(created.get("payment_request", ""))
-    payment_hash = str(created.get("r_hash", "")).lower()
-    if not payment_request or len(payment_hash) != 64:
-        raise RingMarketError(f"{seller_service} did not issue a usable invoice")
-    if not include_route_hints:
-        decoded = await _lncli(lncli, seller_service, "decodepayreq", payment_request)
-        if decoded.get("route_hints") != []:
-            raise RingMarketError(
-                f"{seller_service} direct market invoice contains route hints"
+class _LncliHoldInvoices:
+    """The seller's hold-invoice backend, driven through ``lncli`` in its ring node.
+
+    It implements the same contract as :class:`jmswap.lnd_invoices.LndInvoiceClient`
+    (which the product uses over gRPC), so the market service and settlement
+    reconciler run unchanged against real LND hold invoices.
+    """
+
+    def __init__(
+        self,
+        lncli: Callable[..., dict[str, Any]],
+        service: str,
+        *,
+        include_route_hints: bool,
+    ) -> None:
+        self.lncli = lncli
+        self.service = service
+        self.include_route_hints = include_route_hints
+
+    async def add_hold_invoice(
+        self, payment_hash: bytes, amount_sats: int, expiry_seconds: int
+    ) -> str:
+        existing = await self.lookup(payment_hash)
+        if existing is not None:
+            return existing.payment_request
+        args = [
+            "addholdinvoice",
+            f"--amt={amount_sats}",
+            f"--expiry={expiry_seconds}",
+            payment_hash.hex(),
+        ]
+        if self.include_route_hints:
+            args.insert(1, "--private")
+        created = await _lncli(self.lncli, self.service, *args)
+        request = str(created.get("payment_request", ""))
+        if not request:
+            raise RingMarketError(f"{self.service} did not issue a hold invoice")
+        if not self.include_route_hints:
+            decoded = await _lncli(self.lncli, self.service, "decodepayreq", request)
+            if decoded.get("route_hints") != []:
+                raise RingMarketError(
+                    f"{self.service} direct market invoice contains route hints"
+                )
+        return request
+
+    async def lookup(self, payment_hash: bytes) -> HoldInvoiceStatus | None:
+        try:
+            found = await asyncio.to_thread(
+                self.lncli, self.service, "lookupinvoice", payment_hash.hex()
             )
-    return _Invoice(payment_request=payment_request, payment_hash=payment_hash)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            # lncli fails for an unknown hash; the reconciler treats it as absent.
+            return None
+        heights = [
+            int(htlc.get("expiry_height", 0))
+            for htlc in found.get("htlcs", [])
+            if str(htlc.get("state", "")).upper() == "ACCEPTED"
+        ]
+        return HoldInvoiceStatus(
+            InvoiceState[str(found.get("state", "")).upper()],
+            str(found.get("payment_request", "")),
+            int(found.get("amt_paid_sat", 0)),
+            min(heights) if heights else None,
+        )
+
+    async def settle(self, preimage: bytes) -> None:
+        await _lncli(self.lncli, self.service, "settleinvoice", preimage.hex())
+
+    async def cancel(self, payment_hash: bytes) -> None:
+        await _lncli(self.lncli, self.service, "cancelinvoice", payment_hash.hex())
 
 
-async def _settle_quoted_invoice(
+async def _pay_held_invoice(
     lncli: Callable[..., dict[str, Any]],
     payer_service: str,
     seller_service: str,
-    invoice: _Invoice,
-    quoted_request: str,
-) -> bytes:
-    """Pay the quoted invoice for real and return the locally observed preimage.
+    settlement: MarketSettlement,
+    payment: PaymentTerms,
+) -> None:
+    """Pay the quoted hold invoice for real while the seller settles it automatically.
 
-    The payer node is the one that learns the preimage, so the buyer never has
-    to trust a seller-supplied secret. The payment is cross-checked against the
-    amount and payment hash on both sides before it is accepted as settlement.
+    ``payinvoice`` only returns once the seller settles or cancels, so the
+    payment runs concurrently with the seller's reconciler. The payer checks that
+    the preimage it learned commits to the quoted payment hash.
     """
-    if quoted_request != invoice.payment_request:
-        raise RingMarketError(
-            "The quote does not reference the invoice that was issued"
+    payment_hash = validate_payment_terms(
+        payment, NETWORK, int(time.time()), int(time.time()) + 1
+    ).removeprefix("ln:")
+    paying = asyncio.create_task(
+        _lncli(
+            lncli,
+            payer_service,
+            "payinvoice",
+            "--json",
+            "--force",
+            f"--fee_limit={FEE_LIMIT_SATS}",
+            payment.request,
         )
-
-    payment = await _lncli(
-        lncli,
-        payer_service,
-        "payinvoice",
-        "--json",
-        "--force",
-        f"--fee_limit={FEE_LIMIT_SATS}",
-        quoted_request,
     )
-    if payment.get("payment_error"):
+    try:
+        # Keep the seller reconciling until the payer sees the outcome.
+        async with asyncio.timeout(PAYMENT_TIMEOUT_SECONDS):
+            while not paying.done():
+                await settlement.reconcile_once()
+                await asyncio.wait({paying}, timeout=SETTLEMENT_POLL_SECONDS)
+        result = paying.result()
+    finally:
+        paying.cancel()
+    if result.get("payment_error"):
         raise RingMarketError(f"{payer_service} could not pay the market invoice")
-    if str(payment.get("status", "")).upper() not in {"SUCCEEDED", "2"}:
+    if str(result.get("status", "")).upper() not in {"SUCCEEDED", "2"}:
         raise RingMarketError(f"{payer_service} did not reach a settled payment status")
-    if str(payment.get("payment_hash", "")).lower() != invoice.payment_hash:
+    if str(result.get("payment_hash", "")).lower() != payment_hash:
         raise RingMarketError("The payment settled a different invoice")
-    if int(payment.get("value_sat", 0)) != PRICE_SATS:
+    if int(result.get("value_sat", 0)) != PRICE_SATS:
         raise RingMarketError("The payment amount does not match the market price")
-
-    await _await_settled_invoice(lncli, seller_service, invoice.payment_hash)
-    preimage = bytes.fromhex(str(payment.get("payment_preimage", "")))
-    if len(preimage) != 32:
+    preimage = bytes.fromhex(str(result.get("payment_preimage", "")))
+    if hashlib.sha256(preimage).hexdigest() != payment_hash:
         raise RingMarketError(f"{payer_service} did not report a usable payment proof")
-    return preimage
+    await _await_settled_invoice(lncli, seller_service, payment_hash)
 
 
 async def _await_settled_invoice(

@@ -21,6 +21,7 @@ from jmcore.btc_script import derive_bond_address
 from jmcore.credential_market import (
     Allocation,
     BondReference,
+    CredentialPackage,
     FaultProof,
     MarketAuthorization,
     MarketQuote,
@@ -50,10 +51,8 @@ from nacl.public import PrivateKey
 from taker._vendor.bolt11 import Bolt11, MilliSatoshi, Tag, TagChar, Tags, encode
 from taker.config import TakerConfig
 from taker.market_cli import _import_bond_credential
-from taker.market_payments import (
-    validate_payment_terms,
-    verify_lightning_preimage,
-)
+from jmswap.lnd_invoices import HoldInvoiceStatus
+from jmswap.lnd_peer import InvoiceState
 from taker.market_service import (
     DeliveryRequest,
     MarketService,
@@ -63,7 +62,8 @@ from taker.market_service import (
     make_bond_credential,
     open_delivery,
 )
-from jmcore.market_store import MarketStore
+from jmcore.market_store import HoldReservation, MarketStore
+from taker.market_settlement import MarketSettlement
 from taker.market_transport import MarketTransport
 from taker.podle_manager import PoDLEManager
 from taker.taker import Taker
@@ -110,7 +110,8 @@ class _AuthorizedBond:
 class _PoDLEMarket:
     bond: _AuthorizedBond
     podle: ExternalPoDLE
-    terms: PaymentTerms
+    invoices: _HoldInvoices
+    settlement: MarketSettlement
     store: MarketStore
     service: MarketService
     seller_encryption_key: PrivateKey
@@ -224,50 +225,131 @@ async def _create_external_podle(amount_sats: int = 1_000_000) -> ExternalPoDLE:
     )
 
 
-def _lightning_terms(now: int, preimage: bytes) -> PaymentTerms:
+class _HoldInvoices:
+    """In-memory seller hold-invoice node; this suite exercises the Bitcoin side.
+
+    Real LND hold invoices are covered by the ring market e2e helpers and the
+    jmswap LND regtest suite.
+    """
+
+    def __init__(self) -> None:
+        self.invoices: dict[bytes, HoldInvoiceStatus] = {}
+
+    async def add_hold_invoice(
+        self, payment_hash: bytes, amount_sats: int, expiry_seconds: int
+    ) -> str:
+        if payment_hash not in self.invoices:
+            request = _lightning_invoice(payment_hash, amount_sats, expiry_seconds)
+            self.invoices[payment_hash] = HoldInvoiceStatus(
+                InvoiceState.OPEN, request, 0, None
+            )
+        return self.invoices[payment_hash].payment_request
+
+    async def lookup(self, payment_hash: bytes) -> HoldInvoiceStatus | None:
+        return self.invoices.get(payment_hash)
+
+    async def settle(self, preimage: bytes) -> None:
+        self._set(hashlib.sha256(preimage).digest(), InvoiceState.SETTLED)
+
+    async def cancel(self, payment_hash: bytes) -> None:
+        self._set(payment_hash, InvoiceState.CANCELED)
+
+    def pay(self, payment: PaymentTerms) -> None:
+        [payment_hash] = [
+            key
+            for key, value in self.invoices.items()
+            if value.payment_request == payment.request
+        ]
+        self.invoices[payment_hash] = HoldInvoiceStatus(
+            InvoiceState.ACCEPTED, payment.request, payment.amount_sats, 10_000_000
+        )
+
+    def _set(self, payment_hash: bytes, state: InvoiceState) -> None:
+        status = self.invoices[payment_hash]
+        self.invoices[payment_hash] = HoldInvoiceStatus(
+            state, status.payment_request, status.amount_paid_sats, None
+        )
+
+
+def _lightning_invoice(payment_hash: bytes, amount_sats: int, expiry: int) -> str:
     invoice = Bolt11(
         currency="bcrt",
-        date=now - 1,
-        amount_msat=MilliSatoshi(_MARKET_PRICE_SATS * 1_000),
+        date=int(time.time()),
+        amount_msat=MilliSatoshi(amount_sats * 1_000),
         tags=Tags(
             [
-                Tag(TagChar.payment_hash, hashlib.sha256(preimage).hexdigest()),
+                Tag(TagChar.payment_hash, payment_hash.hex()),
                 Tag(TagChar.payment_secret, "22" * 32),
-                Tag(TagChar.description, "native market manual settlement"),
-                Tag(TagChar.expire_time, 600),
+                Tag(TagChar.description, ""),
+                Tag(TagChar.expire_time, expiry),
                 Tag(TagChar.min_final_cltv_expiry, 18),
             ]
         ),
     )
-    return PaymentTerms(
-        rail="lightning",
-        request=encode(invoice, private_key="11" * 32),
-        amount_sats=_MARKET_PRICE_SATS,
+    return encode(invoice, private_key="11" * 32)
+
+
+async def _store_quote(
+    store: MarketStore,
+    bond: _AuthorizedBond,
+    certificate_pubkey: str,
+    height: int,
+) -> SignedDocument:
+    """Reserve and issue one bond quote directly in the seller store."""
+    reservation = store.reserve_hold_quote(
+        bond.authorization,
+        bond.seller_key,
+        bytes(PrivateKey.generate().public_key).hex(),
+        "bond",
+        certificate_pubkey,
+        "lightning",
+        _MARKET_PRICE_SATS,
+        _MARKET_PRICE_SATS,
+        int(time.time()),
+        height,
+        request_id=secrets.token_hex(16),
     )
+    assert isinstance(reservation, HoldReservation)
+    request = _lightning_invoice(reservation.payment_hash, _MARKET_PRICE_SATS, 600)
+    terms = PaymentTerms(
+        rail="lightning", request=request, amount_sats=_MARKET_PRICE_SATS
+    )
+    return store.issue_hold_quote(
+        reservation.quote_id,
+        bond.seller_key,
+        terms,
+        f"ln:{reservation.payment_hash.hex()}",
+        int(time.time()),
+    )
+
+
+def _store_settle(
+    store: MarketStore, quote_id: str, seller_key: CKey, height: int
+) -> CredentialPackage:
+    """Finalize as if the hold invoice was accepted, then record its settlement."""
+    package = store.finalize(quote_id, seller_key, int(time.time()), height)
+    store.complete_hold_settle(quote_id)
+    return package
 
 
 async def _podle_market(
     tmp_path: Path,
     backend: object,
-    terms: PaymentTerms,
     podle_amount_sats: int = 1_000_000,
 ) -> _PoDLEMarket:
     bond = await _create_authorized_bond(backend)
     podle = await _create_external_podle(podle_amount_sats)
     store = MarketStore(tmp_path / "seller.sqlite")
-    now = int(time.time())
     store.add_inventory("podle", podle.commitment, podle.model_dump(mode="json"))
-    store.add_payment(
-        terms,
-        validate_payment_terms(terms, "regtest", now, now + 180),
-    )
     encryption_key = PrivateKey.generate()
+    invoices = _HoldInvoices()
     service = MarketService(
         store,
         bond.authorization,
         bond.seller_key,
         encryption_key,
         backend,  # type: ignore[arg-type]
+        invoices,
         products=["podle"],
         price_sats=_MARKET_PRICE_SATS,
         quote_ttl=180,
@@ -275,7 +357,13 @@ async def _podle_market(
     return _PoDLEMarket(
         bond=bond,
         podle=podle,
-        terms=terms,
+        invoices=invoices,
+        settlement=MarketSettlement(
+            store,
+            invoices,
+            bond.seller_key,
+            backend.get_block_height,  # type: ignore[attr-defined]
+        ),
         store=store,
         service=service,
         seller_encryption_key=encryption_key,
@@ -387,7 +475,6 @@ async def test_market_transport_uses_real_directory_for_relay_and_direct(
     market = await _podle_market(
         tmp_path,
         bitcoin_core_backend,
-        _lightning_terms(int(time.time()), bytes(range(32))),
     )
     port = _free_loopback_port() if route == "direct" else 0
     synthetic_onion = f"{'a' * 56}.onion"
@@ -467,11 +554,9 @@ async def test_paid_podle_purchase_authorizes_external_only_coinjoin(
     tmp_path: Path,
 ) -> None:
     """A paid PoDLE is imported, consumed once, and never funds the CoinJoin."""
-    preimage = bytes(range(32))
     market = await _podle_market(
         tmp_path,
         bitcoin_core_backend,
-        _lightning_terms(int(time.time()), preimage),
         podle_amount_sats=20_000_000,
     )
     seller = _market_transport(
@@ -540,26 +625,16 @@ async def test_paid_podle_purchase_authorizes_external_only_coinjoin(
             int(time.time()),
         )
 
-        # The operator pays the invoice from its own Lightning wallet and only
-        # then hands the seller the preimage it observed locally.
-        settlement_ref = verify_lightning_preimage(
-            quote.payment,
-            "regtest",
-            preimage,
-            int(time.time()),
-            quote.expires_at,
-        )
+        # The buyer pays the hold invoice; the seller settles it automatically
+        # once the delivery is prepared.
         market.store.attach_credential(
             quote.quote_id,
             market.podle.model_dump(mode="json"),
         )
-        package = market.store.finalize(
-            quote.quote_id,
-            market.bond.seller_key,
-            settlement_ref,
-            int(time.time()),
-            await bitcoin_core_backend.get_block_height(),
-        )
+        market.invoices.pay(quote.payment)
+        await market.settlement.reconcile_once()
+        package = market.store.get_package(quote.quote_id)
+        assert package is not None
         assert package.verify() == market.podle
 
         delivery = await buyer.request(
@@ -657,16 +732,14 @@ async def test_paid_podle_purchase_authorizes_external_only_coinjoin(
 
 
 @pytest.mark.asyncio
-async def test_lightning_manual_settlement_requires_local_acknowledgement(
+async def test_delivery_waits_for_the_held_payment_and_buyers_cannot_settle(
     bitcoin_core_backend,
     tmp_path: Path,
 ) -> None:
-    """A deterministic BOLT11 preimage needs a local acknowledgement before delivery."""
-    preimage = bytes(range(32))
+    """Only the seller's own settlement of the held payment releases the package."""
     market = await _podle_market(
         tmp_path,
         bitcoin_core_backend,
-        _lightning_terms(int(time.time()), preimage),
     )
     buyer_key = PrivateKey.generate()
     try:
@@ -701,29 +774,21 @@ async def test_lightning_manual_settlement_requires_local_acknowledgement(
             {
                 "action": "settle",
                 "quote_id": quote.quote_id,
-                "preimage": preimage.hex(),
+                "preimage": "00" * 32,
             },
         )
         assert remote_claim == {"error": "unavailable"}
-        assert market.store.get_delivery(quote.quote_id) is None
-
-        settlement_ref = verify_lightning_preimage(
-            quote.payment,
-            "regtest",
-            preimage,
-            int(time.time()),
-            quote.expires_at,
-        )
         market.store.attach_credential(
             quote.quote_id, market.podle.model_dump(mode="json")
         )
-        package = market.store.finalize(
-            quote.quote_id,
-            market.bond.seller_key,
-            settlement_ref,
-            int(time.time()),
-            await bitcoin_core_backend.get_block_height(),
-        )
+        # A prepared credential is not delivered while the invoice is unpaid.
+        await market.settlement.reconcile_once()
+        assert market.store.get_delivery(quote.quote_id) is None
+
+        market.invoices.pay(quote.payment)
+        await market.settlement.reconcile_once()
+        package = market.store.get_package(quote.quote_id)
+        assert package is not None
         assert package.verify() == market.podle
         encrypted = market.store.get_delivery(quote.quote_id)
         assert encrypted is not None
@@ -753,42 +818,21 @@ async def test_delegated_bond_package_imports_for_maker_proof_without_owner_key(
     )
     assert credential.cert_expiry == period_at_height(bond.height) + 1
 
-    payment = _lightning_terms(int(time.time()), bytes([0x71]) * 32)
     store = MarketStore(tmp_path / "seller.sqlite")
-    buyer_key = PrivateKey.generate()
     try:
-        now = int(time.time())
         store.add_inventory(
             "bond",
             bond_resource(bond.reference, period_at_height(bond.height)),
             None,
         )
-        store.add_payment(
-            payment, validate_payment_terms(payment, "regtest", now, now + 180)
-        )
-        quote_document = store.create_quote(
-            bond.authorization,
-            bond.seller_key,
-            bytes(buyer_key.public_key).hex(),
-            "bond",
-            credential.cert_pubkey,
-            "lightning",
-            _MARKET_PRICE_SATS,
-            now,
-            bond.height,
-            request_id=secrets.token_hex(16),
+        quote_document = await _store_quote(
+            store, bond, credential.cert_pubkey, bond.height
         )
         quote_id = str(quote_document.body["quote_id"])
         quoted = MarketQuote.model_validate(quote_document.body)
         assert quoted.payment.rail == "lightning"
         store.attach_credential(quote_id, credential.model_dump(mode="json"))
-        package = store.finalize(
-            quote_id,
-            bond.seller_key,
-            "delegated-local-settlement",
-            now,
-            bond.height,
-        )
+        package = _store_settle(store, quote_id, bond.seller_key, bond.height)
         assert package.verify() == credential
 
         fingerprint = "de1e6a7e"
@@ -875,35 +919,13 @@ async def test_signed_market_fault_excludes_matching_verified_makers(
     )
     try:
         resource = bond_resource(bond.reference, current_period)
-        terms = _lightning_terms(int(time.time()), bytes([0x72]) * 32)
         store.add_inventory("bond", resource, None)
-        store.add_payment(
-            terms,
-            validate_payment_terms(
-                terms, "regtest", int(time.time()), int(time.time()) + 180
-            ),
-        )
-        quote_document = store.create_quote(
-            bond.authorization,
-            bond.seller_key,
-            bytes(PrivateKey.generate().public_key).hex(),
-            "bond",
-            credential.cert_pubkey,
-            "lightning",
-            _MARKET_PRICE_SATS,
-            int(time.time()),
-            current_height,
-            request_id=secrets.token_hex(16),
+        quote_document = await _store_quote(
+            store, bond, credential.cert_pubkey, current_height
         )
         quote = MarketQuote.model_validate(quote_document.body)
         store.attach_credential(quote.quote_id, credential.model_dump(mode="json"))
-        package = store.finalize(
-            quote.quote_id,
-            bond.seller_key,
-            f"fault-settlement-{secrets.token_hex(8)}",
-            int(time.time()),
-            current_height,
-        )
+        package = _store_settle(store, quote.quote_id, bond.seller_key, current_height)
 
         # The store created the honest allocation. Fabricate only the conflicting,
         # seller-signed allocation to produce evidence for the fault path.

@@ -212,7 +212,7 @@ async def test_ledger_activate_block_and_recover_return_durable_states(tmp_path:
 
     assert activated.status_code == 200
     assert activated.json()["state"] == "ready"
-    assert activated.json()["schema_version"] == "1"
+    assert activated.json()["schema_version"] == "2"
     assert blocked.status_code == 200
     assert blocked.json()["state"] == "recovery_required"
     assert recovered.status_code == 200
@@ -379,7 +379,7 @@ async def test_ledger_rebind_uses_canonical_target_and_refuses_invalid_requests(
     )
     assert rebound.status_code == 200
     assert rebound.json()["state"] == "ready"
-    assert rebound.json()["schema_version"] == "1"
+    assert rebound.json()["schema_version"] == "2"
     assert target == daemon_dir / "cmtdata" / "commitments.json"
     assert intent.read_bytes() == MarketStore._wallet_intent_bytes(target)
     assert not source.exists()

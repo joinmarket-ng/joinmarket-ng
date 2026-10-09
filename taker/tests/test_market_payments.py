@@ -18,7 +18,6 @@ from taker.market_payments import (
     PaymentValidationError,
     payment_uri,
     validate_payment_terms,
-    verify_lightning_preimage,
 )
 
 NOW = 1_700_000_000
@@ -87,8 +86,6 @@ def test_validate_rejects_a_non_lightning_rail() -> None:
         validate_payment_terms(terms, "regtest", NOW, QUOTE_EXPIRY)
     with pytest.raises(PaymentValidationError, match="Unsupported payment rail"):
         payment_uri(terms)
-    with pytest.raises(PaymentValidationError, match="Unsupported payment rail"):
-        verify_lightning_preimage(terms, "regtest", PREIMAGE, NOW, QUOTE_EXPIRY)
 
 
 def test_validate_lightning_rejects_amount_and_network_mismatches() -> None:
@@ -161,14 +158,3 @@ def test_validate_lightning_rejects_malformed_hash_duplicate_tags_and_required_f
     for invoice in (malformed_hash, duplicate_hash, required_feature):
         with pytest.raises(PaymentValidationError):
             validate_payment_terms(lightning_terms(invoice), "regtest", NOW, QUOTE_EXPIRY)
-
-
-def test_verify_lightning_preimage_requires_matching_32_byte_preimage() -> None:
-    terms = lightning_terms(make_invoice())
-
-    assert verify_lightning_preimage(terms, "regtest", PREIMAGE, NOW, QUOTE_EXPIRY) == (
-        f"ln:{PAYMENT_HASH}"
-    )
-    for preimage in (b"x" * 31, b"x" * 32):
-        with pytest.raises(PaymentValidationError):
-            verify_lightning_preimage(terms, "regtest", preimage, NOW, QUOTE_EXPIRY)

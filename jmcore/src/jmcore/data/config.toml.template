@@ -835,6 +835,20 @@
 # uptime_grace_period = 60     # Seconds
 
 # ============================================================================
+# Credential Market Seller Settings (experimental)
+# ============================================================================
+
+[market]
+# A seller sells each quote against its own LND hold invoice: the buyer's
+# payment stays locked until the delivery is prepared, then settles, or is
+# refunded by canceling the invoice. Use a separate LND node, not a ring node,
+# and give it a public channel so buyers can route to it.
+# lnd_grpc_url = "127.0.0.1:10009"
+# lnd_tls_cert_path = "~/.lnd/tls.cert"
+# Only invoice permissions are needed (LND's invoice.macaroon).
+# lnd_macaroon_path = "~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon"
+
+# ============================================================================
 # TUI Settings
 # ============================================================================
 

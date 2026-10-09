@@ -15,8 +15,10 @@ import secrets
 import sqlite3
 import stat
 import threading
+import time
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -67,19 +69,56 @@ class WalletLedgerDiagnosis(TypedDict):
     reason: str
 
 
-_SCHEMA_VERSION = "1"
+HoldState = Literal["reserved", "open", "canceling", "canceled", "settling", "settled"]
+
+# Version 2 replaced operator-queued payment requests with one hold invoice per
+# quote. Version 1 stores are migrated on open (see _migrate_from_v1).
+_SCHEMA_VERSION = "2"
+_LEGACY_SCHEMA_VERSION = "1"
 _STANDALONE_MODE = "standalone"
 _WALLET_MODE = "wallet"
 _UNSUPPORTED_SCHEMA_MESSAGE = (
-    "unsupported market store format; move the market store aside and start a new experiment"
+    "unsupported market store format; keep the file and use a release that supports it"
 )
+# A hold invoice outlives its quote, so a payment sent just before the quote
+# expires can still be accepted and completed.
+HOLD_INVOICE_GRACE_SECONDS = 120
+_ACTIVE_HOLD_SQL = "('reserved', 'open', 'canceling', 'settling')"
+_MAX_PRICE_SATS = 2_100_000_000_000_000
 _WALLET_LEDGER_INTENT_VERSION = 1
 _MAX_ACTIVE_QUOTES = 64
 _MAX_QUOTE_TTL = 900
 _MAX_REQUEST_ID_LENGTH = 32
 _MAX_OPAQUE_ID_LENGTH = 256
-_MAX_SETTLEMENT_REF_LENGTH = 4096
 _HEX32_LENGTH = 64
+
+
+@dataclass(frozen=True)
+class HoldReservation:
+    """A quote reservation waiting for its hold invoice."""
+
+    quote_id: str
+    payment_hash: bytes
+    amount_sats: int
+    quote_expires_at: int
+    invoice_expires_at: int
+
+
+@dataclass(frozen=True)
+class HoldInvoice:
+    """One unfinished hold invoice, as the settlement reconciler sees it."""
+
+    quote_id: str
+    payment_hash: bytes
+    preimage: bytes
+    amount_sats: int
+    product: Product
+    state: HoldState
+    quote_state: str | None
+    credential_attached: bool
+    created_at: int
+    quote_expires_at: int
+    invoice_expires_at: int
 
 
 class MarketStoreError(Exception):
@@ -102,12 +141,60 @@ class MarketStoreCorruptError(MarketStoreError):
     """On-disk store contents are invalid and must not be reset implicitly."""
 
 
+_HOLD_INVOICE_SCHEMA = (
+    """
+    CREATE TABLE hold_invoices (
+        quote_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        request_fingerprint BLOB NOT NULL,
+        authorization BLOB NOT NULL,
+        rail TEXT NOT NULL CHECK (rail = 'lightning'),
+        payment_hash TEXT NOT NULL UNIQUE,
+        preimage TEXT NOT NULL,
+        amount_sats INTEGER NOT NULL,
+        inventory_id INTEGER NOT NULL REFERENCES inventory(id),
+        buyer_pubkey TEXT NOT NULL,
+        product TEXT NOT NULL CHECK (product IN ('podle', 'bond')),
+        resource TEXT NOT NULL,
+        certificate_pubkey TEXT,
+        created_at INTEGER NOT NULL,
+        quote_expires_at INTEGER NOT NULL,
+        invoice_expires_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (
+            state IN ('reserved', 'open', 'canceling', 'canceled', 'settling', 'settled')
+        )
+    )
+    """,
+    "CREATE INDEX hold_invoices_state ON hold_invoices(state)",
+)
+_HOLD_INVOICE_COLUMNS = {
+    "quote_id",
+    "request_id",
+    "request_fingerprint",
+    "authorization",
+    "rail",
+    "payment_hash",
+    "preimage",
+    "amount_sats",
+    "inventory_id",
+    "buyer_pubkey",
+    "product",
+    "resource",
+    "certificate_pubkey",
+    "created_at",
+    "quote_expires_at",
+    "invoice_expires_at",
+    "state",
+}
+
+
 class MarketStore:
     """A synchronous, process-safe durable seller lifecycle store.
 
     Every mutation uses ``BEGIN IMMEDIATE`` with SQLite ``synchronous=FULL``.
-    A reservation may release its inventory on expiry, but its payment request is
-    deliberately retained forever so a late payment cannot fund another quote.
+    Each quote is paid through its own hold invoice. Inventory returns only after
+    the invoice is confirmed canceled, and a payment request is retained forever
+    so a late payment cannot fund another quote.
     """
 
     def __init__(self, path: Path, *, wallet_id: str | None = None, create: bool = True) -> None:
@@ -615,34 +702,26 @@ class MarketStore:
                     (resource, owner, cursor.lastrowid),
                 )
 
-    def add_payment(self, terms: PaymentTerms, payment_id: str) -> None:
-        """Queue one validated, never-reassignable payment request."""
-        if not isinstance(terms, PaymentTerms):
-            raise TypeError("terms must be a PaymentTerms")
-        try:
-            validated_terms = PaymentTerms.model_validate(terms.model_dump(mode="json"))
-        except ValidationError as exc:
-            raise MarketError("invalid payment terms") from exc
-        self._require_rail(validated_terms.rail)
-        self._require_opaque_identifier(payment_id, "payment_id", _MAX_OPAQUE_ID_LENGTH)
-        encoded_terms = canonical(validated_terms)
-        with self._transaction() as connection:
-            self._require_seller_wallet_ready(connection)
-            existing = connection.execute(
-                "SELECT payment_id FROM payments WHERE payment_id = ? OR request = ?",
-                (payment_id, validated_terms.request),
-            ).fetchone()
-            if existing is not None:
-                raise MarketStoreConflictError("payment id or request has already been recorded")
-            connection.execute(
-                """
-                INSERT INTO payments (payment_id, rail, request, terms, state, quote_id)
-                VALUES (?, ?, ?, ?, 'available', NULL)
-                """,
-                (payment_id, validated_terms.rail, validated_terms.request, encoded_terms),
-            )
+    def seller_runtime(self) -> AbstractContextManager[None]:
+        """Hold the single seller-runtime lock that owns hold-invoice settlement.
 
-    def create_quote(
+        Only the holder may create, settle, or cancel hold invoices for this store,
+        so two serving processes never race on the same invoice.
+        """
+        return self._seller_runtime_lock()
+
+    @contextmanager
+    def _seller_runtime_lock(self) -> Iterator[None]:
+        lock_path = self.path.with_name(f"{self.path.name}.seller.lock")
+        try:
+            with exclusive_file_lock(lock_path, blocking=False):
+                yield
+        except BlockingIOError:
+            raise MarketStoreError(
+                "another seller runtime is already serving this market store"
+            ) from None
+
+    def reserve_hold_quote(
         self,
         authorization: SignedDocument,
         seller_key: CKey | BoundMarketKeys,
@@ -651,17 +730,20 @@ class MarketStore:
         certificate_pubkey: str | None,
         rail: PaymentRail,
         max_price_sats: int,
+        price_sats: int,
         now: int,
         height: int,
         *,
         ttl: int = 300,
         request_id: str,
-    ) -> SignedDocument:
-        """Reserve matching inventory and payment terms, then return a signed quote.
+    ) -> SignedDocument | HoldReservation:
+        """Reserve inventory and a fresh hold-invoice preimage for one quote request.
 
-        ``request_id`` is an immutable idempotency key. Replaying every parameter
-        exactly returns the original signed quote; changing any bound parameter is
-        rejected, even after the quote has expired.
+        Nothing is signed and no invoice exists yet. The reservation is durable
+        before the caller creates the hold invoice, so after a crash the settlement
+        reconciler can cancel it. ``request_id`` is an immutable idempotency key:
+        replaying it returns the issued signed quote, or the same reservation while
+        its invoice is still being created.
         """
         self._require_signed_document(authorization, "authorization")
         seller_pubkey = self._seller_pubkey(seller_key)
@@ -671,6 +753,7 @@ class MarketStore:
         self._validate_certificate_pubkey(product, certificate_pubkey)
         self._require_rail(rail)
         self._require_int(max_price_sats, "max_price_sats", minimum=1)
+        self._require_int(price_sats, "price_sats", minimum=1, maximum=_MAX_PRICE_SATS)
         self._require_int(now, "now", minimum=1)
         self._require_int(height, "height", minimum=1)
         self._require_int(ttl, "ttl", minimum=1, maximum=_MAX_QUOTE_TTL)
@@ -705,33 +788,28 @@ class MarketStore:
                     authority, _quote = self._verified_quote_from_row(existing)
                     seller_key.validate_seller_authorization(authority)
                 return self._signed_document_from_storage(bytes(existing["quote_document"]))
+            hold = connection.execute(
+                "SELECT * FROM hold_invoices WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if hold is not None:
+                if bytes(hold["request_fingerprint"]) != fingerprint:
+                    raise MarketStoreConflictError(
+                        "request_id is bound to different quote parameters"
+                    )
+                if hold["state"] != "reserved" or int(hold["quote_expires_at"]) <= now:
+                    raise MarketStoreUnavailableError("quote reservation is no longer available")
+                return self._hold_reservation(hold)
 
             authority = self._validate_authorization(authorization, seller_pubkey, height)
             if isinstance(seller_key, BoundMarketKeys):
                 seller_key.validate_seller_authorization(authority)
+            if price_sats > max_price_sats:
+                raise MarketStoreUnavailableError("seller price exceeds buyer price limit")
             active = connection.execute(
-                "SELECT COUNT(*) AS count FROM quotes WHERE state = 'live'"
+                f"SELECT COUNT(*) AS count FROM hold_invoices WHERE state IN {_ACTIVE_HOLD_SQL}"
             ).fetchone()
             if active is None or int(active["count"]) >= _MAX_ACTIVE_QUOTES:
                 raise MarketStoreUnavailableError("maximum active quote capacity reached")
-
-            payment_row = connection.execute(
-                """
-                SELECT payment_id, terms FROM payments
-                WHERE state = 'available' AND rail = ?
-                ORDER BY rowid
-                LIMIT 1
-                """,
-                (rail,),
-            ).fetchone()
-            if payment_row is None:
-                raise MarketStoreUnavailableError("no payment request is available for this rail")
-            payment = self._payment_terms_from_storage(bytes(payment_row["terms"]))
-            if payment.amount_sats > max_price_sats:
-                raise MarketStoreUnavailableError(
-                    "available payment request exceeds buyer price limit"
-                )
-
             inventory_row = self._select_inventory(
                 connection, authority, product, certificate_pubkey
             )
@@ -739,19 +817,7 @@ class MarketStore:
                 raise MarketStoreUnavailableError("no matching credential inventory is available")
 
             quote_id = secrets.token_hex(32)
-            quote = MarketQuote(
-                authorization=authorization,
-                quote_id=quote_id,
-                buyer_pubkey=buyer_pubkey,
-                product=product,
-                resource=str(inventory_row["resource"]),
-                certificate_pubkey=certificate_pubkey,
-                payment=payment,
-                created_at=now,
-                expires_at=now + ttl,
-            )
-            quote_document = self._sign_document(quote, seller_key)
-            encoded_quote = canonical(quote_document)
+            preimage = secrets.token_bytes(32)
             cursor = connection.execute(
                 """
                 UPDATE inventory
@@ -762,16 +828,131 @@ class MarketStore:
             )
             if cursor.rowcount != 1:
                 raise MarketStoreUnavailableError("inventory was reserved by another writer")
-            cursor = connection.execute(
+            connection.execute(
                 """
-                UPDATE payments
-                SET state = 'reserved', quote_id = ?
-                WHERE payment_id = ? AND state = 'available'
+                INSERT INTO hold_invoices (
+                    quote_id, request_id, request_fingerprint, authorization, rail,
+                    payment_hash, preimage, amount_sats, inventory_id, buyer_pubkey,
+                    product, resource, certificate_pubkey, created_at, quote_expires_at,
+                    invoice_expires_at, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')
                 """,
-                (quote_id, str(payment_row["payment_id"])),
+                (
+                    quote_id,
+                    request_id,
+                    fingerprint,
+                    canonical(authorization),
+                    rail,
+                    hashlib.sha256(preimage).hexdigest(),
+                    preimage.hex(),
+                    price_sats,
+                    int(inventory_row["id"]),
+                    buyer_pubkey,
+                    product,
+                    str(inventory_row["resource"]),
+                    certificate_pubkey,
+                    now,
+                    now + ttl,
+                    now + ttl + HOLD_INVOICE_GRACE_SECONDS,
+                ),
             )
-            if cursor.rowcount != 1:
-                raise MarketStoreUnavailableError("payment request was reserved by another writer")
+            row = connection.execute(
+                "SELECT * FROM hold_invoices WHERE quote_id = ?", (quote_id,)
+            ).fetchone()
+            return self._hold_reservation(row)
+
+    def issue_hold_quote(
+        self,
+        quote_id: str,
+        seller_key: CKey | BoundMarketKeys,
+        terms: PaymentTerms,
+        payment_id: str,
+        now: int,
+    ) -> SignedDocument:
+        """Sign and publish the quote for a reservation whose hold invoice exists.
+
+        ``payment_id`` is the caller-validated ``ln:<payment_hash>`` of
+        ``terms.request``; it must commit to the reserved preimage.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        seller_pubkey = self._seller_pubkey(seller_key)
+        if not isinstance(terms, PaymentTerms):
+            raise TypeError("terms must be a PaymentTerms")
+        try:
+            validated_terms = PaymentTerms.model_validate(terms.model_dump(mode="json"))
+        except ValidationError as exc:
+            raise MarketError("invalid payment terms") from exc
+        self._require_opaque_identifier(payment_id, "payment_id", _MAX_OPAQUE_ID_LENGTH)
+        self._require_int(now, "now", minimum=1)
+
+        with self._transaction() as connection:
+            wallet_ledger = self._require_seller_wallet_ready(connection)
+            self._require_bound_seller_wallet(connection, seller_key, wallet_ledger)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("quote reservation does not exist")
+            existing = self._quote_row(connection, quote_id)
+            if existing is not None:
+                _authority, quote = self._verified_quote_from_row(existing)
+                if quote.payment != validated_terms:
+                    raise MarketStoreConflictError("quote was issued with different payment terms")
+                return self._signed_document_from_storage(bytes(existing["quote_document"]))
+            if hold["state"] != "reserved":
+                raise MarketStoreUnavailableError("quote reservation is no longer available")
+            if payment_id != f"ln:{hold['payment_hash']}":
+                raise MarketStoreConflictError("payment request does not commit to the reservation")
+            if validated_terms.rail != hold["rail"] or validated_terms.amount_sats != int(
+                hold["amount_sats"]
+            ):
+                raise MarketStoreConflictError("payment terms do not match the reservation")
+            if now >= int(hold["quote_expires_at"]):
+                raise MarketStoreExpiredError("quote reservation has expired")
+            authorization = self._signed_document_from_storage(bytes(hold["authorization"]))
+            try:
+                authority = verify_authorization(authorization)
+            except (MarketError, ValidationError, ValueError) as exc:
+                raise MarketStoreCorruptError("stored authorization is invalid") from exc
+            self._require_matching_seller(authority, seller_pubkey)
+            if isinstance(seller_key, BoundMarketKeys):
+                seller_key.validate_seller_authorization(authority)
+            inventory = connection.execute(
+                "SELECT credential, state, reservation_quote_id FROM inventory WHERE id = ?",
+                (int(hold["inventory_id"]),),
+            ).fetchone()
+            if (
+                inventory is None
+                or inventory["state"] != "reserved"
+                or inventory["reservation_quote_id"] != quote_id
+            ):
+                raise MarketStoreCorruptError("quote inventory reservation is missing")
+            quote = MarketQuote(
+                authorization=authorization,
+                quote_id=quote_id,
+                buyer_pubkey=str(hold["buyer_pubkey"]),
+                product=cast(Product, hold["product"]),
+                resource=str(hold["resource"]),
+                certificate_pubkey=hold["certificate_pubkey"],
+                payment=validated_terms,
+                created_at=int(hold["created_at"]),
+                expires_at=int(hold["quote_expires_at"]),
+            )
+            quote_document = self._sign_document(quote, seller_key)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO payments (payment_id, rail, request, terms, state, quote_id)
+                    VALUES (?, ?, ?, ?, 'reserved', ?)
+                    """,
+                    (
+                        payment_id,
+                        validated_terms.rail,
+                        validated_terms.request,
+                        canonical(validated_terms),
+                        quote_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise MarketStoreConflictError("payment request has already been used") from exc
             connection.execute(
                 """
                 INSERT INTO quotes (
@@ -783,21 +964,160 @@ class MarketStore:
                 """,
                 (
                     quote_id,
-                    request_id,
-                    fingerprint,
-                    encoded_quote,
-                    buyer_pubkey,
-                    product,
-                    str(inventory_row["resource"]),
-                    certificate_pubkey,
-                    int(inventory_row["id"]),
-                    str(payment_row["payment_id"]),
-                    now,
-                    now + ttl,
-                    inventory_row["credential"],
+                    str(hold["request_id"]),
+                    bytes(hold["request_fingerprint"]),
+                    canonical(quote_document),
+                    quote.buyer_pubkey,
+                    quote.product,
+                    quote.resource,
+                    quote.certificate_pubkey,
+                    int(hold["inventory_id"]),
+                    payment_id,
+                    quote.created_at,
+                    quote.expires_at,
+                    inventory["credential"],
                 ),
             )
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'open' WHERE quote_id = ? AND state = 'reserved'",
+                (quote_id,),
+            )
             return quote_document
+
+    def hold_invoices(self, now: int) -> list[HoldInvoice]:
+        """Return every hold invoice whose outcome is not final yet, oldest first."""
+        self._require_int(now, "now", minimum=1)
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            self._expire_live_quotes(connection, now)
+            rows = connection.execute(
+                f"""
+                SELECT h.*, q.state AS quote_state,
+                       q.pending_credential IS NOT NULL AS has_credential
+                FROM hold_invoices h LEFT JOIN quotes q ON q.quote_id = h.quote_id
+                WHERE h.state IN {_ACTIVE_HOLD_SQL}
+                ORDER BY h.created_at, h.quote_id
+                """
+            ).fetchall()
+            return [
+                HoldInvoice(
+                    quote_id=str(row["quote_id"]),
+                    payment_hash=bytes.fromhex(str(row["payment_hash"])),
+                    preimage=bytes.fromhex(str(row["preimage"])),
+                    amount_sats=int(row["amount_sats"]),
+                    product=cast(Product, row["product"]),
+                    state=cast(HoldState, row["state"]),
+                    quote_state=row["quote_state"],
+                    credential_attached=bool(row["has_credential"]),
+                    created_at=int(row["created_at"]),
+                    quote_expires_at=int(row["quote_expires_at"]),
+                    invoice_expires_at=int(row["invoice_expires_at"]),
+                )
+                for row in rows
+            ]
+
+    def begin_hold_cancel(self, quote_id: str) -> None:
+        """Durably record the intent to cancel before calling ``CancelInvoice``.
+
+        Refused once settlement has been decided, so the two outcomes are exclusive.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] in ("canceling", "canceled"):
+                return
+            if hold["state"] not in ("reserved", "open"):
+                raise MarketStoreConflictError("hold invoice is being settled")
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceling' WHERE quote_id = ?", (quote_id,)
+            )
+
+    def abandon_undeliverable_settlement(self, quote_id: str, height: int) -> bool:
+        """Turn a pending settlement into a refund once its package is unusable.
+
+        A prepared package is bound to its authorization's retarget period; the
+        buyer cannot import it in a later period, so the held payment must be
+        canceled instead of settled. The prepared allocation stays consumed.
+        Returns whether the hold invoice now awaits cancellation.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "canceling":
+                return True
+            if hold["state"] != "settling":
+                return False
+            row = self._quote_row(connection, quote_id)
+            if row is None:
+                raise MarketStoreCorruptError("hold invoice has no quote")
+            authority, _ = self._verified_quote_from_row(row)
+            if authority.period == period_at_height(height):
+                return False
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceling' WHERE quote_id = ?", (quote_id,)
+            )
+            return True
+
+    def complete_hold_cancel(self, quote_id: str) -> None:
+        """Record that LND reports the hold invoice canceled.
+
+        Inventory returns only for an allocation that was never prepared. A
+        prepared allocation whose payment was lost stays consumed and undelivered.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "canceled":
+                return
+            if hold["state"] not in ("canceling", "settling"):
+                raise MarketStoreConflictError("hold invoice cancellation was not started")
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceled' WHERE quote_id = ?", (quote_id,)
+            )
+            quote = self._quote_row(connection, quote_id)
+            if quote is not None and quote["state"] == "finalized":
+                return
+            connection.execute(
+                "UPDATE quotes SET state = 'expired' WHERE quote_id = ? AND state = 'live'",
+                (quote_id,),
+            )
+            connection.execute(
+                """
+                UPDATE inventory SET state = 'available', reservation_quote_id = NULL
+                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
+                """,
+                (int(hold["inventory_id"]), quote_id),
+            )
+
+    def complete_hold_settle(self, quote_id: str) -> None:
+        """Record that LND reports the hold invoice settled; delivery becomes available."""
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "settled":
+                return
+            if hold["state"] != "settling":
+                raise MarketStoreConflictError("hold invoice settlement was not started")
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'settled' WHERE quote_id = ?", (quote_id,)
+            )
 
     def get_quote(self, quote_id: str) -> SignedDocument:
         """Return the locally persisted signed quote, including terminal quotes."""
@@ -812,7 +1132,11 @@ class MarketStore:
         return self._signed_document_from_storage(bytes(row["quote_document"]))
 
     def pending(self, now: int) -> list[SignedDocument]:
-        """Return at most 64 live quotes after expiring stale reservations."""
+        """Return at most 64 quotes that can still be paid.
+
+        These are live quotes and expired quotes whose hold invoice is still open,
+        since an HTLC accepted just before expiry still needs the credential.
+        """
         self._require_int(now, "now", minimum=1)
         with self._transaction() as connection:
             if self._ledger_mode(connection) == _WALLET_MODE:
@@ -820,12 +1144,14 @@ class MarketStore:
             self._expire_live_quotes(connection, now)
             rows = connection.execute(
                 """
-                SELECT * FROM quotes
-                WHERE state = 'live'
-                ORDER BY created_at, quote_id
+                SELECT q.* FROM quotes q
+                LEFT JOIN hold_invoices h ON h.quote_id = q.quote_id
+                WHERE q.state = 'live'
+                    OR (q.state = 'expired' AND h.state = 'open' AND h.invoice_expires_at > ?)
+                ORDER BY q.created_at, q.quote_id
                 LIMIT ?
                 """,
-                (_MAX_ACTIVE_QUOTES,),
+                (now, _MAX_ACTIVE_QUOTES),
             ).fetchall()
             for row in rows:
                 self._verified_quote_from_row(row)
@@ -834,7 +1160,7 @@ class MarketStore:
             ]
 
     def attach_credential(self, quote_id: str, credential: dict[str, Any]) -> None:
-        """Persist one credential supplied while the corresponding quote is live."""
+        """Persist one credential while the quote's payment can still be accepted."""
         self._require_hex32(quote_id, "quote_id")
         if type(credential) is not dict:
             raise TypeError("credential must be a dict")
@@ -844,7 +1170,10 @@ class MarketStore:
             row = self._quote_row(connection, quote_id)
             if row is None:
                 raise MarketStoreUnavailableError("quote does not exist")
-            if row["state"] != "live":
+            hold = self._hold_row(connection, quote_id)
+            if row["state"] != "live" and not (
+                row["state"] == "expired" and hold is not None and hold["state"] == "open"
+            ):
                 raise MarketStoreExpiredError("quote is no longer live")
             self._require_quote_wallet_ownership(connection, row)
             authority, quote = self._verified_quote_from_row(row)
@@ -864,21 +1193,19 @@ class MarketStore:
         self,
         quote_id: str,
         seller_key: CKey | BoundMarketKeys,
-        settlement_ref: str,
         now: int,
         height: int,
     ) -> CredentialPackage:
-        """Irreversibly sign and persist an allocation after caller-owned settlement.
+        """Irreversibly prepare the allocation for a quote whose payment is held.
 
-        A finalized quote is idempotent only for its original settlement reference.
-        The persisted package and encrypted delivery are committed before this method
-        returns, so a crash cannot cause a second allocation for the same resource.
+        The caller must have observed the hold invoice ACCEPTED for at least the
+        quoted amount. The same transaction records the intent to settle, so the
+        invoice can no longer be canceled through this store, and the package is
+        withheld from delivery until :meth:`complete_hold_settle`. Once committed,
+        a crash cannot cause a second allocation for the same resource.
         """
         self._require_hex32(quote_id, "quote_id")
         seller_pubkey = self._seller_pubkey(seller_key)
-        self._require_opaque_identifier(
-            settlement_ref, "settlement_ref", _MAX_SETTLEMENT_REF_LENGTH
-        )
         self._require_int(now, "now", minimum=1)
         self._require_int(height, "height", minimum=1)
 
@@ -893,24 +1220,28 @@ class MarketStore:
                 seller_key.validate_seller_authorization(authority)
             self._require_matching_seller(authority, seller_pubkey)
             self._require_quote_wallet_ownership(connection, row)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreExpiredError("quote has no hold invoice")
+            settlement_ref = f"ln:{hold['payment_hash']}"
             if row["state"] == "finalized":
                 if row["settlement_ref"] != settlement_ref:
-                    raise MarketStoreConflictError(
-                        "quote was finalized with a different settlement reference"
-                    )
+                    raise MarketStoreCorruptError("finalized quote has a foreign settlement")
                 package = row["package"]
                 if package is None:
                     raise MarketStoreCorruptError("finalized quote has no credential package")
                 return self._package_from_storage(bytes(package))
 
+            if hold["state"] != "open":
+                raise MarketStoreExpiredError("quote hold invoice is no longer open")
             self._expire_live_quotes(connection, now)
             row = self._quote_row(connection, quote_id)
-            if row is None or row["state"] != "live":
+            # An expired quote with an open hold invoice still holds its inventory;
+            # an HTLC accepted before the invoice expired may complete the sale.
+            if row is None or row["state"] not in ("live", "expired"):
                 raise MarketStoreExpiredError("quote has expired")
             if authority.period != period_at_height(height):
                 raise MarketStoreExpiredError("quote is from a different retarget period")
-            if quote.expires_at <= now:
-                raise MarketStoreExpiredError("quote has expired")
 
             settlement_owner = connection.execute(
                 "SELECT quote_id FROM quotes WHERE settlement_ref = ?", (settlement_ref,)
@@ -958,9 +1289,13 @@ class MarketStore:
                 """
                 UPDATE quotes
                 SET state = 'finalized', settlement_ref = ?, package = ?, sealed_delivery = ?
-                WHERE quote_id = ? AND state = 'live'
+                WHERE quote_id = ? AND state IN ('live', 'expired')
                 """,
                 (settlement_ref, encoded_package, sealed_delivery, quote_id),
+            )
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'settling' WHERE quote_id = ? AND state = 'open'",
+                (quote_id,),
             )
             connection.execute(
                 """
@@ -979,14 +1314,21 @@ class MarketStore:
             return package
 
     def get_delivery(self, quote_id: str) -> str | None:
-        """Return only the cached sealed-box package for an authenticated service path."""
+        """Return the cached sealed-box package once its payment has settled."""
         self._require_hex32(quote_id, "quote_id")
         with self._lock:
             row = self._connection.execute(
-                "SELECT sealed_delivery FROM quotes WHERE quote_id = ?", (quote_id,)
+                """
+                SELECT q.sealed_delivery, h.state AS hold_state FROM quotes q
+                LEFT JOIN hold_invoices h ON h.quote_id = q.quote_id
+                WHERE q.quote_id = ?
+                """,
+                (quote_id,),
             ).fetchone()
         if row is None:
             raise MarketStoreUnavailableError("quote does not exist")
+        if row["hold_state"] not in (None, "settled"):
+            return None
         delivery = row["sealed_delivery"]
         if delivery is None:
             return None
@@ -995,14 +1337,21 @@ class MarketStore:
         return delivery
 
     def get_package(self, quote_id: str) -> CredentialPackage | None:
-        """Return trusted local package evidence for explicit CLI export/import only."""
+        """Return settled local package evidence for explicit CLI export/import only."""
         self._require_hex32(quote_id, "quote_id")
         with self._lock:
             row = self._connection.execute(
-                "SELECT package FROM quotes WHERE quote_id = ?", (quote_id,)
+                """
+                SELECT q.package, h.state AS hold_state FROM quotes q
+                LEFT JOIN hold_invoices h ON h.quote_id = q.quote_id
+                WHERE q.quote_id = ?
+                """,
+                (quote_id,),
             ).fetchone()
         if row is None:
             raise MarketStoreUnavailableError("quote does not exist")
+        if row["hold_state"] not in (None, "settled"):
+            return None
         package = row["package"]
         if package is None:
             return None
@@ -1038,6 +1387,8 @@ class MarketStore:
                     self._create_schema()
                 else:
                     self._verify_schema()
+                    if self._schema_version(self._connection) == _LEGACY_SCHEMA_VERSION:
+                        self._migrate_from_v1(int(time.time()))
                 self._connection.commit()
             except BaseException:
                 self._connection.rollback()
@@ -1113,6 +1464,7 @@ class MarketStore:
             """,
             "CREATE INDEX quotes_live_expiry ON quotes(state, expires_at)",
             "CREATE INDEX wallet_ledger_state ON wallet_ledger(state)",
+            *_HOLD_INVOICE_SCHEMA,
             f"INSERT INTO metadata (key, value) VALUES ('schema_version', '{_SCHEMA_VERSION}')",
             f"INSERT INTO metadata (key, value) VALUES ('ledger_mode', '{_STANDALONE_MODE}')",
         )
@@ -1142,13 +1494,98 @@ class MarketStore:
             return
         self._verify_wallet_ledger(self._connection, readonly=readonly, rebind_paths=rebind_paths)
 
-    def _schema_version(self, connection: sqlite3.Connection) -> Literal["1"]:
+    def _schema_version(self, connection: sqlite3.Connection) -> Literal["1", "2"]:
         row = connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        if row is None or row["value"] != _SCHEMA_VERSION:
+        if row is None or row["value"] not in (_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION):
             raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
-        return cast(Literal["1"], row["value"])
+        version = cast(Literal["1", "2"], row["value"])
+        has_holds = "hold_invoices" in self._table_names(connection)
+        if has_holds != (version == _SCHEMA_VERSION):
+            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
+        if has_holds and not _HOLD_INVOICE_COLUMNS.issubset(
+            self._table_columns(connection, "hold_invoices")
+        ):
+            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
+        return version
+
+    def _migrate_from_v1(self, now: int) -> None:
+        """Upgrade a version 1 store inside the caller's open write transaction.
+
+        Version 1 quotes were paid through operator-queued invoices and settled
+        manually, which this release no longer supports. A quote that a buyer can
+        still pay must finish under the previous release, so the upgrade waits for
+        it rather than stranding the payment. Expired quotes follow version 1
+        semantics (inventory released), and queued payment requests stay unused
+        forever. A private snapshot of the version 1 file is written first.
+        """
+        connection = self._connection
+        live = connection.execute(
+            """
+            SELECT COUNT(*) AS count, MAX(expires_at) AS until FROM quotes
+            WHERE state = 'live' AND expires_at > ?
+            """,
+            (now,),
+        ).fetchone()
+        if live is not None and int(live["count"]) > 0:
+            raise MarketStoreUnavailableError(
+                f"market store upgrade waits for {int(live['count'])} live quote(s) from the"
+                " previous release; settle them with that release, or retry in"
+                f" {int(live['until']) - now} seconds"
+            )
+        self._snapshot_v1()
+        expired = connection.execute(
+            "SELECT quote_id, inventory_id FROM quotes WHERE state = 'live'"
+        ).fetchall()
+        for row in expired:
+            connection.execute(
+                "UPDATE quotes SET state = 'expired' WHERE quote_id = ?", (str(row["quote_id"]),)
+            )
+            connection.execute(
+                """
+                UPDATE inventory SET state = 'available', reservation_quote_id = NULL
+                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
+                """,
+                (int(row["inventory_id"]), str(row["quote_id"])),
+            )
+        for statement in _HOLD_INVOICE_SCHEMA:
+            connection.execute(statement)
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'schema_version' AND value = ?",
+            (_SCHEMA_VERSION, _LEGACY_SCHEMA_VERSION),
+        )
+
+    def _snapshot_v1(self) -> None:
+        """Write a private, fsynced copy of the committed version 1 store."""
+        name = f"{self.path.name}.v1-backup"
+        backup = self.path.with_name(name)
+        suffix = 1
+        while backup.exists() or backup.is_symlink():
+            suffix += 1
+            backup = self.path.with_name(f"{name}.{suffix}")
+        descriptor = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(descriptor)
+        source = sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True)
+        try:
+            target = sqlite3.connect(backup)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        finally:
+            source.close()
+        descriptor = os.open(backup, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if os.name != "nt":
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
 
     @staticmethod
     def _ledger_mode(connection: sqlite3.Connection) -> LedgerMode:
@@ -2038,6 +2475,12 @@ class MarketStore:
 
     @staticmethod
     def _expire_live_quotes(connection: sqlite3.Connection, now: int) -> None:
+        """Mark stale quotes expired.
+
+        Inventory of a quote with a hold invoice stays reserved until LND confirms
+        the invoice canceled (:meth:`complete_hold_cancel`); an HTLC may still be
+        accepted until the invoice itself expires.
+        """
         expired = connection.execute(
             "SELECT quote_id, inventory_id FROM quotes WHERE state = 'live' AND expires_at <= ?",
             (now,),
@@ -2051,9 +2494,29 @@ class MarketStore:
                 """
                 UPDATE inventory SET state = 'available', reservation_quote_id = NULL
                 WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
+                AND NOT EXISTS (SELECT 1 FROM hold_invoices WHERE quote_id = ?)
                 """,
-                (int(row["inventory_id"]), str(row["quote_id"])),
+                (int(row["inventory_id"]), str(row["quote_id"]), str(row["quote_id"])),
             )
+
+    @staticmethod
+    def _hold_row(connection: sqlite3.Connection, quote_id: str) -> sqlite3.Row | None:
+        return cast(
+            sqlite3.Row | None,
+            connection.execute(
+                "SELECT * FROM hold_invoices WHERE quote_id = ?", (quote_id,)
+            ).fetchone(),
+        )
+
+    @staticmethod
+    def _hold_reservation(row: sqlite3.Row) -> HoldReservation:
+        return HoldReservation(
+            quote_id=str(row["quote_id"]),
+            payment_hash=bytes.fromhex(str(row["payment_hash"])),
+            amount_sats=int(row["amount_sats"]),
+            quote_expires_at=int(row["quote_expires_at"]),
+            invoice_expires_at=int(row["invoice_expires_at"]),
+        )
 
     @staticmethod
     def _quote_row(connection: sqlite3.Connection, quote_id: str) -> sqlite3.Row | None:

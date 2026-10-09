@@ -18,12 +18,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+from _taker_market_helpers import FakeHoldInvoices
 from bitcointx.core.key import CKey  # type: ignore[import-not-found]
 from jmcore.bitcoin import hash160
 from jmcore.credential_market import (
     BondReference,
     MarketAuthorization,
-    PaymentTerms,
     sign_document,
 )
 from jmcore.external_podle import ExternalPoDLEOutpoint
@@ -37,6 +37,7 @@ from nacl.public import PrivateKey
 from taker import market_cli
 from taker._vendor.bolt11 import Bolt11, MilliSatoshi, Tag, TagChar, Tags, encode
 from taker.market_service import MarketService
+from taker.market_settlement import MarketSettlement
 from taker.podle_manager import PoDLEManager
 
 SELLER_NICK = "J5ABCDEFGHJKLMNP"
@@ -186,17 +187,15 @@ class _Quickstart:
         self.podle = _podle_record(CKey(b"\x61" * 32))
         self.store = MarketStore(seller_dir / "seller.sqlite")
         self.store.add_inventory("podle", cast(str, self.podle["commitment"]), self.podle)
-        self.store.add_payment(
-            PaymentTerms(rail="lightning", request=_invoice(), amount_sats=100),
-            f"ln:{PAYMENT_HASH}",
-        )
         self.backend = _Backend(cast(str, self.podle["scriptpubkey"]))
+        self.invoices = FakeHoldInvoices()
         self.service = MarketService(
             self.store,
             authorization,
             self.seller_key,
             PrivateKey(bytes.fromhex(self.bundle["encryption_key"])),
             cast(BlockchainBackend, self.backend),
+            self.invoices,
             products=["podle"],
             price_sats=100,
         )
@@ -214,7 +213,12 @@ class _Quickstart:
     def settle(self, quote_id: str) -> None:
         """Release the credential the way a seller does once the invoice is paid."""
         self.store.attach_credential(quote_id, self.podle)
-        self.store.finalize(quote_id, self.seller_key, f"ln:{PAYMENT_HASH}", int(time.time()), 1)
+        settlement = MarketSettlement(
+            self.store, self.invoices, self.seller_key, self.backend.get_block_height
+        )
+        [payment_hash] = self.invoices.invoices
+        self.invoices.pay(payment_hash, 100)
+        asyncio.run(settlement.reconcile_once())
 
     def close(self) -> None:
         self.store.close()

@@ -118,7 +118,7 @@ def test_diagnose_standalone_store_preserves_artifact(tmp_path: Path) -> None:
 
     assert diagnosis == {
         "state": "standalone",
-        "schema_version": "1",
+        "schema_version": "2",
         "reason": "standalone market store",
     }
     assert path.read_bytes() == before
@@ -153,15 +153,15 @@ def test_diagnose_reports_ready_disabled_and_recovery_required(tmp_path: Path) -
     )
 
     assert ready["state"] == "ready"
-    assert ready["schema_version"] == "1"
+    assert ready["schema_version"] == "2"
     assert disabled["state"] == "disabled"
-    assert disabled["schema_version"] == "1"
+    assert disabled["schema_version"] == "2"
     assert mismatched["state"] == "recovery_required"
-    assert mismatched["schema_version"] == "1"
+    assert mismatched["schema_version"] == "2"
     assert activating["state"] == "activating"
-    assert activating["schema_version"] == "1"
+    assert activating["schema_version"] == "2"
     assert recovery_required["state"] == "recovery_required"
-    assert recovery_required["schema_version"] == "1"
+    assert recovery_required["schema_version"] == "2"
 
 
 @pytest.mark.parametrize("artifact", ("missing", "malformed", "symlink"))

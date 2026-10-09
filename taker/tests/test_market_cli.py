@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from _taker_market_helpers import FakeHoldInvoices
 from bitcointx.core.key import CKey  # type: ignore[import-not-found]
 from jmcore.bitcoin import address_to_scriptpubkey_for_network, hash160
 from jmcore.credential_market import (
@@ -36,12 +37,14 @@ from jmcore.market_store import MarketStore
 from jmcore.models import NetworkType
 from jmcore.podle import generate_podle
 from jmcore.settings import JoinMarketSettings, NetworkSettings
+from jmswap.lnd_peer import InvoiceState
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from nacl.public import PrivateKey
 
 from taker import market_cli
 from taker._vendor.bolt11 import Bolt11, MilliSatoshi, Tag, TagChar, Tags, encode
 from taker.market_service import MarketService
+from taker.market_settlement import MarketSettlement
 
 
 def _write(path: Path, data: bytes) -> None:
@@ -218,38 +221,25 @@ def test_offline_seller_buyer_lifecycle_uses_real_crypto(
         )
         == 0
     )
-    terms = _payment_terms()
-    terms_file = tmp_path / "terms.json"
-    _json(terms_file, terms.model_dump(mode="json"))
     assert (
         market_cli.run(
             ["seller", "add-inventory", "--data-dir", str(tmp_path), "--credential", str(podle)]
         )
         == 0
     )
-    assert (
-        market_cli.run(
-            [
-                "seller",
-                "add-payment",
-                "--data-dir",
-                str(tmp_path),
-                "--terms",
-                str(terms_file),
-            ]
-        )
-        == 0
-    )
 
     seller_bundle = json.loads(seller_keys.read_text(encoding="ascii"))
-    service_backend = _Backend(terms)
+    seller_key = CKey(bytes.fromhex(seller_bundle["seller_signing_key"]))
+    service_backend = _Backend()
     service_store = MarketStore(tmp_path / "market" / "seller.sqlite")
+    invoices = FakeHoldInvoices()
     service = MarketService(
         service_store,
         market_cli._signed_document(authorization),
         CKey(bytes.fromhex(seller_bundle["seller_signing_key"])),
         PrivateKey(bytes.fromhex(seller_bundle["encryption_key"])),
         cast(BlockchainBackend, service_backend),
+        invoices,
         products=["podle"],
         price_sats=100,
     )
@@ -296,7 +286,6 @@ def test_offline_seller_buyer_lifecycle_uses_real_crypto(
     assert request_data["version"] == 2
 
     listing_document = SignedDocument.model_validate(json.loads(listing.decode("ascii")))
-    seller_key = CKey(bytes.fromhex(seller_bundle["seller_signing_key"]))
     listing_model = listing_document.verified(MarketListing, bytes(seller_key.pub).hex())
     refreshed_listing = sign_document(
         listing_model.model_copy(update={"expires_at": listing_model.expires_at + 1}), seller_key
@@ -350,30 +339,50 @@ def test_offline_seller_buyer_lifecycle_uses_real_crypto(
         )
         == 0
     )
+    raw_delivery = tmp_path / "delivery.json"
+    poll_argv = [
+        "poll",
+        "--data-dir",
+        str(tmp_path),
+        "--quote",
+        str(quote_file),
+        "--seller",
+        str(listing_file),
+        "--request-file",
+        str(request_file),
+        "--raw-output",
+        str(raw_delivery),
+    ]
+    capsys.readouterr()
+    # Before payment there is nothing to deliver, and the buyer is told why.
+    assert market_cli.run(poll_argv) == 1
+    assert "poll again shortly" in capsys.readouterr().err
+
+    settlement = MarketSettlement(
+        service_store, invoices, seller_key, service_backend.get_block_height
+    )
+    [payment_hash] = invoices.invoices
+    asyncio.run(settlement.reconcile_once())
+    assert market_cli.run(poll_argv) == 1
+    invoices.pay(payment_hash, 100)
+    asyncio.run(settlement.reconcile_once())
+    assert invoices.invoices[payment_hash].state is InvoiceState.SETTLED
     package_file = tmp_path / "package.json"
-    preimage_file = tmp_path / "preimage"
-    _write(preimage_file, PREIMAGE)
     assert (
         market_cli.run(
             [
                 "seller",
-                "settle",
+                "export",
                 "--data-dir",
                 str(tmp_path),
                 "--quote-id",
                 quote_id,
-                "--keys",
-                str(seller_keys),
-                "--preimage-file",
-                str(preimage_file),
-                "--acknowledge-ln-settlement",
                 "--output",
                 str(package_file),
             ]
         )
         == 0
     )
-    raw_delivery = tmp_path / "delivery.json"
     assert (
         market_cli.run(
             [
@@ -556,55 +565,19 @@ def _lightning_invoice(now: int, preimage: bytes) -> str:
     return encode(invoice, private_key="11" * 32)
 
 
-def test_lightning_settlement_requires_explicit_acknowledgement(
-    tmp_path: Path, monkeypatch
-) -> None:
-    now = int(time.time())
+def test_serve_requires_a_seller_lightning_node(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Without [market] LND settings there is no way to take payments, so serve refuses."""
     settings = _settings(tmp_path)
     monkeypatch.setattr(market_cli, "_settings", lambda _args: settings)
-    owner, seller, buyer = _key(0x31), _key(0x32), PrivateKey(bytes([0x33]) * 32)
-    bond = _bond(owner)
-    authorization = sign_document(
-        MarketAuthorization(bond=bond, period=0, seller_pubkey=bytes(seller.pub).hex()), owner
-    )
-    proof = generate_podle(b"\x34" * 32, f"{'34' * 32}:1", 0)
-    podle = {
-        "version": 1,
-        "network": "regtest",
-        "outpoint": {"txid": "34" * 32, "vout": 1},
-        "P": proof.p.hex(),
-        "P2": proof.p2.hex(),
-        "sig": proof.sig.hex(),
-        "e": proof.e.hex(),
-        "commitment": proof.commitment.hex(),
-        "index": 0,
-        "scriptpubkey": (b"\x00\x14" + hash160(proof.p)).hex(),
-        "blockheight": 1,
-    }
-    preimage = bytes(range(32))
-    terms = PaymentTerms(
-        rail="lightning",
-        request=_lightning_invoice(now, preimage),
-        amount_sats=100,
-    )
-    store = MarketStore(tmp_path / "market" / "seller.sqlite")
-    store.add_inventory("podle", proof.commitment.hex(), podle)
-    store.add_payment(terms, "ln:test-payment")
-    quote = store.create_quote(
+    owner, seller = _key(0x31), _key(0x32)
+    authorization = tmp_path / "authorization.json"
+    _json(
         authorization,
-        seller,
-        bytes(buyer.public_key).hex(),
-        "podle",
-        None,
-        "lightning",
-        100,
-        now,
-        1,
-        request_id="01" * 16,
+        sign_document(
+            MarketAuthorization(bond=_bond(owner), period=0, seller_pubkey=bytes(seller.pub).hex()),
+            owner,
+        ).model_dump(mode="json"),
     )
-    store.attach_credential(quote.body["quote_id"], podle)
-    store.close()
-
     keys = tmp_path / "seller-keys.json"
     _json(
         keys,
@@ -615,28 +588,10 @@ def test_lightning_settlement_requires_explicit_acknowledgement(
             "renter_certificate_key": _key(0x35).secret_bytes.hex(),
         },
     )
-    preimage_file = tmp_path / "preimage"
-    _write(preimage_file, preimage)
-    monkeypatch.setattr(market_cli, "_new_backend", lambda _settings: _Backend())
-    assert (
-        market_cli.run(
-            [
-                "seller",
-                "settle",
-                "--data-dir",
-                str(tmp_path),
-                "--quote-id",
-                quote.body["quote_id"],
-                "--keys",
-                str(keys),
-                "--preimage-file",
-                str(preimage_file),
-                "--output",
-                str(tmp_path / "package.json"),
-            ]
-        )
-        == 1
-    )
+    argv = ["serve", "--authorization", str(authorization), "--keys", str(keys)]
+    assert market_cli.run([*argv, "--products", "podle", "--price-sats", "100"]) == 1
+    assert "[market] lnd_grpc_url" in capsys.readouterr().err
+    assert not (tmp_path / "market" / "seller.sqlite").exists()
 
 
 def test_removed_compatibility_flags_are_rejected(tmp_path: Path) -> None:
@@ -666,10 +621,16 @@ def test_removed_compatibility_flags_are_rejected(tmp_path: Path) -> None:
         "01" * 16,
         "--keys",
         str(tmp_path / "seller-keys.json"),
+        "--preimage-file",
+        str(tmp_path / "preimage"),
+        "--acknowledge-ln-settlement",
         "--output",
         str(tmp_path / "package.json"),
     ]
     removed = [
+        # Manual settlement was replaced by automatic hold-invoice settlement.
+        settle,
+        ["seller", "add-payment", "--terms", str(tmp_path / "terms.json")],
         [*request, "--keys", str(tmp_path / "buyer-keys.json")],
         [*request, "--rail", "onchain"],
         [*poll, "--keys", str(tmp_path / "buyer-keys.json")],
@@ -683,42 +644,12 @@ def test_removed_compatibility_flags_are_rejected(tmp_path: Path) -> None:
         assert failure.value.code == 2
 
 
-def test_poll_and_settle_require_their_remaining_arguments(tmp_path: Path) -> None:
-    """poll is request-file bound and settle is preimage bound; neither is optional."""
+def test_poll_requires_its_request_file(tmp_path: Path) -> None:
+    """poll is request-file bound; it is not optional."""
     parser = market_cli.build_parser()
-    for argv in (
-        ["poll", "--seller", str(tmp_path / "listing.json")],
-        [
-            "seller",
-            "settle",
-            "--quote-id",
-            "01" * 16,
-            "--keys",
-            str(tmp_path / "seller-keys.json"),
-            "--output",
-            str(tmp_path / "package.json"),
-        ],
-    ):
-        with pytest.raises(SystemExit) as failure:
-            parser.parse_args(argv)
-        assert failure.value.code == 2
-
-    settle = parser.parse_args(
-        [
-            "seller",
-            "settle",
-            "--quote-id",
-            "01" * 16,
-            "--keys",
-            str(tmp_path / "seller-keys.json"),
-            "--preimage-file",
-            str(tmp_path / "preimage"),
-            "--output",
-            str(tmp_path / "package.json"),
-        ]
-    )
-    assert settle.preimage_file == tmp_path / "preimage"
-    assert settle.acknowledge_ln_settlement is False
+    with pytest.raises(SystemExit) as failure:
+        parser.parse_args(["poll", "--seller", str(tmp_path / "listing.json")])
+    assert failure.value.code == 2
 
 
 def test_serve_refuses_a_quote_ttl_beyond_the_payment_window(tmp_path: Path) -> None:
@@ -1308,7 +1239,8 @@ def test_bare_seller_and_proof_print_their_own_help(capsys) -> None:
     assert market_cli.run(["seller"]) == 0
     seller_out = capsys.readouterr().out
     assert seller_out.startswith("usage: jm-market seller")
-    assert "add-inventory" in seller_out and "settle" in seller_out
+    assert "add-inventory" in seller_out and "attach" in seller_out
+    assert "add-payment" not in seller_out
 
     assert market_cli.run(["proof"]) == 0
     proof_out = capsys.readouterr().out

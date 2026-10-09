@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _taker_market_helpers import FakeHoldInvoices, settle_quote
 from bitcointx.core.key import CKey
 from jmcore.credential_market import (
     BondCredential,
@@ -177,7 +178,6 @@ async def test_wallet_bound_seller_lifecycle_uses_private_transport(tmp_path: Pa
     bound = keys.bind(_scope(bond))
     store = _activate_store(tmp_path / "seller.sqlite", bound.wallet_id)
     store.add_inventory("bond", bond_resource(bond, 0), None)
-    store.add_payment(_payment(), "payment-1")
     authorization = _authorization(bound, bond)
     backend = _Backend()
     service = MarketService(
@@ -186,6 +186,7 @@ async def test_wallet_bound_seller_lifecycle_uses_private_transport(tmp_path: Pa
         bound,
         bound,
         backend,
+        FakeHoldInvoices(),
         products=["bond"],
         price_sats=1_000,
     )
@@ -242,7 +243,7 @@ async def test_wallet_bound_seller_lifecycle_uses_private_transport(tmp_path: Pa
         assert quote == quote_document.verified(MarketQuote, listing.seller_pubkey)
 
         store.attach_credential(quote.quote_id, _credential(bond))
-        store.finalize(quote.quote_id, bound, "synthetic-settlement", int(time.time()), 1)
+        settle_quote(store, quote.quote_id, bound, int(time.time()), 1)
         delivery = await buyer.request(
             seller_nick,
             bytes.fromhex(listing.encryption_pubkey),
@@ -276,6 +277,7 @@ def test_wallet_bound_service_rejects_mixed_scope_and_wallet_constructors(tmp_pa
                 bound,
                 PrivateKey.generate(),
                 backend,
+                FakeHoldInvoices(),
                 products=["bond"],
                 price_sats=1_000,
             )
@@ -286,6 +288,7 @@ def test_wallet_bound_service_rejects_mixed_scope_and_wallet_constructors(tmp_pa
                 bound,
                 different_scope,
                 backend,
+                FakeHoldInvoices(),
                 products=["bond"],
                 price_sats=1_000,
             )
@@ -296,6 +299,7 @@ def test_wallet_bound_service_rejects_mixed_scope_and_wallet_constructors(tmp_pa
                 bound,
                 bound,
                 backend,
+                FakeHoldInvoices(),
                 products=["bond"],
                 price_sats=1_000,
             )
@@ -345,7 +349,6 @@ async def test_revoked_or_recovery_required_wallet_stops_seller_issuance(tmp_pat
     bound = keys.bind(_scope(bond))
     store = _activate_store(tmp_path / "seller.sqlite", bound.wallet_id)
     store.add_inventory("bond", bond_resource(bond, 0), None)
-    store.add_payment(_payment(), "payment-1")
     authorization = _authorization(bound, bond)
     backend = _BlockingBackend()
     service = MarketService(
@@ -354,6 +357,7 @@ async def test_revoked_or_recovery_required_wallet_stops_seller_issuance(tmp_pat
         bound,
         bound,
         backend,
+        FakeHoldInvoices(),
         products=["bond"],
         price_sats=1_000,
     )
@@ -388,6 +392,7 @@ async def test_revoked_or_recovery_required_wallet_stops_seller_issuance(tmp_pat
             restored_bound,
             restored_bound,
             _Backend(),
+            FakeHoldInvoices(),
             products=["bond"],
             price_sats=1_000,
         )
@@ -415,6 +420,7 @@ async def test_closed_provider_capability_drops_request_before_responder(tmp_pat
         bound,
         bound,
         _Backend(),
+        FakeHoldInvoices(),
         products=["bond"],
         price_sats=1_000,
     )

@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Literal
 
 from jmcore import experimental
 from jmcore.credential_market import (
-    CredentialPackage,
     MarketError,
     MarketQuote,
-    PaymentTerms,
     SignedDocument,
     bond_resource,
     verify_authorization,
@@ -28,8 +27,8 @@ from jmcore.settings import JoinMarketSettings
 from jmcore.wallet_market import WalletMarketSellerOptions as WalletMarketSellerOptions
 from jmwallet.wallet.service import WalletService
 
-from taker.market_payments import validate_payment_terms, verify_lightning_preimage
 from taker.market_service import MarketService
+from taker.market_settlement import MarketSettlement, seller_invoice_client
 from taker.market_transport import MarketTransport
 
 
@@ -76,6 +75,9 @@ class WalletMarketSeller:
         self._fault_cache: MarketFaultCache | None = None
         self._nickname: str | None = None
         self._seller_public_key: str | None = None
+        self._resources = AsyncExitStack()
+        self._settlement: MarketSettlement | None = None
+        self._settlement_task: asyncio.Task[None] | None = None
 
     @property
     def running(self) -> bool:
@@ -139,6 +141,7 @@ class WalletMarketSeller:
             await self._cleanup_owned_resources()
 
     async def _start_owned_resources(self) -> None:
+        invoices = seller_invoice_client(self.settings)
         store = MarketStore(
             get_market_store_path(self._data_dir),
             wallet_id=self.wallet.market_wallet_id,
@@ -148,6 +151,9 @@ class WalletMarketSeller:
         if not store.is_wallet_ledger or store.wallet_state() != "ready":
             raise MarketStoreUnavailableError("Wallet market ledger is not ready")
         store.check_commitments_path(get_used_commitments_path(self._data_dir, create=False))
+        # One seller runtime per store owns hold-invoice settlement.
+        self._resources.enter_context(store.seller_runtime())
+        await self._resources.enter_async_context(invoices)
 
         bound_keys, authorization = await self.wallet.create_market_authorization(self._bond)
         if self._closed:
@@ -160,6 +166,7 @@ class WalletMarketSeller:
             bound_keys,
             bound_keys,
             self.wallet.backend,
+            invoices,
             products=list(self._products),
             price_sats=self._price_sats,
             quote_ttl=self._quote_ttl,
@@ -168,6 +175,13 @@ class WalletMarketSeller:
         self._fault_cache = fault_cache
         self._service = service
         self._seller_public_key = bound_keys.signing_public_key().hex()
+        settlement = MarketSettlement(
+            store,
+            invoices,
+            bound_keys,
+            lambda: self.wallet.backend.get_block_height(),
+            credential_provider=self._provide_credential,
+        )
 
         transport = MarketTransport(
             directory_servers=self.settings.get_directory_servers(),
@@ -197,6 +211,8 @@ class WalletMarketSeller:
         if self._closed:
             raise RuntimeError("Wallet market seller stopped during startup")
         self._running = True
+        self._settlement = settlement
+        self._settlement_task = asyncio.create_task(settlement.run())
 
     def _callbacks_available(self) -> bool:
         return self._running and not self._closed
@@ -226,15 +242,6 @@ class WalletMarketSeller:
             "bond", bond_resource(service.authority.bond, service.authority.period), None
         )
 
-    def add_payment(self, terms: PaymentTerms) -> None:
-        """Queue externally generated Lightning terms; never contact a payment wallet."""
-        service = self._local_service()
-        now = int(time.time())
-        # Validation refuses a non-Lightning rail before the ledger sees the
-        # request, so no other payment form can ever be reserved for a quote.
-        payment_id = validate_payment_terms(terms, self.wallet.network, now, now + self._quote_ttl)
-        service.store.add_payment(terms, payment_id)
-
     def pending_quotes(self) -> list[SignedDocument]:
         service = self._local_service()
         return [
@@ -244,55 +251,27 @@ class WalletMarketSeller:
             == service.authority
         ]
 
-    async def settle(
-        self,
-        quote_id: str,
-        *,
-        preimage: bytes,
-        acknowledge_ln_settlement: bool = False,
-    ) -> CredentialPackage:
-        """Finalize only after an authenticated local operator verifies settlement.
+    async def _provide_credential(self, quote_id: str) -> None:
+        """Sign the bond lease for an accepted bond quote with this wallet.
 
-        Remote market messages cannot call this operation. A preimage alone proves
-        nothing, so the caller must also acknowledge local-wallet receipt. Every
-        awaited backend check is followed by runtime, key, and ledger validation
-        before mutation.
+        Called by the settlement reconciler once the buyer's payment is held.
+        Every await is followed by runtime, key, and ledger validation.
         """
         service = self._local_service()
-        document = service.store.get_quote(quote_id)
-        quote = document.verified(MarketQuote, service.authority.seller_pubkey)
+        quote = service.store.get_quote(quote_id).verified(
+            MarketQuote, service.authority.seller_pubkey
+        )
+        if quote.product != "bond":
+            return
         if verify_authorization(quote.authorization) != service.authority:
             raise MarketError("Quote does not belong to this seller authority")
-        height = await self.wallet.backend.get_block_height()
-        self._local_service()
-        now = int(time.time())
-        quote.check(
-            network=self.wallet.network,
-            height=height,
-            now=now,
-            max_price_sats=quote.payment.amount_sats,
-        )
-        validate_payment_terms(quote.payment, self.wallet.network, now, quote.expires_at)
-        if acknowledge_ln_settlement is not True:
-            raise MarketError("Local Lightning settlement acknowledgment is required")
-        reference = verify_lightning_preimage(
-            quote.payment, self.wallet.network, preimage, now, quote.expires_at
+        if quote.certificate_pubkey is None:
+            raise MarketError("Bond quote has no renter certificate key")
+        credential = await self.wallet.create_market_bond_credential(
+            quote.authorization, quote.certificate_pubkey
         )
         self._local_service()
-        if quote.product == "bond":
-            if quote.certificate_pubkey is None:
-                raise MarketError("Bond quote has no renter certificate key")
-            credential = await self.wallet.create_market_bond_credential(
-                quote.authorization, quote.certificate_pubkey
-            )
-            self._local_service()
-            service.store.attach_credential(quote_id, credential.model_dump(mode="json"))
-        # Do not trust a height or expiry read before an awaited payment/bond check.
-        height = await self.wallet.backend.get_block_height()
-        self._local_service()
-        return service.store.finalize(
-            quote_id, service.signing_key, reference, int(time.time()), height
-        )
+        service.store.attach_credential(quote_id, credential.model_dump(mode="json"))
 
     async def _listing_callback(self) -> bytes:
         if not self._callbacks_available() or self._service is None:
@@ -315,9 +294,13 @@ class WalletMarketSeller:
             self._fault_cache.ingest(raw)
 
     async def _cleanup_owned_resources(self) -> None:
-        """Close transport then store, preserving each failed close for retry."""
+        """Stop settlement, close transport then store, keeping failed closes for retry."""
         async with self._cleanup_lock:
             close_error: BaseException | None = None
+            settlement_task, self._settlement_task = self._settlement_task, None
+            if settlement_task is not None:
+                settlement_task.cancel()
+                await asyncio.gather(settlement_task, return_exceptions=True)
             try:
                 transport = self._transport
                 if transport is not None:
@@ -328,6 +311,11 @@ class WalletMarketSeller:
                     else:
                         self._transport = None
             finally:
+                try:
+                    # Release the invoice client and the seller-runtime lock.
+                    await self._resources.aclose()
+                except BaseException as exc:
+                    close_error = close_error or exc
                 store = self._store
                 if store is not None:
                     try:

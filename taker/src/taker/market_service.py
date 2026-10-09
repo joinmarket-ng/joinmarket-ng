@@ -19,6 +19,7 @@ from jmcore.credential_market import (
     MarketListing,
     MarketModel,
     MarketQuote,
+    PaymentTerms,
     Product,
     Pubkey,
     SignedDocument,
@@ -36,12 +37,19 @@ from jmcore.credential_market import (
 )
 from jmcore.market_faults import MarketFaultCache
 from jmcore.market_keys import BoundMarketKeys, MarketKeyError
-from jmcore.market_store import MarketStore, MarketStoreError
+from jmcore.market_store import (
+    HoldReservation,
+    MarketStore,
+    MarketStoreError,
+    MarketStoreExpiredError,
+)
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
+from loguru import logger
 from nacl.public import PrivateKey, SealedBox
 from pydantic import Field
 
 from taker.market_payments import validate_payment_terms
+from taker.market_settlement import HoldInvoiceBackend
 
 
 # The market settles over Lightning only. Any other rail is rejected by schema
@@ -114,6 +122,7 @@ class MarketService:
         signing_key: CKey | BoundMarketKeys,
         encryption_key: PrivateKey | BoundMarketKeys,
         backend: BlockchainBackend,
+        invoices: HoldInvoiceBackend,
         *,
         products: list[Product],
         price_sats: int,
@@ -135,6 +144,7 @@ class MarketService:
         if self._signing_public_key() != self.authority.seller_pubkey:
             raise MarketError("Wrong seller signing key")
         self.backend = backend
+        self.invoices = invoices
         self.products = products
         self.price_sats = price_sats
         self.quote_ttl = quote_ttl
@@ -228,7 +238,7 @@ class MarketService:
             self._next_quote = time.monotonic() + 1
             height = await self._check_stake()
             self._validate_bound_keys()
-            quote_document = self.store.create_quote(
+            reserved = self.store.reserve_hold_quote(
                 self.authorization,
                 self.signing_key,
                 quote_request.buyer_pubkey,
@@ -236,10 +246,16 @@ class MarketService:
                 quote_request.certificate_pubkey,
                 quote_request.rail,
                 quote_request.max_price_sats,
+                self.price_sats,
                 int(time.time()),
                 height,
                 ttl=self.quote_ttl,
                 request_id=quote_request.request_id,
+            )
+            quote_document = (
+                reserved
+                if isinstance(reserved, SignedDocument)
+                else await self._issue_hold_quote(reserved)
             )
             quote = quote_document.verified(MarketQuote, self.authority.seller_pubkey)
             validate_payment_terms(
@@ -248,6 +264,30 @@ class MarketService:
             return {"quote": quote_document.model_dump(mode="json")}
         except (MarketKeyError, ValueError, MarketStoreError):
             return {"error": "unavailable"}
+        except Exception as exc:
+            # An LND failure leaves the reservation for the settlement reconciler,
+            # which cancels it; the buyer may retry with the same request.
+            logger.warning("Hold invoice creation failed: {}", type(exc).__name__)
+            return {"error": "unavailable"}
+
+    async def _issue_hold_quote(self, reservation: HoldReservation) -> SignedDocument:
+        """Create the reservation's hold invoice, then sign the quote that names it."""
+        expiry = reservation.invoice_expires_at - int(time.time())
+        if expiry < 1:
+            raise MarketStoreExpiredError("quote reservation has expired")
+        request = await self.invoices.add_hold_invoice(
+            reservation.payment_hash, reservation.amount_sats, expiry
+        )
+        terms = PaymentTerms(rail="lightning", request=request, amount_sats=reservation.amount_sats)
+        # The invoice must name the reserved hash and amount, outlive the quote,
+        # and be for this network before the buyer is ever shown it.
+        payment_id = validate_payment_terms(
+            terms, self.authority.bond.network, int(time.time()), reservation.quote_expires_at
+        )
+        self._validate_bound_keys()
+        return self.store.issue_hold_quote(
+            reservation.quote_id, self.signing_key, terms, payment_id, int(time.time())
+        )
 
 
 async def accept_quote(

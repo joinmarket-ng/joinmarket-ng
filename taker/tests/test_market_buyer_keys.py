@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from _taker_market_helpers import FakeHoldInvoices, settle_quote
 from bitcointx.core.key import CKey  # type: ignore[import-not-found]
 from jmcore.bitcoin import hash160
 from jmcore.credential_market import (
@@ -142,7 +143,7 @@ def _podle_record(owner: CKey, txid: str, vout: int) -> dict[str, object]:
 class _Market:
     """One loopback seller plus the buyer files the CLI needs to talk to it."""
 
-    def __init__(self, tmp_path: Path, monkeypatch, *, products: list[str], payments: int) -> None:
+    def __init__(self, tmp_path: Path, monkeypatch, *, products: list[str]) -> None:
         self.tmp_path = tmp_path
         self.settings = JoinMarketSettings(
             data_dir=tmp_path,
@@ -168,14 +169,8 @@ class _Market:
         self.authorization_file = tmp_path / "authorization.json"
         _write(self.authorization_file, canonical(authorization))
 
-        self.terms = [_payment_terms(0x40 + index) for index in range(payments)]
         self.backend = _Backend()
         store = MarketStore(tmp_path / "market" / "seller.sqlite")
-        for index, terms in enumerate(self.terms):
-            now = int(time.time())
-            from taker.market_payments import validate_payment_terms
-
-            store.add_payment(terms, validate_payment_terms(terms, "regtest", now, now + 600))
         if "podle" in products:
             for index in range(2):
                 record = _podle_record(_key(0x61 + index), str(index + 11) * 32, index)
@@ -191,6 +186,7 @@ class _Market:
             seller_key,
             PrivateKey(bytes.fromhex(bundle["encryption_key"])),
             cast(BlockchainBackend, self.backend),
+            FakeHoldInvoices(),
             products=cast(list, products),
             price_sats=100,
         )
@@ -256,7 +252,7 @@ def _bundle_pubkey(path: Path) -> str:
 
 def test_default_request_uses_a_fresh_buyer_key_per_request(tmp_path: Path, monkeypatch) -> None:
     """Two purchases must not share a buyer pubkey when no key bundle is supplied."""
-    market = _Market(tmp_path, monkeypatch, products=["podle"], payments=2)
+    market = _Market(tmp_path, monkeypatch, products=["podle"])
     try:
         first_code, first_request, _ = market.request("first")
         second_code, second_request, _ = market.request("second")
@@ -281,7 +277,7 @@ def test_default_request_uses_a_fresh_buyer_key_per_request(tmp_path: Path, monk
 
 def test_default_request_retry_reuses_the_persisted_buyer_key(tmp_path: Path, monkeypatch) -> None:
     """A retry must present the key the seller already quoted, not a rotated one."""
-    market = _Market(tmp_path, monkeypatch, products=["podle"], payments=2)
+    market = _Market(tmp_path, monkeypatch, products=["podle"])
     try:
         code, request_file, quote_file = market.request("retry")
         assert code == 0
@@ -321,7 +317,7 @@ def test_request_fails_closed_when_the_persisted_bundle_is_missing(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     """A persisted request without its key must never silently rotate to a new key."""
-    market = _Market(tmp_path, monkeypatch, products=["podle"], payments=2)
+    market = _Market(tmp_path, monkeypatch, products=["podle"])
     try:
         code, request_file, _ = market.request("lost")
         assert code == 0
@@ -340,7 +336,7 @@ def test_request_fails_closed_when_the_persisted_bundle_is_missing(
 
 def test_request_fails_closed_on_a_corrupt_bundle(tmp_path: Path, monkeypatch, capsys) -> None:
     """Unreadable key state is an error, not a reason to generate replacement keys."""
-    market = _Market(tmp_path, monkeypatch, products=["podle"], payments=2)
+    market = _Market(tmp_path, monkeypatch, products=["podle"])
     try:
         code, request_file, _ = market.request("corrupt")
         assert code == 0
@@ -380,7 +376,7 @@ def test_bond_request_uses_the_generated_renter_certificate_key(
     tmp_path: Path, monkeypatch
 ) -> None:
     """The implicit bundle must also supply a per-request renter certificate key."""
-    market = _Market(tmp_path, monkeypatch, products=["podle", "bond"], payments=1)
+    market = _Market(tmp_path, monkeypatch, products=["podle", "bond"])
     try:
         code, request_file, quote_file = market.request("bond", product="bond")
     finally:
@@ -397,7 +393,7 @@ def test_bond_request_uses_the_generated_renter_certificate_key(
 
 def test_poll_opens_the_delivery_with_the_request_file_bundle(tmp_path: Path, monkeypatch) -> None:
     """Delivery recovery only needs the request file the buyer already keeps."""
-    market = _Market(tmp_path, monkeypatch, products=["podle"], payments=1)
+    market = _Market(tmp_path, monkeypatch, products=["podle"])
     try:
         code, request_file, quote_file = market.request("poll")
         assert code == 0
@@ -405,29 +401,7 @@ def test_poll_opens_the_delivery_with_the_request_file_bundle(tmp_path: Path, mo
         credential = tmp_path / "podle.json"
         _write(credential, canonical(_podle_record(_key(0x61), "11" * 32, 0)))
         market.store.attach_credential(quote_id, json.loads(credential.read_text("ascii")))
-        package = tmp_path / "package.json"
-        preimage_file = tmp_path / "preimage"
-        _write(preimage_file, _preimage(0x40))
-        assert (
-            market_cli.run(
-                [
-                    "seller",
-                    "settle",
-                    "--data-dir",
-                    str(tmp_path),
-                    "--quote-id",
-                    quote_id,
-                    "--keys",
-                    str(market.seller_keys_file),
-                    "--preimage-file",
-                    str(preimage_file),
-                    "--acknowledge-ln-settlement",
-                    "--output",
-                    str(package),
-                ]
-            )
-            == 0
-        )
+        settle_quote(market.store, quote_id, market.service.signing_key, int(time.time()), 1)
 
         delivery = tmp_path / "delivery.json"
         assert (

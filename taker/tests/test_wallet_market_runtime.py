@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _taker_market_helpers import FakeHoldInvoices
 from bitcointx.core.key import CKey
 from jmcore.constants import MAX_MONEY
 from jmcore.credential_market import (
@@ -127,8 +128,17 @@ def _wallet(data_dir: Path) -> tuple[WalletService, _Backend]:
     return WalletService(MNEMONIC, backend, network="regtest", data_dir=data_dir), backend
 
 
+class _NullInvoices(FakeHoldInvoices):
+    async def __aenter__(self) -> _NullInvoices:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
 @pytest.fixture(autouse=True)
-def _reset_transport() -> None:
+def _reset_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wallet_market, "seller_invoice_client", lambda _settings: _NullInvoices())
     _Transport.instances.clear()
     _Transport.start_error = None
     _Transport.close_error = None

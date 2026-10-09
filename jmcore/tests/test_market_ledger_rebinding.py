@@ -15,7 +15,6 @@ from jmcore.bitcoin import hash160
 from jmcore.credential_market import (
     BondReference,
     MarketAuthorization,
-    PaymentTerms,
     canonical,
     period_at_height,
     sign_document,
@@ -78,14 +77,6 @@ def _authorization() -> object:
             bond=bond, period=period_at_height(1), seller_pubkey=bytes(seller.pub).hex()
         ),
         owner,
-    )
-
-
-def _payment(value: int) -> PaymentTerms:
-    return PaymentTerms(
-        rail="lightning",
-        request=f"regtest-payment-{value}",
-        amount_sats=1_000 + value,
     )
 
 
@@ -170,8 +161,7 @@ def _moved_ledger(
         assert other_wallet.hold_local(OTHER_WALLET_HOLD)
     credential = _podle_credential(0x41)
     store.add_inventory("podle", str(credential["commitment"]), credential)
-    store.add_payment(_payment(1), "payment-1")
-    store.create_quote(
+    store.reserve_hold_quote(
         _authorization(),
         _seller_key(0x22),
         bytes(PrivateKey(bytes([0x23]) * 32).public_key).hex(),
@@ -179,6 +169,7 @@ def _moved_ledger(
         None,
         "lightning",
         10_000,
+        1_000,
         100,
         1,
         request_id="01" * 16,
@@ -229,7 +220,7 @@ def test_rebind_moves_renamed_ledger_without_resetting_market_or_local_data(
         "commitments_path": str(target),
         "commitments_rebind_completed": _marker(source, target),
         "ledger_mode": "wallet",
-        "schema_version": "1",
+        "schema_version": "2",
     }
     assert _intent_path(database).read_bytes() == MarketStore._wallet_intent_bytes(target)
     assert _seller_rows(database) == before_seller
@@ -268,7 +259,7 @@ def test_rebind_commits_marker_before_merge_and_clears_it_after_fsynced_intent(
             "commitments_path": str(target),
             "commitments_rebind": marker,
             "ledger_mode": "wallet",
-            "schema_version": "1",
+            "schema_version": "2",
         }
         assert _intent_path(database).read_bytes() == MarketStore._wallet_intent_bytes(target)
         events.append("fsync")
@@ -279,7 +270,7 @@ def test_rebind_commits_marker_before_merge_and_clears_it_after_fsynced_intent(
             "commitments_path": str(target),
             "commitments_rebind": marker,
             "ledger_mode": "wallet",
-            "schema_version": "1",
+            "schema_version": "2",
         }
         assert _intent_path(database).read_bytes() == old_intent
         events.append("intent-start")
@@ -306,7 +297,7 @@ def test_rebind_commits_marker_before_merge_and_clears_it_after_fsynced_intent(
         "commitments_path": str(target),
         "commitments_rebind_completed": marker,
         "ledger_mode": "wallet",
-        "schema_version": "1",
+        "schema_version": "2",
     }
 
 
@@ -501,7 +492,7 @@ def test_rebind_crashes_leave_a_pending_exact_retry_and_block_normal_use(
         "commitments_path": str(expected_path),
         "commitments_rebind": marker,
         "ledger_mode": "wallet",
-        "schema_version": "1",
+        "schema_version": "2",
     }
     assert _intent_path(database).read_bytes() == expected_intent
     assert not source.exists()
@@ -510,7 +501,7 @@ def test_rebind_crashes_leave_a_pending_exact_retry_and_block_normal_use(
     with pytest.raises(MarketStoreCorruptError, match="rebinding requires explicit completion"):
         retained.hold_local("17" * 32)
     with pytest.raises(MarketStoreCorruptError, match="rebinding requires explicit completion"):
-        retained.add_payment(_payment(2), "payment-2")
+        retained.begin_hold_cancel("00" * 32)
     with pytest.raises(MarketStoreCorruptError, match="rebinding requires explicit completion"):
         retained.pending(400)
     retained.close()
@@ -527,7 +518,7 @@ def test_rebind_crashes_leave_a_pending_exact_retry_and_block_normal_use(
         "commitments_path": str(target),
         "commitments_rebind_completed": marker,
         "ledger_mode": "wallet",
-        "schema_version": "1",
+        "schema_version": "2",
     }
     assert _intent_path(database).read_bytes() == target_intent
     assert (MOVED_HISTORY_USED, None, "used", None) in _ownership_rows(database)

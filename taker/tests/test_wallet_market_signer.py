@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from _taker_market_helpers import hold_quote, settle_quote
 from bitcointx.core.key import CKey
 from jmcore.credential_market import (
     BondCredential,
@@ -111,7 +112,8 @@ def _quote(
     request_id: str = "01" * 16,
     height: int = 1,
 ) -> SignedDocument:
-    return store.create_quote(
+    return hold_quote(
+        store,
         authorization,
         seller,
         bytes(PrivateKey(bytes([0x33]) * 32).public_key).hex(),
@@ -134,7 +136,6 @@ def test_bound_seller_can_issue_and_idempotently_replay_package(tmp_path: Path) 
     authority = _authorization(bound, bond)
     try:
         store.add_inventory("bond", bond_resource(bond, 0), None)
-        store.add_payment(_payment(), "payment-1")
         quote = _quote(store, authority, bound)
         verified_quote = quote.verified(MarketQuote, bound.signing_public_key().hex())
         assert verified_quote == MarketQuote.model_validate(quote.body)
@@ -142,11 +143,11 @@ def test_bound_seller_can_issue_and_idempotently_replay_package(tmp_path: Path) 
 
         quote_id = str(quote.body["quote_id"])
         store.attach_credential(quote_id, _bond_credential(bond, certificate))
-        package = store.finalize(quote_id, bound, "settlement-1", 101, 1)
+        package = settle_quote(store, quote_id, bound, 101, 1)
         assert package.verify() == BondCredential.model_validate(
             _bond_credential(bond, certificate)
         )
-        assert store.finalize(quote_id, bound, "settlement-1", 10_000, 2017) == package
+        assert settle_quote(store, quote_id, bound, 10_000, 2017) == package
         assert store.get_package(quote_id) == package
     finally:
         store.close()
@@ -210,7 +211,6 @@ def test_revoked_bound_seller_rolls_back_before_and_during_signing(
     certificate = _key(0x44)
     try:
         store.add_inventory("bond", bond_resource(bond, 0), None)
-        store.add_payment(_payment(), "payment-1")
         authority = _authorization(bound, bond)
         parent.close()
         with pytest.raises(MarketKeysClosedError):
@@ -231,7 +231,7 @@ def test_revoked_bound_seller_rolls_back_before_and_during_signing(
 
         monkeypatch.setattr(BoundMarketKeys, "sign_document", close_after_first_signature)
         with pytest.raises(MarketKeysClosedError):
-            store.finalize(quote_id, restored, "settlement-1", 101, 1)
+            settle_quote(store, quote_id, restored, 101, 1)
         assert store.get_package(quote_id) is None
         with sqlite3.connect(store.path) as connection:
             state, settlement_ref, package = connection.execute(
@@ -240,7 +240,7 @@ def test_revoked_bound_seller_rolls_back_before_and_during_signing(
         assert (state, settlement_ref, package) == ("live", None, None)
 
         recovered = WalletMarketKeys(SEED, "regtest").bind(scope)
-        package = store.finalize(quote_id, recovered, "settlement-1", 101, 1)
+        package = settle_quote(store, quote_id, recovered, 101, 1)
         assert isinstance(package, CredentialPackage)
     finally:
         store.close()

@@ -49,8 +49,10 @@ pit, and the patched LND build in `lnd/`.
 The market sells external PoDLE openings to takers and rents delegated fidelity
 bond certificates to makers. It is independent of rings and buyouts. Sellers
 push signed listings that last one hour and re-announce them every 30 minutes.
-Payment is Lightning-only and there is no fair exchange: the seller decides when
-a payment is settled and when to release a credential.
+Payment is Lightning-only through seller hold invoices: a payment settles only
+after the seller has prepared the delivery, and is refunded otherwise. This is
+still not a fair exchange, since a seller that settles can withhold the
+delivery; the signed quote and settled payment are your evidence.
 
 ## Prerequisites
 
@@ -238,7 +240,9 @@ jm-market request --data-dir "$DATA" --listing seller.json --product podle \
 ```
 
 Verify the signed quote and invoice (network, amount, seller) and pay it from
-your own Lightning wallet. Then:
+your own Lightning wallet. The payment stays pending until the seller settles
+it, which happens automatically once the delivery is ready; if `poll` reports
+nothing yet, poll again shortly. Then:
 
 ```sh
 jm-market poll --data-dir "$DATA" --seller seller.json --request-file podle.json
@@ -252,11 +256,11 @@ For a bond rental use `--product bond`, and import with
 ### 5. Sell Credentials
 
 Selling needs seller keys, an offline-signed bond authorization, inventory, and
-pre-generated Lightning invoices. The full sequence (`keygen`, `public`,
-`authorize`, `export-podle`, `seller add-inventory`, `seller add-payment`,
-`serve`, `seller settle`) and the wallet-native `jmwalletd` seller API are in the
-[credential market reference](credential-market.md). Never release a delivery
-before verifying payment in your own Lightning node.
+a separate LND node configured under `[market]` for hold invoices. The full
+sequence (`keygen`, `public`, `authorize`, `export-podle`, `seller add-inventory`,
+`serve`, and `seller attach` for bond rentals) and the wallet-native `jmwalletd`
+seller API are in the [credential market reference](credential-market.md).
+`serve` settles each payment only once its delivery is prepared.
 
 ## Mainnet Notes
 

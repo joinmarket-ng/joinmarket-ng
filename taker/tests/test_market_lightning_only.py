@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _taker_market_helpers import FakeHoldInvoices, hold_quote
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import pubkey_to_p2wpkh_address
 from jmcore.credential_market import (
@@ -39,9 +40,7 @@ from nacl.public import PrivateKey
 from pydantic import ValidationError
 from test_market_payments import make_invoice
 
-import taker.wallet_market as wallet_market
 from taker.market_service import MarketService, QuoteRequest, accept_quote
-from taker.wallet_market import WalletMarketSeller, WalletMarketSellerOptions
 
 MNEMONIC = "all " * 11 + "all"
 ONCHAIN_ADDRESS = pubkey_to_p2wpkh_address(b"\x02" + b"\x42" * 32, "regtest")
@@ -131,6 +130,7 @@ def _service(tmp_path: Path, bond: BondReference) -> tuple[MarketService, Market
         SELLER_KEY,
         PrivateKey.generate(),
         _Backend(),
+        FakeHoldInvoices(),
         products=["bond"],
         price_sats=1_000,
     )
@@ -144,22 +144,13 @@ def test_quote_request_schema_refuses_another_rail() -> None:
         )
 
 
-def test_store_refuses_queueing_a_non_lightning_payment(tmp_path: Path) -> None:
-    with MarketStore(tmp_path / "market.sqlite") as store:
-        with pytest.raises(ValueError, match="invalid payment terms"):
-            store.add_payment(_onchain_terms(), "onchain-1")
-        assert (
-            store._connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0  # noqa: SLF001
-        )
-
-
 def test_store_refuses_reserving_a_non_lightning_rail(tmp_path: Path) -> None:
     bond = _bond()
     service, store = _service(tmp_path, bond)
     try:
-        store.add_payment(_lightning_terms(), "lightning-1")
         with pytest.raises(ValueError, match="rail must be lightning"):
-            store.create_quote(
+            hold_quote(
+                store,
                 service.authorization,
                 SELLER_KEY,
                 bytes(PrivateKey.generate().public_key).hex(),
@@ -183,8 +174,7 @@ async def test_respond_refuses_another_rail_before_allocation(tmp_path: Path) ->
     service, store = _service(tmp_path, bond)
     buyer_key = PrivateKey.generate()
     try:
-        store.add_payment(_lightning_terms(), "lightning-1")
-        with patch.object(store, "create_quote", side_effect=AssertionError) as allocation:
+        with patch.object(store, "reserve_hold_quote", side_effect=AssertionError) as allocation:
             response = await service.respond(
                 "J5ABCDEFGHJKLMNP", _quote_request_body(buyer_key, "onchain", "01" * 16)
             )
@@ -276,33 +266,3 @@ def _bound_authorization(
         OWNER_KEY,
     )
     return bound, authorization
-
-
-@pytest.mark.asyncio
-async def test_wallet_seller_refuses_queueing_a_non_lightning_payment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    backend = _Backend()
-    wallet = WalletService(MNEMONIC, backend, network="regtest", data_dir=tmp_path)
-    _activate_store(tmp_path, wallet)
-    bond = _bond()
-    bound, authorization = _bound_authorization(wallet, bond)
-    wallet.create_market_authorization = AsyncMock(return_value=(bound, authorization))  # type: ignore[method-assign]
-    monkeypatch.setattr(wallet_market, "MarketTransport", _Transport)
-    seller = WalletMarketSeller(
-        wallet,
-        _settings(tmp_path),
-        WalletMarketSellerOptions(bond=bond.outpoint, products=["bond"], price_sats=1_000),
-    )
-    try:
-        await seller.start()
-        store = seller._store  # noqa: SLF001
-        assert store is not None
-
-        with patch.object(store, "add_payment") as queued:
-            with pytest.raises(ValueError, match="Unsupported payment rail"):
-                seller.add_payment(_onchain_terms())
-            queued.assert_not_called()
-    finally:
-        await seller.stop()
-        await wallet.close()

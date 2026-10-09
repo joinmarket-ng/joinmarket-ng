@@ -209,37 +209,35 @@ jm-market seller add-inventory \
   --authorization market/authorization.json
 ```
 
-Generate every invoice in an external Lightning wallet or node before adding it.
-The market neither owns nor contacts that wallet or node. Queue one fresh
-invoice per possible sale. This `PaymentTerms` example is **NOT WIRE**; the
-BOLT11 value is a placeholder, never a real invoice:
+### Connect The Seller Lightning Node
 
-```json
-{
-  "rail": "lightning",
-  "request": "<bolt11-invoice, NOT WIRE>",
-  "amount_sats": 1000
-}
+Payments use LND hold invoices. For every quote the seller creates one invoice
+whose preimage only the seller store knows. The buyer's payment is locked in
+the seller's node until the package is prepared; only then does the seller
+settle it. If anything goes wrong before that (no payment, an underpayment, a
+payment arriving too close to its HTLC timeout, or a bond credential that never
+arrives), the seller cancels the invoice and the buyer's funds return. A buyer
+who pays just before the quote expires is still served: each invoice outlives
+its quote by two minutes, and an accepted payment completes after the quote
+expiry.
+
+Configure the node in `config.toml`:
+
+```toml
+[market]
+lnd_grpc_url = "127.0.0.1:10009"
+lnd_tls_cert_path = "~/.lnd/tls.cert"
+lnd_macaroon_path = "~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon"
 ```
 
-The invoice must be for the configured Bitcoin network (`lnbc`, `lntb`, signet
-`lntbs`, or `lnbcrt`), carry an exact amount equal to `amount_sats`, and not
-expire before the quote it will back.
+Use LND's default `invoice.macaroon`; selling never needs more. Run a separate
+LND node from any ring channel node, and give it at least one public channel
+with enough inbound liquidity, because the invoices carry no route hints.
+`serve` refuses to start without these settings.
 
-```bash
-jm-market seller add-payment \
-  --data-dir "$MARKET_DATA" \
-  --terms market/payment-lightning.json \
-  --ttl 300
-```
-
-`add-payment --ttl` is a 1 to 900 second validation horizon, primarily so a
-BOLT11 invoice must outlive the immediate queueing check. It is distinct from
-the quote lifetime. On-chain terms are refused here, before anything is queued.
-
-Set `--price-sats` consistently with the queued `amount_sats`. The listing
-price is indicative; the buyer must rely on the signed quote's payment amount
-and its own `--max-price-sats` cap.
+Set `--price-sats` to the price you want: every quote's invoice is created for
+exactly that amount. The buyer still relies on the signed quote and its own
+`--max-price-sats` cap.
 
 ### Serve Over Tor
 
@@ -275,17 +273,23 @@ for one hour and the seller re-announces them every 30 minutes. The store permit
 most one new quote per second globally. These are resource bounds, not DoS or
 Sybil protection.
 
-### Settle Locally
+### Settlement
 
-Inspect pending live quotes locally:
+`serve` settles on its own: it polls the node, and once a quote's payment is
+held and its credential is attached, it finalizes the package and releases the
+preimage. Only one `serve` (or wallet-native seller) may run per market store.
+Restarting it is safe: a held payment is settled or refunded on the next run.
+
+Inspect pending quotes, including expired quotes whose invoice can still be
+paid:
 
 ```bash
 jm-market seller pending --data-dir "$MARKET_DATA" --output market/pending.json
 ```
 
-For a bond quote, obtain the renter's public metadata from the buyer. On the
-offline owner machine, sign only that renter public key, then attach the public
-credential on the seller host:
+A PoDLE quote needs nothing more. For a bond quote, obtain the renter's public
+metadata from the buyer. On the offline owner machine, sign only that renter
+public key, then attach the public credential on the seller host:
 
 ```bash
 jm-market sign-bond \
@@ -300,26 +304,14 @@ jm-market seller attach \
   --credential market/renter-bond-credential.json
 ```
 
-Settlement is a deliberate local act. First obtain confirmation from the
-external Lightning wallet or node that the invoice really was paid, save the
-32-byte preimage in an owner-only file, then give the explicit acknowledgment.
-A remotely claimed preimage never settles a trade, and a preimage alone proves
-neither the payer nor the payment.
+Attach it before the invoice expires. A held payment for a quote without a
+credential is refunded ten minutes after its invoice expiry, or earlier when
+the HTLC nears its timeout.
 
-```bash
-jm-market seller settle \
-  --data-dir "$MARKET_DATA" \
-  --quote-id "$QUOTE_ID" \
-  --keys market/seller-keys.json \
-  --preimage-file market/settled-preimage.bin \
-  --acknowledge-ln-settlement \
-  --output market/finalized-package.json
-```
-
-Finalization atomically consumes the inventory
-and payment request and persists the signed allocation, delivery, and
-buyer-sealed package. To recover a finalized package after the quote has
-expired or after a process restart:
+Finalization atomically consumes the inventory and persists the signed
+allocation, delivery, and buyer-sealed package; the buyer can fetch the
+delivery once the payment is settled. To recover a settled package after the
+quote has expired or after a process restart:
 
 ```bash
 jm-market seller export \
@@ -447,9 +439,7 @@ requests queued while the wallet is locked or switched.
 | `GET /seller` | Starting, running, or stopped status, public seller identity, and sanitized startup error |
 | `POST /seller/stop` | Stop this seller; keep the wallet and shared backend open |
 | `POST /seller/inventory` | `{"product":"bond"}` for the configured owned bond, or `{"product":"podle","credential":...}` for a validated external opening |
-| `POST /seller/payments` | Externally generated `PaymentTerms`, as in the CLI workflow |
-| `GET /seller/pending` | Live signed quotes for this seller authority |
-| `POST /seller/settle/{quote_id}` | One locally verified settlement form, described below |
+| `GET /seller/pending` | Signed quotes for this seller authority that can still be paid |
 
 Start accepts this shape (the outpoint is a placeholder, **NOT WIRE** data):
 
@@ -470,20 +460,20 @@ the ledger, sync the wallet, or rescan to find a bond. Directory relay uses the
 configured Tor connection and a fresh nickname; native direct onion hosting is
 not configured by these endpoints.
 
-Queue inventory and Lightning invoices explicitly after startup. The native quote
-lifetime is currently 1 to 900 seconds, default 300. Settlement takes
-`{"preimage":"<64-lowercase-hex, NOT WIRE>","acknowledge_ln_settlement":true}`.
-A Lightning preimage
-must come from the operator's payment wallet or node, with explicit local
-settlement acknowledgment. Remote market messages cannot settle a trade, and none
-of these operations sends a payment.
+The native seller uses the same `[market]` LND node and hold-invoice settlement
+as `jm-market serve` (see Connect The Seller Lightning Node); startup fails
+without it. Add inventory after startup. The native quote lifetime is currently
+1 to 900 seconds, default 300. There is no settlement endpoint: the seller
+settles each held payment itself once the package is ready, or cancels it so
+the buyer is refunded. Remote market messages cannot settle a trade, and none of
+these operations sends a payment.
 
-For a bond sale, the wallet creates the renter's delegated certificate internally
-before finalization. The bond spending key stays inside the wallet. Finalization
-persists the signed package and buyer-sealed delivery before returning. If an API
-response is lost or authentication expires after finalization, the buyer can still
-retrieve the saved delivery. Use `jm-market seller export` to recover a finalized
-package, including after expiry or restart; do not pay again based on an API error.
+For a bond sale, the wallet creates the renter's delegated certificate itself
+once the buyer's payment is held. The bond spending key stays inside the wallet.
+The signed package and buyer-sealed delivery are persisted before the payment is
+settled, so a stop or crash in between only delays delivery: the next run
+settles or refunds. Use `jm-market seller export` to recover a settled package,
+including after expiry or restart.
 
 Seller startup and settlement chain checks allow wallet lock to proceed. Lock
 revokes capabilities before stopping seller resources; a failed close keeps the

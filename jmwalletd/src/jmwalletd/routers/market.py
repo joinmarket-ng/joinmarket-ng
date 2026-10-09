@@ -6,13 +6,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, model_validator
 
 from jmcore.credential_market import (
-    CredentialPackage,
-    Hex32,
     MarketModel,
-    PaymentTerms,
     SignedDocument,
 )
 from jmcore.external_podle import ExternalPoDLE
@@ -41,22 +38,6 @@ class InventoryRequest(MarketModel):
     def matching_product(self) -> InventoryRequest:
         if (self.product == "podle") != (self.credential is not None):
             raise ValueError("Only PoDLE inventory requires a supplied credential")
-        return self
-
-
-class SettlementRequest(MarketModel):
-    """A Lightning settlement claim: a preimage plus explicit local acknowledgment."""
-
-    preimage: SecretStr
-    acknowledge_ln_settlement: bool = False
-
-    @model_validator(mode="after")
-    def settlement_form(self) -> SettlementRequest:
-        value = self.preimage.get_secret_value()
-        if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
-            raise ValueError("Preimage must be 32 lowercase hexadecimal bytes")
-        if not self.acknowledge_ln_settlement:
-            raise ValueError("Local Lightning settlement acknowledgment is required")
         return self
 
 
@@ -217,28 +198,6 @@ async def add_inventory(
         return {"recorded": True}
 
 
-@router.post("/wallet/{walletname}/market/seller/payments")
-async def add_payment(
-    walletname: str,
-    request: Request,
-    body: PaymentTerms,
-    _auth: dict[str, Any] = Depends(require_auth),
-    _wallet: None = Depends(require_wallet_match),
-    state: DaemonState = Depends(get_daemon_state),
-) -> dict[str, bool]:
-    async with state.wallet_lifecycle_lock:
-        require_auth(request, state)
-        require_wallet_match(walletname, state)
-        seller = state._market_seller_ref
-        if seller is None:
-            raise ActionNotAllowed("Start the market seller first.")
-        try:
-            seller.add_payment(body)
-        except (MarketStoreError, ValueError) as exc:
-            raise ActionNotAllowed("Payment terms could not be queued.") from exc
-        return {"recorded": True}
-
-
 @router.get("/wallet/{walletname}/market/seller/pending")
 async def pending_quotes(
     walletname: str,
@@ -257,36 +216,3 @@ async def pending_quotes(
             return seller.pending_quotes()
         except (MarketStoreError, ValueError) as exc:
             raise ActionNotAllowed("Seller quotes are unavailable.") from exc
-
-
-@router.post("/wallet/{walletname}/market/seller/settle/{quote_id}")
-async def settle_quote(
-    walletname: str,
-    quote_id: Hex32,
-    request: Request,
-    body: SettlementRequest,
-    _auth: dict[str, Any] = Depends(require_auth),
-    _wallet: None = Depends(require_wallet_match),
-    state: DaemonState = Depends(get_daemon_state),
-) -> CredentialPackage:
-    async with state.wallet_lifecycle_lock:
-        require_auth(request, state)
-        require_wallet_match(walletname, state)
-        seller = state._market_seller_ref
-        if seller is None:
-            raise ActionNotAllowed("Start the market seller first.")
-    # Let wallet lock revoke/cancel service while chain verification awaits.
-    try:
-        package = await seller.settle(
-            quote_id,
-            preimage=bytes.fromhex(body.preimage.get_secret_value()),
-            acknowledge_ln_settlement=body.acknowledge_ln_settlement,
-        )
-    except (MarketStoreError, ValueError) as exc:
-        raise ActionNotAllowed("Settlement could not be verified or finalized.") from exc
-    async with state.wallet_lifecycle_lock:
-        require_auth(request, state)
-        require_wallet_match(walletname, state)
-        if state._market_seller_ref is not seller:
-            raise ActionNotAllowed("Seller session changed during settlement.")
-        return package

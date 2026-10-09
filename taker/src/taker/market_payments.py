@@ -1,14 +1,10 @@
 """Validation helpers for experimental credential-market payment terms.
 
-The market settles over Lightning only. These helpers validate payment requests
-and settlements. They never send a payment or acknowledge delivery of a
-credential.
+The market settles over Lightning only. These helpers validate payment
+requests. They never send a payment or acknowledge delivery of a credential.
 """
 
 from __future__ import annotations
-
-import hashlib
-import hmac
 
 from bech32 import CHARSET, bech32_decode
 from jmcore.credential_market import PaymentTerms
@@ -51,33 +47,6 @@ def validate_payment_terms(
     return _validate_lightning_request(
         terms.request, terms.amount_sats, network_value, now_value, quote_expiry
     )
-
-
-def verify_lightning_preimage(
-    terms: PaymentTerms,
-    network: str | NetworkType,
-    preimage: bytes,
-    now: int,
-    expires_at: int,
-) -> str:
-    """Validate a Lightning preimage against an invoice payment hash.
-
-    A preimage proves neither payer identity nor actual settlement. The invoice
-    provider knows its preimage, so a seller must obtain explicit local-wallet
-    acknowledgement before delivery. Never use a remotely supplied preimage to
-    trigger credential delivery.
-    """
-    payment_id = validate_payment_terms(terms, network, now, expires_at)
-    if not payment_id.startswith("ln:"):
-        raise PaymentValidationError("Lightning settlement requires a Lightning payment request")
-    if not isinstance(preimage, bytes) or len(preimage) != 32:
-        raise PaymentValidationError("Lightning preimage must be exactly 32 bytes")
-
-    payment_hash = payment_id.removeprefix("ln:")
-    actual_hash = hashlib.sha256(preimage).hexdigest()
-    if not hmac.compare_digest(actual_hash, payment_hash):
-        raise PaymentValidationError("Lightning preimage does not match payment hash")
-    return payment_id
 
 
 def payment_uri(terms: PaymentTerms) -> str:
