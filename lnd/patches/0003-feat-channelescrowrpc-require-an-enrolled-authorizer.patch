@@ -19,7 +19,7 @@ sessions are unchanged. The authorizer cannot change while an escrow
 record exists, except for the first enrollment of a legacy session.
 ---
  channeldb/channel_escrow.go                   | 130 +++-
- channeldb/channel_escrow_test.go              | 149 +++-
+ channeldb/channel_escrow_test.go              | 150 +++-
  lnrpc/channelescrowrpc/authorization.go       | 170 +++++
  lnrpc/channelescrowrpc/authorization_test.go  | 167 +++++
  lnrpc/channelescrowrpc/channelescrow.pb.go    | 705 ++++++++++++++----
@@ -29,7 +29,7 @@ record exists, except for the first enrollment of a legacy session.
  lnrpc/channelescrowrpc/config_active.go       |   7 +
  lnrpc/channelescrowrpc/server.go              |  28 +-
  subrpcserver_config.go                        |   8 +
- 11 files changed, 1391 insertions(+), 153 deletions(-)
+ 11 files changed, 1392 insertions(+), 153 deletions(-)
  create mode 100644 lnrpc/channelescrowrpc/authorization.go
  create mode 100644 lnrpc/channelescrowrpc/authorization_test.go
 
@@ -251,7 +251,7 @@ index fc6f08e..e7ac7c5 100644
  		return nil, err
  	}
 diff --git a/channeldb/channel_escrow_test.go b/channeldb/channel_escrow_test.go
-index 0fae3be..040ed87 100644
+index 0fae3be..031f531 100644
 --- a/channeldb/channel_escrow_test.go
 +++ b/channeldb/channel_escrow_test.go
 @@ -8,9 +8,14 @@ import (
@@ -312,7 +312,7 @@ index 0fae3be..040ed87 100644
  	record := testLockedEscrowRecord()
  	// Absence alone is never a cancellation receipt.
  	require.ErrorIs(t, channel.CancelEscrow(record.SessionID), ErrNoEscrowRecord)
-@@ -227,3 +236,139 @@ func TestEscrowCancellationReceipt(t *testing.T) {
+@@ -227,3 +236,140 @@ func TestEscrowCancellationReceipt(t *testing.T) {
  	// A receipt for a different epoch is not affirmative evidence.
  	require.ErrorIs(t, reloaded.CancelEscrow(record.SessionID), ErrNoEscrowRecord)
  }
@@ -407,6 +407,7 @@ index 0fae3be..040ed87 100644
 +
 +	record := testEscrowRecord()
 +	record.PolicyVersion = 1
++	record.Stage = EscrowParentSigned
 +	decoded, err := decodeEscrowRecord(encodeEscrowRecordV1(t, record))
 +	require.NoError(t, err)
 +	require.Equal(t, uint32(0), decoded.PolicyVersion)
