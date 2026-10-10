@@ -15,7 +15,6 @@ import secrets
 import sqlite3
 import stat
 import threading
-import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
@@ -65,21 +64,14 @@ class WalletLedgerDiagnosis(TypedDict):
     """A momentary, non-authoritative wallet ledger inspection result."""
 
     state: WalletLedgerDiagnosisState
-    schema_version: str | None
     reason: str
 
 
 HoldState = Literal["reserved", "open", "canceling", "canceled", "settling", "settled"]
 
-# Version 2 replaced operator-queued payment requests with one hold invoice per
-# quote. Version 1 stores are migrated on open (see _migrate_from_v1).
-_SCHEMA_VERSION = "2"
-_LEGACY_SCHEMA_VERSION = "1"
 _STANDALONE_MODE = "standalone"
 _WALLET_MODE = "wallet"
-_UNSUPPORTED_SCHEMA_MESSAGE = (
-    "unsupported market store format; keep the file and use a release that supports it"
-)
+_UNSUPPORTED_SCHEMA_MESSAGE = "unsupported market store format; keep the file for inspection"
 # A hold invoice outlives its quote, so a payment sent just before the quote
 # expires can still be accepted and completed.
 HOLD_INVOICE_GRACE_SECONDS = 120
@@ -279,7 +271,7 @@ class MarketStore:
         and validate the store normally before taking an operational action.
         """
 
-        unavailable = cls._wallet_diagnosis("unavailable", None, "inspection unavailable")
+        unavailable = cls._wallet_diagnosis("unavailable", "inspection unavailable")
         if not isinstance(path, Path) or not isinstance(commitments_path, Path):
             return unavailable
         try:
@@ -295,31 +287,31 @@ class MarketStore:
 
         if database_before is None:
             if intent_before is None:
-                diagnosis = cls._wallet_diagnosis("absent", None, "no ledger artifacts")
+                diagnosis = cls._wallet_diagnosis("absent", "no ledger artifacts")
             else:
                 diagnosis = cls._wallet_diagnosis(
-                    "recovery_required", None, "ledger artifacts are incomplete"
+                    "recovery_required", "ledger artifacts are incomplete"
                 )
             return cls._finish_wallet_diagnosis(
                 path, intent_path, database_before, intent_before, diagnosis
             )
         if not cls._signature_is_regular(database_before):
             diagnosis = cls._wallet_diagnosis(
-                "recovery_required", None, "market store artifact is invalid"
+                "recovery_required", "market store artifact is invalid"
             )
             return cls._finish_wallet_diagnosis(
                 path, intent_path, database_before, intent_before, diagnosis
             )
         if intent_before is not None and not cls._signature_is_regular(intent_before):
             diagnosis = cls._wallet_diagnosis(
-                "recovery_required", None, "ledger intent artifact is invalid"
+                "recovery_required", "ledger intent artifact is invalid"
             )
             return cls._finish_wallet_diagnosis(
                 path, intent_path, database_before, intent_before, diagnosis
             )
 
         connection: sqlite3.Connection | None = None
-        diagnosis = cls._wallet_diagnosis("recovery_required", None, "wallet ledger is invalid")
+        diagnosis = cls._wallet_diagnosis("recovery_required", "wallet ledger is invalid")
         try:
             connection = sqlite3.connect(
                 path.absolute().as_uri() + "?mode=ro&immutable=1",
@@ -336,22 +328,21 @@ class MarketStore:
             inspection._closed = False
             inspection._lock = threading.RLock()
             inspection._verify_schema(readonly=True)
-            version = inspection._schema_version(connection)
             if inspection._ledger_mode(connection) == _STANDALONE_MODE:
-                diagnosis = cls._wallet_diagnosis("standalone", version, "standalone market store")
+                diagnosis = cls._wallet_diagnosis("standalone", "standalone market store")
             else:
                 bound_path = inspection._verify_wallet_ledger(connection, readonly=True)
                 if bound_path != canonical_path:
                     diagnosis = cls._wallet_diagnosis(
-                        "recovery_required", version, "commitments binding does not match"
+                        "recovery_required", "commitments binding does not match"
                     )
                 else:
                     state = inspection._wallet_state_for_connection(connection, wallet_id)
-                    diagnosis = cls._wallet_diagnosis(state, version, f"wallet ledger is {state}")
+                    diagnosis = cls._wallet_diagnosis(state, f"wallet ledger is {state}")
         except sqlite3.DatabaseError:
-            diagnosis = cls._wallet_diagnosis("unavailable", None, "inspection unavailable")
+            diagnosis = cls._wallet_diagnosis("unavailable", "inspection unavailable")
         except (MarketStoreError, OSError, TypeError, ValueError):
-            diagnosis = cls._wallet_diagnosis("recovery_required", None, "wallet ledger is invalid")
+            diagnosis = cls._wallet_diagnosis("recovery_required", "wallet ledger is invalid")
         finally:
             if connection is not None:
                 with suppress(sqlite3.Error):
@@ -376,16 +367,14 @@ class MarketStore:
                 or cls._artifact_signature(path) != database_before
                 or cls._artifact_signature(intent_path) != intent_before
             ):
-                return cls._wallet_diagnosis("unavailable", None, "inspection unavailable")
+                return cls._wallet_diagnosis("unavailable", "inspection unavailable")
         except OSError:
-            return cls._wallet_diagnosis("unavailable", None, "inspection unavailable")
+            return cls._wallet_diagnosis("unavailable", "inspection unavailable")
         return diagnosis
 
     @staticmethod
-    def _wallet_diagnosis(
-        state: WalletLedgerDiagnosisState, schema_version: str | None, reason: str
-    ) -> WalletLedgerDiagnosis:
-        return {"state": state, "schema_version": schema_version, "reason": reason}
+    def _wallet_diagnosis(state: WalletLedgerDiagnosisState, reason: str) -> WalletLedgerDiagnosis:
+        return {"state": state, "reason": reason}
 
     @staticmethod
     def _artifact_signature(path: Path) -> tuple[int, int, int, int, int, int] | None:
@@ -1327,7 +1316,7 @@ class MarketStore:
             ).fetchone()
         if row is None:
             raise MarketStoreUnavailableError("quote does not exist")
-        if row["hold_state"] not in (None, "settled"):
+        if row["hold_state"] != "settled":
             return None
         delivery = row["sealed_delivery"]
         if delivery is None:
@@ -1350,7 +1339,7 @@ class MarketStore:
             ).fetchone()
         if row is None:
             raise MarketStoreUnavailableError("quote does not exist")
-        if row["hold_state"] not in (None, "settled"):
+        if row["hold_state"] != "settled":
             return None
         package = row["package"]
         if package is None:
@@ -1387,8 +1376,6 @@ class MarketStore:
                     self._create_schema()
                 else:
                     self._verify_schema()
-                    if self._schema_version(self._connection) == _LEGACY_SCHEMA_VERSION:
-                        self._migrate_from_v1(int(time.time()))
                 self._connection.commit()
             except BaseException:
                 self._connection.rollback()
@@ -1465,7 +1452,6 @@ class MarketStore:
             "CREATE INDEX quotes_live_expiry ON quotes(state, expires_at)",
             "CREATE INDEX wallet_ledger_state ON wallet_ledger(state)",
             *_HOLD_INVOICE_SCHEMA,
-            f"INSERT INTO metadata (key, value) VALUES ('schema_version', '{_SCHEMA_VERSION}')",
             f"INSERT INTO metadata (key, value) VALUES ('ledger_mode', '{_STANDALONE_MODE}')",
         )
         for statement in statements:
@@ -1485,107 +1471,51 @@ class MarketStore:
             "quotes",
             "wallet_ledger",
             "podle_ownership",
+            "hold_invoices",
         }.issubset(tables):
             raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
-        self._schema_version(self._connection)
+        current_columns = {
+            "metadata": {"key", "value"},
+            "payments": {"payment_id", "rail", "request", "terms", "state", "quote_id"},
+            "quotes": {
+                "quote_id",
+                "request_id",
+                "request_fingerprint",
+                "quote_document",
+                "buyer_pubkey",
+                "product",
+                "resource",
+                "certificate_pubkey",
+                "inventory_id",
+                "payment_id",
+                "created_at",
+                "expires_at",
+                "state",
+                "pending_credential",
+                "settlement_ref",
+                "package",
+                "sealed_delivery",
+            },
+            "hold_invoices": _HOLD_INVOICE_COLUMNS,
+        }
+        for table, columns in current_columns.items():
+            if not columns.issubset(self._table_columns(self._connection, table)):
+                raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
+        quote_without_hold = self._connection.execute(
+            """
+            SELECT 1 FROM quotes
+            WHERE NOT EXISTS (
+                SELECT 1 FROM hold_invoices WHERE hold_invoices.quote_id = quotes.quote_id
+            ) LIMIT 1
+            """
+        ).fetchone()
+        if quote_without_hold is not None:
+            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
         self._verify_ledger_structure(self._connection)
         if self._ledger_mode(self._connection) == _STANDALONE_MODE:
             self._verify_standalone_ledger(self._connection)
             return
         self._verify_wallet_ledger(self._connection, readonly=readonly, rebind_paths=rebind_paths)
-
-    def _schema_version(self, connection: sqlite3.Connection) -> Literal["1", "2"]:
-        row = connection.execute(
-            "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone()
-        if row is None or row["value"] not in (_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION):
-            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
-        version = cast(Literal["1", "2"], row["value"])
-        has_holds = "hold_invoices" in self._table_names(connection)
-        if has_holds != (version == _SCHEMA_VERSION):
-            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
-        if has_holds and not _HOLD_INVOICE_COLUMNS.issubset(
-            self._table_columns(connection, "hold_invoices")
-        ):
-            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
-        return version
-
-    def _migrate_from_v1(self, now: int) -> None:
-        """Upgrade a version 1 store inside the caller's open write transaction.
-
-        Version 1 quotes were paid through operator-queued invoices and settled
-        manually, which this release no longer supports. A quote that a buyer can
-        still pay must finish under the previous release, so the upgrade waits for
-        it rather than stranding the payment. Expired quotes follow version 1
-        semantics (inventory released), and queued payment requests stay unused
-        forever. A private snapshot of the version 1 file is written first.
-        """
-        connection = self._connection
-        live = connection.execute(
-            """
-            SELECT COUNT(*) AS count, MAX(expires_at) AS until FROM quotes
-            WHERE state = 'live' AND expires_at > ?
-            """,
-            (now,),
-        ).fetchone()
-        if live is not None and int(live["count"]) > 0:
-            raise MarketStoreUnavailableError(
-                f"market store upgrade waits for {int(live['count'])} live quote(s) from the"
-                " previous release; settle them with that release, or retry in"
-                f" {int(live['until']) - now} seconds"
-            )
-        self._snapshot_v1()
-        expired = connection.execute(
-            "SELECT quote_id, inventory_id FROM quotes WHERE state = 'live'"
-        ).fetchall()
-        for row in expired:
-            connection.execute(
-                "UPDATE quotes SET state = 'expired' WHERE quote_id = ?", (str(row["quote_id"]),)
-            )
-            connection.execute(
-                """
-                UPDATE inventory SET state = 'available', reservation_quote_id = NULL
-                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
-                """,
-                (int(row["inventory_id"]), str(row["quote_id"])),
-            )
-        for statement in _HOLD_INVOICE_SCHEMA:
-            connection.execute(statement)
-        connection.execute(
-            "UPDATE metadata SET value = ? WHERE key = 'schema_version' AND value = ?",
-            (_SCHEMA_VERSION, _LEGACY_SCHEMA_VERSION),
-        )
-
-    def _snapshot_v1(self) -> None:
-        """Write a private, fsynced copy of the committed version 1 store."""
-        name = f"{self.path.name}.v1-backup"
-        backup = self.path.with_name(name)
-        suffix = 1
-        while backup.exists() or backup.is_symlink():
-            suffix += 1
-            backup = self.path.with_name(f"{name}.{suffix}")
-        descriptor = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-        os.close(descriptor)
-        source = sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True)
-        try:
-            target = sqlite3.connect(backup)
-            try:
-                source.backup(target)
-            finally:
-                target.close()
-        finally:
-            source.close()
-        descriptor = os.open(backup, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        if os.name != "nt":
-            directory = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
 
     @staticmethod
     def _ledger_mode(connection: sqlite3.Connection) -> LedgerMode:
@@ -2477,26 +2407,18 @@ class MarketStore:
     def _expire_live_quotes(connection: sqlite3.Connection, now: int) -> None:
         """Mark stale quotes expired.
 
-        Inventory of a quote with a hold invoice stays reserved until LND confirms
+        Inventory stays reserved until LND confirms
         the invoice canceled (:meth:`complete_hold_cancel`); an HTLC may still be
         accepted until the invoice itself expires.
         """
         expired = connection.execute(
-            "SELECT quote_id, inventory_id FROM quotes WHERE state = 'live' AND expires_at <= ?",
+            "SELECT quote_id FROM quotes WHERE state = 'live' AND expires_at <= ?",
             (now,),
         ).fetchall()
         for row in expired:
             connection.execute(
                 "UPDATE quotes SET state = 'expired' WHERE quote_id = ? AND state = 'live'",
                 (str(row["quote_id"]),),
-            )
-            connection.execute(
-                """
-                UPDATE inventory SET state = 'available', reservation_quote_id = NULL
-                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
-                AND NOT EXISTS (SELECT 1 FROM hold_invoices WHERE quote_id = ?)
-                """,
-                (int(row["inventory_id"]), str(row["quote_id"]), str(row["quote_id"])),
             )
 
     @staticmethod

@@ -72,7 +72,7 @@ def test_standalone_store_sells_without_a_wallet_until_explicit_activation(tmp_p
         ownership = connection.execute(
             "SELECT commitment, wallet_id, state FROM podle_ownership"
         ).fetchall()
-    assert metadata == {"schema_version": "2", "ledger_mode": "standalone"}
+    assert metadata == {"ledger_mode": "standalone"}
     assert wallets == (0,)
     assert ownership == [(commitment, None, "market_inventory")]
     assert not path.with_name(f"{path.name}.wallet-ledger").exists()

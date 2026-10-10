@@ -84,7 +84,6 @@ def test_diagnose_absent_directory_creates_nothing(tmp_path: Path) -> None:
 
     assert diagnosis == {
         "state": "absent",
-        "schema_version": None,
         "reason": "no ledger artifacts",
     }
     assert not path.parent.exists()
@@ -100,7 +99,7 @@ def test_diagnose_missing_database_with_intent_requires_recovery(tmp_path: Path)
     )
 
     assert diagnosis["state"] == "recovery_required"
-    assert diagnosis["schema_version"] is None
+    assert "schema_version" not in diagnosis
     assert not path.exists()
     assert intent_path.read_bytes() == b"{}"
 
@@ -118,7 +117,6 @@ def test_diagnose_standalone_store_preserves_artifact(tmp_path: Path) -> None:
 
     assert diagnosis == {
         "state": "standalone",
-        "schema_version": "2",
         "reason": "standalone market store",
     }
     assert path.read_bytes() == before
@@ -153,15 +151,10 @@ def test_diagnose_reports_ready_disabled_and_recovery_required(tmp_path: Path) -
     )
 
     assert ready["state"] == "ready"
-    assert ready["schema_version"] == "2"
     assert disabled["state"] == "disabled"
-    assert disabled["schema_version"] == "2"
     assert mismatched["state"] == "recovery_required"
-    assert mismatched["schema_version"] == "2"
     assert activating["state"] == "activating"
-    assert activating["schema_version"] == "2"
     assert recovery_required["state"] == "recovery_required"
-    assert recovery_required["schema_version"] == "2"
 
 
 @pytest.mark.parametrize("artifact", ("missing", "malformed", "symlink"))
@@ -247,7 +240,6 @@ def test_diagnose_journal_artifact_is_unavailable_and_unchanged(tmp_path: Path) 
 
     assert diagnosis == {
         "state": "unavailable",
-        "schema_version": None,
         "reason": "inspection unavailable",
     }
     assert {

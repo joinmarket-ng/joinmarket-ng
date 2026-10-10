@@ -220,7 +220,6 @@ def test_rebind_moves_renamed_ledger_without_resetting_market_or_local_data(
         "commitments_path": str(target),
         "commitments_rebind_completed": _marker(source, target),
         "ledger_mode": "wallet",
-        "schema_version": "2",
     }
     assert _intent_path(database).read_bytes() == MarketStore._wallet_intent_bytes(target)
     assert _seller_rows(database) == before_seller
@@ -259,7 +258,6 @@ def test_rebind_commits_marker_before_merge_and_clears_it_after_fsynced_intent(
             "commitments_path": str(target),
             "commitments_rebind": marker,
             "ledger_mode": "wallet",
-            "schema_version": "2",
         }
         assert _intent_path(database).read_bytes() == MarketStore._wallet_intent_bytes(target)
         events.append("fsync")
@@ -270,7 +268,6 @@ def test_rebind_commits_marker_before_merge_and_clears_it_after_fsynced_intent(
             "commitments_path": str(target),
             "commitments_rebind": marker,
             "ledger_mode": "wallet",
-            "schema_version": "2",
         }
         assert _intent_path(database).read_bytes() == old_intent
         events.append("intent-start")
@@ -297,7 +294,6 @@ def test_rebind_commits_marker_before_merge_and_clears_it_after_fsynced_intent(
         "commitments_path": str(target),
         "commitments_rebind_completed": marker,
         "ledger_mode": "wallet",
-        "schema_version": "2",
     }
 
 
@@ -492,7 +488,6 @@ def test_rebind_crashes_leave_a_pending_exact_retry_and_block_normal_use(
         "commitments_path": str(expected_path),
         "commitments_rebind": marker,
         "ledger_mode": "wallet",
-        "schema_version": "2",
     }
     assert _intent_path(database).read_bytes() == expected_intent
     assert not source.exists()
@@ -518,7 +513,6 @@ def test_rebind_crashes_leave_a_pending_exact_retry_and_block_normal_use(
         "commitments_path": str(target),
         "commitments_rebind_completed": marker,
         "ledger_mode": "wallet",
-        "schema_version": "2",
     }
     assert _intent_path(database).read_bytes() == target_intent
     assert (MOVED_HISTORY_USED, None, "used", None) in _ownership_rows(database)

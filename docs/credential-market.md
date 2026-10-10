@@ -365,8 +365,11 @@ The private ledger identifier is SHA256 of the key bytes of the additional
 seed/passphrase across roles and networks, is not the eight-character wallet
 fingerprint, and must not be published as a market identity.
 
-The durable seller store is shared as `jmcore.market_store`. It uses schema
-version 1 with an explicit `ledger_mode` of `standalone` or `wallet`.
+The durable seller store is shared as `jmcore.market_store`, with an explicit
+`ledger_mode` of `standalone` or `wallet`. This experimental format has no
+legacy migration or schema-version machinery. Existing files must have the current
+structure, including a hold-invoice record for every quote; unsupported files are
+rejected rather than migrated, reset, or released for resale.
 
 ### Wallet Ledger Activation
 
@@ -434,7 +437,7 @@ requests queued while the wallet is locked or switched.
 
 | Method and Path | Request or Result |
 | --- | --- |
-| `GET /ledger` | Read-only state, schema version, and a short diagnosis; no private wallet identifier or credential data |
+| `GET /ledger` | Read-only state and a short diagnosis; no private wallet identifier or credential data |
 | `POST /seller/start` | `bond` outpoint, `products` list, positive `price_sats`, optional `quote_ttl`; returns 202 with startup status |
 | `GET /seller` | Starting, running, or stopped status, public seller identity, and sanitized startup error |
 | `POST /seller/stop` | Stop this seller; keep the wallet and shared backend open |

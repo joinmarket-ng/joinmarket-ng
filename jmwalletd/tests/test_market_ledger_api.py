@@ -121,7 +121,6 @@ async def test_ledger_diagnosis_is_authenticated_read_only_and_redacted(tmp_path
     assert response.status_code == 200
     assert response.json() == {
         "state": "absent",
-        "schema_version": None,
         "reason": "no ledger artifacts",
     }
     assert _tree_snapshot(tmp_path) == before
@@ -212,7 +211,7 @@ async def test_ledger_activate_block_and_recover_return_durable_states(tmp_path:
 
     assert activated.status_code == 200
     assert activated.json()["state"] == "ready"
-    assert activated.json()["schema_version"] == "2"
+    assert "schema_version" not in activated.json()
     assert blocked.status_code == 200
     assert blocked.json()["state"] == "recovery_required"
     assert recovered.status_code == 200
@@ -379,7 +378,7 @@ async def test_ledger_rebind_uses_canonical_target_and_refuses_invalid_requests(
     )
     assert rebound.status_code == 200
     assert rebound.json()["state"] == "ready"
-    assert rebound.json()["schema_version"] == "2"
+    assert "schema_version" not in rebound.json()
     assert target == daemon_dir / "cmtdata" / "commitments.json"
     assert intent.read_bytes() == MarketStore._wallet_intent_bytes(target)
     assert not source.exists()
