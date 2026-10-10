@@ -965,6 +965,8 @@ build_images() {
         build --parallel 2>&1 | tee "${PARALLEL_DIR}/build.log"
     docker build -t "${JM_BUYOUT_LND_IMAGE:-jm-buyout-lnd:v0.21.3-beta}" \
         lnd 2>&1 | tee "${PARALLEL_DIR}/build-lnd.log"
+    bash "${SCRIPT_DIR}/build-legacy-buyout-lnd.sh" \
+        2>&1 | tee "${PARALLEL_DIR}/build-legacy-lnd.log"
     configure_shared_images
     log_success "Docker images built"
 }

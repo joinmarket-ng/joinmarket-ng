@@ -51,6 +51,13 @@ picks it up.
 Because the patches are applied to the working tree and not committed, the
 built binary reports `v0.21.3-beta-dirty`.
 
+The signed-session upgrade regression also needs a test-only image containing
+just patches 1 and 2. Build it with `bash scripts/build-legacy-buyout-lnd.sh`
+from the repository root, then run the LND regtests. CI builds both images.
+Never use `jm-buyout-lnd:legacy-v1` with live funds: it deliberately lacks
+authorizer enforcement, so the test can prove that signed sessions survive an
+upgrade on the same channel database without requiring a mnemonic or enrollment.
+
 ## Scope and limitations
 
 - Exactly one parent transaction per escrow session. There is no multi-parent

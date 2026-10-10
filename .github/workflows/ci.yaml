@@ -185,6 +185,7 @@ jobs:
         if: matrix.python-version == '3.14'
         run: |
           docker build -t jm-buyout-lnd:v0.21.3-beta lnd
+          bash scripts/build-legacy-buyout-lnd.sh
           pytest -c pytest.ini jmswap/tests/test_lnd_buyout_regtest.py \
             jmswap/tests/test_lnd_invoices_regtest.py \
             -m docker --no-cov --fail-on-skip -v

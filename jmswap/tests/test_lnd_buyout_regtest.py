@@ -48,9 +48,9 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Generator, Iterator, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -87,7 +87,7 @@ from jmswap.buyout_config import BuyoutSettings
 from jmswap.buyout_messages import Outpoint, Prevout
 from jmswap.buyout_runtime import BuyoutRuntime
 from jmswap.buyout_settlement import BuyoutSettlement
-from jmswap.buyout_signing import BuyoutBuyer, BuyoutPolicy, CounterpartySigner
+from jmswap.buyout_signing import BuyoutBuyer, BuyoutPolicy, CounterpartySigner, _funding_partial
 from jmswap.buyout_store import BuyoutStore
 from jmswap.buyout_terms import BuyoutTerms, ProtocolError
 from jmswap.buyout_transport import BuyoutTransport
@@ -108,6 +108,7 @@ pytestmark = [pytest.mark.docker, pytest.mark.timeout(600)]
 # --------------------------------------------------------------------------- #
 
 LND_IMAGE = os.environ.get("JM_BUYOUT_LND_IMAGE", "jm-buyout-lnd:v0.21.3-beta")
+LEGACY_LND_IMAGE = os.environ.get("JM_BUYOUT_LEGACY_LND_IMAGE", "jm-buyout-lnd:legacy-v1")
 BITCOIN_IMAGE = os.environ.get("JM_BUYOUT_BITCOIN_IMAGE", "bitcoin/bitcoin:30.0")
 COMPOSE_FILE = Path(__file__).resolve().parent / "regtest" / "compose.yml"
 REPO_TMP = Path(__file__).resolve().parents[2] / "tmp"
@@ -157,6 +158,7 @@ class BuyoutRegtest:
     secrets_dir: Path
     node_ids: dict[str, str]
     compose_override_file: str | None = None
+    lnd_image: str = LND_IMAGE
 
     # -- Compose ------------------------------------------------------------ #
 
@@ -169,6 +171,7 @@ class BuyoutRegtest:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env={**os.environ, "JM_BUYOUT_LND_IMAGE": self.lnd_image},
         )
         if done.returncode:
             raise RegtestError(f"compose {args[0]} failed: {done.stderr.strip()}")
@@ -365,7 +368,7 @@ async def peer_client(stack: BuyoutRegtest, node: str) -> AsyncIterator[LndPeerC
         yield client
 
 
-def _require_docker() -> None:
+def _require_docker(lnd_image: str = LND_IMAGE) -> None:
     try:
         done = subprocess.run(
             ["docker", "version", "--format", "{{.Server.Version}}"],
@@ -377,7 +380,7 @@ def _require_docker() -> None:
         raise RegtestError(f"{DOCKER_REQUIRED}: {exc}") from exc
     if done.returncode:
         raise RegtestError(f"{DOCKER_REQUIRED}: {done.stderr.strip()}")
-    for image in (LND_IMAGE, BITCOIN_IMAGE):
+    for image in (lnd_image, BITCOIN_IMAGE):
         found = subprocess.run(
             ["docker", "image", "inspect", image],
             capture_output=True,
@@ -519,9 +522,11 @@ async def _wait_for_post_restart_catchup(
     )
 
 
-def _isolated_stack(*, maker_stack: bool = False) -> Iterator[BuyoutRegtest]:
+def _isolated_stack(
+    *, maker_stack: bool = False, lnd_image: str = LND_IMAGE
+) -> Generator[BuyoutRegtest, None, None]:
     """Start one throwaway stack, fund both nodes, and always tear it down."""
-    _require_docker()
+    _require_docker(lnd_image)
     REPO_TMP.mkdir(exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="buyout-regtest-", dir=REPO_TMP))
     directory.chmod(0o700)
@@ -535,6 +540,7 @@ def _isolated_stack(*, maker_stack: bool = False) -> Iterator[BuyoutRegtest]:
         directory,
         {},
         compose_override_file=os.environ.get(override_env),
+        lnd_image=lnd_image,
     )
     try:
         running.compose("up", "-d", "--wait", "--wait-timeout", "180")
@@ -944,6 +950,113 @@ async def _freeze_both(
 # --------------------------------------------------------------------------- #
 # The buyout parent, end to end
 # --------------------------------------------------------------------------- #
+
+
+async def test_signed_v1_session_survives_hardened_upgrade_without_authorizer() -> None:
+    """An actual old-build signature remains recoverable on the same LND volumes."""
+    _require_docker()
+    fixture = _isolated_stack(lnd_image=LEGACY_LND_IMAGE)
+    stack = next(fixture)
+    try:
+        point = _open_private_taproot_channel(stack, enroll=False)
+        session = secrets.token_bytes(32)
+        async with AsyncExitStack() as connections:
+            clients = [
+                await connections.enter_async_context(escrow_client(stack, node)) for node in NODES
+            ]
+            with pytest.raises(LndEscrowRpcError) as unsupported:
+                await clients[0].policy_versions()
+            assert unsupported.value.code is grpc.StatusCode.UNIMPLEMENTED
+            alice, _ = await _freeze_both(clients, point, session)
+            parent = _build_parent(
+                stack,
+                point,
+                Prevout(value=alice.capacity_sat, script_pubkey=alice.funding_script.hex()),
+                EscrowKeys.fresh(),
+            )
+            await asyncio.gather(
+                *(
+                    client.prepare(
+                        point,
+                        session,
+                        parent.raw,
+                        list(parent.prevouts),
+                        parent.channel_input_index,
+                    )
+                    for client in clients
+                )
+            )
+            attempts = await asyncio.gather(*(client.begin(point, session) for client in clients))
+            # The old proto ignores these new fields. No channel is enrolled,
+            # and no authorizer is loaded or used anywhere in this scenario.
+            partials = await asyncio.gather(
+                *(
+                    client.sign(
+                        point, session, attempts[i], attempts[1 - i].public_nonce, bytes(64)
+                    )
+                    for i, client in enumerate(clients)
+                )
+            )
+            before = await asyncio.gather(*(client.status(point, session) for client in clients))
+            assert all(status.stage is EscrowStage.PARENT_SIGNED for status in before)
+
+        stack.compose("stop", *NODES)
+        upgraded = replace(stack, lnd_image=LND_IMAGE)
+        upgraded.compose("up", "-d", "--no-deps", "--force-recreate", *NODES)
+        for node in NODES:
+            assert _wait_for_sync(upgraded, node) == stack.node_ids[node]
+        async with AsyncExitStack() as connections:
+            clients = [
+                await connections.enter_async_context(escrow_client(upgraded, node))
+                for node in NODES
+            ]
+            recovered: list[bytes] = []
+            for i, client in enumerate(clients):
+                assert await client.policy_versions() == frozenset({1})
+                status = await client.status(point, session)
+                assert status.stage is EscrowStage.PARENT_SIGNED
+                assert status.active_attempt is None
+                assert status.parent_txid == before[i].parent_txid == parent.txid
+                assert status.durable_local_nonce == before[i].durable_local_nonce
+                assert status.durable_remote_nonce == before[i].durable_remote_nonce
+                assert (
+                    status.durable_local_partial == before[i].durable_local_partial == partials[i]
+                )
+                recovered.append(
+                    await _funding_partial(
+                        client,
+                        None,
+                        point,
+                        session,
+                        attempts[i],
+                        attempts[1 - i].public_nonce,
+                        cast(Any, parent),
+                        list(parent.prevouts),
+                        parent.channel_input_index,
+                    )
+                )
+            finalized = await asyncio.gather(
+                *(
+                    client.finalize(point, session, attempts[i], recovered[1 - i])
+                    for i, client in enumerate(clients)
+                )
+            )
+            assert finalized[0] == finalized[1]
+            completed = upgraded.bitcoin("signrawtransactionwithwallet", finalized[0].hex())
+            assert completed["complete"], completed.get("errors")
+            acceptance = upgraded.bitcoin("testmempoolaccept", json.dumps([completed["hex"]]))[0]
+            assert acceptance["allowed"], acceptance
+            assert upgraded.bitcoin("sendrawtransaction", str(completed["hex"])) == parent.txid
+            upgraded.mine_and_confirm(parent.txid)
+            for client in clients:
+                status = await client.status(point, session)
+                assert status.stage is EscrowStage.FINALIZED
+                assert status.finalized_parent == finalized[0]
+    except BaseException:
+        print(stack.logs())
+        raise
+    finally:
+        fixture.close()
 
 
 async def test_channel_input_pays_the_escrow_with_the_split_held_first(
