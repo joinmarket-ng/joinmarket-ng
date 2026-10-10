@@ -1780,6 +1780,64 @@ async def test_maker_minimum_fee_policy_rejects_low_fee_and_missing_prevout():
     assert f"{'bb' * 32}:1" in sensitive_warning.call_args.args[1]
 
 
+@pytest.mark.parametrize(
+    ("taproot", "foreign_script", "output_script", "expected_vsize"),
+    [
+        (False, "0014" + "22" * 20, "0014" + "11" * 20, 271),
+        (True, "5120" + "22" * 32, "5120" + "11" * 32, 298),
+        (True, "0014" + "22" * 20, "5120" + "11" * 32, 308),
+        (True, "6a", "5120" + "11" * 32, 298),
+        (True, "5120" + "22" * 32, "0014" + "11" * 20, 250),
+    ],
+)
+@pytest.mark.asyncio
+async def test_maker_minimum_fee_uses_pit_inputs_and_actual_outputs(
+    taproot: bool, foreign_script: str, output_script: str, expected_vsize: int
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from jmcore.bitcoin import TxInput, TxOutput, serialize_transaction
+    from jmcore.models import OfferType
+    from jmwallet.backends.base import UTXO
+
+    from maker.coinjoin import CoinJoinSession
+
+    backend = MagicMock()
+    backend.get_utxo = AsyncMock(return_value=UTXO("bb" * 32, 1, 10_000, "", 1, foreign_script))
+    session = CoinJoinSession(
+        taker_nick="J5FeePolicy",
+        offer=MagicMock(ordertype=OfferType.TR0_RELATIVE if taproot else OfferType.SW0_RELATIVE),
+        wallet=MagicMock(address_type="p2tr" if taproot else "p2wpkh"),
+        backend=backend,
+        minimum_fee_rate_sat_vb=1.0,
+    )
+    session.our_utxos = {
+        ("aa" * 32, 0): MagicMock(
+            value=10_000, scriptpubkey="5120" + "33" * 32 if taproot else "0014" + "33" * 20
+        )
+    }
+
+    def transaction(fee: int) -> str:
+        return serialize_transaction(
+            version=2,
+            inputs=[TxInput.from_hex("aa" * 32, 0), TxInput.from_hex("bb" * 32, 1)],
+            outputs=[
+                TxOutput(value=value, script=bytes.fromhex(output_script))
+                for value in (5_000, 5_000, 5_000, 5_000 - fee)
+            ],
+            locktime=0,
+        ).hex()
+
+    assert "below required" in (
+        await session._verify_minimum_miner_fee(transaction(expected_vsize - 1), None) or ""
+    )
+    assert await session._verify_minimum_miner_fee(transaction(expected_vsize), None) is None
+    assert backend.get_utxo.await_args_list == [
+        (("bb" * 32, 1), {}),
+        (("bb" * 32, 1), {}),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_zero_minimum_fee_still_verifies_prevouts_and_negative_fees() -> None:
     from unittest.mock import AsyncMock, MagicMock, patch

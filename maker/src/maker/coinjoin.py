@@ -19,7 +19,12 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import address_to_scriptpubkey, parse_transaction
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    estimate_vsize,
+    parse_transaction,
+    serialize_output,
+)
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     estimate_p2wpkh_vsize,
@@ -970,6 +975,31 @@ class CoinJoinSession:
         total_output = sum(output.value for output in tx.outputs)
         fee = total_input - total_output
         vsize = estimate_p2wpkh_vsize(len(tx.inputs), len(tx.outputs))
+        if self.pit_script_type == "p2tr":
+            prevout_scripts = {
+                outpoint: bytes.fromhex(utxo.scriptpubkey)
+                for outpoint, utxo in self.our_utxos.items()
+            }
+            prevout_scripts.update(
+                (outpoint, bytes.fromhex(utxo.scriptpubkey))
+                for outpoint, (utxo, _) in zip(foreign_inputs, lookup_results, strict=True)
+                if utxo is not None
+            )
+            # A foreign witness is not available before signing. Count known
+            # P2WPKH inputs accordingly, and otherwise assume a Taproot key spend
+            # (as in ring fee verification) to avoid rejecting larger spend paths.
+            input_types = [
+                "p2wpkh"
+                if len(prevout_scripts[(inp.txid, inp.vout)]) == 22
+                and prevout_scripts[(inp.txid, inp.vout)][:2] == b"\x00\x14"
+                else "p2tr"
+                for inp in tx.inputs
+            ]
+            # Outputs are fully specified already, so use their exact serialized
+            # sizes instead of treating Taproot outputs as P2WPKH outputs.
+            vsize = estimate_vsize(input_types, []) + sum(
+                len(serialize_output(output)) for output in tx.outputs
+            )
         if fee < 0:
             return "CoinJoin has a negative miner fee"
         minimum_fee_rate = self.minimum_fee_rate_sat_vb
