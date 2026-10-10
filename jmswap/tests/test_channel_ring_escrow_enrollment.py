@@ -203,6 +203,40 @@ async def test_endpoint_must_resolve_to_the_recorded_node_before_enrolling(
     assert node_info["closed"] == 1
 
 
+async def test_later_node_mismatch_refuses_all_enrollment_and_closes_both_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid first endpoint cannot enroll before the remaining endpoints pass."""
+    config = _config(tmp_path, "alpha", "beta")
+    config.nodes["beta"] = SimpleNamespace(
+        **{**vars(config.nodes["alpha"]), "lnd_grpc_url": "https://other:10009"}
+    )
+    checked: list[str] = []
+    closed: list[str] = []
+
+    async def info(self: LndBackend, **_: object) -> Any:
+        checked.append(self.host)
+        identity = NODE_ID if self.host == "lnd:10009" else "03" + "22" * 32
+        return SimpleNamespace(identity_pubkey=identity, network="regtest")
+
+    async def close(self: LndBackend) -> None:
+        closed.append(self.host)
+
+    monkeypatch.setattr(LndBackend, "node_info", info)
+    monkeypatch.setattr(LndBackend, "close", close)
+    with pytest.raises(RingAuthorizationError, match="another LND identity"):
+        await authorize_recorded_ring_channels(
+            config,
+            [_record((0, 1)), _record((2, 3), node="beta")],
+            network="regtest",
+            wallet_identity=WALLET,
+            authorizer_pubkey=KEY,
+        )
+    assert checked == ["lnd:10009", "other:10009"]
+    assert closed == checked
+    assert FakeEscrow.instances == []
+
+
 @pytest.mark.parametrize(
     ("record", "match"),
     [
