@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any
 from unittest.mock import AsyncMock
 
+import grpc  # type: ignore[import-untyped]
 import pytest
 from jmcore.bitcoin import (
     TxInput,
@@ -61,13 +62,18 @@ FUNDEE_RESERVE = 15_000
 
 
 class FakeStream:
-    def __init__(self, update: Any = None, *, delay: float = 0) -> None:
+    def __init__(
+        self, update: Any = None, *, delay: float = 0, error: Exception | None = None
+    ) -> None:
         self.update = update
         self.delay = delay
+        self.error = error
 
     async def read(self) -> Any:
         if self.delay:
             await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
         return self.update
 
 
@@ -104,6 +110,8 @@ class FakeStub:
         self.connect_requests: list[Any] = []
         self.pending_responses: list[Any] = []
         self.open_errors: list[Exception] = []
+        self.open_read_errors: list[Exception] = []
+        self.open_streams: list[FakeStream] = []
         self.open_delay = 0.0
         self.acceptor_requests: list[Any] = []
         self.acceptor_call: FakeAcceptorCall | None = None
@@ -139,7 +147,7 @@ class FakeStub:
         self.open_requests.append(request)
         if self.open_errors:
             raise self.open_errors.pop(0)
-        return FakeStream(
+        stream = FakeStream(
             ln.OpenStatusUpdate(
                 pending_chan_id=request.funding_shim.psbt_shim.pending_chan_id,
                 psbt_fund=ln.ReadyForPsbtFunding(
@@ -148,7 +156,10 @@ class FakeStub:
                 ),
             ),
             delay=self.open_delay,
+            error=self.open_read_errors.pop(0) if self.open_read_errors else None,
         )
+        self.open_streams.append(stream)
+        return stream
 
     async def FundingStateStep(self, request: Any) -> Any:  # noqa: N802
         self.funding_steps.append(request)
@@ -505,6 +516,133 @@ async def test_open_retries_peer_not_online_without_changing_pending_id() -> Non
     assert {bytes(r.funding_shim.psbt_shim.pending_chan_id) for r in stub.open_requests} == {
         PENDING_ID
     }
+
+
+def _open_rpc_error(details: str, code: grpc.StatusCode = grpc.StatusCode.UNKNOWN) -> Exception:
+    return grpc.aio.AioRpcError(
+        code,
+        initial_metadata=grpc.aio.Metadata(),
+        trailing_metadata=grpc.aio.Metadata(),
+        details=details,
+    )
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+async def test_open_retries_only_pre_funding_peer_disconnect_and_retains_success(
+    failures: int,
+) -> None:
+    stub = FakeStub()
+    stub.open_read_errors = [
+        _open_rpc_error(f"peer {FUNDEE_ID} disconnected") for _ in range(failures)
+    ]
+    target = backend(stub)
+    negotiated = await negotiate(target)
+    assert len(stub.open_requests) == failures + 1
+    assert all(request is stub.open_requests[0] for request in stub.open_requests)
+    assert negotiated.pending_channel_id == PENDING_ID
+    assert len(stub.connect_requests) == failures + 1
+    assert stub.funding_steps == []
+    assert list(target._pending) == [PENDING_ID]
+    assert target._pending[PENDING_ID].stream is stub.open_streams[-1]
+    raw, utxos = funding_tx()
+    await target.verify_external_funding(negotiated, raw, get_txid(raw), 0, utxos)
+    assert stub.funding_steps[-1].WhichOneof("trigger") == "psbt_verify"
+    assert len(stub.open_requests) == failures + 1
+
+
+async def test_open_pre_funding_disconnect_has_three_attempt_budget() -> None:
+    stub = FakeStub()
+    stub.open_read_errors = [_open_rpc_error(f"peer {FUNDEE_ID} disconnected") for _ in range(3)]
+    target = backend(stub)
+    with pytest.raises(LndRpcError, match="disconnected"):
+        await negotiate(target)
+    assert len(stub.open_requests) == len(stub.connect_requests) == 3
+    assert not target._pending
+    assert stub.funding_steps == []
+
+
+async def test_open_pre_funding_disconnect_does_not_reconnect_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    stub = FakeStub()
+    stub.open_read_errors = [_open_rpc_error(f"peer {FUNDEE_ID} disconnected")]
+    target = backend(stub)
+    clock = [0.0]
+
+    async def exhaust_deadline(_delay: float) -> None:
+        clock[0] = 3.0
+
+    monkeypatch.setattr("jmswap.lnd.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr("jmswap.lnd.asyncio.sleep", exhaust_deadline)
+    with pytest.raises(LndTimeoutError, match="OpenChannel"):
+        await target.start_external_channel(external_request())
+    assert len(stub.open_requests) == len(stub.connect_requests) == 1
+    assert not target._pending
+    assert stub.funding_steps == []
+
+
+async def test_open_timeout_after_safe_disconnect_still_cancels_the_new_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = FakeStub()
+    stub.open_read_errors = [_open_rpc_error(f"peer {FUNDEE_ID} disconnected")]
+    target = backend(stub)
+    original_read = FakeStream.read
+
+    async def read(self: FakeStream) -> Any:
+        if self.error is None:
+            await asyncio.Event().wait()
+        return await original_read(self)
+
+    monkeypatch.setattr(FakeStream, "read", read)
+    with pytest.raises(LndTimeoutError, match="OpenChannel"):
+        await negotiate(target)
+    assert len(stub.open_requests) == len(stub.connect_requests) == 2
+    assert not target._pending
+    assert [step.WhichOneof("trigger") for step in stub.funding_steps] == ["shim_cancel"]
+
+
+@pytest.mark.parametrize(
+    ("details", "code"),
+    [
+        ("peer disconnected", grpc.StatusCode.UNKNOWN),
+        (f"peer {OPENER_ID} disconnected", grpc.StatusCode.UNKNOWN),
+        (f"peer {FUNDEE_ID} disconnected", grpc.StatusCode.UNAVAILABLE),
+        (f"peer {FUNDEE_ID} disconnected", grpc.StatusCode.DEADLINE_EXCEEDED),
+        (f"peer {FUNDEE_ID} disconnected during funding", grpc.StatusCode.UNKNOWN),
+    ],
+)
+async def test_open_does_not_retry_ambiguous_disconnect(
+    details: str, code: grpc.StatusCode
+) -> None:
+    stub = FakeStub()
+    stub.open_read_errors = [_open_rpc_error(details, code)]
+    target = backend(stub)
+    with pytest.raises(LndRpcError, match="disconnected"):
+        await negotiate(target)
+    assert len(stub.open_requests) == len(stub.connect_requests) == 1
+    assert not target._pending
+    assert stub.funding_steps == []
+
+
+async def test_open_does_not_retry_disconnect_after_psbt_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = FakeStub()
+    target = backend(stub)
+    negotiated = await negotiate(target)
+    monkeypatch.setattr(
+        stub,
+        "FundingStateStep",
+        AsyncMock(side_effect=_open_rpc_error(f"peer {FUNDEE_ID} disconnected")),
+    )
+    raw, utxos = funding_tx()
+    with pytest.raises(LndRpcError, match="PsbtVerify"):
+        await target.verify_external_funding(negotiated, raw, get_txid(raw), 0, utxos)
+    assert len(stub.open_requests) == len(stub.connect_requests) == 1
+    assert target._pending[PENDING_ID].verified is None
 
 
 async def test_open_timeout_attempts_safe_cancel() -> None:

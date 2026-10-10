@@ -290,6 +290,12 @@ Stop and investigate if a ring record is corrupt, blocked, or unresolved. Never
 delete ring journals, binding registries, wallet metadata, commitment files,
 market stores, LND state, or buyout journals to retry.
 
+Channel opening retries a peer that is not online and the exact LND error
+`peer <expected-node-id> disconnected` within the original deadline and a
+three-attempt budget. That qualified error occurs before funding registration.
+Bare `peer disconnected` and errors after the PSBT funding update are not retried:
+funding state or asynchronous cleanup may already exist.
+
 ```sh
 jm-maker ring-records --component maker --config-file "$MAKER_CONFIG"
 jm-maker ring-records --component taker --config-file "$TAKER_CONFIG"

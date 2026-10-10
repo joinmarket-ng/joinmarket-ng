@@ -718,6 +718,8 @@ class LndBackend:
     async def _negotiate_external_channel(
         self, request: ExternalChannelRequest
     ) -> FundingNegotiation:
+        import grpc  # type: ignore[import-untyped]
+
         self._ensure()
         pending_id = bytes(request.pending_channel_id)
         if pending_id in self._seen_pending_ids:
@@ -764,11 +766,13 @@ class LndBackend:
         stream: Any = None
         update: Any = None
         last_error: Exception | None = None
+        pre_funding_disconnect = False
         for attempt in range(3):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
+                pre_funding_disconnect = False
                 stream = self._stub.OpenChannel(open_request)
                 update = await asyncio.wait_for(stream.read(), remaining)
                 last_error = None
@@ -778,19 +782,33 @@ class LndBackend:
                 break
             except Exception as exc:
                 last_error = exc
-                if "not online" not in str(exc).lower() or attempt == 2:
+                # This exact LND error is emitted before InitFundingWorkflow.
+                # Bare "peer disconnected" can occur after a PSBT intent exists,
+                # whose asynchronous cleanup may race reuse of the pending ID.
+                pre_funding_disconnect = (
+                    isinstance(exc, grpc.RpcError)
+                    and exc.code() == grpc.StatusCode.UNKNOWN
+                    and exc.details() == f"peer {request.peer_node_id} disconnected"
+                )
+                if (
+                    not pre_funding_disconnect and "not online" not in str(exc).lower()
+                ) or attempt == 2:
                     raise
                 await asyncio.sleep(
                     min(0.25 * (attempt + 1), max(0.0, deadline - time.monotonic()))
                 )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 await self.connect_peer(
                     request.peer_node_id,
                     request.peer_host,
-                    timeout_seconds=max(0.1, deadline - time.monotonic()),
+                    timeout_seconds=remaining,
                 )
         if update is None:
-            with contextlib.suppress(Exception):
-                await self._cancel_pending_id(pending_id, timeout_seconds=2.0)
+            if not pre_funding_disconnect:
+                with contextlib.suppress(Exception):
+                    await self._cancel_pending_id(pending_id, timeout_seconds=2.0)
             raise LndTimeoutError(
                 "OpenChannel did not negotiate funding before timeout"
             ) from last_error
