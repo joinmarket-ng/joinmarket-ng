@@ -37,9 +37,10 @@ def test_manifest_builds_recovery_enabled_libsecp256k1() -> None:
 
     assert secp_module["buildsystem"] == "cmake-ninja"
     assert "-DSECP256K1_ENABLE_MODULE_RECOVERY=ON" in secp_module["config-opts"]
+    assert "-DSECP256K1_ENABLE_MODULE_MUSIG=ON" in secp_module["config-opts"]
     source = secp_module["sources"][0]
     assert source["type"] == "git"
-    assert source["commit"] == "e3a885d42a7800c1ccebad94ad1e2b82c4df5c65"
+    assert source["commit"] == "6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d"
 
 
 def test_latest_appstream_release_matches_project_version() -> None:

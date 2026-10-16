@@ -30,6 +30,7 @@ ARG DEBIAN_SNAPSHOT
 RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-apt-install.sh \
     sh /tmp/docker-apt-install.sh \
     build-essential \
+    cmake \
     libffi-dev \
     libsodium-dev \
     pkg-config
@@ -38,6 +39,10 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
 # When not provided, pip install runs without it (non-reproducible but works)
 # Usage: docker build --build-arg SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ...
 ARG SOURCE_DATE_EPOCH
+
+# Keep the MuSig2-capable native library inside the copied runtime environment.
+RUN --mount=type=bind,source=scripts/build_secp256k1.py,target=/tmp/build_secp256k1.py \
+    python /tmp/build_secp256k1.py --prefix /opt/venv --build-dir /build/secp256k1
 
 # Stamp the commit/ref into the built wheels (issue #451).
 ARG JOINMARKET_BUILD_COMMIT
@@ -63,6 +68,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 # while keeping the image layer small (the cache lives on the host, not in the image).
 COPY jmcore/requirements.txt /build/requirements-jmcore.txt
 COPY jmwallet/requirements.txt /build/requirements-jmwallet.txt
+COPY jmswap/requirements.txt /build/requirements-jmswap.txt
 COPY maker/requirements.txt /build/requirements-maker.txt
 COPY taker/requirements.txt /build/requirements-taker.txt
 COPY orderbook_watcher/requirements.txt /build/requirements-obwatcher.txt
@@ -73,6 +79,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
     pip install \
         -r /build/requirements-jmcore.txt \
         -r /build/requirements-jmwallet.txt \
+        -r /build/requirements-jmswap.txt \
         -r /build/requirements-maker.txt \
         -r /build/requirements-taker.txt \
         -r /build/requirements-obwatcher.txt \
@@ -84,6 +91,8 @@ COPY jmcore/pyproject.toml /build/jmcore/
 COPY jmcore/setup.py /build/jmcore/
 COPY jmwallet/src /build/jmwallet/src
 COPY jmwallet/pyproject.toml /build/jmwallet/
+COPY jmswap/src /build/jmswap/src
+COPY jmswap/pyproject.toml /build/jmswap/
 COPY maker/src /build/maker/src
 COPY maker/pyproject.toml /build/maker/
 COPY taker/src /build/taker/src
@@ -103,7 +112,7 @@ COPY --chmod=0644 completions/*.bash completions/jm-completions-loader.sh /build
 
 # Normalize file timestamps so local working-copy mtimes don't differ from CI clone
 RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then \
-        find /build/jmcore /build/jmwallet /build/maker /build/taker \
+        find /build/jmcore /build/jmwallet /build/jmswap /build/maker /build/taker \
              /build/orderbook_watcher /build/jmwalletd /build/tumbler \
              /build/completions \
              -exec touch -d @${SOURCE_DATE_EPOCH} {} +; \
@@ -113,6 +122,7 @@ RUN if [ -n "$SOURCE_DATE_EPOCH" ]; then export SOURCE_DATE_EPOCH=$SOURCE_DATE_E
     pip install --no-cache-dir --no-deps --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/jmwallet \
+        /build/jmswap \
         /build/maker \
         /build/taker \
         /build/orderbook_watcher \
@@ -143,7 +153,9 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
         /usr/local/lib/python${PYTHON_VERSION%.*}/site-packages/pip-*.dist-info
 
 COPY --from=builder /opt/venv /opt/venv
+RUN printf '/opt/venv/lib\n' > /etc/ld.so.conf.d/jmng-secp256k1.conf && ldconfig
 ENV PATH="/opt/venv/bin:$PATH"
+RUN python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig'
 
 # Reproducible builds: SOURCE_DATE_EPOCH for consistent timestamps
 ARG SOURCE_DATE_EPOCH

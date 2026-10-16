@@ -170,3 +170,49 @@ async def test_signature_error_completes_independent_of_message_length():
     )
 
     assert responses[maker.nick]["error"] is True
+
+
+@pytest.mark.asyncio
+async def test_stall_callback_fires_once_for_silent_makers_and_keeps_partial_sigs():
+    client = make_directory_client()
+    me = client.nick_identity.nick
+    partial, silent = NickIdentity(5), NickIdentity(5)
+    await client._direct_message_queue.put(
+        {"type": MessageType.PRIVMSG.value, "line": signed_line(partial, me, "sig", "s1")}
+    )
+    client.clients = {}
+    stalled: list[set[str]] = []
+
+    async def on_stalled(nicks: set[str]) -> None:
+        stalled.append(nicks)
+        for identity, data in ((partial, "s2"), (silent, "s3")):
+            await client._direct_message_queue.put(
+                {"type": MessageType.PRIVMSG.value, "line": signed_line(identity, me, "sig", data)}
+            )
+
+    responses = await client.wait_for_responses(
+        expected_nicks=[partial.nick, silent.nick],
+        expected_command="!sig",
+        timeout=5.0,
+        expected_counts={partial.nick: 2, silent.nick: 1},
+        on_stalled=(0.5, on_stalled),
+    )
+    assert stalled == [{silent.nick}]
+    assert [d.split()[0] for d in responses[partial.nick]["data"]] == ["s1", "s2"]
+    assert [d.split()[0] for d in responses[silent.nick]["data"]] == ["s3"]
+
+
+@pytest.mark.asyncio
+async def test_directory_channel_skips_connected_direct_peer():
+    from unittest.mock import AsyncMock, MagicMock
+
+    client = make_directory_client()
+    peer = MagicMock(send_privmsg=AsyncMock(return_value=True))
+    client._get_connected_peer = MagicMock(return_value=peer)  # type: ignore[method-assign]
+    directory = MagicMock(send_private_message=AsyncMock(), host="dir", port=1)
+    client.clients = {"dir:1": directory}
+
+    channel = await client.send_privmsg("maker", "tx", "blob", force_channel="directory")
+    assert channel == "directory:dir:1"
+    directory.send_private_message.assert_awaited_once_with("maker", "tx", "blob")
+    peer.send_privmsg.assert_not_awaited()

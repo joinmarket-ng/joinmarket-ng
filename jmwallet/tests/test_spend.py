@@ -75,6 +75,8 @@ def _make_utxo(
 
 
 REGTEST_P2WPKH_ADDR = "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m"
+REGTEST_P2TR_ADDR = "bcrt1p4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w4spc6qv8"
+REGTEST_P2TR_SCRIPT = "5120" + "ab" * 32
 
 # ---------------------------------------------------------------------------
 # BlockchainBackend.get_median_time_past
@@ -1051,6 +1053,64 @@ class TestPrepareDirectSend:
         assert {tx_input.sequence for tx_input in parsed.inputs} == {0xFFFFFFFE}
 
     @pytest.mark.anyio
+    async def test_change_output_script_matches_reported_change_address(self) -> None:
+        """The serialized change output must pay the address the wallet reports.
+
+        A Taproot change address previously received a hardcoded P2WPKH
+        script, so the funds landed on a script the wallet's tr() descriptors
+        could not see.
+        """
+        utxos = [_make_utxo(value=200_000, address="bcrt1qinput")]
+        wallet = _make_mock_wallet(utxos, change_addr=REGTEST_P2TR_ADDR)
+        backend = _make_mock_backend()
+
+        result = await prepare_direct_send(
+            wallet=wallet,
+            backend=backend,
+            mixdepth=0,
+            amount_sats=50_000,
+            destination=REGTEST_P2WPKH_ADDR,
+            fee_rate=1.0,
+        )
+
+        assert result.change_address == REGTEST_P2TR_ADDR
+        parsed = parse_transaction(result.tx_hex)
+        change_outputs = [
+            output for output in parsed.outputs if output.value == result.change_amount
+        ]
+        assert len(change_outputs) == 1
+        assert change_outputs[0].script.hex() == REGTEST_P2TR_SCRIPT
+        # The recorded output metadata must agree with the serialized script.
+        recorded = [output for output in result.outputs if output["address"] == REGTEST_P2TR_ADDR]
+        assert len(recorded) == 1
+        assert recorded[0]["scriptPubKey"] == REGTEST_P2TR_SCRIPT
+
+    @pytest.mark.anyio
+    async def test_p2wpkh_change_output_script_is_unchanged(self) -> None:
+        """P2WPKH change keeps paying the witness-v0 script for its address."""
+        utxos = [_make_utxo(value=200_000, address="bcrt1qinput")]
+        wallet = _make_mock_wallet(utxos, change_addr=REGTEST_P2WPKH_ADDR)
+        backend = _make_mock_backend()
+
+        result = await prepare_direct_send(
+            wallet=wallet,
+            backend=backend,
+            mixdepth=0,
+            amount_sats=50_000,
+            destination=REGTEST_P2TR_ADDR,
+            fee_rate=1.0,
+        )
+
+        assert result.change_address == REGTEST_P2WPKH_ADDR
+        expected_script = _decode_bech32_scriptpubkey(REGTEST_P2WPKH_ADDR, network="regtest")
+        parsed = parse_transaction(result.tx_hex)
+        change_outputs = [
+            output for output in parsed.outputs if output.value == result.change_amount
+        ]
+        assert len(change_outputs) == 1
+        assert change_outputs[0].script == expected_script
+
+    @pytest.mark.anyio
     async def test_prepare_sweep_has_empty_change_address(self) -> None:
         """Sweep (amount_sats=0) produces no change output; change_address must be empty."""
         utxos = [_make_utxo(value=100_000, address="bcrt1qinput")]
@@ -1209,6 +1269,52 @@ class TestPrepareDirectSendExplicitInputs:
 
 class TestResolveConflictedInputs:
     """Conflict reconstruction admits only a proven, signable wallet prevout."""
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("wrong_key", [False, True])
+    async def test_taproot_conflict_requires_exact_wallet_key(
+        self, test_mnemonic: str, wrong_key: bool
+    ) -> None:
+        from jmcore.bitcoin import TxInput, address_to_scriptpubkey
+
+        from jmwallet.wallet.service import WalletService
+
+        backend = AsyncMock(spec=BlockchainBackend)
+        wallet = WalletService(test_mnemonic, backend, network="regtest", address_type="p2tr")
+        wallet.get_utxos = AsyncMock(return_value=[])
+        address = wallet.get_address(0, 0, 7)
+        script = address_to_scriptpubkey(address)
+        raw = serialize_transaction(
+            2, [TxInput(bytes(32), 0, b"", 0xFFFFFFFF)], [TxOutput(123_456, script)], 0
+        )
+        txid = get_txid(raw.hex())
+        backend.get_mempool_spender.return_value = MempoolSpenderLookupResult(
+            spending_txid="cc" * 32
+        )
+        backend.get_wallet_transaction.return_value = Transaction(
+            txid=txid, raw=raw.hex(), confirmations=3
+        )
+        if wrong_key:
+            wallet.address_cache[address] = (0, 0, 8)
+            with pytest.raises(ValueError, match="does not match this wallet's signing key"):
+                await resolve_input_utxos(
+                    wallet=wallet,
+                    backend=backend,
+                    mixdepth=0,
+                    input_utxos=[f"{txid}:0"],
+                    allow_conflicts=True,
+                )
+        else:
+            utxos, _ = await resolve_input_utxos(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                input_utxos=[f"{txid}:0"],
+                allow_conflicts=True,
+            )
+            assert len(utxos) == 1
+            assert utxos[0].path == "m/86'/1'/0'/0/7"
+            assert utxos[0].scriptpubkey == script.hex()
 
     def _wallet_and_parent(self) -> tuple[MagicMock, MagicMock, str, str]:
         key = _make_mock_key()

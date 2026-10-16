@@ -87,6 +87,42 @@ def test_conflicting_script_claims_survive_directory_cache() -> None:
     assert set(client.offers) == {("Maker1", 0), ("ConflictingMaker", 0)}
 
 
+def test_shared_bond_across_pits_keeps_both_nicks() -> None:
+    """A sw0 nick and a tr0 nick may share one bond; neither evicts the other."""
+    client = DirectoryClient("directory-a", 5222, "mainnet")
+    bond_data = {
+        "utxo_txid": "cd" * 32,
+        "utxo_vout": 1,
+        "locktime": 2_000_000_000,
+        "utxo_pub": "02" + "33" * 32,
+        "cert_expiry": 901_152,
+    }
+    sw0_nick, tr0_nick, sw0_rival = VALID_MAKER_NICKS[:3]
+    tr0_offer = _bond_offer(tr0_nick, 0, {**bond_data, "cert_expiry": 901_000})
+    tr0_offer.ordertype = OfferType.TR0_RELATIVE
+
+    assert client._cache_offer_announcement(
+        sw0_nick, _bond_offer(sw0_nick, 0, bond_data), bond_data
+    )
+    # An older certificate in the other pit is not stale relative to this pit.
+    assert client._cache_offer_announcement(tr0_nick, tr0_offer, tr0_offer.fidelity_bond_data)
+
+    assert set(client.offers) == {(sw0_nick, 0), (tr0_nick, 0)}
+    assert {bond.counterparty for bond in client.get_current_bonds()} == {sw0_nick, tr0_nick}
+
+    client.remove_offers_for_nick(sw0_nick)
+    assert set(client.offers) == {(tr0_nick, 0)}
+    assert [bond.counterparty for bond in client.get_current_bonds()] == [tr0_nick]
+
+    # Within one pit a new nick with the same bond still replaces the old one.
+    assert client._cache_offer_announcement(
+        sw0_rival, _bond_offer(sw0_rival, 0, bond_data), bond_data
+    )
+    replacement = _bond_offer(VALID_MAKER_NICKS[3], 0, bond_data)
+    assert client._cache_offer_announcement(VALID_MAKER_NICKS[3], replacement, bond_data)
+    assert set(client.offers) == {(tr0_nick, 0), (VALID_MAKER_NICKS[3], 0)}
+
+
 def test_renewed_certificate_replaces_same_directory_claim() -> None:
     client = DirectoryClient("directory-a", 5222, "mainnet")
     bond_data = {

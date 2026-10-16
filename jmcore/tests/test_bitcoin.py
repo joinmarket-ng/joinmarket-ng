@@ -35,6 +35,7 @@ from jmcore.bitcoin import (
     parse_derivation_path,
     parse_transaction,
     psbt_to_base64,
+    pubkey_to_p2tr_address,
     pubkey_to_p2wpkh_address,
     pubkey_to_p2wpkh_script,
     sats_to_btc,
@@ -1023,6 +1024,22 @@ class TestPubkeyToP2wpkhAddress:
         assert addr.startswith("bc1q")
 
 
+class TestPubkeyToP2trAddress:
+    def test_output_key_roundtrip(self) -> None:
+        output_key = bytes.fromhex(
+            "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cd9e71a4bceaa7c10c05df779a"
+        )
+
+        address = pubkey_to_p2tr_address(output_key, "regtest")
+
+        assert address.startswith("bcrt1p")
+        assert address_to_scriptpubkey(address) == b"\x51\x20" + output_key
+
+    def test_rejects_non_xonly_key(self) -> None:
+        with pytest.raises(ValueError, match="(must be 32 bytes|x-only pubkey length)"):
+            pubkey_to_p2tr_address(b"\x02" + b"\x00" * 32)
+
+
 class TestAddressToScriptpubkey:
     """Tests for address_to_scriptpubkey."""
 
@@ -1036,11 +1053,11 @@ class TestAddressToScriptpubkey:
 
     def test_p2tr_address(self) -> None:
         """P2TR address should produce OP_1 <32-byte> scriptpubkey."""
-        import bech32 as bech32_lib
+        from bitcointx.segwit_addr import encode
 
         # Create a synthetic P2TR address (witness version 1, 32-byte program)
         pubkey_x = b"\xdd" * 32
-        addr = bech32_lib.encode("bcrt", 1, pubkey_x)
+        addr = encode("bcrt", 1, pubkey_x)
         assert addr is not None
 
         spk = address_to_scriptpubkey(addr)
@@ -1359,10 +1376,10 @@ class TestGetAddressType:
 
     def test_p2tr(self) -> None:
         """P2TR address should be detected."""
-        import bech32 as bech32_lib
+        from bitcointx.segwit_addr import encode
 
         x_only = b"\xcd" * 32
-        addr = bech32_lib.encode("bcrt", 1, x_only)
+        addr = encode("bcrt", 1, x_only)
         assert addr is not None
         assert get_address_type(addr) == "p2tr"
 
