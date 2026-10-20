@@ -130,6 +130,7 @@ nav:
           - Maker verification: technical/maker-verification-checklist.md
           - Threat model: technical/threat-model.md
           - Neutrino TLS: technical/neutrino-tls.md
+          - Standard Taproot setup: technical/standard-taproot-setup.md
           - Sources: technical/references.md
       - Python API: api/
   - Contribute:
