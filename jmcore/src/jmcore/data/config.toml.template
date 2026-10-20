@@ -663,9 +663,14 @@
 # taker_utxo_age = 5          # Minimum confirmations on the PoDLE input
 # taker_utxo_retries = 3      # Max PoDLE index retries per UTXO
 # taker_utxo_amtpercent = 20  # Min UTXO value as % of CJ amount
-# EXPERIMENTAL (docs/experimental-ring-market.md). Set to "only" to consume
-# imported external PoDLE credentials. Their backing
-# UTXOs are independently verified and are never selected as CoinJoin inputs.
+# EXPERIMENTAL (docs/experimental-ring-market.md). Where the PoDLE commitment
+# comes from. "disabled": your own UTXOs. "only": imported external PoDLE
+# credentials only; their backing UTXOs are independently verified and are
+# never selected as CoinJoin inputs. "prefer" (P2TR wallets only): an external
+# credential, bought automatically from the source mixdepth's Lightning node
+# (or shown as an invoice in interactive runs) for at most twice the fee of a
+# one-input one-output Taproot transaction, falling back to your own UTXOs.
+# Unset, it is "prefer" with [lightning] mode enabled, else "disabled".
 # external_podle_mode = "disabled"
 
 # Opt in to experimental maker exclusion based on independently verified market

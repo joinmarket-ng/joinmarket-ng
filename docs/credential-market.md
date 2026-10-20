@@ -659,6 +659,16 @@ If the pool is empty, invalid, exhausted, or a replacement wave needs another
 credential, the CoinJoin fails rather than falling back to a local wallet-input
 PoDLE. `disabled` is the default and permits the existing local behavior.
 
+`prefer` (P2TR wallets only, and the default once `[lightning]` is enabled)
+uses an imported credential when one fits, and otherwise buys one before maker
+selection. `jm-taker coinjoin` pays from the Lightning node of the source
+mixdepth; an interactive run without a usable node shows the invoice and a QR
+code instead, and `--yes` runs without one skip the purchase. The total cost,
+routing included, is capped at twice the fee of a one-input, one-output
+Taproot transaction at the 3-block fee rate. When nothing is bought, the round
+commits to a wallet UTXO as with `disabled`. Purchase records live under
+`<data-dir>/market/purchases`; `--external-podle` overrides the mode per run.
+
 ### Seller Separation
 
 `import` records the seller's fidelity bond alongside the purchased opening. A

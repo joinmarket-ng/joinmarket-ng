@@ -626,10 +626,13 @@ class PoDLEManager:
         min_percent: int,
         blacklist: Any,
         seller_policy: SellerSeparationPolicy | None,
+        exclude_commitments: frozenset[str] = frozenset(),
     ) -> ExternalPoDLEPreview | None:
         """Advance the candidate window to the next chain-valid, allowed credential."""
         for candidate in candidates:
             if seller_policy is not None and not seller_policy.allows(candidate.seller_bond):
+                continue
+            if candidate.record.commitment in exclude_commitments:
                 continue
             try:
                 usable = await self._external_record_is_usable(
@@ -686,8 +689,12 @@ class PoDLEManager:
         max_retries: int,
         *,
         seller_policy: SellerSeparationPolicy | None = None,
+        exclude_commitments: frozenset[str] = frozenset(),
     ) -> ExternalPoDLEPreview | None:
         """Choose and validate one external credential without consuming it.
+
+        ``exclude_commitments`` are skipped, for example credentials bought from
+        another mixdepth's Lightning node, which would link the two mixdepths.
 
         The returned credential is advisory: nothing is reserved, so a
         concurrent round may claim it first. Only
@@ -712,6 +719,7 @@ class PoDLEManager:
             min_percent,
             blacklist,
             seller_policy,
+            exclude_commitments,
         )
 
     def claim_previewed_external(
@@ -749,6 +757,7 @@ class PoDLEManager:
         max_retries: int,
         *,
         seller_policy: SellerSeparationPolicy | None = None,
+        exclude_commitments: frozenset[str] = frozenset(),
     ) -> ExtendedPoDLECommitment | None:
         """Validate then atomically claim one external credential, or fail closed."""
         if not self._valid_selection_parameters(
@@ -771,6 +780,7 @@ class PoDLEManager:
                 min_percent,
                 blacklist,
                 seller_policy,
+                exclude_commitments,
             )
             if preview is None:
                 return None

@@ -203,6 +203,12 @@ which also yields three new wallet commitments. The cap includes routing
 fees. A run buys at most a few commitments, because an allocated commitment is
 consumed even if the round later fails.
 
+Each purchase is recorded before every step that can leave money in flight,
+so a commitment paid for before a crash is collected on the next run instead
+of being bought twice, and no second seller is paid while an earlier payment
+is unresolved. A purchased commitment stays bound to the mixdepth whose node
+paid for it: rounds from other mixdepths skip it.
+
 ## Maker: Selling and Renting
 
 The seller runs inside the maker process, using the wallet's own market keys

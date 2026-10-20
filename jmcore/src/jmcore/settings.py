@@ -1174,11 +1174,14 @@ class TakerSettings(BaseModel):
             "PoDLE commitments (reference default: 20)."
         ),
     )
-    external_podle_mode: Literal["disabled", "only"] = Field(
+    external_podle_mode: Literal["disabled", "only", "prefer"] = Field(
         default="disabled",
         description=(
-            "Use imported external PoDLE credentials only, without selecting their backing "
-            "UTXOs as CoinJoin funding inputs."
+            "Where the CoinJoin PoDLE commitment comes from. 'disabled': own UTXOs. "
+            "'only': imported external credentials only, without selecting their backing "
+            "UTXOs as CoinJoin funding inputs. 'prefer': an external credential, bought "
+            "automatically when none is usable, falling back to own UTXOs. Unset, it is "
+            "'prefer' with a P2TR wallet and Lightning enabled, else 'disabled'."
         ),
     )
     market_fault_exclusion: bool = Field(
@@ -1822,11 +1825,23 @@ class JoinMarketSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _lightning_requires_taproot(self) -> JoinMarketSettings:
-        """No channels or market integration without the Taproot switch."""
-        if self.lightning.mode != "off" and self.wallet.address_type != "p2tr":
+        """No channels or market integration without the Taproot switch.
+
+        With it, an unset PoDLE source prefers market credentials (bought from the
+        source mixdepth's node) because they never reveal the taker's own UTXOs.
+        """
+        taproot = self.wallet.address_type == "p2tr"
+        if self.lightning.mode != "off" and not taproot:
             raise ValueError(
                 f"lightning.mode = {self.lightning.mode!r} requires wallet.address_type = 'p2tr'"
             )
+        if self.taker.external_podle_mode == "prefer" and not taproot:
+            raise ValueError(
+                "taker.external_podle_mode = 'prefer' requires wallet.address_type = 'p2tr'"
+            )
+        unset = "external_podle_mode" not in self.taker.model_fields_set
+        if unset and taproot and self.lightning.mode != "off":
+            self.taker.external_podle_mode = "prefer"
         return self
 
     def get_data_dir(self) -> Path:

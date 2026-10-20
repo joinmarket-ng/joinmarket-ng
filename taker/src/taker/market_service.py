@@ -35,6 +35,7 @@ from jmcore.credential_market import (
 from jmcore.credential_market import (
     accept_listing as accept_listing,
 )
+from jmcore.external_podle import ExternalPoDLE
 from jmcore.market_faults import MarketFaultCache
 from jmcore.market_keys import BoundMarketKeys, MarketKeyError
 from jmcore.market_store import (
@@ -367,6 +368,31 @@ def open_delivery(
     ):
         raise MarketError("Delivery does not match purchased quote")
     return package
+
+
+async def verify_podle_backing(record: ExternalPoDLE, backend: BlockchainBackend) -> None:
+    """Require the credential's backing UTXO to exist, confirmed, with its script and height."""
+    try:
+        if backend.requires_neutrino_metadata():
+            result = await backend.verify_utxo_with_metadata(
+                txid=record.outpoint.txid,
+                vout=record.outpoint.vout,
+                scriptpubkey=record.scriptpubkey,
+                blockheight=record.blockheight,
+            )
+            if not result.valid or not result.scriptpubkey_matches or result.confirmations < 1:
+                raise ValueError
+            return
+        utxo = await backend.get_utxo(record.outpoint.txid, record.outpoint.vout)
+        if (
+            utxo is None
+            or utxo.confirmations < 1
+            or utxo.scriptpubkey.lower() != record.scriptpubkey
+            or (utxo.height is not None and utxo.height != record.blockheight)
+        ):
+            raise ValueError
+    except Exception as exc:
+        raise MarketError("PoDLE backing UTXO could not be verified") from exc
 
 
 def make_bond_credential(

@@ -75,6 +75,7 @@ from taker.podle_manager import BondKey, ExternalPoDLEPreview, PoDLEManager
 
 if TYPE_CHECKING:
     from taker.buyout import ChannelBuyout
+    from taker.podle_purchase import PoDLEPurchaser
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
 __all__ = [
@@ -330,6 +331,7 @@ class Taker(TakerMonitoringMixin):
         backend: BlockchainBackend,
         config: TakerConfig,
         confirmation_callback: ConfirmationCallback | None = None,
+        podle_purchaser: PoDLEPurchaser | None = None,
     ):
         """
         Initialize the Taker.
@@ -339,6 +341,8 @@ class Taker(TakerMonitoringMixin):
             backend: Blockchain backend for broadcasting
             config: Taker configuration
             confirmation_callback: Optional callback for user confirmation before proceeding
+            podle_purchaser: Buys an external PoDLE credential when
+                ``external_podle_mode`` is "prefer" and none is usable
         """
         podle_data_dir = config.data_dir
         wallet_data_dir = getattr(wallet, "data_dir", None)
@@ -354,6 +358,8 @@ class Taker(TakerMonitoringMixin):
         self.backend = backend
         self.config = config
         self.confirmation_callback = confirmation_callback
+        self.podle_purchaser = podle_purchaser
+        self._podle_data_dir = podle_data_dir
 
         pit_script_type = offer_output_script_type(config.preferred_offer_type)
         wallet_type = getattr(wallet, "address_type", None)
@@ -710,7 +716,7 @@ class Taker(TakerMonitoringMixin):
                 *([experimental.CHANNEL_RING] if self.config.channel_ring.enabled else []),
                 *(
                     [experimental.CREDENTIAL_MARKET]
-                    if self.config.external_podle_mode == "only"
+                    if self.config.external_podle_mode in ("only", "prefer")
                     or self.config.market_fault_exclusion
                     else []
                 ),
@@ -875,15 +881,12 @@ class Taker(TakerMonitoringMixin):
                 raise ValueError(msg)
             # The PoDLE commitment covers the CoinJoin amount itself, so channel
             # value never lowers the wallet UTXO size this requires.
-            if (
-                not podle_threshold_met(
-                    selected,
-                    amount,
-                    self.config.taker_utxo_age,
-                    self.config.taker_utxo_amtpercent,
-                )
-                and self.config.external_podle_mode != "only"
-            ):
+            if not podle_threshold_met(
+                selected,
+                amount,
+                self.config.taker_utxo_age,
+                self.config.taker_utxo_amtpercent,
+            ) and not self._external_podle_may_cover(mixdepth):
                 min_value = int(amount * self.config.taker_utxo_amtpercent / 100)
                 msg = (
                     "No explicit input UTXO is large enough for the PoDLE commitment: "
@@ -1000,12 +1003,9 @@ class Taker(TakerMonitoringMixin):
         # PoDLE necessary condition: a commitment needs a UTXO worth at least
         # ``taker_utxo_amtpercent`` of the amount. Without one the round always
         # fails at commitment generation, so reject early with a clear message.
-        if (
-            not podle_threshold_met(
-                breakdown.eligible, amount, min_conf, self.config.taker_utxo_amtpercent
-            )
-            and self.config.external_podle_mode != "only"
-        ):
+        if not podle_threshold_met(
+            breakdown.eligible, amount, min_conf, self.config.taker_utxo_amtpercent
+        ) and not self._external_podle_may_cover(mixdepth):
             min_value = int(amount * self.config.taker_utxo_amtpercent / 100)
             return (
                 f"No eligible UTXO in mixdepth {mixdepth} is large enough for the "
@@ -1106,7 +1106,10 @@ class Taker(TakerMonitoringMixin):
         excluded_outpoints: set[tuple[str, int]],
     ) -> list[UTXOInfo]:
         """Select funding inputs containing a usable local PoDLE UTXO when enabled."""
-        if self.config.external_podle_mode == "only":
+        if (
+            self.config.external_podle_mode == "only"
+            or self._session.external_podle_preview is not None
+        ):
             return self.wallet.select_utxos(
                 mixdepth,
                 target_amount,
@@ -1170,23 +1173,33 @@ class Taker(TakerMonitoringMixin):
         wallet_utxos: list[UTXOInfo],
         get_private_key: Callable[[str], bytes | None],
     ) -> ExtendedPoDLECommitment | None:
-        """Allocate exactly the configured PoDLE source without changing funding inputs."""
-        if self.config.external_podle_mode == "only":
+        """Allocate exactly the configured PoDLE source without changing funding inputs.
+
+        "prefer" tries the external credential first and falls back to an own
+        UTXO; an own commitment never involves a seller, so the fallback keeps
+        seller separation intact.
+        """
+        mode = self.config.external_podle_mode
+        if mode in ("only", "prefer"):
             preview = self._session.external_podle_preview
             if preview is not None:
                 # The round already excluded this seller from maker selection,
                 # so it must burn this exact record or none at all.
                 self._session.external_podle_preview = None
-                return self._claim_previewed_external(preview)
-            return await self.podle_manager.consume_external(
-                backend=self.backend,
-                network=(self.config.bitcoin_network or self.config.network).value,
-                cj_amount=self._session.cj_amount,
-                min_confirmations=self.config.taker_utxo_age,
-                min_percent=self.config.taker_utxo_amtpercent,
-                max_retries=self.config.taker_utxo_retries,
-                seller_policy=self._seller_separation,
-            )
+                claimed = self._claim_previewed_external(preview)
+            else:
+                claimed = await self.podle_manager.consume_external(
+                    backend=self.backend,
+                    network=(self.config.bitcoin_network or self.config.network).value,
+                    cj_amount=self._session.cj_amount,
+                    min_confirmations=self.config.taker_utxo_age,
+                    min_percent=self.config.taker_utxo_amtpercent,
+                    max_retries=self.config.taker_utxo_retries,
+                    seller_policy=self._seller_separation,
+                    exclude_commitments=self._foreign_commitments(),
+                )
+            if claimed is not None or mode == "only":
+                return claimed
         return self.podle_manager.generate_fresh_commitment(
             wallet_utxos=wallet_utxos,
             cj_amount=self._session.cj_amount,
@@ -1206,6 +1219,27 @@ class Taker(TakerMonitoringMixin):
         """
         return _RoundSellerSeparation(self)
 
+    def _external_podle_may_cover(self, mixdepth: int | None) -> bool:
+        """Whether an external credential may replace a local PoDLE-capable UTXO."""
+        mode = self.config.external_podle_mode
+        if mode == "only":
+            return True
+        return (
+            mode == "prefer"
+            and self.podle_purchaser is not None
+            and mixdepth is not None
+            and self.podle_purchaser.can_pay(mixdepth)
+        )
+
+    def _foreign_commitments(self) -> frozenset[str]:
+        """Credentials bought from another mixdepth's node, never used for this one."""
+        mixdepth = self.last_source_mixdepth
+        if mixdepth is None:
+            return frozenset()
+        from taker.podle_purchase import foreign_commitments
+
+        return foreign_commitments(self._podle_data_dir or get_default_data_dir(), mixdepth)
+
     async def _prepare_external_podle(self, cj_amount_bound: int) -> None:
         """Pick the external credential this round will use, before selecting makers.
 
@@ -1224,27 +1258,52 @@ class Taker(TakerMonitoringMixin):
         existed; any credential allocated there is still filtered by the same
         seller separation policy.
         """
-        if self.config.external_podle_mode != "only":
+        mode = self.config.external_podle_mode
+        if mode not in ("only", "prefer"):
             return
-        preview = await self.podle_manager.preview_external(
-            backend=self.backend,
-            network=(self.config.bitcoin_network or self.config.network).value,
-            cj_amount=cj_amount_bound,
-            min_confirmations=self.config.taker_utxo_age,
-            min_percent=self.config.taker_utxo_amtpercent,
-            max_retries=self.config.taker_utxo_retries,
-            seller_policy=self._seller_separation,
-        )
-        if preview is None:
-            logger.warning(
-                "No usable external PoDLE credential is available yet for this CoinJoin "
-                "(external_podle_mode=only)"
+        preview = await self._preview_external_podle(cj_amount_bound)
+        mixdepth = self.last_source_mixdepth
+        if (
+            preview is None
+            and mode == "prefer"
+            and self.podle_purchaser is not None
+            and mixdepth is not None
+        ):
+            logger.info("Buying an external PoDLE credential so no own UTXO is revealed")
+            bought = await self.podle_purchaser.buy(
+                backend=self.backend,
+                podle_manager=self.podle_manager,
+                mixdepth=mixdepth,
+                cj_amount=cj_amount_bound,
+                min_percent=self.config.taker_utxo_amtpercent,
             )
+            if bought:
+                preview = await self._preview_external_podle(cj_amount_bound)
+        if preview is None:
+            if mode == "only":
+                logger.warning(
+                    "No usable external PoDLE credential is available yet for this CoinJoin "
+                    "(external_podle_mode=only)"
+                )
+            else:
+                logger.info("No external PoDLE credential; committing to an own UTXO")
             return
         self._session.external_podle_preview = preview
         # Exclude the seller before selection, not after: makers chosen now
         # would otherwise learn a commitment their own bond authorized.
         self._seller_separation.record_claim(preview.seller_bond)
+
+    async def _preview_external_podle(self, cj_amount: int) -> ExternalPoDLEPreview | None:
+        return await self.podle_manager.preview_external(
+            backend=self.backend,
+            network=(self.config.bitcoin_network or self.config.network).value,
+            cj_amount=cj_amount,
+            min_confirmations=self.config.taker_utxo_age,
+            min_percent=self.config.taker_utxo_amtpercent,
+            max_retries=self.config.taker_utxo_retries,
+            seller_policy=self._seller_separation,
+            exclude_commitments=self._foreign_commitments(),
+        )
 
     def _claim_previewed_external(
         self, preview: ExternalPoDLEPreview

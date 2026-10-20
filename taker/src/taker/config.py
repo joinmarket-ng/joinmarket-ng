@@ -207,11 +207,12 @@ class TakerConfig(WalletConfig):
     taker_utxo_amtpercent: int = Field(
         default=20, ge=1, le=100, description="Min UTXO value as % of CJ amount"
     )
-    external_podle_mode: Literal["disabled", "only"] = Field(
+    external_podle_mode: Literal["disabled", "only", "prefer"] = Field(
         default="disabled",
         description=(
-            "Use externally imported PoDLE credentials only. Their backing UTXOs are "
-            "verified but never selected as CoinJoin inputs."
+            "'only': use externally imported PoDLE credentials only; their backing UTXOs "
+            "are verified but never selected as CoinJoin inputs. 'prefer': use (and buy, "
+            "when a purchaser is available) an external credential, else an own UTXO."
         ),
     )
     market_fault_exclusion: bool = Field(

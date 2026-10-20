@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, cast
 
 import typer
 from jmcore.cli_common import resolve_mnemonic, setup_cli
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from jmswap.buyout_runtime import BuyoutRuntime
 
     from taker.buyout import ChannelBuyout
+    from taker.podle_purchase import PoDLEPurchaser
 
 __all__ = ["app", "build_taker_config", "create_backend"]
 
@@ -396,6 +398,16 @@ def coinjoin(
             "Requires --buyout-config.",
         ),
     ] = None,
+    external_podle: Annotated[
+        str | None,
+        typer.Option(
+            "--external-podle",
+            help="PoDLE commitment source: disabled (own UTXOs), only (imported "
+            "credentials), or prefer (P2TR only: buy one from the source mixdepth's "
+            "Lightning node, or show an invoice when interactive, else own UTXOs). "
+            "Default: taker.external_podle_mode",
+        ),
+    ] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
     data_dir: Annotated[
         Path | None,
@@ -496,6 +508,12 @@ def coinjoin(
         config.creation_height = resolved_creation_height
     if resolved is not None:
         config.mnemonic_file = resolved.mnemonic_file
+    if external_podle is not None:
+        try:
+            config.external_podle_mode = _external_podle_mode(external_podle, config)
+        except ValueError as e:
+            logger.error(str(e))
+            raise typer.Exit(1)
 
     # Log configuration source
     logger.info(f"Using network: {config.network.value}")
@@ -530,6 +548,27 @@ def coinjoin(
         logger.error("Unexpected CoinJoin error")
         logger.bind(sensitive=True).exception("Unexpected CoinJoin error")
         raise typer.Exit(1)
+
+
+def _external_podle_mode(value: str, config: TakerConfig) -> Literal["disabled", "only", "prefer"]:
+    if value not in ("disabled", "only", "prefer"):
+        raise ValueError("--external-podle must be disabled, only or prefer")
+    if value == "prefer" and config.address_type != "p2tr":
+        raise ValueError("--external-podle prefer requires wallet.address_type = 'p2tr'")
+    return cast(Literal["disabled", "only", "prefer"], value)
+
+
+def _podle_purchaser(
+    settings: JoinMarketSettings, config: TakerConfig, *, interactive: bool
+) -> PoDLEPurchaser | None:
+    """The automatic PoDLE buyer of a "prefer" taker: pays from the source mixdepth's node."""
+    if config.external_podle_mode != "prefer":
+        return None
+    from taker.podle_purchase import PoDLEPurchaser, payer_for_mixdepth
+
+    ring = config.channel_ring
+    payer_for = payer_for_mixdepth(ring.nodes, ring.mixdepth_nodes, interactive=interactive)
+    return PoDLEPurchaser(settings, payer_for)
 
 
 async def _run_coinjoin(
@@ -630,7 +669,15 @@ async def _run_coinjoin(
         )
 
     # Create taker
-    taker = Taker(wallet, backend, config, confirmation_callback=confirmation_callback)
+    taker = Taker(
+        wallet,
+        backend,
+        config,
+        confirmation_callback=confirmation_callback,
+        podle_purchaser=_podle_purchaser(
+            settings, config, interactive=not skip_confirmation and sys.stdin.isatty()
+        ),
+    )
 
     # One taker per CoinJoin pit: the nick state filename is fixed per address type.
     nick_component = get_nick_state_component("taker", config.address_type)

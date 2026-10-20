@@ -76,6 +76,7 @@ from taker.market_service import (
     make_bond_credential,
     open_delivery,
     verify_market_bond,
+    verify_podle_backing,
 )
 from taker.market_transport import MAX_LISTING_BYTES, MAX_LISTINGS, MarketTransport
 from taker.multi_directory import MultiDirectoryClient
@@ -951,26 +952,9 @@ def _command_poll(args: argparse.Namespace) -> None:
 
 async def _verify_podle_chain(record: ExternalPoDLE, backend: Any) -> None:
     try:
-        if backend.requires_neutrino_metadata():
-            result = await backend.verify_utxo_with_metadata(
-                txid=record.outpoint.txid,
-                vout=record.outpoint.vout,
-                scriptpubkey=record.scriptpubkey,
-                blockheight=record.blockheight,
-            )
-            if not result.valid or not result.scriptpubkey_matches or result.confirmations < 1:
-                raise ValueError
-            return
-        utxo = await backend.get_utxo(record.outpoint.txid, record.outpoint.vout)
-        if (
-            utxo is None
-            or utxo.confirmations < 1
-            or utxo.scriptpubkey.lower() != record.scriptpubkey
-            or (utxo.height is not None and utxo.height != record.blockheight)
-        ):
-            raise ValueError
-    except Exception as exc:
-        raise MarketCLIError("PoDLE backing UTXO could not be verified") from exc
+        await verify_podle_backing(record, backend)
+    except MarketError as exc:
+        raise MarketCLIError(str(exc)) from exc
 
 
 def _wallet_fingerprint(value: str) -> str:

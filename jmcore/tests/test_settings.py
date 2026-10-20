@@ -433,6 +433,23 @@ class TestSettingsDefaults:
         settings = JoinMarketSettings(wallet={"address_type": "p2tr"}, lightning={"mode": mode})
         assert settings.lightning.mode == mode
 
+    def test_lightning_makes_an_unset_podle_source_prefer_the_market(self) -> None:
+        """P2TR plus Lightning buys PoDLEs by default; explicit choices are kept."""
+        p2tr = {"address_type": "p2tr"}
+        assert JoinMarketSettings(wallet=p2tr).taker.external_podle_mode == "disabled"
+        managed = JoinMarketSettings(wallet=p2tr, lightning={"mode": "managed"})
+        assert managed.taker.external_podle_mode == "prefer"
+        explicit = JoinMarketSettings(
+            wallet=p2tr, lightning={"mode": "manual"}, taker={"external_podle_mode": "disabled"}
+        )
+        assert explicit.taker.external_podle_mode == "disabled"
+
+        with pytest.raises(ValidationError, match="'prefer' requires wallet.address_type"):
+            JoinMarketSettings(taker={"external_podle_mode": "prefer"})
+        # Existing segwit users of imported credentials keep working.
+        legacy = JoinMarketSettings(taker={"external_podle_mode": "only"})
+        assert legacy.taker.external_podle_mode == "only"
+
     def test_lightning_reserve_range_must_be_ordered(self) -> None:
         with pytest.raises(ValidationError, match="reserve_min_sats exceeds"):
             JoinMarketSettings(lightning={"reserve_min_sats": 200_000, "reserve_max_sats": 100_000})
