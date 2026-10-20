@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from pydantic import BaseModel
 
 from jmswap.lnd_config import LndEnvironment
 from jmswap.managed_lnd import ManagedLnd
-from jmswap.managed_nodes import ManagedNode, ManagedNodePaths, NodeRegistry, NodeState
+from jmswap.managed_nodes import (
+    ManagedNode,
+    ManagedNodeError,
+    ManagedNodePaths,
+    NodeRegistry,
+    NodeState,
+)
 
 
 class NodeStatus(BaseModel):
@@ -96,3 +103,45 @@ async def registry_status(
             *(node_status(n, paths, env, reserve_min_sats=reserve_min_sats) for n in nodes)
         )
     )
+
+
+def mixdepth_lines(rows: list[NodeStatus], reserve_min_sats: int) -> list[str]:
+    """One line per mixdepth node, for `jm-wallet info`."""
+    lines: list[str] = []
+    for row in sorted(rows, key=lambda r: (r.mixdepth, r.generation)):
+        label = f"  Mixdepth {row.mixdepth}: {(row.identity_pubkey or '-')[:12]}"
+        if row.state is not NodeState.ACTIVE:
+            label += f" ({row.state.value})"
+        if not row.running:
+            lines.append(f"{label}  {row.error or 'not running'}")
+            continue
+        detail = (
+            f"reserve {row.confirmed_sats:,}, {row.channels} channels, "
+            f"out {row.outbound_sats:,}, in {row.inbound_sats:,} sats"
+        )
+        if row.pending_channels:
+            detail += f", {row.pending_channels} pending"
+        if row.state is NodeState.ACTIVE and not row.reserve_ok:
+            detail += f" (reserve below {reserve_min_sats:,})"
+        if not row.synced:
+            detail += " (syncing)"
+        lines.append(f"{label}  {detail}")
+    if any(not row.running for row in rows):
+        lines.append("  Start the nodes with `jm-lightning run`")
+    return lines
+
+
+async def wallet_lightning_lines(settings: Any, seed: bytes) -> list[str]:
+    """The Lightning section of `jm-wallet info` for this wallet's managed nodes."""
+    from jmswap.lightning_context import lightning_context
+
+    try:
+        ctx = lightning_context(settings, seed, with_keys=False)
+        registry = ctx.store.load()
+    except ManagedNodeError as exc:
+        return [f"  Unavailable: {exc}"]
+    if registry is None:
+        return ["  No managed nodes yet; create them with `jm-lightning init`"]
+    reserve_min = int(settings.lightning.reserve_min_sats)
+    rows = await registry_status(registry, ctx.paths, ctx.env, reserve_min_sats=reserve_min)
+    return mixdepth_lines(rows, reserve_min)

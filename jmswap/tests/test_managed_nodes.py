@@ -181,3 +181,37 @@ def test_ring_nodes_map_only_active_nodes_but_keep_retiring_ones(tmp_path: Path)
     settings = nodes[registry.nodes[0].name]
     assert settings.lnd_grpc_url == "https://127.0.0.1:20002"
     assert settings.lnd_macaroon_path == paths.macaroon(registry.nodes[0])
+
+
+def test_wallet_info_lines_flag_low_reserves_and_stopped_nodes() -> None:
+    from jmswap.managed_status import NodeStatus, mixdepth_lines
+
+    def row(mixdepth: int, **changes: object) -> NodeStatus:
+        base: dict[str, object] = {
+            "name": f"n{mixdepth}",
+            "mixdepth": mixdepth,
+            "generation": 0,
+            "state": NodeState.ACTIVE,
+            "identity_pubkey": "02" + f"{mixdepth:02x}" * 32,
+            "onion_endpoint": ONION,
+            "running": True,
+            "synced": True,
+            "confirmed_sats": 30_000,
+            "channels": 2,
+            "outbound_sats": 1_000,
+            "inbound_sats": 2_000,
+            "reserve_ok": True,
+        }
+        return NodeStatus.model_validate({**base, **changes})
+
+    lines = mixdepth_lines(
+        [row(1, confirmed_sats=5_000, reserve_ok=False), row(0), row(2, running=False)],
+        25_000,
+    )
+
+    assert lines[0] == (
+        "  Mixdepth 0: 020000000000  reserve 30,000, 2 channels, out 1,000, in 2,000 sats"
+    )
+    assert lines[1].endswith("(reserve below 25,000)")
+    assert lines[2] == "  Mixdepth 2: 020202020202  not running"
+    assert lines[3] == "  Start the nodes with `jm-lightning run`"

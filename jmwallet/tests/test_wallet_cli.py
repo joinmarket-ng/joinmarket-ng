@@ -3325,6 +3325,56 @@ async def test_info_does_not_issue_addresses_or_change_reservations(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("extended", [False, True])
+async def test_info_shows_managed_lightning_nodes_before_the_footer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], extended: bool
+) -> None:
+    from jmwallet.cli.wallet import _show_wallet_info
+    from jmwallet.wallet.service import WalletService
+
+    backend = _make_descriptor_info_mock_backend()
+    settings = ResolvedBackendSettings(
+        network="regtest",
+        bitcoin_network="regtest",
+        backend_type="descriptor_wallet",
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        neutrino_url="",
+        neutrino_add_peers=[],
+        data_dir=tmp_path,
+    )
+
+    async def sync_without_network(instance: WalletService) -> None:
+        instance.utxo_cache = {md: [] for md in range(instance.mixdepth_count)}
+
+    lines = AsyncMock(return_value=["  Mixdepth 0: 02aa  reserve 30,000"])
+    with (
+        patch(
+            "jmwallet.backends.descriptor_wallet.DescriptorWalletBackend",
+            _stub_backend_class(backend),
+        ),
+        patch.object(WalletService, "sync_with_registered_bonds", sync_without_network),
+        patch("jmwallet.cli.wallet._lightning_lines", lines),
+    ):
+        await _show_wallet_info(
+            "abandon " * 11 + "about",
+            settings,
+            "secret",
+            extended=extended,
+            reconstruct_history=False,
+            lightning_settings=object(),
+        )
+
+    output = capsys.readouterr().out
+    section = output.index("Lightning Nodes by Mixdepth:")
+    assert section < output.index("Mixdepth 0: 02aa  reserve 30,000")
+    assert output.index("Mixdepth 0: 02aa") < output.index("Total Wallet Balance")
+    assert lines.await_args is not None
+    assert lines.await_args.args[1:] == ("abandon " * 11 + "about", "secret")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("destination_branch", [0, 1])
 @pytest.mark.parametrize("reused", [False, True])
 async def test_info_preserves_pending_taker_output_roles(
