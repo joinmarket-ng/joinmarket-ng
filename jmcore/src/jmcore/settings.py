@@ -1767,6 +1767,22 @@ class JoinMarketSettings(BaseSettings):
             toml_source,
         )
 
+    @model_validator(mode="after")
+    def _offer_families_follow_wallet(self) -> JoinMarketSettings:
+        """Make wallet.address_type the single pit switch (JMP-0010).
+
+        A P2TR wallet can only serve and join the Taproot pit, so unset maker and taker
+        offer types follow it. Explicit values are kept, and a mismatch still fails in the
+        component configuration with its existing error.
+        """
+        if self.wallet.address_type != "p2tr":
+            return self
+        if "offer_type" not in self.maker.model_fields_set:
+            self.maker.offer_type = OfferType.TR0_RELATIVE.value
+        if "preferred_offer_type" not in self.taker.model_fields_set:
+            self.taker.preferred_offer_type = OfferType.TR0_RELATIVE
+        return self
+
     def get_data_dir(self) -> Path:
         """Get the data directory, using default if not set."""
         if self.data_dir is not None:

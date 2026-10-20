@@ -425,9 +425,11 @@
 #   "tr0absoffer" - absolute fee, Taproot (P2TR) pit (JMP-0010)
 #
 # The family must match wallet.address_type above: a p2wpkh wallet serves sw0
-# offers and a p2tr wallet serves tr0 offers. A mismatch is rejected at startup,
-# and a round never mixes P2WPKH and P2TR (rigid pit). One maker process serves
-# one pit; run a separate process with its own wallet type for the other pit.
+# offers and a p2tr wallet serves tr0 offers. When offer_type is not set it
+# follows the wallet ("tr0reloffer" for a p2tr wallet). An explicit mismatch is
+# rejected at startup, and a round never mixes P2WPKH and P2TR (rigid pit). One
+# maker process serves one pit; run a separate process with its own wallet type
+# for the other pit.
 #
 # Example: To use absolute fees, set BOTH:
 #   offer_type = "sw0absoffer"
@@ -625,7 +627,8 @@
 # "tr0absoffer" a Taproot (P2TR) pit. The taker only contacts makers of the
 # chosen family, and its own equal output, change and inputs all use that type,
 # so this MUST match the wallet.address_type above (a p2tr wallet for a tr0
-# pit). A round never mixes P2WPKH and P2TR. Default: sw0reloffer.
+# pit). A round never mixes P2WPKH and P2TR. When not set it follows the wallet:
+# sw0reloffer for p2wpkh, tr0reloffer for p2tr.
 # preferred_offer_type = "sw0reloffer"
 
 # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)

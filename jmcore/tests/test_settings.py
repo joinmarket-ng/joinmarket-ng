@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from jmcore.models import NetworkType
+from jmcore.models import NetworkType, OfferType
 from jmcore.nick_auth import NickAuthMode
 from jmcore.settings import (
     BitcoinSettings,
@@ -404,6 +404,24 @@ class TestSettingsDefaults:
         assert settings.maker.orderbook_violation_warning_threshold == 10
         assert settings.maker.orderbook_violation_severe_threshold == 50
         assert settings.maker.orderbook_ban_duration == 3600.0
+
+    def test_p2tr_wallet_is_the_pit_switch(self) -> None:
+        """Unset offer types follow a P2TR wallet into the Taproot pit."""
+        settings = JoinMarketSettings(wallet={"address_type": "p2tr"})
+
+        assert settings.maker.offer_type == "tr0reloffer"
+        assert settings.taker.preferred_offer_type is OfferType.TR0_RELATIVE
+
+    def test_explicit_offer_types_survive_the_pit_switch(self) -> None:
+        """An explicit choice is kept, so a mismatch still fails in component config."""
+        settings = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            maker={"offer_type": "tr0absoffer"},
+            taker={"preferred_offer_type": "sw0reloffer"},
+        )
+
+        assert settings.maker.offer_type == "tr0absoffer"
+        assert settings.taker.preferred_offer_type is OfferType.SW0_RELATIVE
 
     def test_default_taker_settings(self) -> None:
         """Test default taker settings."""
