@@ -19,14 +19,19 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import Any
 
-from jmcore.bitcoin import address_to_scriptpubkey, parse_transaction
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    estimate_vsize,
+    parse_transaction,
+    serialize_output,
+)
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     estimate_p2wpkh_vsize,
     fee_rate_meets_minimum,
     format_low_fee_error,
 )
-from jmcore.models import NetworkType, Offer
+from jmcore.models import NetworkType, Offer, offer_output_script_type
 from jmcore.podle import parse_podle_revelation, verify_podle, verify_podle_binding
 from jmcore.protocol import (
     UTXOMetadata,
@@ -106,6 +111,19 @@ class CoinJoinSession:
         self.cj_address = ""
         self.change_address = ""
         self.mixdepth = 0
+        # Rigid pit (JMP-0010): the equal-output, change and input script types
+        # are all fixed by the offer family (sw0 -> p2wpkh, tr0 -> p2tr). There
+        # is no per-transaction or taker-chosen output type. A single-type
+        # wallet only derives/spends one family, so the offer family must match
+        # the wallet type or the maker cannot serve a uniform pit.
+        self.pit_script_type = offer_output_script_type(offer.ordertype)
+        wallet_type = getattr(wallet, "address_type", None)
+        if wallet_type in ("p2wpkh", "p2tr") and self.pit_script_type != wallet_type:
+            raise ValueError(
+                f"Offer {offer.ordertype.value!r} implies a {self.pit_script_type!r} pit but "
+                f"the wallet is {wallet_type!r}; a rigid JMP-0010 pit requires them to "
+                f"match (advertise a {wallet_type!r} offer family)."
+            )
         self.commitment = b""
         self.commitment_authenticated = False
         self.taker_nacl_pk = ""  # Taker's NaCl pubkey (hex) for btc_sig
@@ -625,6 +643,16 @@ class CoinJoinSession:
             # Convert network string to NetworkType enum
             network = NetworkType(self.wallet.network)
 
+            # Reference/JAM sw0 takers set nLockTime to the current block
+            # height for anti-fee-sniping by default; the locktime check needs
+            # our own view of the chain tip to validate that (a `None` height
+            # fails closed, rejecting any height-based locktime).
+            current_block_height: int | None = None
+            try:
+                current_block_height = await self.backend.get_block_height()
+            except Exception as exc:  # noqa: BLE001 - fail closed, not fatal to the round
+                logger.warning(f"Could not fetch chain tip for locktime check: {exc}")
+
             is_valid, error = verify_unsigned_transaction(
                 tx_hex=tx_hex,
                 our_utxos=self.our_utxos,
@@ -635,6 +663,7 @@ class CoinJoinSession:
                 txfee=self.offer.txfee,
                 offer_type=self.offer.ordertype,
                 network=network,
+                current_block_height=current_block_height,
             )
 
             if not is_valid:
@@ -799,6 +828,31 @@ class CoinJoinSession:
         total_output = sum(output.value for output in tx.outputs)
         fee = total_input - total_output
         vsize = estimate_p2wpkh_vsize(len(tx.inputs), len(tx.outputs))
+        if self.pit_script_type == "p2tr":
+            prevout_scripts = {
+                outpoint: bytes.fromhex(utxo.scriptpubkey)
+                for outpoint, utxo in self.our_utxos.items()
+            }
+            prevout_scripts.update(
+                (outpoint, bytes.fromhex(utxo.scriptpubkey))
+                for outpoint, (utxo, _) in zip(foreign_inputs, lookup_results, strict=True)
+                if utxo is not None
+            )
+            # A foreign witness is not available before signing. Count known
+            # P2WPKH inputs accordingly, and otherwise assume a Taproot key spend
+            # (as in ring fee verification) to avoid rejecting larger spend paths.
+            input_types = [
+                "p2wpkh"
+                if len(prevout_scripts[(inp.txid, inp.vout)]) == 22
+                and prevout_scripts[(inp.txid, inp.vout)][:2] == b"\x00\x14"
+                else "p2tr"
+                for inp in tx.inputs
+            ]
+            # Outputs are fully specified already, so use their exact serialized
+            # sizes instead of treating Taproot outputs as P2WPKH outputs.
+            vsize = estimate_vsize(input_types, []) + sum(
+                len(serialize_output(output)) for output in tx.outputs
+            )
         if fee < 0:
             return "CoinJoin has a negative miner fee"
         minimum_fee_rate = self.minimum_fee_rate_sat_vb
@@ -965,14 +1019,37 @@ class CoinJoinSession:
                 self.wallet.release_coinjoin_inputs(reserved_outpoints, owner=self.input_lock_owner)
             return {}, "", "", -1
 
+    async def _assemble_prevouts(self, tx: Any) -> tuple[list[int], list[bytes]]:
+        """Resolve every input's value and script for BIP341 signing."""
+        values: list[int] = []
+        scripts: list[bytes] = []
+        for tx_input in tx.inputs:
+            txid_hex = tx_input.txid_le[::-1].hex()
+            key = (txid_hex, tx_input.vout)
+            if key in self.our_utxos:
+                utxo = self.our_utxos[key]
+                values.append(utxo.value)
+                scripts.append(bytes.fromhex(utxo.scriptpubkey))
+                continue
+
+            utxo = await self.backend.get_utxo(txid_hex, tx_input.vout)
+            if utxo is None or not utxo.scriptpubkey:
+                raise TransactionSigningError(
+                    f"Cannot resolve prevout for {txid_hex}:{tx_input.vout} "
+                    "(required for taproot sighash)"
+                )
+            values.append(utxo.value)
+            scripts.append(bytes.fromhex(utxo.scriptpubkey))
+        return values, scripts
+
     async def _sign_transaction(
         self, tx_hex: str, active_check: Callable[[], bool] | None = None
     ) -> list[str]:
         """Sign our inputs in the transaction.
 
         Returns list of base64-encoded signatures in JM format.
-        Each signature is: base64(varint(sig_len) + sig + varint(pub_len) + pub)
-        This matches the CScript serialization format.
+        Each signature is ``base64(sig_len || sig || pub_len || pub)``. Taproot
+        signatures use a 64-byte BIP340 signature and 32-byte x-only output key.
         """
         import base64
 
@@ -989,6 +1066,12 @@ class CoinJoinSession:
                 # Convert little-endian txid bytes to big-endian hex string (RPC format)
                 txid_hex = tx_input.txid_le[::-1].hex()
                 input_index_map[(txid_hex, tx_input.vout)] = idx
+
+            need_prevouts = any(utxo.is_p2tr for utxo in self.our_utxos.values())
+            prevout_values: list[int] = []
+            prevout_scripts: list[bytes] = []
+            if need_prevouts:
+                prevout_values, prevout_scripts = await self._assemble_prevouts(tx)
 
             for (txid, vout), utxo_info in self.our_utxos.items():
                 if active_check is not None and not active_check():
@@ -1014,7 +1097,13 @@ class CoinJoinSession:
 
                 # Delegate key access and signing to the wallet so private keys
                 # never leave the wallet (issue #518).
-                signed = self.wallet.sign_input(tx, input_index, utxo_info)
+                signed = self.wallet.sign_input(
+                    tx,
+                    input_index,
+                    utxo_info,
+                    prevout_values=prevout_values if need_prevouts else None,
+                    prevout_scripts=prevout_scripts if need_prevouts else None,
+                )
                 signature = signed.signature
                 pubkey_bytes = signed.pubkey
 
@@ -1024,13 +1113,9 @@ class CoinJoinSession:
                     f"pubkey={pubkey_bytes.hex()[:16]}..."
                 )
 
-                # Format as CScript: varint(sig_len) + sig + varint(pub_len) + pub
-                # For lengths < 0x4c (76), varint is just the length byte
-                sig_len = len(signature)
-                pub_len = len(pubkey_bytes)
-
-                # Build the sigmsg in JM format
-                sigmsg = bytes([sig_len]) + signature + bytes([pub_len]) + pubkey_bytes
+                sigmsg = (
+                    bytes([len(signature)]) + signature + bytes([len(pubkey_bytes)]) + pubkey_bytes
+                )
 
                 # Base64 encode for transmission
                 sig_b64 = base64.b64encode(sigmsg).decode("ascii")

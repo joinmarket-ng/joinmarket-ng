@@ -15,7 +15,7 @@ from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.crypto import NickIdentity
 from jmcore.mempool_api import MempoolAPI, TxOut
-from jmcore.models import FidelityBond, Offer, OrderBook
+from jmcore.models import FidelityBond, Offer, OrderBook, is_taproot_offer_type
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import JM_VERSION
 from loguru import logger
@@ -943,7 +943,7 @@ class OrderbookAggregator:
         self, all_offers_with_timestamps: list[tuple[Offer, float, str | None, str]]
     ) -> list[Offer]:
         bond_oid_to_best_offer: dict[
-            tuple[str, int, int | None, str | None],
+            tuple[str, int, int | None, str | None, bool],
             tuple[Offer, float, list[str], str],
         ] = {}
         offers_without_bond: list[Offer] = []
@@ -965,11 +965,13 @@ class OrderbookAggregator:
 
             offers_with_bonds += 1
             bond_data = offer.fidelity_bond_data or {}
+            # Pits never share a CoinJoin, so one bond may back a sw0 and a tr0 nick.
             dedup_key = (
                 bond_utxo_key,
                 offer.oid,
                 bond_data.get("locktime"),
                 bond_data.get("utxo_pub"),
+                is_taproot_offer_type(offer.ordertype),
             )
             existing = bond_oid_to_best_offer.get(dedup_key)
             if existing is None:
@@ -1132,6 +1134,13 @@ class OrderbookAggregator:
         utxo_pub = bond_data.get("utxo_pub") or bond.script
         return f"{bond.utxo_txid}:{bond.utxo_vout}:{bond.locktime}:{utxo_pub}"
 
+    @staticmethod
+    def _offer_bond_claim_key(bond_data: dict[str, Any]) -> str:
+        return (
+            f"{bond_data.get('utxo_txid')}:{bond_data.get('utxo_vout')}:"
+            f"{bond_data.get('locktime')}:{bond_data.get('utxo_pub')}"
+        )
+
     def _get_active_bond_retry(self, cache_key: str) -> tuple[bool | None, float] | None:
         retry_entry = self._bond_retry_cache.get(cache_key)
         if retry_entry is None:
@@ -1220,7 +1229,11 @@ class OrderbookAggregator:
                     self._bond_cache.popitem(last=False)
 
     def _link_bonds_to_offers(self, orderbook: OrderBook) -> None:
+        pits_by_nick: dict[str, set[bool]] = {}
         for offer in orderbook.offers:
+            pits_by_nick.setdefault(offer.counterparty, set()).add(
+                is_taproot_offer_type(offer.ordertype)
+            )
             offer.fidelity_bond_value = 0
             offer.fidelity_bond_verified = None
             offer.fidelity_bond_verification_stale = False
@@ -1237,6 +1250,19 @@ class OrderbookAggregator:
                     and ((bond.fidelity_bond_data or {}).get("utxo_pub") or bond.script)
                     == offer.fidelity_bond_data.get("utxo_pub")
                 ]
+                if not matching_bonds:
+                    # Bond deduplication keeps one bond per claim. A maker may back
+                    # its sw0 and tr0 nicks with the same bond; each offer carries
+                    # its own signed proof, so an offer may use the claim's bond when
+                    # that bond's nick does not compete in the offer's pit.
+                    offer_pit = is_taproot_offer_type(offer.ordertype)
+                    claim_key = self._offer_bond_claim_key(offer.fidelity_bond_data)
+                    matching_bonds = [
+                        bond
+                        for bond in orderbook.fidelity_bonds
+                        if self._bond_claim_key(bond) == claim_key
+                        and offer_pit not in pits_by_nick.get(bond.counterparty, set())
+                    ]
                 if matching_bonds and matching_bonds[0].bond_value is not None:
                     offer.fidelity_bond_value = matching_bonds[0].bond_value
                 if matching_bonds:

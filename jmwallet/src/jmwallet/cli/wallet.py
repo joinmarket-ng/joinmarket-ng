@@ -927,6 +927,7 @@ def info(
             creation_height=resolved.creation_height if resolved else None,
             mnemonic_file=resolved.mnemonic_file if resolved else None,
             scan_status_only=scan_status,
+            address_type=settings.wallet.address_type,
         )
     )
 
@@ -1019,6 +1020,7 @@ async def _show_wallet_info(
     creation_height: int | None = None,
     mnemonic_file: Path | None = None,
     scan_status_only: bool = False,
+    address_type: str = "p2wpkh",
 ) -> None:
     """Show wallet info implementation.
 
@@ -1152,6 +1154,7 @@ async def _show_wallet_info(
         max_sats_freeze_reuse=max_sats_freeze_reuse,
         reconstruct_history=reconstruct_history,
         mnemonic_file=mnemonic_file,
+        address_type=address_type,
     )
 
     try:
@@ -2668,6 +2671,7 @@ def rescan(
             mixdepth_count=settings.wallet.mixdepth_count,
             max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
             reconstruct_history=settings.wallet.reconstruct_history,
+            address_type=settings.wallet.address_type,
         )
     )
 
@@ -2685,6 +2689,7 @@ async def _run_rescan(
     max_sats_freeze_reuse: int = -1,
     reconstruct_history: bool = True,
     mnemonic_file: Path | None = None,
+    address_type: str = "p2wpkh",
 ) -> None:
     """Implementation of ``jm-wallet rescan``.
 
@@ -2728,6 +2733,7 @@ async def _run_rescan(
             max_sats_freeze_reuse=max_sats_freeze_reuse,
             reconstruct_history=reconstruct_history,
             mnemonic_file=mnemonic_file,
+            address_type=address_type,
         )
 
     try:

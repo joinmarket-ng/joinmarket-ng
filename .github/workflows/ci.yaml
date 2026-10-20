@@ -379,6 +379,7 @@ jobs:
             -DSECP256K1_ENABLE_MODULE_RECOVERY=ON `
             -DSECP256K1_ENABLE_MODULE_ECDH=ON `
             -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON `
+            -DSECP256K1_ENABLE_MODULE_MUSIG=ON `
             -DSECP256K1_BUILD_TESTS=ON `
             -DSECP256K1_BUILD_BENCHMARK=OFF `
             -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=ON
@@ -403,7 +404,7 @@ jobs:
         shell: pwsh
         run: |
           $env:EXPECTED_SECP256K1_DLL = Join-Path $env:RUNNER_TEMP "secp256k1-runtime\secp256k1.dll"
-          python -c "import os; from pathlib import Path; from bitcointx.core.secp256k1 import get_secp256k1; s = get_secp256k1(); print(s.lib._name, s.cap); assert Path(s.lib._name).resolve() == Path(os.environ['EXPECTED_SECP256K1_DLL']).resolve(); assert s.cap.has_pubkey_recovery and s.cap.has_ecdh and s.cap.has_schnorrsig"
+          python -c "import os; from pathlib import Path; from bitcointx.core.secp256k1 import get_secp256k1; s = get_secp256k1(); print(s.lib._name, s.cap); assert Path(s.lib._name).resolve() == Path(os.environ['EXPECTED_SECP256K1_DLL']).resolve(); assert s.cap.has_pubkey_recovery and s.cap.has_ecdh and s.cap.has_schnorrsig and s.cap.has_musig"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest -q bitcointx.tests.test_key bitcointx.tests.test_signmessage bitcointx.tests.test_secp256k1_compat
       - name: Install Tor, start it, and fetch the signet orderbook
