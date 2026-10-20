@@ -399,7 +399,7 @@ def test_show_utxos_headers_colored_on_tty(categorized_wallet):
             # Reset sequences follow every colored span.
             assert "\033[0m" in result.stdout, "Reset sequence missing"
             # Plain text is still present underneath the ANSI codes.
-            assert "Total Wallet Balance" in result.stdout
+            assert "Total wallet balance" in result.stdout
             assert "Spendable Balance by Mixdepth:" in result.stdout
 
 
@@ -461,7 +461,7 @@ def test_basic_view_mixdepth_rows_follow_wallet_mixdepth_count(
             for row in rows[:-1]:
                 assert row.endswith("0 sats") or row.endswith("0 sats (44,866 Fidelity Bonds)")
             total_row = next(
-                line for line in result.stdout.splitlines() if "Total Wallet Balance" in line
+                line for line in result.stdout.splitlines() if "Total wallet balance" in line
             )
             # Sums-first footer: the amount opens the (unindented) line.
             assert total_row.lstrip().startswith(

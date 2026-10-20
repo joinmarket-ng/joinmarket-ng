@@ -346,6 +346,6 @@ def render_legend(*, show_fidelity_bonds: bool = True) -> list[str]:
         "  flags:",
         f"    {colorize('RU!', ANSI_BOLD_RED)}    - "
         "reused: address was paid to more than once "
-        "(privacy warning; avoid reuse), shown at the end of the row",
+        "(privacy warning; avoid reuse), shown at the end of a row",
     ]
     return lines

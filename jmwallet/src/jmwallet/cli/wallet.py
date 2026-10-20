@@ -803,10 +803,11 @@ def info(
         typer.Option(
             "--view",
             help=(
-                "Extended-view layout: 'legacy' (the existing layout, default) "
-                "or 'full' (pipe-aligned table, one line per UTXO, exact "
-                "confirmation counts, explicit spendable state). "
-                "Requires --extended."
+                "Extended-view layout: 'legacy' (the existing layout, default), "
+                "'full' (pipe-aligned table, one line per UTXO, exact "
+                "confirmation counts, explicit spendable state), or 'compact' "
+                "(80-column variant of 'full': two lines per UTXO, three for "
+                "funded bonds, full copyable outpoints). Requires --extended."
             ),
         ),
     ] = "legacy",
@@ -873,8 +874,8 @@ def info(
     # Fail fast on invalid flag combinations, before any mnemonic prompt or
     # backend connection: --view only selects the *extended* layout, so it is
     # meaningless (and likely a user mistake) without --extended.
-    if view not in ("legacy", "full"):
-        typer.echo(f"Error: Invalid --view '{view}'. Choose from: legacy, full.", err=True)
+    if view not in ("legacy", "full", "compact"):
+        typer.echo(f"Error: Invalid --view '{view}'. Choose from: legacy, full, compact.", err=True)
         raise typer.Exit(2)
     view_source = ctx.get_parameter_source("view")
     if view_source is not None and view_source.name == "COMMANDLINE" and not extended:
@@ -936,6 +937,8 @@ def _balance_footer_lines(
     fb_balance: int,
     bond_locked_total: int,
     expired_frozen: int,
+    *,
+    compact: bool = False,
 ) -> list[str]:
     """Format the wallet-wide balance footer printed after every info view.
 
@@ -949,6 +952,11 @@ def _balance_footer_lines(
     split the total into the regular part and the part that needs bond selection
     whenever the latter is non-zero.
 
+    ``compact=True`` (the 80-column ``compact`` view) shortens the
+    explicit-selection thereof line (``fidelity bonds`` -> ``bonds``) so the
+    footer keeps the view's 80-column budget even for very large balances;
+    every other view keeps the full wording.
+
     Returns the footer lines including the leading blank line; the caller
     prints any trailing hint and blank line.
     """
@@ -959,24 +967,26 @@ def _balance_footer_lines(
     # Rows of the calculation: (marker, amount, text). The marker prefixes
     # the amount so the arithmetic reads top-down (total minus deductions
     # equals spendable); unmarked rows are the total and the thereof-split.
-    rows: list[tuple[str, int, str]] = [(" ", total_balance, "Total Wallet Balance")]
+    rows: list[tuple[str, int, str]] = [(" ", total_balance, "Total wallet balance")]
     if total_frozen > 0:
-        rows.append(("-", total_frozen, "Frozen UTXOs"))
+        rows.append(("-", total_frozen, "frozen UTXOs"))
     if fb_balance > 0:
         if bond_locked_total > 0:
             rows.append(("-", bond_locked_total, "fidelity bonds time-locked"))
         if expired_frozen > 0:
             rows.append(("-", expired_frozen, "fidelity bonds expired (frozen)"))
-    rows.append(("=", spendable_total, "Total Spendable Balance"))
+    rows.append(("=", spendable_total, "Total spendable balance"))
     if expired_spendable > 0:
         rows.append((" ", spendable_balance, "thereof auto-selectable"))
-        rows.append(
-            (
-                " ",
-                expired_spendable,
-                "thereof expired fidelity bonds (explicit selection or bond-only sweep)",
-            )
+        # The compact view's 80-column budget cannot afford the full
+        # wording next to very large amounts; the legend explains the
+        # spendability rule, so the footer stays a pure calculation.
+        thereof_text = (
+            "thereof expired bonds"
+            if compact
+            else "thereof expired fidelity bonds (explicit selection or bond-only sweep)"
         )
+        rows.append((" ", expired_spendable, thereof_text))
 
     # Right-align the amounts so the sats column lines up, sizing the column
     # to the widest printed amount; the free-text explanations trail after
@@ -987,7 +997,7 @@ def _balance_footer_lines(
     for marker, amount, text in rows:
         line = f"{marker} {amount:>{amount_width},} sats  {text}"
         # The total line is rendered like the "Mixdepth N" headers.
-        lines.append(colorize(line, ANSI_BOLD_CYAN) if text == "Total Wallet Balance" else line)
+        lines.append(colorize(line, ANSI_BOLD_CYAN) if text == "Total wallet balance" else line)
     return lines
 
 
@@ -1250,9 +1260,20 @@ async def _show_wallet_info(
         if extended:
             # Extended view with detailed address information. ``legacy``
             # keeps the existing layout; ``full`` renders the
-            # canonical row model as pipe-aligned tables.
+            # canonical row model as pipe-aligned tables; ``compact`` is
+            # the 80-column two-line variant of ``full``.
             if view == "full":
                 _show_full_wallet_info(
+                    wallet,
+                    used_addresses,
+                    history_addresses,
+                    display_gap,
+                    show_empty=show_empty,
+                    show_fidelity_bonds=show_fidelity_bonds,
+                    now=bond_now,
+                )
+            elif view == "compact":
+                _show_compact_wallet_info(
                     wallet,
                     used_addresses,
                     history_addresses,
@@ -1316,6 +1337,7 @@ async def _show_wallet_info(
             fb_balance,
             bond_locked_total,
             expired_frozen,
+            compact=view == "compact",
         ):
             print(line)
         # Basic (non-extended) view: point users to how to get a fresh receive
@@ -1588,19 +1610,21 @@ def _print_branch_addresses(
     return total_balance, hidden
 
 
-def _fidelity_bond_hidden_notice(
+def _fidelity_bond_hidden_notice_parts(
     bond_addresses: list[AddressInfo], coin_type: int, *, now: int | None = None
-) -> str | None:
-    """One-line notice standing in for the hidden fidelity bond table.
+) -> tuple[str, str] | None:
+    """``(base, hint)`` parts of the notice standing in for the hidden bond table.
 
-    Shown when ``wallet.info_show_fidelity_bonds`` is false so the user
-    knows the wallet holds bonds and where to re-enable the table. Only
-    funded bonds (balance > 0) count — an unfunded or fully redeemed
+    Only funded bonds (balance > 0) count — an unfunded or fully redeemed
     bond address hides nothing, so ``None`` is returned and no notice
     appears at all. Funded bonds are split into active (locktime still
     running) and expired (redeemable); the total value is included so
     the page's balances stay reconcilable even though the branch and
     mixdepth totals exclude the hidden bonds.
+
+    The ``full`` view joins the parts with ``" - "`` into a single line
+    (:func:`_fidelity_bond_hidden_notice`); the ``compact`` view prints
+    the hint indented on a second line to stay within 80 columns.
     """
     from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
 
@@ -1624,11 +1648,27 @@ def _fidelity_bond_hidden_notice(
     )
     total = sum(a.balance for a in bond_addresses)
     bond_path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}"
-    return (
+    base = (
         f"{colorize('fidelity bond addr.', ANSI_CYAN)}  {bond_path}  hidden "
-        f"({counts}, {total:,} sats) - "
-        "set wallet.info_show_fidelity_bonds = true in config.toml to show"
+        f"({counts}, {total:,} sats)"
     )
+    hint = "set wallet.info_show_fidelity_bonds = true in config.toml to show"
+    return base, hint
+
+
+def _fidelity_bond_hidden_notice(
+    bond_addresses: list[AddressInfo], coin_type: int, *, now: int | None = None
+) -> str | None:
+    """One-line notice standing in for the hidden fidelity bond table.
+
+    Shown when ``wallet.info_show_fidelity_bonds`` is false so the user
+    knows the wallet holds bonds and where to re-enable the table. See
+    :func:`_fidelity_bond_hidden_notice_parts` for the counting rules.
+    """
+    parts = _fidelity_bond_hidden_notice_parts(bond_addresses, coin_type, now=now)
+    if parts is None:
+        return None
+    return f"{parts[0]} - {parts[1]}"
 
 
 def _show_extended_wallet_info(
@@ -2097,6 +2137,150 @@ def _show_full_wallet_info(
     if hidden_total > 0:
         # Single aggregated hidden-address note for the whole page.
         print(render_hidden_note(hidden_total))
+
+
+def _show_compact_wallet_info(
+    wallet: WalletService,
+    used_addresses: set[str],
+    history_addresses: dict[str, str],
+    gap_limit: int,
+    show_empty: bool = False,
+    show_fidelity_bonds: bool = True,
+    *,
+    now: int | None = None,
+) -> None:
+    """Render the ``compact`` extended view (80-column, ``--view compact``).
+
+    Same data sources and row model as :func:`_show_full_wallet_info`; only
+    the renderer differs (:mod:`jmwallet.cli.info_compact`): two lines per
+    UTXO with the full, copyable outpoint on the detail line. This function
+    only orchestrates: it fetches the address lists, builds rows, strips
+    hidden rows into the aggregated note, and prints the page.
+
+    ``show_fidelity_bonds=False`` (``wallet.info_show_fidelity_bonds``)
+    drops the fidelity bond branch; the addresses are still fetched so a
+    two-line notice can point at funded hidden bonds instead of hiding
+    them silently. The legend keeps its fb-a/fb-x vocabulary whenever the
+    corresponding bond state exists in the wallet, so the page's balance
+    footer (which always counts hidden bond funds) stays explained.
+    """
+    from jmwallet.cli.info_compact import render_compact_page
+    from jmwallet.history import get_pending_transactions
+    from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
+    from jmwallet.wallet.rows import (
+        EXTERNAL_BRANCH,
+        INTERNAL_BRANCH,
+        HiddenRow,
+        Row,
+        build_branch_rows,
+    )
+
+    # One time snapshot for the whole page (bond existence, row states,
+    # summaries, notices) -- same as the full view.
+    if now is None:
+        now = int(time.time())
+
+    # Get pending transactions to mark addresses (scoped to active wallet,
+    # #473) -- same source as the other views.
+    pending_txs = get_pending_transactions(
+        wallet.data_dir, wallet_fingerprint=wallet.wallet_fingerprint
+    )
+    pending_addresses: set[str] = set()
+    for entry in pending_txs:
+        if entry.destination_address:
+            pending_addresses.add(entry.destination_address)
+        if entry.change_address:
+            pending_addresses.add(entry.change_address)
+
+    coin_type = 0 if wallet.network == "mainnet" else 1
+
+    # Pass 1: fetch the addresses and build the row model for every branch
+    # (same plan shape as the full view, minus the account zpub).
+    plan: list[tuple[int, list[tuple[int, str, str, list[Row]]]]] = []
+    # md -> (base, hint) notice parts standing in for the hidden bond table.
+    hidden_fb_notices: dict[int, tuple[str, str]] = {}
+    # Bond-state existence for the legend, from the unfiltered wallet data:
+    # the page references bond funds even when the branch is hidden (notice,
+    # balance footer), so the vocabulary is explained whenever the state
+    # exists at all -- same rule as the footer, independent of the display
+    # config.
+    has_locked_bond = False
+    has_expired_bond = False
+    for md in range(wallet.mixdepth_count):
+        branches: list[tuple[int, str, str, list[Row]]] = []
+        # Fidelity bond branch first (only for mixdepth 0); fetched even
+        # when hidden so the notice can count funded bonds instead of
+        # hiding them silently.
+        if md == 0:
+            bond_addresses = wallet.get_fidelity_bond_addresses_info(gap_limit)
+            has_locked_bond = any(
+                a.balance > 0 and a.locktime is not None and a.locktime >= now
+                for a in bond_addresses
+            )
+            has_expired_bond = any(
+                a.balance > 0 and (a.locktime is None or a.locktime < now) for a in bond_addresses
+            )
+            if show_fidelity_bonds and bond_addresses:
+                bond_path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}"
+                bond_rows = build_branch_rows(
+                    bond_addresses,
+                    mixdepth=md,
+                    branch=FIDELITY_BOND_BRANCH,
+                    pending_addresses=pending_addresses,
+                    show_empty=show_empty,
+                    now=now,
+                )
+                branches.append((FIDELITY_BOND_BRANCH, "fidelity bond addr.", bond_path, bond_rows))
+            elif not show_fidelity_bonds:
+                notice_parts = _fidelity_bond_hidden_notice_parts(
+                    bond_addresses, coin_type, now=now
+                )
+                if notice_parts is not None:
+                    hidden_fb_notices[md] = notice_parts
+
+        # External addresses (receive / deposit), then internal (change /
+        # CJ output) -- same order as the full and legacy views.
+        for branch, branch_name in (
+            (EXTERNAL_BRANCH, "external addresses"),
+            (INTERNAL_BRANCH, "internal addresses"),
+        ):
+            addresses = wallet.get_address_info_for_mixdepth(
+                md, branch, gap_limit, used_addresses, history_addresses
+            )
+            branch_path = f"m/84'/{coin_type}'/{md}'/{branch}"
+            rows = build_branch_rows(
+                addresses,
+                mixdepth=md,
+                branch=branch,
+                pending_addresses=pending_addresses,
+                show_empty=show_empty,
+            )
+            branches.append((branch, branch_name, branch_path, rows))
+
+        plan.append((md, branches))
+
+    # Pull the HiddenRows out of the plan and aggregate them into a single
+    # note at the end of the page (same as the full view).
+    hidden_total = 0
+    for _md, md_branches in plan:
+        for i, (branch, branch_name, branch_path, rows) in enumerate(md_branches):
+            visible_rows: list[Row] = []
+            for row in rows:
+                if isinstance(row, HiddenRow):
+                    hidden_total += row.hidden_count
+                else:
+                    visible_rows.append(row)
+            md_branches[i] = (branch, branch_name, branch_path, visible_rows)
+
+    for line in render_compact_page(
+        plan,
+        hidden_fb_notices=hidden_fb_notices,
+        hidden_total=hidden_total,
+        now=now,
+        has_locked_bond=has_locked_bond,
+        has_expired_bond=has_expired_bond,
+    ):
+        print(line)
 
 
 @app.command("verify-password")

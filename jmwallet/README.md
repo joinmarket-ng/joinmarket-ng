@@ -901,13 +901,18 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                                       fidelity bonds.        │
 │ --view                                        <str>   Extended-view layout:  │
 │                                                       'legacy' (the existing │
-│                                                       layout, default) or    │
+│                                                       layout, default),      │
 │                                                       'full' (pipe-aligned   │
 │                                                       table, one line per    │
 │                                                       UTXO, exact            │
 │                                                       confirmation counts,   │
 │                                                       explicit spendable     │
-│                                                       state). Requires       │
+│                                                       state), or 'compact'   │
+│                                                       (80-column variant of  │
+│                                                       'full': two lines per  │
+│                                                       UTXO, three for funded │
+│                                                       bonds, full copyable   │
+│                                                       outpoints). Requires   │
 │                                                       --extended.            │
 │                                                       [default: legacy]      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
