@@ -423,6 +423,20 @@ class TestSettingsDefaults:
         assert settings.maker.offer_type == "tr0absoffer"
         assert settings.taker.preferred_offer_type is OfferType.SW0_RELATIVE
 
+    @pytest.mark.parametrize("mode", ["managed", "manual"])
+    def test_lightning_requires_the_taproot_switch(self, mode: str) -> None:
+        """No channels or market integration without a P2TR wallet."""
+        assert JoinMarketSettings().lightning.mode == "off"
+        with pytest.raises(ValidationError, match="requires wallet.address_type"):
+            JoinMarketSettings(lightning={"mode": mode})
+
+        settings = JoinMarketSettings(wallet={"address_type": "p2tr"}, lightning={"mode": mode})
+        assert settings.lightning.mode == mode
+
+    def test_lightning_reserve_range_must_be_ordered(self) -> None:
+        with pytest.raises(ValidationError, match="reserve_min_sats exceeds"):
+            JoinMarketSettings(lightning={"reserve_min_sats": 200_000, "reserve_max_sats": 100_000})
+
     def test_default_taker_settings(self) -> None:
         """Test default taker settings."""
         settings = JoinMarketSettings()

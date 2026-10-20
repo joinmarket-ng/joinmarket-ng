@@ -863,6 +863,28 @@
 # lnd_macaroon_path = "~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon"
 
 # ============================================================================
+# Lightning Nodes (experimental)
+# ============================================================================
+
+[lightning]
+# "off": no Lightning automation (explicit [maker/taker.channel_ring] settings
+# still apply). "managed": JoinMarket runs one LND per mixdepth (`jm-lightning
+# init`, then `jm-lightning run`) over Tor and Bitcoin Core, and wires rings
+# and market payments to them. "manual": the same automation with your own
+# LND endpoints from the channel ring sections.
+# Requires [wallet] address_type = "p2tr". See docs/technical/standard-taproot-setup.md.
+# mode = "off"
+
+# Managed mode: lnd executable. Defaults to the pinned, digest-verified release
+# installed by `jm-lightning install-lnd`.
+# lnd_binary = "/usr/local/bin/lnd"
+
+# Managed mode: confirmed node wallet balance kept for force-close fee bumps
+# (advisory), and the largest change or equal output sent to a node to top it up.
+# reserve_min_sats = 25000
+# reserve_max_sats = 150000
+
+# ============================================================================
 # TUI Settings
 # ============================================================================
 

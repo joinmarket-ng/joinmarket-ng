@@ -1576,6 +1576,42 @@ class MarketSettings(BaseModel):
     )
 
 
+class LightningSettings(BaseModel):
+    """Lightning nodes used by channel rings and the credential market."""
+
+    mode: Literal["off", "managed", "manual"] = Field(
+        default="off",
+        description=(
+            "'managed' runs one JoinMarket-owned LND per mixdepth (jm-lightning) and wires "
+            "rings and market payments to them; 'manual' does the same with the operator's "
+            "LND endpoints from the channel ring sections; 'off' adds no Lightning automation "
+            "(explicit channel ring settings still apply). Requires wallet.address_type = 'p2tr'."
+        ),
+    )
+    lnd_binary: str | None = Field(
+        default=None,
+        description="Managed mode: lnd executable (default: the one jm-lightning install-lnd fetched)",
+    )
+    reserve_min_sats: int = Field(
+        default=25_000,
+        ge=0,
+        le=10_000_000,
+        description="Managed mode: confirmed node wallet balance kept for force-close fee bumps",
+    )
+    reserve_max_sats: int = Field(
+        default=150_000,
+        ge=0,
+        le=10_000_000,
+        description="Managed mode: largest change or equal output sent to a node as its reserve",
+    )
+
+    @model_validator(mode="after")
+    def _reserve_range(self) -> LightningSettings:
+        if self.reserve_min_sats > self.reserve_max_sats:
+            raise ValueError("lightning.reserve_min_sats exceeds lightning.reserve_max_sats")
+        return self
+
+
 class TuiSettings(BaseModel):
     """Menu settings, consumed by the shell TUI rather than Python components."""
 
@@ -1733,6 +1769,7 @@ class JoinMarketSettings(BaseSettings):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     tui: TuiSettings = Field(default_factory=TuiSettings)
     market: MarketSettings = Field(default_factory=MarketSettings)
+    lightning: LightningSettings = Field(default_factory=LightningSettings)
 
     # Component-specific settings
     maker: MakerSettings = Field(default_factory=MakerSettings)
@@ -1781,6 +1818,15 @@ class JoinMarketSettings(BaseSettings):
             self.maker.offer_type = OfferType.TR0_RELATIVE.value
         if "preferred_offer_type" not in self.taker.model_fields_set:
             self.taker.preferred_offer_type = OfferType.TR0_RELATIVE
+        return self
+
+    @model_validator(mode="after")
+    def _lightning_requires_taproot(self) -> JoinMarketSettings:
+        """No channels or market integration without the Taproot switch."""
+        if self.lightning.mode != "off" and self.wallet.address_type != "p2tr":
+            raise ValueError(
+                f"lightning.mode = {self.lightning.mode!r} requires wallet.address_type = 'p2tr'"
+            )
         return self
 
     def get_data_dir(self) -> Path:
