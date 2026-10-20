@@ -78,6 +78,7 @@ class WalletService(
         max_sats_freeze_reuse: int = -1,
         reconstruct_history: bool = True,
         mnemonic_file: Path | None = None,
+        address_type: str = "p2wpkh",
     ):
         self.backend = backend
         self._address_allocation_lock = Lock()
@@ -105,7 +106,16 @@ class WalletService(
         self.master_key = HDKey.from_seed(seed)
 
         coin_type = 0 if network == "mainnet" else 1
-        self.root_path = f"m/84'/{coin_type}'"
+        if address_type not in ("p2wpkh", "p2tr"):
+            raise ValueError(f"Unsupported wallet address_type: {address_type!r}")
+        self.address_type = address_type
+        # BIP84 (native segwit, P2WPKH) uses purpose 84'; BIP86 (Taproot,
+        # P2TR key-path) uses purpose 86'. The descriptor function follows.
+        purpose = 86 if address_type == "p2tr" else 84
+        self.descriptor_function = "tr" if address_type == "p2tr" else "wpkh"
+        self.root_path = f"m/{purpose}'/{coin_type}'"
+        # P2WSH fidelity bonds are shared by both pits, never BIP86 outputs.
+        self.fidelity_bond_root_path = f"m/84'/{coin_type}'"
         # HDKey derivation is immutable, so account and regular branch parents
         # can be reused safely while deriving many address indices.
         self._account_key_cache: dict[int, HDKey] = {}
@@ -350,7 +360,7 @@ class WalletService(
             migrate_legacy_registry,
         )
 
-        predicate = make_wallet_ownership_predicate(self.master_key, self.root_path)
+        predicate = make_wallet_ownership_predicate(self.master_key, self.fidelity_bond_root_path)
         migrate_legacy_registry(data_dir, self.wallet_fingerprint, predicate)
 
     # -- Key derivation & address generation (Group A) ----------------------
@@ -367,7 +377,10 @@ class WalletService(
     def _derive_key(self, mixdepth: int, change: int, index: int) -> HDKey:
         """Derive a wallet key, caching only regular BIP84 branch parents."""
         if change not in (0, 1):
-            path = f"{self.root_path}/{mixdepth}'/{change}/{index}"
+            root = (
+                self.fidelity_bond_root_path if change == FIDELITY_BOND_BRANCH else self.root_path
+            )
+            path = f"{root}/{mixdepth}'/{change}/{index}"
             return self.master_key.derive(path)
 
         branch_key = self._branch_key_cache.get((mixdepth, change))
@@ -389,7 +402,11 @@ class WalletService(
             return cached
 
         key = self._derive_key(mixdepth, change, index)
-        address = key.get_address(self.network)
+        address = (
+            key.get_p2tr_address(self.network)
+            if self.address_type == "p2tr"
+            else key.get_address(self.network)
+        )
 
         self.address_cache[address] = (mixdepth, change, index)
         self._path_cache[path_key] = address
@@ -454,20 +471,25 @@ class WalletService(
         """
         descriptors = []
 
+        fn = self.descriptor_function
         for mixdepth in range(self.mixdepth_count):
             xpub = self.get_account_xpub(mixdepth)
 
             # External (receive) addresses: .../0/*
-            descriptors.append({"desc": f"wpkh({xpub}/0/*)", "range": [0, scan_range - 1]})
+            descriptors.append({"desc": f"{fn}({xpub}/0/*)", "range": [0, scan_range - 1]})
 
             # Internal (change) addresses: .../1/*
-            descriptors.append({"desc": f"wpkh({xpub}/1/*)", "range": [0, scan_range - 1]})
+            descriptors.append({"desc": f"{fn}({xpub}/1/*)", "range": [0, scan_range - 1]})
 
         logger.debug(
             f"Generated {len(descriptors)} descriptors for {self.mixdepth_count} mixdepths "
             f"with range [0, {scan_range - 1}]"
         )
         return descriptors
+
+    def get_fidelity_bond_path(self, index: int) -> str:
+        """P2WSH bond path, always under BIP84 so both pits share the same bonds."""
+        return f"{self.fidelity_bond_root_path}/0'/{FIDELITY_BOND_BRANCH}/{index}"
 
     def get_fidelity_bond_key(self, index: int, locktime: int) -> HDKey:
         """
@@ -497,7 +519,7 @@ class WalletService(
         # The BIP32 child index is the timenumber derived from the locktime,
         # matching the reference JoinMarket implementation.
         timenumber = timestamp_to_timenumber(locktime)
-        path = f"{self.root_path}/0'/{FIDELITY_BOND_BRANCH}/{timenumber}"
+        path = self.get_fidelity_bond_path(timenumber)
         return self.master_key.derive(path)
 
     def get_fidelity_bond_address(self, index: int, locktime: int) -> str:

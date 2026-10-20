@@ -97,6 +97,11 @@ If no positive source is available and the static floor is disabled, no positive
 minimum is imposed. This does not guarantee relay or confirmation. Neutrino
 makers cannot verify foreign prevouts and do not enforce this fee policy.
 
+The pre-signing rate uses an estimated witness size. Taproot makers use known
+P2WPKH input scripts where present, otherwise assume Taproot key spends, and
+count the actual serialized outputs. Unknown or script-path witnesses can be
+larger, so this estimate is not a guarantee of the final signed fee rate.
+
 Explicit configured floors are preserved; omitted floors follow the current
 configuration default on restart. DEBUG logs identify the resolved floor and its source.
 

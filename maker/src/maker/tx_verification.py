@@ -35,6 +35,23 @@ from loguru import logger
 read_varint = decode_varint
 get_bech32_hrp = get_hrp
 
+# BIP65: nLockTime values below this threshold are block heights, at or above
+# are Unix timestamps.
+LOCKTIME_THRESHOLD = 500_000_000
+
+# Tolerance (seconds) for a time-based nLockTime that sits slightly in the future
+# due to clock skew between the taker and maker. A legitimate fidelity-bond spend
+# always uses an nLockTime in the past (the bond must already be unlocked).
+LOCKTIME_FUTURE_TOLERANCE_SEC = 2 * 60 * 60
+
+# Tolerance (blocks) for a height-based nLockTime that sits slightly ahead of our
+# own view of the chain tip (our backend may lag the taker's by a block or two).
+# Reference/JAM sw0 takers set nLockTime to the current block height for
+# anti-fee-sniping (jmclient.wallet.compute_tx_locktime), or up to 99 blocks
+# behind it; roughly matches the 2-hour time-based tolerance above (~12 blocks
+# at 10 min/block on mainnet, comfortably generous on faster testnets/regtest).
+LOCKTIME_HEIGHT_FUTURE_TOLERANCE_BLOCKS = 12
+
 
 class TransactionVerificationError(Exception):
     """Raised when transaction verification fails"""
@@ -52,6 +69,7 @@ def verify_unsigned_transaction(
     txfee: int,
     offer_type: OfferType,
     network: NetworkType = NetworkType.MAINNET,
+    current_block_height: int | None = None,
 ) -> tuple[bool, str]:
     """
     Verify unsigned CoinJoin transaction proposed by taker.
@@ -68,6 +86,10 @@ def verify_unsigned_transaction(
         txfee: Transaction fee we're contributing (satoshis)
         offer_type: Offer type (absolute or relative fee)
         network: Network type for address encoding
+        current_block_height: Our current view of the chain tip, used to
+            validate a height-based nLockTime (reference/JAM sw0 takers set
+            this for anti-fee-sniping). ``None`` rejects any height-based
+            locktime outright (fail closed when the tip is unknown).
 
     Returns:
         (is_valid, error_message)
@@ -80,6 +102,12 @@ def verify_unsigned_transaction(
 
         tx_inputs = tx["inputs"]
         tx_outputs = tx["outputs"]
+
+        locktime_ok, locktime_error = _verify_locktime(
+            tx.get("locktime", 0), current_block_height=current_block_height
+        )
+        if not locktime_ok:
+            return False, locktime_error
 
         our_utxo_set = set(our_utxos.keys())
         tx_utxo_set = {(inp["txid"], inp["vout"]) for inp in tx_inputs}
@@ -153,6 +181,65 @@ def verify_unsigned_transaction(
         return False, f"Verification error: {e}"
 
 
+def _verify_locktime(
+    locktime: int,
+    now: int | None = None,
+    current_block_height: int | None = None,
+) -> tuple[bool, str]:
+    """Defense-in-depth check on the transaction-wide nLockTime.
+
+    Two legitimate uses of a non-zero nLockTime: reference/JAM sw0 takers set
+    a height-based nLockTime to the current block tip (or up to ~99 blocks
+    behind it) for anti-fee-sniping (jmclient.wallet.compute_tx_locktime) --
+    this is the ecosystem-standard default, not an edge case -- and a
+    fidelity-bond spend uses a time-based CLTV that already lies in the past.
+    Either way the guard's job is only to reject a locktime that would strand
+    our signed inputs behind a lock that hasn't opened yet: a far-future
+    height or time-based value.
+
+    Args:
+        locktime: Transaction nLockTime field.
+        now: Current Unix time (defaults to wall clock); injectable for tests.
+        current_block_height: Our current view of the chain tip, needed to
+            bound a height-based locktime. ``None`` rejects any non-zero
+            height-based locktime outright (fail closed when the tip is
+            unknown, rather than accept an unbounded height).
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if locktime == 0:
+        return True, ""
+
+    if locktime < LOCKTIME_THRESHOLD:
+        if current_block_height is None:
+            return (
+                False,
+                f"Block-height nLockTime {locktime} cannot be verified without a known chain tip",
+            )
+        max_height = current_block_height + LOCKTIME_HEIGHT_FUTURE_TOLERANCE_BLOCKS
+        if locktime > max_height:
+            return (
+                False,
+                f"nLockTime height {locktime} is ahead of our chain tip "
+                f"{current_block_height} (max {max_height}); refusing to lock "
+                "our inputs behind a future height",
+            )
+        return True, ""
+
+    import time
+
+    current = int(time.time()) if now is None else now
+    if locktime > current + LOCKTIME_FUTURE_TOLERANCE_SEC:
+        return (
+            False,
+            f"nLockTime {locktime} is in the future (now={current}); refusing to "
+            "lock our inputs behind a future timelock",
+        )
+
+    return True, ""
+
+
 def parse_transaction(
     tx_hex: str, network: NetworkType = NetworkType.MAINNET
 ) -> dict[str, Any] | None:
@@ -192,7 +279,7 @@ def parse_transaction(
         ]
 
         inputs = [{"txid": inp.txid, "vout": inp.vout} for inp in parsed.inputs]
-        return {"inputs": inputs, "outputs": outputs}
+        return {"inputs": inputs, "outputs": outputs, "locktime": parsed.locktime}
 
     except Exception as e:
         logger.error("Failed to parse transaction")

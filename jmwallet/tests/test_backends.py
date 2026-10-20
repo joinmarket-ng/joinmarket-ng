@@ -49,6 +49,15 @@ class TestBackendCloseReuse:
         await backend.close()
 
     @pytest.mark.asyncio
+    async def test_descriptor_wallet_backend_resolves_foreign_prevouts(self):
+        """Core/descriptor backend can resolve arbitrary prevouts (tr0-capable)."""
+        from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+
+        backend = DescriptorWalletBackend()
+        assert backend.can_resolve_foreign_prevouts() is True
+        await backend.close()
+
+    @pytest.mark.asyncio
     async def test_neutrino_backend_reusable_after_close(self):
         """Closing a NeutrinoBackend should produce a fresh httpx client and reset state."""
         backend = NeutrinoBackend(neutrino_url="http://localhost:8080")
@@ -127,6 +136,8 @@ class TestNeutrinoBackend:
         assert backend.requires_neutrino_metadata() is True
         # Can provide metadata for its own wallet UTXOs (scriptpubkey + blockheight)
         assert backend.can_provide_neutrino_metadata() is True
+        # But CANNOT resolve arbitrary foreign prevouts (needed for tr0 sighashes)
+        assert backend.can_resolve_foreign_prevouts() is False
         await backend.close()
 
     @pytest.mark.asyncio
