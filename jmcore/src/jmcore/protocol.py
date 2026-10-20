@@ -83,6 +83,7 @@ FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
 FEATURE_PUSH_ENCRYPTED = "push_encrypted"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
+FEATURE_DIRECT_PING_V1 = "direct_ping_v1"  # Verified direct sockets echo a 16-byte hex nonce
 FEATURE_NICK_AUTH = "nick_auth"
 
 # Feature dependencies: feature -> list of required features
@@ -91,6 +92,7 @@ FEATURE_DEPENDENCIES: dict[str, list[str]] = {
     FEATURE_PUSH_ENCRYPTED: [],  # Requires NaCl session, but that's implicit
     FEATURE_PEERLIST_FEATURES: [],  # No dependencies
     FEATURE_PING: [],  # No dependencies
+    FEATURE_DIRECT_PING_V1: [],
     FEATURE_NICK_AUTH: [],  # No dependencies
 }
 
@@ -100,6 +102,7 @@ ALL_FEATURES = {
     FEATURE_PUSH_ENCRYPTED,
     FEATURE_PEERLIST_FEATURES,
     FEATURE_PING,
+    FEATURE_DIRECT_PING_V1,
     FEATURE_NICK_AUTH,
 }
 
