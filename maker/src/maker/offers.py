@@ -8,6 +8,7 @@ Supports multiple simultaneous offers with different fee structures (relative/ab
 from __future__ import annotations
 
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
+from typing import TYPE_CHECKING
 
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.models import (
@@ -24,6 +25,10 @@ from loguru import logger
 from maker.config import MakerConfig, OfferConfig
 from maker.fidelity import get_best_fidelity_bond
 from maker.offer_math import max_fillable_cj_amount
+
+if TYPE_CHECKING:
+    # A maker without a prepared channel buyout never imports jmswap at runtime.
+    from jmswap.coinjoin_funding import ChannelBuyout
 
 
 def _randomize(value: float, factor: float, low: float | None = None) -> float:
@@ -75,10 +80,23 @@ class OfferManager:
     This allows makers to advertise both relative and absolute fee offers at the same time.
     """
 
-    def __init__(self, wallet: WalletService, config: MakerConfig, maker_nick: str):
+    def __init__(
+        self,
+        wallet: WalletService,
+        config: MakerConfig,
+        maker_nick: str,
+        buyout: ChannelBuyout | None = None,
+        buyout_mixdepth: int = -1,
+    ):
         self.wallet = wallet
         self.config = config
         self.maker_nick = maker_nick
+        # Optional prepared channel buyout and the wallet mixdepth its binding
+        # was validated against at startup (see MakerBot). When set, offers
+        # describe that one mixdepth funded by channel value; when unset the
+        # maker advertises ordinary liquidity exactly as before.
+        self.buyout = buyout
+        self.buyout_mixdepth = buyout_mixdepth
         self._validate_offer_types_match_wallet()
         # Max mixdepth balance the most recent create_offers() result was built
         # from. The bot compares fresh wallet state against this to decide when
@@ -94,6 +112,10 @@ class OfferManager:
 
         Excludes fidelity bonds, unconfirmed coins below ``min_confirmations``,
         restricted mixdepth 0 coins, and inputs locked by in-flight rounds.
+
+        With a prepared channel buyout the result describes the buyout instead
+        (see :meth:`_buyout_offer_balances`), because a bound round can only be
+        funded from the one mixdepth the buyout names.
         """
         locked_outpoints = self.wallet.get_locked_input_outpoints()
         restrict_md0 = not self.config.allow_mixdepth_zero_merge
@@ -109,7 +131,62 @@ class OfferManager:
                 md0_mergeable_outpoints=md0_mergeable_outpoints,
                 exclude=locked_outpoints,
             )
-        return balances
+        if self.buyout is None:
+            return balances
+        return self._buyout_offer_balances(self.buyout, balances)
+
+    def _buyout_offer_balances(
+        self, buyout: ChannelBuyout, balances: dict[int, int]
+    ) -> dict[int, int]:
+        """Replace ordinary liquidity with what the prepared buyout can fund.
+
+        Only the bound mixdepth may participate: spending another one would
+        link funds the buyout binding never authorized, and
+        ``CoinJoinSession`` refuses such a round anyway. The bound mixdepth
+        advertises its ordinary balance plus the channel value that is not
+        reserved for the escrow change output, which is exactly the budget
+        fill-time selection will accept.
+
+        A buyout whose durable record is no longer ``ACCEPTED`` (it was
+        reserved for a round, canceled or settled) or whose record no longer
+        matches this runtime's binding withdraws *all* liquidity. Falling back
+        to ordinary funds would serve a different round than the operator
+        prepared, so an unusable buyout means no offers at all.
+        """
+        from jmswap.buyout_signing import matches_runtime_binding
+
+        withdrawn: dict[int, int] = dict.fromkeys(balances, 0)
+        try:
+            record = buyout.buyer.store.get(buyout.session_id)
+        except Exception as e:
+            logger.warning("Withdrawing offers: the prepared buyout record is unreadable")
+            logger.bind(sensitive=True).warning(f"Prepared buyout record is unreadable: {e}")
+            return withdrawn
+        if record.role != "buyer" or record.state != "ACCEPTED":
+            logger.info(
+                f"Withdrawing offers: the prepared buyout is no longer accepted "
+                f"(state={record.state})"
+            )
+            return withdrawn
+        if not matches_runtime_binding(record, buyout.buyer.runtime_binding):
+            logger.warning("Withdrawing offers: the prepared buyout is not bound to this runtime")
+            return withdrawn
+
+        wallet_balance = balances.get(self.buyout_mixdepth, 0)
+        if wallet_balance <= 0:
+            # A buyout always needs an ordinary wallet input for the !ioauth
+            # ownership proof, so channel value alone is not fillable.
+            logger.info(
+                "Withdrawing offers: the mixdepth bound to the prepared buyout has no "
+                "ordinary liquidity"
+            )
+            return withdrawn
+        budget = wallet_balance + buyout.total_value - buyout.minimum_change
+        if budget <= 0:
+            logger.info("Withdrawing offers: the prepared buyout leaves no fillable budget")
+            return withdrawn
+        withdrawn[self.buyout_mixdepth] = budget
+        return withdrawn
 
     async def get_max_offer_balance(self) -> int:
         """Largest single-mixdepth balance available for offers (0 when none)."""

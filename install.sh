@@ -1052,8 +1052,73 @@ setup_virtualenv() {
 DEP_PIN_ARGS=()
 DEP_HASHED_FILE=""
 DEP_CONSTRAINTS_FILE=""
+TARGET_REQUIRES_JMSWAP=""
+
+# A saved installer may target an older application release. Inspect the
+# selected release's manifests, not the installed roles or this script's
+# version, before introducing a dependency that older releases lack.
+detect_target_jmswap() {
+    local pkg metadata required
+    TARGET_REQUIRES_JMSWAP=false
+    # A watcher/core-only profile has no consumer of this package. Do not
+    # fetch unrelated metadata or add new prerequisites to that path.
+    if ! has_swap_consumers "${1:-false}"; then
+        return 0
+    fi
+    for pkg in maker taker; do
+        if ! metadata=$(read_release_file "$pkg/pyproject.toml"); then
+            print_error "Could not read $pkg dependency metadata from the selected release."
+            return 1
+        fi
+        if ! required=$(printf '%s\n' "$metadata" | command python3 -c '
+import re
+import sys
+import tomllib
+
+dependencies = tomllib.load(sys.stdin.buffer)["project"]["dependencies"]
+if not isinstance(dependencies, list) or not all(isinstance(dep, str) for dep in dependencies):
+    raise ValueError("Invalid project dependencies")
+requires_swap = any(re.match(r"(?i)^jmswap(?=$|[^a-z0-9._-])", dep) for dep in dependencies)
+print("true" if requires_swap else "false")
+'); then
+            print_error "Invalid $pkg dependency metadata in the selected release."
+            return 1
+        fi
+        if [[ "$required" == "true" ]]; then
+            TARGET_REQUIRES_JMSWAP=true
+        fi
+    done
+    if needs_jmswap "${1:-false}" \
+        && ! read_release_file "jmswap/pyproject.toml" > /dev/null; then
+        print_error "Selected release requires jmswap, but its source is unavailable."
+        return 1
+    fi
+}
+
+needs_jmswap() {
+    [[ "$TARGET_REQUIRES_JMSWAP" == "true" ]] || return 1
+    has_swap_consumers "${1:-false}"
+}
+
+has_swap_consumers() {
+    if [[ "${INSTALL_MAKER:-true}" == "true" || "${INSTALL_TAKER:-true}" == "true" \
+        || "${INSTALL_TUMBLER:-false}" == "true" || "${INSTALL_JMWALLETD:-false}" == "true" ]]; then
+        return 0
+    fi
+    if [[ "${1:-false}" == "true" ]]; then
+        local pkg
+        for pkg in jm-maker jm-taker jm-tumbler jmwalletd jmswap; do
+            if pip show "$pkg" &> /dev/null; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
 prepare_dep_pinning() {
     local commit="$1"
+    local updating="${2:-false}"
 
     DEP_PIN_ARGS=()
     DEP_HASHED_FILE=""
@@ -1083,12 +1148,29 @@ prepare_dep_pinning() {
     if pip show jmwalletd &> /dev/null; then
         daemon_installed=true
     fi
+    if needs_jmswap "$updating"; then
+        pkgs+=("jmswap")
+    fi
     if [[ "${INSTALL_JMWALLETD:-false}" == "true" || "$daemon_installed" == "true" ]]; then
         pkgs+=("maker" "taker" "tumbler" "jmwalletd")
     else
-        [[ "${INSTALL_MAKER:-true}" == "true" ]] && pkgs+=("maker")
-        [[ "${INSTALL_TAKER:-true}" == "true" ]] && pkgs+=("taker")
-        [[ "${INSTALL_TUMBLER:-false}" == "true" ]] && pkgs+=("tumbler")
+        local tumbler_installed=false
+        if [[ "$updating" == "true" ]] && pip show jm-tumbler &> /dev/null; then
+            tumbler_installed=true
+        fi
+        if [[ "${INSTALL_MAKER:-true}" == "true" || "${INSTALL_TUMBLER:-false}" == "true" \
+            || "$tumbler_installed" == "true" ]] \
+            || { [[ "$updating" == "true" ]] && pip show jm-maker &> /dev/null; }; then
+            pkgs+=("maker")
+        fi
+        if [[ "${INSTALL_TAKER:-true}" == "true" || "${INSTALL_TUMBLER:-false}" == "true" \
+            || "$tumbler_installed" == "true" ]] \
+            || { [[ "$updating" == "true" ]] && pip show jm-taker &> /dev/null; }; then
+            pkgs+=("taker")
+        fi
+        if [[ "${INSTALL_TUMBLER:-false}" == "true" || "$tumbler_installed" == "true" ]]; then
+            pkgs+=("tumbler")
+        fi
     fi
     if [[ "${INSTALL_ORDERBOOK_WATCHER:-false}" == "true" ]] \
         || pip show joinmarket-orderbook-watcher &> /dev/null; then
@@ -1239,7 +1321,8 @@ install_packages() {
     # decide how to pin: hash-checked by default (installing the verified
     # deps up front and resolving packages with --no-deps), or exact-version
     # constraints when --no-hash-deps was explicitly selected.
-    prepare_dep_pinning "$install_commit" || { cleanup_dep_pinning; exit 1; }
+    detect_target_jmswap false || exit 1
+    prepare_dep_pinning "$install_commit" false || { cleanup_dep_pinning; exit 1; }
     apply_dep_pinning || { cleanup_dep_pinning; exit 1; }
     local pkg_extra=("${DEP_PIN_ARGS[@]}")
 
@@ -1250,6 +1333,12 @@ install_packages() {
     print_info "Installing jmwallet..."
     pip install "${git_base}#subdirectory=jmwallet" "${pkg_extra[@]}" --quiet
     print_success "jmwallet installed"
+
+    if needs_jmswap false; then
+        print_info "Installing jmswap..."
+        pip install "${git_base}#subdirectory=jmswap" "${pkg_extra[@]}" --quiet
+        print_success "jmswap installed"
+    fi
 
     # Install selected components
     if [[ "$INSTALL_MAKER" == "true" ]]; then
@@ -1329,8 +1418,8 @@ update_packages() {
     export JOINMARKET_BUILD_COMMIT="${commit_hash:0:7}"
     export JOINMARKET_BUILD_REF="$VERSION"
 
-    # The local jmcore/jmwallet URLs. maker/taker declare ``jmcore`` and
-    # ``jmwallet`` as bare dependencies; those names do not exist on
+    # Local component URLs. maker/taker declare jmcore, jmwallet and, in
+    # newer releases, jmswap as bare dependencies; those names do not exist on
     # PyPI, so we must hand pip the git URLs explicitly. When a
     # requirement is given as a direct URL, pip uses it to satisfy the
     # matching name instead of querying PyPI. This lets us resolve and
@@ -1338,6 +1427,7 @@ update_packages() {
     # while keeping the JoinMarket-NG packages pinned to git.
     local core_url="${git_base}#subdirectory=jmcore"
     local wallet_url="${git_base}#subdirectory=jmwallet"
+    local swap_url="${git_base}#subdirectory=jmswap"
     local maker_url="${git_base}#subdirectory=maker"
     local taker_url="${git_base}#subdirectory=taker"
     local tumbler_url="${git_base}#subdirectory=tumbler"
@@ -1348,9 +1438,14 @@ update_packages() {
     # decide how to pin: hash-checked by default (installing verified deps
     # up front so the resolving installs below become --no-deps), or
     # exact-version constraints when --no-hash-deps was explicitly selected.
-    prepare_dep_pinning "$commit_hash" || { cleanup_dep_pinning; exit 1; }
+    detect_target_jmswap true || exit 1
+    prepare_dep_pinning "$commit_hash" true || { cleanup_dep_pinning; exit 1; }
     apply_dep_pinning || { cleanup_dep_pinning; exit 1; }
     local dep_extra=("${DEP_PIN_ARGS[@]}")
+    local swap_dep=()
+    if [[ "$TARGET_REQUIRES_JMSWAP" == "true" ]]; then
+        swap_dep=("$swap_url")
+    fi
 
     # Update core libraries. We force-reinstall the JoinMarket-NG
     # packages (so a same-version-different-commit update is picked up)
@@ -1373,6 +1468,13 @@ update_packages() {
     pip install --upgrade "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
     print_success "jmcore and jmwallet updated"
 
+    if needs_jmswap true; then
+        print_info "Updating jmswap..."
+        pip install --upgrade --force-reinstall --no-deps "$swap_url" --quiet
+        pip install --upgrade "$swap_url" "$core_url" "${dep_extra[@]}" --quiet
+        print_success "jmswap updated"
+    fi
+
     # Update/install maker (default: install if not present)
     local should_install_maker="${INSTALL_MAKER:-true}"
     if pip show jm-maker &> /dev/null; then
@@ -1380,11 +1482,13 @@ update_packages() {
         pip install --upgrade --force-reinstall --no-deps "$maker_url" --quiet
         # Resolve maker deps from git so jmcore/jmwallet are not sought
         # on PyPI and new third-party deps (e.g. pynacl) are installed.
-        pip install --upgrade "$maker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install --upgrade "$maker_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
+            "${dep_extra[@]}" --quiet
         print_success "Maker updated"
     elif [[ "$should_install_maker" == "true" ]]; then
         print_info "Installing maker..."
-        pip install "$maker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install "$maker_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
+            "${dep_extra[@]}" --quiet
         print_success "Maker installed"
     fi
 
@@ -1393,11 +1497,13 @@ update_packages() {
     if pip show jm-taker &> /dev/null; then
         print_info "Updating taker..."
         pip install --upgrade --force-reinstall --no-deps "$taker_url" --quiet
-        pip install --upgrade "$taker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install --upgrade "$taker_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
+            "${dep_extra[@]}" --quiet
         print_success "Taker updated"
     elif [[ "$should_install_taker" == "true" ]]; then
         print_info "Installing taker..."
-        pip install "$taker_url" "$core_url" "$wallet_url" "${dep_extra[@]}" --quiet
+        pip install "$taker_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
+            "${dep_extra[@]}" --quiet
         print_success "Taker installed"
     fi
 
@@ -1407,13 +1513,13 @@ update_packages() {
     if pip show jm-tumbler &> /dev/null; then
         print_info "Updating tumbler..."
         pip install --upgrade --force-reinstall --no-deps "$tumbler_url" --quiet
-        pip install --upgrade "$tumbler_url" "$core_url" "$wallet_url" "$maker_url" "$taker_url" \
-            "${dep_extra[@]}" --quiet
+        pip install --upgrade "$tumbler_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
+            "$maker_url" "$taker_url" "${dep_extra[@]}" --quiet
         print_success "Tumbler updated"
     elif [[ "$should_install_tumbler" == "true" ]]; then
         print_info "Installing tumbler..."
-        pip install "$tumbler_url" "$core_url" "$wallet_url" "$maker_url" "$taker_url" \
-            "${dep_extra[@]}" --quiet
+        pip install "$tumbler_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
+            "$maker_url" "$taker_url" "${dep_extra[@]}" --quiet
         print_success "Tumbler installed"
     fi
 
@@ -1422,12 +1528,12 @@ update_packages() {
     if pip show jmwalletd &> /dev/null; then
         print_info "Updating jmwalletd..."
         pip install --upgrade --force-reinstall --no-deps "$jmwalletd_url" --quiet
-        pip install --upgrade "$jmwalletd_url" "$core_url" "$wallet_url" \
+        pip install --upgrade "$jmwalletd_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
             "$maker_url" "$taker_url" "$tumbler_url" "${dep_extra[@]}" --quiet
         print_success "jmwalletd updated"
     elif [[ "${INSTALL_JMWALLETD:-false}" == "true" ]]; then
         print_info "Installing jmwalletd..."
-        pip install "$jmwalletd_url" "$core_url" "$wallet_url" \
+        pip install "$jmwalletd_url" "$core_url" "$wallet_url" "${swap_dep[@]}" \
             "$maker_url" "$taker_url" "$tumbler_url" "${dep_extra[@]}" --quiet
         print_success "jmwalletd installed"
     elif [[ "${INSTALL_TUMBLER:-false}" == "true" ]]; then

@@ -57,6 +57,7 @@ FLATPAK_METAINFO = PROJECT_ROOT / "flatpak" / "org.joinmarketng.JamNG.metainfo.x
 PYPROJECT_FILES = [
     PROJECT_ROOT / "jmcore" / "pyproject.toml",
     PROJECT_ROOT / "jmwallet" / "pyproject.toml",
+    PROJECT_ROOT / "jmswap" / "pyproject.toml",
     PROJECT_ROOT / "maker" / "pyproject.toml",
     PROJECT_ROOT / "taker" / "pyproject.toml",
     PROJECT_ROOT / "tumbler" / "pyproject.toml",
