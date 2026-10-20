@@ -266,3 +266,34 @@ def _bound_authorization(
         OWNER_KEY,
     )
     return bound, authorization
+
+
+def test_minimum_backing_is_optional_on_the_wire() -> None:
+    from pydantic import ValidationError
+
+    from taker.market_service import QuoteRequest
+
+    plain = {
+        "request_id": "ab" * 16,
+        "buyer_pubkey": "cd" * 32,
+        "product": "podle",
+        "rail": "lightning",
+        "max_price_sats": 500,
+    }
+    # Sellers that predate the field reject unknown keys, so it is never sent unset.
+    assert "min_backing_sats" not in QuoteRequest.model_validate(plain).wire()
+    assert (
+        QuoteRequest.model_validate({**plain, "min_backing_sats": 20_000}).wire()[
+            "min_backing_sats"
+        ]
+        == 20_000
+    )
+    with pytest.raises(ValidationError, match="PoDLE requests only"):
+        QuoteRequest.model_validate(
+            {
+                **plain,
+                "product": "bond",
+                "certificate_pubkey": "02" + "11" * 32,
+                "min_backing_sats": 1,
+            }
+        )

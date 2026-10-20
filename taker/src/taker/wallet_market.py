@@ -171,6 +171,7 @@ class WalletMarketSeller:
             price_sats=self._price_sats,
             quote_ttl=self._quote_ttl,
             fault_cache=fault_cache,
+            backing_sats=self._backing_sats,
         )
         self._fault_cache = fault_cache
         self._service = service
@@ -213,6 +214,14 @@ class WalletMarketSeller:
         self._running = True
         self._settlement = settlement
         self._settlement_task = asyncio.create_task(settlement.run())
+
+    def _backing_sats(self, txid: str, vout: int) -> int | None:
+        """The value of a confirmed wallet UTXO backing a PoDLE, from the wallet cache."""
+        for utxos in self.wallet.utxo_cache.values():
+            for utxo in utxos:
+                if utxo.txid == txid and utxo.vout == vout:
+                    return utxo.value if utxo.confirmations > 0 else None
+        return None
 
     def _callbacks_available(self) -> bool:
         return self._running and not self._closed

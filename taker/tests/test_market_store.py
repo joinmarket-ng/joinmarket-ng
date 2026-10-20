@@ -631,3 +631,52 @@ def test_lightning_hold_limit_bounds_every_quote(tmp_path: Path) -> None:
             )
     finally:
         store.close()
+
+
+def test_minimum_backing_selects_the_first_large_enough_podle(tmp_path: Path) -> None:
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path)
+    small, large, unknown = (_podle_credential(value) for value in (0x51, 0x52, 0x53))
+    for credential in (unknown, small, large):
+        store.add_inventory("podle", str(credential["commitment"]), credential)
+    values = {f"{0x51:02x}" * 32: 1_000, f"{0x52:02x}" * 32: 50_000}
+
+    def lookup(txid: str, vout: int) -> int | None:
+        return values.get(txid) if vout == 1 else None
+
+    arguments = (
+        _authorization(),
+        _key(0x22),
+        bytes(_buyer_key(0x33).public_key).hex(),
+        "podle",
+        None,
+        "lightning",
+        10_000,
+        1_500,
+        100,
+        1,
+    )
+
+    def reserved() -> set[str]:
+        with sqlite3.connect(path) as connection:
+            rows = connection.execute("SELECT resource FROM inventory WHERE state = 'reserved'")
+            return {row[0] for row in rows}
+
+    with pytest.raises(MarketStoreUnavailableError, match="inventory"):
+        store.reserve_hold_quote(*arguments, request_id=_request_id(1), min_backing_sats=10_000)
+    store.reserve_hold_quote(
+        *arguments, request_id=_request_id(2), min_backing_sats=10_000, backing_sats=lookup
+    )
+    assert reserved() == {large["commitment"]}
+    with pytest.raises(MarketStoreUnavailableError, match="inventory"):
+        store.reserve_hold_quote(
+            *arguments, request_id=_request_id(3), min_backing_sats=10_000, backing_sats=lookup
+        )
+    # A request without a minimum keeps taking the oldest row, whatever it backs.
+    store.reserve_hold_quote(*arguments, request_id=_request_id(4), backing_sats=lookup)
+    assert reserved() == {large["commitment"], unknown["commitment"]}
+    with pytest.raises(MarketStoreConflictError, match="different quote parameters"):
+        store.reserve_hold_quote(
+            *arguments, request_id=_request_id(2), min_backing_sats=20_000, backing_sats=lookup
+        )
+    store.close()

@@ -239,6 +239,12 @@ Set `--price-sats` to the price you want: every quote's invoice is created for
 exactly that amount. The buyer still relies on the signed quote and its own
 `--max-price-sats` cap.
 
+A PoDLE request may also carry `min_backing_sats`, the smallest backing UTXO
+the buyer can use for its CoinJoin amount. A wallet-native seller then quotes
+only inventory backed by a confirmed wallet UTXO at least that large; a
+standalone seller cannot check backing values and answers such requests as
+unavailable. Requests without it behave as before.
+
 ### Serve Over Tor
 
 The market uses existing JoinMarket directories for discovery. A buyer tries a

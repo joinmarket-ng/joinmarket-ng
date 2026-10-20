@@ -38,6 +38,7 @@ from jmcore.credential_market import (
 from jmcore.market_faults import MarketFaultCache
 from jmcore.market_keys import BoundMarketKeys, MarketKeyError
 from jmcore.market_store import (
+    BackingLookup,
     HoldReservation,
     MarketStore,
     MarketStoreError,
@@ -46,7 +47,7 @@ from jmcore.market_store import (
 from jmwallet.backends.base import BlockchainBackend, BondVerificationRequest
 from loguru import logger
 from nacl.public import PrivateKey, SealedBox
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from taker.market_payments import validate_payment_terms
 from taker.market_settlement import HoldInvoiceBackend
@@ -62,6 +63,21 @@ class QuoteRequest(MarketModel):
     certificate_pubkey: Pubkey | None = None
     rail: Literal["lightning"]
     max_price_sats: int = Field(ge=1, le=2100000000000000)
+    # The smallest PoDLE backing UTXO the buyer can use: makers require it to
+    # hold a share of the CoinJoin amount. Optional and omitted from the wire
+    # when unset, so sellers that predate it keep accepting plain requests.
+    min_backing_sats: int | None = Field(default=None, ge=1, le=2100000000000000)
+
+    @model_validator(mode="after")
+    def _backing_is_podle_only(self) -> QuoteRequest:
+        if self.min_backing_sats is not None and self.product != "podle":
+            raise ValueError("min_backing_sats applies to PoDLE requests only")
+        return self
+
+    def wire(self) -> dict[str, Any]:
+        """The request as sent: an unset ``min_backing_sats`` is left out."""
+        exclude = {"min_backing_sats"} if self.min_backing_sats is None else set()
+        return self.model_dump(mode="json", exclude=exclude)
 
 
 class DeliveryRequest(MarketModel):
@@ -128,7 +144,12 @@ class MarketService:
         price_sats: int,
         quote_ttl: int = 300,
         fault_cache: MarketFaultCache | None = None,
+        backing_sats: BackingLookup | None = None,
     ) -> None:
+        """``backing_sats`` returns the value of a PoDLE backing outpoint, if known.
+
+        Without it, requests that need a minimum backing are unavailable.
+        """
         self.authority = verify_authorization(authorization)
         if not 1 <= quote_ttl <= 900:
             raise MarketError("Invalid quote reservation lifetime")
@@ -149,6 +170,7 @@ class MarketService:
         self.price_sats = price_sats
         self.quote_ttl = quote_ttl
         self.fault_cache = fault_cache
+        self.backing_sats = backing_sats
         self._verified_until = 0.0
         self._height = 0
         self._next_quote = 0.0
@@ -251,6 +273,8 @@ class MarketService:
                 height,
                 ttl=self.quote_ttl,
                 request_id=quote_request.request_id,
+                min_backing_sats=quote_request.min_backing_sats,
+                backing_sats=self.backing_sats,
             )
             quote_document = (
                 reserved

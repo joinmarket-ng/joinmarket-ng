@@ -793,6 +793,7 @@ def _request_payload(
         "certificate_pubkey": certificate_pubkey,
         "rail": "lightning",
         "max_price_sats": max_price_sats,
+        "min_backing_sats": None,
     }
     seller = {
         "seller_pubkey": listing.seller_pubkey,
@@ -819,7 +820,7 @@ def _request_payload(
             {
                 "version": 2,
                 "seller": seller,
-                "request": request.model_dump(mode="json"),
+                "request": request.wire(),
             }
         ),
         idempotent=False,
@@ -851,7 +852,7 @@ async def _request_quote(
         response = await transport.request(
             seller_nick,
             bytes.fromhex(listing.encryption_pubkey),
-            request.model_dump(mode="json"),
+            request.wire(),
             args.timeout,
         )
         quote_data = response.get("quote")

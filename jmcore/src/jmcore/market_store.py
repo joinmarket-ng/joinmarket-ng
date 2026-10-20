@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +55,8 @@ from jmcore.secure_files import atomic_write_private, exclusive_file_lock, read_
 Product = Literal["podle", "bond"]
 PaymentRail = Literal["lightning"]
 LedgerMode = Literal["standalone", "wallet"]
+# The value of a PoDLE backing outpoint (txid, vout) in sats, or None if unknown.
+BackingLookup = Callable[[str, int], int | None]
 WalletLedgerDiagnosisState = Literal[
     "absent", "standalone", "disabled", "activating", "ready", "recovery_required", "unavailable"
 ]
@@ -725,8 +727,14 @@ class MarketStore:
         *,
         ttl: int = 300,
         request_id: str,
+        min_backing_sats: int | None = None,
+        backing_sats: BackingLookup | None = None,
     ) -> SignedDocument | HoldReservation:
         """Reserve inventory and a fresh hold-invoice preimage for one quote request.
+
+        ``min_backing_sats`` restricts PoDLE inventory to backing UTXOs worth at
+        least that much, as reported by ``backing_sats``; inventory whose value is
+        unknown never qualifies.
 
         Nothing is signed and no invoice exists yet. The reservation is durable
         before the caller creates the hold invoice, so after a crash the settlement
@@ -747,18 +755,24 @@ class MarketStore:
         self._require_int(height, "height", minimum=1)
         self._require_int(ttl, "ttl", minimum=1, maximum=_MAX_QUOTE_TTL)
         self._require_request_id(request_id)
-        fingerprint = canonical(
-            {
-                "authorization": authorization.model_dump(mode="json"),
-                "seller_pubkey": seller_pubkey,
-                "buyer_pubkey": buyer_pubkey,
-                "product": product,
-                "certificate_pubkey": certificate_pubkey,
-                "rail": rail,
-                "max_price_sats": max_price_sats,
-                "ttl": ttl,
-            }
-        )
+        if min_backing_sats is not None:
+            self._require_int(min_backing_sats, "min_backing_sats", minimum=1)
+            if product != "podle":
+                raise MarketStoreError("min_backing_sats applies to PoDLE inventory only")
+        parameters: dict[str, Any] = {
+            "authorization": authorization.model_dump(mode="json"),
+            "seller_pubkey": seller_pubkey,
+            "buyer_pubkey": buyer_pubkey,
+            "product": product,
+            "certificate_pubkey": certificate_pubkey,
+            "rail": rail,
+            "max_price_sats": max_price_sats,
+            "ttl": ttl,
+        }
+        # Added only when set, so fingerprints of earlier requests are unchanged.
+        if min_backing_sats is not None:
+            parameters["min_backing_sats"] = min_backing_sats
+        fingerprint = canonical(parameters)
 
         with self._transaction() as connection:
             wallet_ledger = self._require_seller_wallet_ready(connection)
@@ -800,7 +814,12 @@ class MarketStore:
             if active is None or int(active["count"]) >= _MAX_ACTIVE_QUOTES:
                 raise MarketStoreUnavailableError("maximum active quote capacity reached")
             inventory_row = self._select_inventory(
-                connection, authority, product, certificate_pubkey
+                connection,
+                authority,
+                product,
+                certificate_pubkey,
+                min_backing_sats=min_backing_sats,
+                backing_sats=backing_sats,
             )
             if inventory_row is None:
                 raise MarketStoreUnavailableError("no matching credential inventory is available")
@@ -2370,25 +2389,34 @@ class MarketStore:
         authority: MarketAuthorization,
         product: Product,
         certificate_pubkey: str | None,
+        *,
+        min_backing_sats: int | None = None,
+        backing_sats: BackingLookup | None = None,
     ) -> sqlite3.Row | None:
         # Unowned rows belong to a standalone store; owned rows require this wallet.
         if product == "podle":
-            return cast(
-                sqlite3.Row | None,
-                connection.execute(
-                    """
-                    SELECT inventory.id, inventory.resource, inventory.credential
-                    FROM inventory
-                    JOIN podle_ownership ON podle_ownership.inventory_id = inventory.id
-                    WHERE inventory.product = 'podle' AND inventory.state = 'available'
-                      AND podle_ownership.state = 'market_inventory'
-                      AND (podle_ownership.wallet_id IS NULL OR podle_ownership.wallet_id = ?)
-                    ORDER BY inventory.id
-                    LIMIT 1
-                    """,
-                    (self.wallet_id,),
-                ).fetchone(),
+            rows = connection.execute(
+                """
+                SELECT inventory.id, inventory.resource, inventory.credential
+                FROM inventory
+                JOIN podle_ownership ON podle_ownership.inventory_id = inventory.id
+                WHERE inventory.product = 'podle' AND inventory.state = 'available'
+                  AND podle_ownership.state = 'market_inventory'
+                  AND (podle_ownership.wallet_id IS NULL OR podle_ownership.wallet_id = ?)
+                ORDER BY inventory.id
+                """,
+                (self.wallet_id,),
             )
+            if min_backing_sats is None:
+                return cast(sqlite3.Row | None, rows.fetchone())
+            if backing_sats is None:
+                return None
+            for row in rows:
+                outpoint = json.loads(bytes(row["credential"]))["outpoint"]
+                value = backing_sats(outpoint["txid"], outpoint["vout"])
+                if value is not None and value >= min_backing_sats:
+                    return cast(sqlite3.Row, row)
+            return None
         expected_resource = bond_resource(authority.bond, authority.period)
         return cast(
             sqlite3.Row | None,
