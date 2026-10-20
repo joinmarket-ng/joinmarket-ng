@@ -13,7 +13,7 @@
 # authorizes destroying the selected project and its host directory.
 #
 # Usage:
-#   scripts/run-ring-e2e.sh [lnd-external|ring|ring-no-taker|all]   (default: all)
+#   scripts/run-ring-e2e.sh [lnd-external|ring-core|ring|ring-no-taker|all] (default: all)
 #
 # Environment:
 #   RING_E2E_KEEP=1     leave the stack running after successful tests
@@ -21,6 +21,7 @@
 #   RING_E2E_NO_RESET=1 is no longer safe for transactional tests; refuse replay
 #   RING_E2E_NO_BUILD=1 reuse existing application images for the ring suite
 #   JM_BUYOUT_LND_IMAGE override the patched LND image (build it with lnd/Dockerfile)
+#   RING_E2E_PEER_READY_TIMEOUT_SECONDS bound authenticated onion readiness
 set -euo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -56,9 +57,9 @@ fi
 LND_EXTERNAL_PROJECT=${LND_EXTERNAL_PROJECT:-jm-lnd-external}
 export LND_EXTERNAL_DATA_DIR RING_E2E_DATA_DIR RING_E2E_PROJECT LND_EXTERNAL_PROJECT
 
-if [ "$SUITE" != "lnd-external" ] && [ "$SUITE" != "ring" ] &&
+if [ "$SUITE" != "lnd-external" ] && [ "$SUITE" != "ring" ] && [ "$SUITE" != "ring-core" ] &&
     [ "$SUITE" != "ring-no-taker" ] && [ "$SUITE" != "all" ]; then
-    echo "usage: $0 [lnd-external|ring|ring-no-taker|all]" >&2
+    echo "usage: $0 [lnd-external|ring-core|ring|ring-no-taker|all]" >&2
     exit 2
 fi
 
@@ -381,9 +382,13 @@ run_ring() {
             "${PROJECT_ROOT}/tests/e2e/test_ring_without_taker_lnd_e2e.py" \
             -m ring_e2e --fail-on-skip --no-cov -v --timeout=1800
     else
+        local scenario="${PROJECT_ROOT}/tests/e2e/test_cofunded_ring_e2e.py"
+        if [ "$SUITE" = ring-core ]; then
+            scenario="${PROJECT_ROOT}/tests/e2e/test_channel_ring_e2e.py"
+        fi
         RING_E2E=1 pytest -c "${PROJECT_ROOT}/pytest.ini" \
             "${PROJECT_ROOT}/tests/e2e/test_direct_heartbeat_e2e.py" \
-        "${PROJECT_ROOT}/tests/e2e/test_channel_ring_e2e.py" \
+            "$scenario" \
             -m ring_e2e --fail-on-skip --no-cov -v --timeout=3600
     fi
 }
@@ -418,7 +423,7 @@ trap 'finish $?' EXIT
 # Inspect every selected target before touching either one, so `all` cannot
 # create or reset one fixture and only then discover retained state in the other.
 case "$SUITE" in
-ring|ring-no-taker|all) preflight_target "$RING_E2E_DATA_DIR" "$RING_E2E_PROJECT" ;;
+ring|ring-core|ring-no-taker|all) preflight_target "$RING_E2E_DATA_DIR" "$RING_E2E_PROJECT" ;;
 esac
 case "$SUITE" in
 lnd-external|all) preflight_target "$LND_EXTERNAL_DATA_DIR" "$LND_EXTERNAL_PROJECT" ;;
@@ -426,7 +431,7 @@ esac
 
 case "$SUITE" in
 lnd-external) run_lnd_external ;;
-    ring|ring-no-taker) run_ring ;;
+    ring|ring-core|ring-no-taker) run_ring ;;
 all)
     run_lnd_external
     run_ring

@@ -363,3 +363,12 @@ same signed bytes; it neither raises the fee nor starts another payment. The
 split can remain blocked until fee conditions improve. Recovery with increased
 fees needs an additional mechanism such as pre-signed fee variants or a
 wallet-signed child transaction.
+
+## Integration validation
+
+Run `scripts/run-ring-e2e.sh ring-core` for ring creation independent of the
+credential market, `ring` for the combined lifecycle, or `ring-no-taker` for
+maker-only rings. Use a fresh isolated fixture for every transactional run.
+Before enrollment, the runner checks authenticated LND connections through every
+onion endpoint. Bootstrap and hostname files alone are not readiness evidence.
+Failed fixtures are retained for inspection, not automatically reset.

@@ -224,7 +224,7 @@ def test_all_preflights_both_targets_before_mutation(
     assert "up -d" not in log.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("suite", ["ring", "all", "ring-no-taker"])
+@pytest.mark.parametrize("suite", ["ring", "ring-core", "all", "ring-no-taker"])
 def test_selected_ring_suite_starts_its_complete_population(
     runner_env: tuple[dict[str, str], Path, Path, Path], suite: str
 ) -> None:
@@ -249,6 +249,20 @@ def test_selected_ring_suite_starts_its_complete_population(
         assert not full_population & started
     else:
         assert full_population <= started
+        test_command = shlex.split(
+            Path(env["FAKE_PYTEST_LOG"]).read_text().splitlines()[-1]
+        )
+        heartbeat = str(ROOT / "tests/e2e/test_direct_heartbeat_e2e.py")
+        scenario = (
+            ROOT
+            / "tests/e2e"
+            / (
+                "test_channel_ring_e2e.py"
+                if suite == "ring-core"
+                else "test_cofunded_ring_e2e.py"
+            )
+        )
+        assert test_command.index(heartbeat) < test_command.index(str(scenario))
 
 
 def test_authenticated_onion_readiness_precedes_enrollment_and_tests(

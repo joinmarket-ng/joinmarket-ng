@@ -1174,6 +1174,20 @@ class TakerSettings(BaseModel):
             "PoDLE commitments (reference default: 20)."
         ),
     )
+    external_podle_mode: Literal["disabled", "only"] = Field(
+        default="disabled",
+        description=(
+            "Use imported external PoDLE credentials only, without selecting their backing "
+            "UTXOs as CoinJoin funding inputs."
+        ),
+    )
+    market_fault_exclusion: bool = Field(
+        default=False,
+        description=(
+            "Opt in to experimental exclusion of makers with verified credential-market "
+            "fault evidence. Independent of buying or selling credentials."
+        ),
+    )
     max_cj_fee_rel: str = Field(
         default="0.001",
         description="Maximum relative CoinJoin fee (0.001 = 0.1%)",
@@ -1544,6 +1558,24 @@ class OrderbookWatcherSettings(BaseModel):
     )
 
 
+class MarketSettings(BaseModel):
+    """Credential-market seller settings."""
+
+    lnd_grpc_url: str | None = Field(
+        default=None,
+        description=(
+            "host:port of the seller LND gRPC that creates, settles, and cancels hold invoices"
+        ),
+    )
+    lnd_tls_cert_path: str | None = Field(
+        default=None, description="Path to that LND node's tls.cert"
+    )
+    lnd_macaroon_path: str | None = Field(
+        default=None,
+        description="Path to a macaroon limited to invoices (LND's invoice.macaroon)",
+    )
+
+
 class TuiSettings(BaseModel):
     """Menu settings, consumed by the shell TUI rather than Python components."""
 
@@ -1700,6 +1732,7 @@ class JoinMarketSettings(BaseSettings):
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     tui: TuiSettings = Field(default_factory=TuiSettings)
+    market: MarketSettings = Field(default_factory=MarketSettings)
 
     # Component-specific settings
     maker: MakerSettings = Field(default_factory=MakerSettings)
