@@ -7,17 +7,36 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from bitcointx.core.key import CKey
 from jmcore.bitcoin import parse_transaction_bytes, scriptpubkey_to_address
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig
 from jmcore.models import NetworkType, OfferType
 from jmwallet.wallet.models import UTXOInfo
 
 from taker.coinjoin_session import CoinJoinSession
 from taker.config import TakerConfig
-from taker.taker import Taker
+from taker.taker import RING_BUYOUT_CONFLICT, Taker, TakerState
 
 SCRIPT = b"\x51\x20" + bytes(CKey(b"\x11" * 32).xonly_pub)
 ESCROW = b"\x51\x20" + bytes(CKey(b"\x22" * 32).xonly_pub)
 CHANNEL = "33" * 32
 MNEMONIC = "abandon " * 11 + "about"
+
+
+def _ring_config(tmp_path) -> ChannelRingConfig:
+    """A minimal valid enabled ring policy (loopback lnd, v3 onion, own store)."""
+    return ChannelRingConfig(
+        enabled=True,
+        nodes={
+            "local": ChannelRingNodeConfig(
+                lnd_grpc_url="https://127.0.0.1:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint="a" * 56 + ".onion:9735",
+            )
+        },
+        mixdepth_nodes={0: "local"},
+        node_binding_directory=tmp_path / "node-bindings",
+        persistence_directory=tmp_path / "rings",
+    )
 
 
 def _prepared_adapter(total_value: int, minimum_change: int) -> MagicMock:
@@ -211,6 +230,66 @@ async def test_preflight_explicit_inputs_use_the_same_funding_requirement(
 
 
 @pytest.mark.parametrize(
+    ("bound_mixdepth", "fingerprint", "failure"),
+    [
+        (0, "f00d", None),
+        (0, None, "wallet identity"),
+        (0, "", "wallet identity"),
+        (0, "different", "wallet identity"),
+        (1, None, "source mixdepth"),
+        (True, None, "source mixdepth"),
+        ("0", None, "source mixdepth"),
+        (None, None, "source mixdepth"),
+    ],
+)
+async def test_buyout_binding_precedes_reservation_and_maker_work(
+    bound_mixdepth: object,
+    fingerprint: str | None,
+    failure: str | None,
+) -> None:
+    taker = Taker.__new__(Taker)
+    taker.config = TakerConfig(
+        mnemonic=MNEMONIC,
+        network=NetworkType.REGTEST,
+        preferred_offer_type=OfferType.TR0_ABSOLUTE,
+        address_type="p2tr",
+    )
+    taker.wallet = MagicMock()
+    taker.wallet.mixdepth_count = 5
+    taker.wallet.wallet_fingerprint = "f00d"
+    taker.wallet.get_new_internal_address.return_value = scriptpubkey_to_address(SCRIPT, "regtest")
+    taker.orderbook_manager = MagicMock(own_wallet_nicks=set())
+    taker._maker_nick_component = "maker_taproot"
+    taker.state = TakerState.IDLE
+    taker._session = CoinJoinSession()
+    taker._session.attach(taker)
+    buyout = MagicMock()
+    buyout.buyer.runtime_binding = {"mixdepth": bound_mixdepth}
+    if fingerprint is not None:
+        buyout.buyer.runtime_binding["wallet_fingerprint"] = fingerprint
+    taker._session.buyout = buyout
+    taker._begin_input_lock_round = MagicMock()
+    taker.release_input_locks = MagicMock()
+    taker._clear_coinjoin_log_context = MagicMock()
+    taker._prepare_requested_input_selection = AsyncMock(return_value=([], [], 0))
+    taker._session._resolve_fee_rate = AsyncMock(side_effect=ValueError("stop after binding"))
+
+    with patch("taker.taker.read_nick_state", return_value=None):
+        assert (
+            await taker._do_coinjoin(500_000, "INTERNAL", mixdepth=0, counterparty_count=2) is None
+        )
+
+    if failure is None:
+        buyout.begin_round.assert_called_once_with()
+        assert taker.last_failure_reason == "stop after binding"
+    else:
+        buyout.begin_round.assert_not_called()
+        assert taker.last_failure_reason is not None
+        assert failure in taker.last_failure_reason
+        taker.wallet.get_new_internal_address.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "amount,offer_type,address_type",
     [
         (0, OfferType.TR0_ABSOLUTE, "p2tr"),
@@ -234,3 +313,42 @@ async def test_buyout_rejects_sweep_and_non_taproot_pit_before_reservation(
     with pytest.raises(ValueError, match="non-sweep Taproot"):
         await taker.do_coinjoin(amount, "INTERNAL", buyout=buyout)
     buyout.begin_round.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_buyout_and_channel_ring_cannot_share_one_round(tmp_path) -> None:
+    """A ring spends every residual into channels, so no escrow change can exist."""
+    taker = Taker.__new__(Taker)
+    taker._round_lock = asyncio.Lock()
+    taker.config = TakerConfig(
+        mnemonic=MNEMONIC,
+        network=NetworkType.REGTEST,
+        preferred_offer_type=OfferType.TR0_ABSOLUTE,
+        address_type="p2tr",
+        channel_ring=_ring_config(tmp_path),
+    )
+    buyout = MagicMock()
+
+    with pytest.raises(ValueError, match="cannot fund a private channel buyout"):
+        await taker.do_coinjoin(500_000, "INTERNAL", buyout=buyout)
+
+    buyout.begin_round.assert_not_called()
+
+
+def test_ring_request_error_rejects_an_attached_buyout(tmp_path) -> None:
+    """The in-round guard also refuses a buyout attached to the session."""
+    taker = Taker.__new__(Taker)
+    taker.config = TakerConfig(
+        mnemonic=MNEMONIC,
+        network=NetworkType.REGTEST,
+        preferred_offer_type=OfferType.TR0_ABSOLUTE,
+        address_type="p2tr",
+        channel_ring=_ring_config(tmp_path),
+    )
+    taker._session = CoinJoinSession()
+    taker._session.attach(taker)
+
+    assert taker._ring_request_error(500_000, 5, None) is None
+    assert taker._ring_request_error(500_000, 5, MagicMock()) == RING_BUYOUT_CONFLICT
+    with pytest.raises(ValueError, match="cannot fund a private channel buyout"):
+        taker._enforce_ring_request(500_000, 5, MagicMock())

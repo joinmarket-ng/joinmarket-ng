@@ -15,6 +15,12 @@ timelocked split protects recovery. It requires the authorized
 [patched LND backend](../lnd/README.md). Follow the
 [buyout configuration and recovery guide](../jmswap/README.md).
 
+Private channel rings turn CoinJoin change into co-funded, unannounced Taproot
+Lightning channels. Each wallet source mixdepth uses a separate enrolled LND
+node. Three makers can form a maker-only ring, or a taker can participate with
+ring makers while ordinary makers join the same CoinJoin. See the
+[node enrollment and recovery guide](../jmswap/README.md#mixdepth-isolated-ring-nodes).
+
 Keep journals, original LND state, and recovery artifacts. Missing state never
 authorizes a new payment, a migration, or deletion. Do not delete intent markers
 or retry a payment manually to bypass an uncertain outcome.

@@ -32,7 +32,12 @@ from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_con
 from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID
 from jmcore.notifications import get_notifier
-from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
+from jmcore.protocol import (
+    COMMAND_PREFIX,
+    FEATURE_PRIVATE_CHANNEL_RING,
+    JM_VERSION,
+    MessageType,
+)
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.tasks import parse_directory_address, spawn_task
 from jmwallet.backends.base import BlockchainBackend
@@ -550,6 +555,10 @@ class ProtocolHandlersMixin:
                 await self._handle_tx(
                     from_nick, command, source=source, generation_id=generation_id
                 )
+            elif command.startswith("ring"):
+                await self._handle_ring(
+                    from_nick, command, source=source, generation_id=generation_id
+                )
             elif command.startswith("push"):
                 await self._handle_push(
                     from_nick, command, source=source, generation_id=generation_id
@@ -580,6 +589,8 @@ class ProtocolHandlersMixin:
         simultaneously, each with a unique ID.
         """
         reservation_owned = False
+        if getattr(self, "_stopping", False) is True:
+            return
         session: MakerSession | None = None
         log_context: AbstractContextManager[None] | None = None
         try:
@@ -726,6 +737,11 @@ class ProtocolHandlersMixin:
                 input_lock_ttl_sec=self.config.pending_tx_timeout_min * 60,
                 merge_algorithm=self.config.merge_algorithm.value,
                 mixdepth_selection_policy=self.config.mixdepth_selection_policy,
+                allowed_mixdepths=(
+                    frozenset(self.config.channel_ring.mixdepth_nodes)
+                    if self.config.channel_ring.enabled
+                    else None
+                ),
                 restrict_md0=not self.config.allow_mixdepth_zero_merge,
                 minimum_fee_rate_sat_vb=(
                     minimum_fee_rate if isinstance(minimum_fee_rate, (int, float)) else None
@@ -742,6 +758,10 @@ class ProtocolHandlersMixin:
             # Pass the taker's NaCl pubkey for setting up encryption
             success, response = await session.handle_fill(amount, commitment, taker_pk)
 
+            if getattr(self, "_stopping", False) is True:
+                self._release_commitment_reservation(commitment)
+                reservation_owned = False
+                return
             if success:
                 session_key = (generation_id, taker_nick)
                 previous_session = self.active_sessions.get(session_key)
@@ -765,6 +785,8 @@ class ProtocolHandlersMixin:
                     self._release_podle_outpoint(previous_session)
                     self._release_commitment_reservation(previous_session.commitment.hex())
 
+                if self.channel_ring_capability_validated:
+                    response.setdefault("features", []).append(FEATURE_PRIVATE_CHANNEL_RING)
                 self.active_sessions[session_key] = session
                 logger.info(
                     f"Created CoinJoin session with {taker_nick} "
@@ -871,6 +893,8 @@ class ProtocolHandlersMixin:
         message on the connection. The session lock still runs a session's
         handlers in order.
         """
+        if getattr(self, "_stopping", False) is True:
+            return
         if session.pending_handlers >= MAX_HANDLERS_PER_SESSION:
             self._log_rate_limited(
                 "maker-session-handler-busy",
@@ -895,12 +919,14 @@ class ProtocolHandlersMixin:
 
         task = asyncio.create_task(session.run_handler(self, handler), name=name)
         task.add_done_callback(handler_finished)
+        self._session_handler_tasks.add(task)
         task.add_done_callback(self._session_handler_done)
         self._register_detached_handler_task(task)
 
     def _session_handler_done(self: MakerBotProtocol, task: asyncio.Task[None]) -> None:
         """Release handler admission and remove completed detached tasks."""
         self._detached_handler_tasks.discard(task)
+        self._session_handler_tasks.discard(task)
         self._session_handler_task_count -= 1
         try:
             task.result()
@@ -981,6 +1007,8 @@ class ProtocolHandlersMixin:
         self._release_podle_outpoint(session)
         session.detached = True
         session.detached_event.set()
+        if session.ring_participant is not None:
+            session.ring_participant.cancel_acceptor_task()
         state = session.state
         logger.debug("Cleaning up timed out session: {} (state={})", session.taker_nick, state)
 
@@ -1073,6 +1101,40 @@ class ProtocolHandlersMixin:
                 logger.error(
                     f"Pending signed-round input ownership was lost for {record.taker_nick}"
                 )
+
+    async def _handle_ring(
+        self: MakerBotProtocol,
+        taker_nick: str,
+        msg: str,
+        source: str = "unknown",
+        generation_id: int | None = None,
+    ) -> None:
+        """Dispatch !ring to the per-taker MakerSession.
+
+        Mirrors :meth:`_handle_tx`: the ring phase only ever runs inside an
+        authenticated CoinJoin session of a live generation.
+        """
+        generation_id = self.current_generation_id if generation_id is None else generation_id
+        generation = self._generation(generation_id)
+        if (
+            generation is None
+            or generation.state is GenerationState.CLOSED
+            or (
+                generation.grace_deadline is not None
+                and time.monotonic() >= generation.grace_deadline
+            )
+        ):
+            return
+        session = self.active_sessions.get((generation_id, taker_nick))
+        if session is None:
+            logger.warning(f"No active session for {taker_nick}")
+            return
+
+        await self._dispatch_session_handler(
+            session,
+            lambda: session.on_ring(self, msg, source),
+            name=f"maker-ring-{taker_nick}",
+        )
 
     async def _handle_push(
         self: MakerBotProtocol,
@@ -1176,6 +1238,19 @@ class ProtocolHandlersMixin:
                 # race a second broadcast attempt. The renewed persisted lease
                 # remains for the complete pending-broadcast window.
                 self._pending_signed_rounds.pop(key, None)
+
+            # A ring participant must bind the broadcast transaction to the
+            # exact round it co-funded before this maker relays it.
+            ring_session = self.active_sessions.get((generation_id, taker_nick))
+            if ring_session is not None and ring_session.ring_participant is not None:
+                try:
+                    await ring_session.ring_participant.observe_final_transaction(tx_hex)
+                except Exception as e:
+                    logger.error("Rejected substituted ring !push transaction")
+                    logger.bind(sensitive=True).error(
+                        f"Rejected substituted ring !push transaction: {e}"
+                    )
+                    return
 
             logger.info(f"Received matched !push from {taker_nick}, broadcasting transaction...")
 

@@ -626,10 +626,12 @@ async def test_old_session_response_uses_only_old_clients(bot: MakerBot) -> None
             "cj_addr": "bcrt1qcj",
             "change_addr": "bcrt1qchange",
             "btc_sig": "signature",
+            "hold_seconds": "0",
         },
     )
 
     assert sent is True
+    inner.crypto.encrypt.assert_called_once_with("ab:0 pubkey bcrt1qcj bcrt1qchange signature 0")
     old_client.send_private_message.assert_awaited_once()
     new_client.send_private_message.assert_not_awaited()
 

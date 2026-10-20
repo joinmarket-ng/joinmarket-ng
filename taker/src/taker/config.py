@@ -6,8 +6,14 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from jmcore.channel_ring import ChannelRingConfig
 from jmcore.config import WalletConfig
-from jmcore.models import OfferType, normalize_relative_fee, offer_output_script_type
+from jmcore.models import (
+    OfferType,
+    is_taproot_offer_type,
+    normalize_relative_fee,
+    offer_output_script_type,
+)
 from jmcore.randomness import secure_random
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
@@ -96,6 +102,7 @@ class TakerConfig(WalletConfig):
             "fixed counterparty count)."
         ),
     )
+    channel_ring: ChannelRingConfig = Field(default_factory=ChannelRingConfig)
 
     # Fee settings
     max_cj_fee: MaxCjFee = Field(
@@ -309,6 +316,11 @@ class TakerConfig(WalletConfig):
         """If bitcoin_network is not set, default to the protocol network."""
         if self.bitcoin_network is None:
             object.__setattr__(self, "bitcoin_network", self.network)
+        if self.channel_ring.enabled:
+            if self.address_type != "p2tr":
+                raise ValueError("enabled channel ring requires a p2tr wallet")
+            if not is_taproot_offer_type(self.preferred_offer_type):
+                raise ValueError("enabled channel ring requires a tr0 preferred offer")
         return self
 
     @model_validator(mode="after")

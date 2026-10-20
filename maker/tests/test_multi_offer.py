@@ -1225,6 +1225,7 @@ class TestMakerBotMultiOfferFill:
                 "cj_addr": "coinjoin-address",
                 "change_addr": "change-address",
                 "btc_sig": "signature",
+                "hold_seconds": "180",
             },
         )
 
@@ -1285,6 +1286,7 @@ class TestMakerBotMultiOfferFill:
                     "cj_addr": "coinjoin-address",
                     "change_addr": "change-address",
                     "btc_sig": "signature",
+                    "hold_seconds": "180",
                 },
             )
 
@@ -1335,6 +1337,7 @@ class TestMakerBotMultiOfferFill:
                 "cj_addr": "coinjoin-address",
                 "change_addr": "change-address",
                 "btc_sig": "signature",
+                "hold_seconds": "180",
             },
         )
 

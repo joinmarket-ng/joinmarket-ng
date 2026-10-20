@@ -58,9 +58,10 @@ RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
 
 # Install jmcore dependencies (with hash verification)
 # All requirements are installed in a single pip invocation so that pip resolves the
-# dependency graph once instead of re-resolving across four sequential calls.
+# dependency graph once instead of re-resolving across separate install calls.
 COPY jmcore/requirements.txt /build/jmcore/requirements.txt
 COPY jmwallet/requirements.txt /build/jmwallet/requirements.txt
+COPY jmswap/requirements.txt /build/jmswap/requirements.txt
 COPY maker/requirements.txt /build/maker/requirements.txt
 COPY taker/requirements.txt /build/taker/requirements.txt
 
@@ -69,6 +70,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
     pip install --prefix=/app \
         -r /build/jmcore/requirements.txt \
         -r /build/jmwallet/requirements.txt \
+        -r /build/jmswap/requirements.txt \
         -r /build/maker/requirements.txt \
         -r /build/taker/requirements.txt
 
@@ -80,6 +82,8 @@ COPY jmcore/pyproject.toml /build/jmcore/
 COPY jmcore/setup.py /build/jmcore/
 COPY jmwallet/src /build/jmwallet/src
 COPY jmwallet/pyproject.toml /build/jmwallet/
+COPY jmswap/src /build/jmswap/src
+COPY jmswap/pyproject.toml /build/jmswap/
 COPY maker/src /build/maker/src
 COPY maker/pyproject.toml /build/maker/
 # Bundle the wallet-operation tools without starting additional services.
@@ -94,6 +98,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
     pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/jmwallet \
+        /build/jmswap \
         /build/maker \
         /build/taker \
         /build/tumbler
