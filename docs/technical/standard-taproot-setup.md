@@ -120,13 +120,16 @@ wallet (ring channels are funded inside the CoinJoin), so the reserve is only
 spent by LND's sweeper.
 
 The reserve of mixdepth N's node is only ever funded from mixdepth N's
-privacy cluster, and one transaction funds at most one node:
+privacy cluster, and one transaction funds at most one node. An output is in
+range when it brings a node below its minimum to a balance between the
+minimum and the maximum:
 
-- Change in range: when a CoinJoin's change for mixdepth N falls within the
-  reserve range and node N is below its minimum, that change pays to node N.
-- Equal output in range: when a CoinJoin from mixdepth N-1 has an amount
-  within the range and node N is below its minimum, its equal output pays to
-  node N. This is the more private path, since the output is mixed.
+- Equal output in range: when a CoinJoin from mixdepth N-1 to the next
+  mixdepth has an amount in range for node N, its equal output pays to node
+  N. This is preferred, since the output is mixed.
+- Change in range: otherwise, when a CoinJoin's ordinary change for mixdepth
+  N is in range for node N, that change pays to node N. Ring and buyout
+  change is never redirected, and a taker sweep has none.
 - Explicit: `jm-wallet fund-reserve N` sends from mixdepth N to a fresh
   Taproot address of node N, and does nothing when the node already holds its
   minimum. Setup suggests this per mixdepth, never for several mixdepths at
@@ -134,6 +137,16 @@ privacy cluster, and one transaction funds at most one node:
 
 Unconfirmed coins count toward the minimum, so a funding transaction still in
 the mempool is not repeated, and no funding raises a node above the maximum.
+
+Only managed nodes are funded by CoinJoin outputs; manual mode leaves the
+operator's node wallets alone. Each node's reserve is read before a CoinJoin
+(a taker) or every few minutes (a maker, so `!ioauth` never waits on LND), and
+an unreachable node or an old reading funds nothing. A node address is handed
+out once and the node is then left alone for a while, since the CoinJoin
+paying it may still be negotiating or may fail; a later reading picks either
+the received coins or a fresh address. A taker redirects only an equal output
+it resolved itself for an internal destination, never a tumbler's planned
+destination, and a maker only with a Taproot offer.
 
 The reserve is advisory: a ring CoinJoin still runs below the minimum and
 the status output and logs warn.

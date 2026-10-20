@@ -22,6 +22,7 @@ import base64
 import binascii
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -234,6 +235,9 @@ class CoinJoinSession:
         self.cj_destination_is_internal: bool = False
         self.taker_change_address: str = ""
         self.buyout: ChannelBuyout | None = None
+        # Ordinary change of this round may pay the source mixdepth's Lightning
+        # reserve: called with the change amount, returns the node's address.
+        self.reserve_change_claim: Callable[[int], str | None] | None = None
 
         # Sweep-only: the tx-fee budget reserved at order-selection time. At
         # build time we re-use this exact number to keep the actual fee in line
@@ -345,6 +349,7 @@ class CoinJoinSession:
         self.cj_destination_is_internal = False
         self.taker_change_address = ""
         self.buyout = None
+        self.reserve_change_claim = None
         self._sweep_tx_fee_budget = 0
         self.crypto_session = None
         self._fee_rate = None
@@ -1604,7 +1609,14 @@ class CoinJoinSession:
                 taker_change_address = self.buyout.change_address
                 self.taker_change_address = taker_change_address
             elif expected_change > BITCOIN_DUST_THRESHOLD:
-                taker_change_address = self.wallet.get_new_internal_address(mixdepth)
+                reserve_address = (
+                    None
+                    if self.is_sweep or self.reserve_change_claim is None
+                    else self.reserve_change_claim(expected_change)
+                )
+                taker_change_address = reserve_address or self.wallet.get_new_internal_address(
+                    mixdepth
+                )
                 self.taker_change_address = taker_change_address
                 logger.bind(sensitive=True).debug(
                     "Generated change address (expected: {} sats)", expected_change

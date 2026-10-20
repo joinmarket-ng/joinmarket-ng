@@ -74,6 +74,8 @@ from taker.podle import ExtendedPoDLECommitment
 from taker.podle_manager import BondKey, ExternalPoDLEPreview, PoDLEManager
 
 if TYPE_CHECKING:
+    from jmswap.lightning_reserve import ReserveFunder
+
     from taker.buyout import ChannelBuyout
     from taker.podle_purchase import PoDLEPurchaser
 
@@ -452,6 +454,13 @@ class Taker(TakerMonitoringMixin):
         self._channel_ring_store: RingParticipantStore | None = None
         self._channel_ring_coordinator_store: CoordinatorStore | None = None
         self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
+        self._reserve_funder: ReserveFunder | None = None
+        if config.channel_ring.reserve_funding is not None:
+            from jmswap.lightning_reserve import ReserveFunder
+
+            self._reserve_funder = ReserveFunder.from_ring_config(
+                config.channel_ring, network=(config.bitcoin_network or config.network).value
+            )
         if config.channel_ring.enabled:
             data_directory = Path(config.data_dir or get_default_data_dir())
             self._channel_ring_store = RingParticipantStore(
@@ -1856,6 +1865,31 @@ class Taker(TakerMonitoringMixin):
             )
         return details
 
+    async def _plan_reserve_funding(
+        self, destination: str, mixdepth: int, *, destination_is_internal: bool
+    ) -> str:
+        """Let this CoinJoin top up at most one managed node's Lightning reserve.
+
+        The equal output of a CoinJoin to the next mixdepth may pay that
+        mixdepth's node; otherwise ordinary change may pay the source
+        mixdepth's node, so no output crosses mixdepths. Only an INTERNAL
+        destination resolved here qualifies: a tumbler's planned destinations
+        are never redirected. Returns the equal output's destination.
+        """
+        funder = self._reserve_funder
+        self._session.reserve_change_claim = None
+        if funder is None or self._session.buyout is not None:
+            return destination
+        next_mixdepth = (mixdepth + 1) % self.wallet.mixdepth_count
+        await funder.refresh({mixdepth, next_mixdepth} if destination_is_internal else {mixdepth})
+        if destination_is_internal:
+            address = funder.claim(next_mixdepth, self._session.cj_amount)
+            if address is not None:
+                return address
+        if not self._session.is_sweep:
+            self._session.reserve_change_claim = lambda change: funder.claim(mixdepth, change)
+        return destination
+
     async def _build_transaction_phase(
         self, destination: str, mixdepth: int, *, destination_is_internal: bool = False
     ) -> bool:
@@ -2413,6 +2447,10 @@ class Taker(TakerMonitoringMixin):
                 f"Estimated transaction (mining) fee: {estimated_tx_fee:,} sats "
                 f"(~{estimated_fee_rate:.2f} sat/vB for ~{estimated_inputs} inputs, "
                 f"{estimated_outputs} outputs)"
+            )
+
+            destination = await self._plan_reserve_funding(
+                destination, mixdepth, destination_is_internal=destination_is_internal
             )
 
             # Prompt for confirmation after maker selection

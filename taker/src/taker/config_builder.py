@@ -310,6 +310,7 @@ def build_taker_config_kwargs(
             passphrase=passphrase,
             data_dir=effective_data_dir,
             network=NetworkType(effective_bitcoin_network).value,
+            reserve_sats=(settings.lightning.reserve_min_sats, settings.lightning.reserve_max_sats),
         ),
     }
 

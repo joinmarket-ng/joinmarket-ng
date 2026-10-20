@@ -855,7 +855,7 @@ def test_managed_lightning_wires_the_taker_ring_to_its_nodes(
     settings = JoinMarketSettings(
         network_config={"network": "signet"},
         wallet={"address_type": "p2tr"},
-        lightning={"mode": "managed"},
+        lightning={"mode": "managed", "reserve_min_sats": 20_000, "reserve_max_sats": 90_000},
     )
 
     config = build_taker_config(
@@ -865,6 +865,7 @@ def test_managed_lightning_wires_the_taker_ring_to_its_nodes(
     assert config.channel_ring.enabled
     assert config.channel_ring.mixdepth_nodes == {1: node.name}
     assert config.channel_ring.taker_joins
+    assert config.channel_ring.reserve_funding == (20_000, 90_000)
     assert config.channel_ring.node_binding_directory == paths.bindings_dir
 
 
