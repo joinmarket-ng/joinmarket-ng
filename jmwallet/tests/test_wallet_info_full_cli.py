@@ -338,11 +338,11 @@ def test_info_uses_one_chain_time_for_bonds(
     info_chain_time.assert_awaited_once()
     out = result.output
     for amount, label in (
-        (422_000, "Total wallet balance"),
-        (100_000, "frozen UTXOs"),
+        (422_000, "Total Wallet Balance"),
+        (100_000, "Frozen UTXOs"),
         (80_000, "fidelity bonds time-locked"),
         (10_000, "fidelity bonds expired (frozen)"),
-        (232_000, "Total spendable balance"),
+        (232_000, "Total Spendable Balance"),
         (192_000, "thereof auto-selectable"),
         (40_000, "thereof expired fidelity bonds (explicit selection or bond-only sweep)"),
     ):
@@ -381,7 +381,7 @@ def test_info_chain_time_failure_does_not_fall_back_to_host_time(
     result = _invoke_info(chain_time_wallet, str(tmp_path), "--extended", "--view", "full")
     assert result.exit_code == 1
     assert result.exception is error
-    assert "Total spendable balance" not in result.output
+    assert "Total Spendable Balance" not in result.output
     chain_time_wallet.close.assert_awaited_once()
 
 

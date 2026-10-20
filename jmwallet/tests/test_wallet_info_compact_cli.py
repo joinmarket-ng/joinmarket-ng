@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from jmwallet.cli import app
@@ -232,6 +233,18 @@ class TestCompactViewFlag:
         )
         assert "Mixdepth 0" in result.output
 
+    @pytest.mark.parametrize("filename", ["x" * 100 + ".mnemonic", "界" * 50 + ".mnemonic"])
+    def test_long_wallet_name_stays_within_budget(self, tmp_path: Path, filename: str) -> None:
+        wallet = _make_wallet([])
+        wallet.data_dir = tmp_path
+        wallet.mnemonic_file = tmp_path / filename
+        result = _invoke_info(wallet, str(tmp_path), "--extended", "--view", "compact")
+        assert result.exit_code == 0, result.output
+        lines = result.stdout.splitlines()
+        # These fixtures contain only single-cell text and two-cell CJK characters.
+        assert all(len(line) + line.count("界") <= MAX_LINE for line in lines)
+        assert filename in "".join(line.strip() for line in lines)
+
 
 class TestLegendConsistency:
     def test_compact_legend_glossary_matches_the_full_view(self) -> None:
@@ -256,6 +269,24 @@ class TestLegendConsistency:
         assert "fb-x" in expired_only
         assert "fb-a" not in expired_only and "lock" not in expired_only
         assert expired_only["spend"].endswith("(except fidelity bonds: see fb-x)")
+
+    @pytest.mark.parametrize("expired", [False, True])
+    def test_visible_unfunded_bond_keeps_its_glossary(self, capsys, expired: bool) -> None:
+        locktime = _NOW - 86400 if expired else _NOW + 86400
+        bond = _address_info(
+            _BOND_EXPIRED_ADDR,
+            0,
+            0,
+            "bond",
+            "m/84'/0'/0'/2/0",
+            is_bond=True,
+            locktime=locktime,
+        )
+        out = _show(_make_wallet([], bonds=[bond]), capsys, now=_NOW)
+        token = "fb-x" if expired else "fb-a"
+        assert f"| {token}" in out
+        assert f"    {token}   - fidelity bond" in out
+        assert "bonds: state + date, outpoint on 3rd line" in out
 
 
 class TestCompactLayout:
@@ -481,6 +512,24 @@ class TestCompactLayout:
         assert data_lines[0].endswith("RU!")
         assert "…" in data_lines[0]
 
+    @pytest.mark.parametrize("reused", [False, True])
+    def test_wide_unicode_label_uses_terminal_columns(self, capsys, reused: bool) -> None:
+        address = _address_info(
+            _EXT_ADDR,
+            0,
+            0,
+            "reused" if reused else "reserved",
+            "m/84'/0'/0'/0/0",
+            base_status="deposit" if reused else None,
+            label="界" * 30,
+        )
+        out = _show(_make_wallet([address]), capsys, show_empty=True)
+        row = next(line for line in out.splitlines() if line.lstrip().startswith("/0 |"))
+        assert "界" in row
+        assert "…" in row
+        assert len(row) + row.count("界") <= MAX_LINE
+        assert row.endswith("RU!") == reused
+
     def test_two_line_entries_close_with_a_dash_line(self, capsys) -> None:
         """Every multi-line entry is closed by a dash line: funded UTXOs
         (regular: 2 lines, funded bonds: 3) and unfunded bond rows with
@@ -645,6 +694,31 @@ class TestCompactInvariants:
         assert render_compact_fb_summary(summary) == [
             "Balance: 60 sats (50 locked + 10 expired; spendable (explicit): 10 sats)"
         ]
+
+    @pytest.mark.parametrize("amount", [100_000_000, 1_000_000_000_000])
+    def test_large_fb_breakdown_wraps_without_losing_amounts(self, amount: int) -> None:
+        summary = BranchSummaryRow(
+            mixdepth=0,
+            branch=FIDELITY_BOND_BRANCH,
+            balance=2 * amount,
+            locked_balance=amount,
+            expired_balance=amount,
+        )
+        lines = render_compact_fb_summary(summary)
+        assert all(len(line) <= MAX_LINE for line in lines)
+        text = " ".join(line.strip() for line in lines)
+        assert f"{2 * amount:,} sats" in text
+        assert f"{amount:,} locked + {amount:,} expired;" in text
+        assert f"spendable (explicit): {amount:,} sats" in text
+
+    def test_large_bond_summary_does_not_widen_page_separators(self, capsys) -> None:
+        wallet = self._stress_wallet()
+        for bond in wallet.get_fidelity_bond_addresses_info.return_value:
+            bond.balance = 100_000_000
+            bond.utxos[0].value = 100_000_000
+        lines = _show(wallet, capsys).splitlines()
+        assert all(len(line) <= MAX_LINE for line in lines)
+        assert len({len(line) for line in lines if line.startswith("-")}) == 1
 
     def test_fb_summary_spendable_explicit_excludes_frozen_expired(self) -> None:
         """Frozen expired bonds are excluded from the spendable figure.

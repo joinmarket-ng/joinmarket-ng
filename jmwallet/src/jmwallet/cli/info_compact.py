@@ -41,10 +41,14 @@ import re
 from collections.abc import Mapping, Sequence
 from textwrap import wrap
 
+from rich.cells import cell_len, chop_cells
+from rich.text import Text
+
 from jmwallet.cli.ansi import (
     ANSI_BOLD_CYAN,
     ANSI_BOLD_RED,
     ANSI_BOLD_WHITE,
+    ANSI_BOLD_YELLOW,
     ANSI_CYAN,
     colorize,
 )
@@ -98,8 +102,15 @@ _PageLine = str | tuple[str, str]
 
 
 def _visible_len(line: str) -> int:
-    """Length of ``line`` with ANSI color codes stripped."""
-    return len(_ANSI_RE.sub("", line))
+    """Terminal-cell width of ``line`` with ANSI color codes stripped."""
+    return cell_len(_ANSI_RE.sub("", line))
+
+
+def render_compact_wallet_header(filename: str) -> list[str]:
+    """Fold a wallet filename without eliding it or changing other views."""
+    lines = chop_cells(f"Wallet: {filename}", MAX_LINE)
+    lines[0] = lines[0].replace("Wallet:", colorize("Wallet:", ANSI_BOLD_YELLOW), 1)
+    return lines
 
 
 def _elide_address(address: str, width: int = _ADDR_WIDTH) -> str:
@@ -116,10 +127,9 @@ def _appendages(row: UtxoRow | AddressRow, line_len: int) -> str:
     suffix = ""
     budget = MAX_LINE - line_len - (4 if row.reused else 0)
     if row.user_label and budget >= 5:
-        label = f' "{row.user_label}"'
-        if len(label) > budget:
-            label = f' "{row.user_label[: budget - 4]}\u2026"'
-        suffix += label
+        label = Text(row.user_label)
+        label.truncate(budget - 3, overflow="ellipsis")
+        suffix += f' "{label.plain}"'
     if row.reused:
         suffix += " " + colorize("RU!", ANSI_BOLD_RED)
     return suffix
@@ -221,7 +231,7 @@ def _render_table(
     )
     for (cells, row), row_details in zip(rows, details, strict=True):
         line = padded(cells)
-        line += _appendages(row, len(line))
+        line += _appendages(row, _visible_len(line))
         lines.append(line)
         for detail in row_details:
             lines.append(f"{' ' * detail_indent}{detail}")
@@ -242,8 +252,8 @@ def render_compact_legend(
     column. Bond vocabulary appears iff the corresponding bond state
     exists in the (unfiltered) wallet data -- the page references bond
     funds even when the bond branch is hidden (hidden-bond notice,
-    balance footer), so, like the footer, the legend follows existence,
-    not the display config. The ``spend`` gloss carries its fb-x
+    balance footer). Visible unfunded bonds also need their tags
+    explained. The ``spend`` gloss carries its fb-x
     exception only when an expired bond exists: active bonds show the
     ``lock`` state, never ``spend``.
     """
@@ -330,8 +340,8 @@ def render_compact_fb_summary(summary: BranchSummaryRow) -> list[str]:
     the page footer (``- fidelity bonds expired (frozen)``) and the suffix
     would break the 80-column budget for large balances; ``--view full``
     carries the full annotation. Uses the one-line wording when it fits the
-    width budget; larger bond balances split into a balance line plus an
-    indented breakdown line, mirroring :func:`render_compact_mixdepth_summary`,
+    width budget; larger bond balances split into a balance line plus
+    wrapped, indented breakdown lines, like :func:`render_compact_mixdepth_summary`,
     so the locked/expired detail is never dropped. The final figure is the
     honestly spendable part -- expired bonds minus frozen ones, spendable
     only via explicit selection or a bond-only sweep (same rule as the full
@@ -349,7 +359,7 @@ def render_compact_fb_summary(summary: BranchSummaryRow) -> list[str]:
         return [one_liner]
     return [
         f"Balance: {summary.balance:,} sats",
-        f"  {detail}{spendable}",
+        *wrap(f"{detail}{spendable}", width=MAX_LINE, initial_indent="  ", subsequent_indent="  "),
     ]
 
 

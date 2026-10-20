@@ -2142,8 +2142,8 @@ def test_info_uses_default_wallet(monkeypatch):
             )
 
             assert result.exit_code == 0, f"info command failed: {result.stdout}"
-            assert "Total wallet balance" in result.stdout
-            assert "Total spendable balance" in result.stdout
+            assert "Total Wallet Balance" in result.stdout
+            assert "Total Spendable Balance" in result.stdout
 
 
 def test_balance_footer_plain_wallet():
@@ -2159,9 +2159,9 @@ def test_balance_footer_plain_wallet():
     )
     text = "\n".join(lines)
     assert lines[1] == "Wallet balance calculation"
-    assert lines[2].endswith("100,000 sats  Total wallet balance")
-    assert lines[3].endswith("100,000 sats  Total spendable balance")
-    assert "frozen UTXOs" not in text
+    assert lines[2].endswith("100,000 sats  Total Wallet Balance")
+    assert lines[3].endswith("100,000 sats  Total Spendable Balance")
+    assert "Frozen UTXOs" not in text
     assert "fidelity bonds" not in text
     assert "thereof" not in text
 
@@ -2178,11 +2178,11 @@ def test_balance_footer_frozen_utxos_deducted():
         expired_frozen=0,
     )
     text = "\n".join(lines)
-    assert lines[2].endswith("100,000 sats  Total wallet balance")
+    assert lines[2].endswith("100,000 sats  Total Wallet Balance")
     assert lines[3].startswith("- ")
-    assert lines[3].endswith("3,000 sats  frozen UTXOs")
+    assert lines[3].endswith("3,000 sats  Frozen UTXOs")
     assert lines[4].startswith("= ")
-    assert lines[4].endswith("97,000 sats  Total spendable balance")
+    assert lines[4].endswith("97,000 sats  Total Spendable Balance")
     assert "thereof" not in text
 
 
@@ -2200,10 +2200,10 @@ def test_balance_footer_expired_bonds_count_as_spendable():
     )
     text = "\n".join(lines)
     # total = 162,623 + 44,467
-    assert lines[2].endswith("207,090 sats  Total wallet balance")
+    assert lines[2].endswith("207,090 sats  Total Wallet Balance")
     assert lines[3].endswith("24,865 sats  fidelity bonds time-locked")
     # spendable total = 162,623 + 19,602 expired bonds
-    assert lines[4].endswith("182,225 sats  Total spendable balance")
+    assert lines[4].endswith("182,225 sats  Total Spendable Balance")
     assert lines[5].endswith("162,623 sats  thereof auto-selectable")
     assert lines[6].endswith(
         "19,602 sats  thereof expired fidelity bonds (explicit selection or bond-only sweep)"
@@ -2231,7 +2231,7 @@ def test_balance_footer_frozen_expired_bonds_deducted():
     assert lines[3].endswith("24,865 sats  fidelity bonds time-locked")
     assert lines[4].endswith("2,000 sats  fidelity bonds expired (frozen)")
     # spendable total = 162,623 + (19,602 - 2,000)
-    assert lines[5].endswith("180,225 sats  Total spendable balance")
+    assert lines[5].endswith("180,225 sats  Total Spendable Balance")
     assert lines[6].endswith("162,623 sats  thereof auto-selectable")
     assert lines[7].endswith(
         "17,602 sats  thereof expired fidelity bonds (explicit selection or bond-only sweep)"
@@ -2252,9 +2252,9 @@ def test_balance_footer_all_expired_bonds_frozen():
     )
     text = "\n".join(lines)
     # total = 119,602; spendable total = 100,000
-    assert lines[2].endswith("119,602 sats  Total wallet balance")
+    assert lines[2].endswith("119,602 sats  Total Wallet Balance")
     assert lines[3].endswith("19,602 sats  fidelity bonds expired (frozen)")
-    assert lines[4].endswith("100,000 sats  Total spendable balance")
+    assert lines[4].endswith("100,000 sats  Total Spendable Balance")
     assert "thereof" not in text
 
 
@@ -2275,7 +2275,7 @@ def test_balance_footer_compact_shortens_thereof_line():
     )
     text = "\n".join(lines)
     # spendable total = 1,234,568,288,435 + 15,600 expired bonds
-    assert lines[5].endswith("1,234,568,304,035 sats  Total spendable balance")
+    assert lines[5].endswith("1,234,568,304,035 sats  Total Spendable Balance")
     assert lines[6].endswith("1,234,568,288,435 sats  thereof auto-selectable")
     assert lines[7].endswith("15,600 sats  thereof expired bonds")
     assert "explicit selection" not in text
@@ -3274,7 +3274,7 @@ async def test_info_does_not_issue_addresses_or_change_reservations(
                 mnemonic, settings, extended=extended, reconstruct_history=False
             )
             output = capsys.readouterr().out
-            assert "Total wallet balance" in output
+            assert "Total Wallet Balance" in output
             if not extended:
                 assert "jm-wallet address new <mixdepth>" in output
                 assert expected_next not in output

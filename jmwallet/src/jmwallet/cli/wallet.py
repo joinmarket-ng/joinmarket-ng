@@ -967,15 +967,15 @@ def _balance_footer_lines(
     # Rows of the calculation: (marker, amount, text). The marker prefixes
     # the amount so the arithmetic reads top-down (total minus deductions
     # equals spendable); unmarked rows are the total and the thereof-split.
-    rows: list[tuple[str, int, str]] = [(" ", total_balance, "Total wallet balance")]
+    rows: list[tuple[str, int, str]] = [(" ", total_balance, "Total Wallet Balance")]
     if total_frozen > 0:
-        rows.append(("-", total_frozen, "frozen UTXOs"))
+        rows.append(("-", total_frozen, "Frozen UTXOs"))
     if fb_balance > 0:
         if bond_locked_total > 0:
             rows.append(("-", bond_locked_total, "fidelity bonds time-locked"))
         if expired_frozen > 0:
             rows.append(("-", expired_frozen, "fidelity bonds expired (frozen)"))
-    rows.append(("=", spendable_total, "Total spendable balance"))
+    rows.append(("=", spendable_total, "Total Spendable Balance"))
     if expired_spendable > 0:
         rows.append((" ", spendable_balance, "thereof auto-selectable"))
         # The compact view's 80-column budget cannot afford the full
@@ -997,7 +997,7 @@ def _balance_footer_lines(
     for marker, amount, text in rows:
         line = f"{marker} {amount:>{amount_width},} sats  {text}"
         # The total line is rendered like the "Mixdepth N" headers.
-        lines.append(colorize(line, ANSI_BOLD_CYAN) if text == "Total wallet balance" else line)
+        lines.append(colorize(line, ANSI_BOLD_CYAN) if text == "Total Wallet Balance" else line)
     return lines
 
 
@@ -1193,7 +1193,14 @@ async def _show_wallet_info(
         # Show the wallet name and master fingerprint so users can pass the
         # fingerprint via --wallet-fingerprint to cold-wallet bond commands.
         if wallet.mnemonic_file is not None:
-            print(f"\n{colorize('Wallet:', ANSI_BOLD_YELLOW)} {wallet.mnemonic_file.name}")
+            if view == "compact":
+                from jmwallet.cli.info_compact import render_compact_wallet_header
+
+                print()
+                for line in render_compact_wallet_header(wallet.mnemonic_file.name):
+                    print(line)
+            else:
+                print(f"\n{colorize('Wallet:', ANSI_BOLD_YELLOW)} {wallet.mnemonic_file.name}")
             print(
                 f"{colorize('Wallet fingerprint:', ANSI_BOLD_YELLOW)} {wallet.wallet_fingerprint}"
             )
@@ -2161,8 +2168,8 @@ def _show_compact_wallet_info(
     drops the fidelity bond branch; the addresses are still fetched so a
     two-line notice can point at funded hidden bonds instead of hiding
     them silently. The legend keeps its fb-a/fb-x vocabulary whenever the
-    corresponding bond state exists in the wallet, so the page's balance
-    footer (which always counts hidden bond funds) stays explained.
+    corresponding bond state is visible or funded, so both unfunded rows
+    and the balance footer (which always counts hidden bond funds) stay explained.
     """
     from jmwallet.cli.info_compact import render_compact_page
     from jmwallet.history import get_pending_transactions
@@ -2201,9 +2208,8 @@ def _show_compact_wallet_info(
     hidden_fb_notices: dict[int, tuple[str, str]] = {}
     # Bond-state existence for the legend, from the unfiltered wallet data:
     # the page references bond funds even when the branch is hidden (notice,
-    # balance footer), so the vocabulary is explained whenever the state
-    # exists at all -- same rule as the footer, independent of the display
-    # config.
+    # balance footer). Visible unfunded bonds also carry fb-a/fb-x tags,
+    # so their vocabulary must remain explained before funding and after redemption.
     has_locked_bond = False
     has_expired_bond = False
     for md in range(wallet.mixdepth_count):
@@ -2214,11 +2220,14 @@ def _show_compact_wallet_info(
         if md == 0:
             bond_addresses = wallet.get_fidelity_bond_addresses_info(gap_limit)
             has_locked_bond = any(
-                a.balance > 0 and a.locktime is not None and a.locktime >= now
+                (show_fidelity_bonds or a.balance > 0)
+                and a.locktime is not None
+                and a.locktime >= now
                 for a in bond_addresses
             )
             has_expired_bond = any(
-                a.balance > 0 and (a.locktime is None or a.locktime < now) for a in bond_addresses
+                (show_fidelity_bonds or a.balance > 0) and (a.locktime is None or a.locktime < now)
+                for a in bond_addresses
             )
             if show_fidelity_bonds and bond_addresses:
                 bond_path = f"m/84'/{coin_type}'/0'/{FIDELITY_BOND_BRANCH}"
