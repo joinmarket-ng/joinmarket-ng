@@ -135,12 +135,16 @@ def build_maker_config(
     fidelity_bond_index: int | None = None,
     no_fidelity_bond: bool = False,
     dual_offers: bool | None = None,
+    sell_podle: bool | None = None,
 ) -> MakerConfig:
     """
     Build MakerConfig from unified settings with CLI overrides.
 
     CLI arguments (when not None) override settings from config file and env vars.
     """
+    effective_sell_podle = settings.maker.sell_podle if sell_podle is None else sell_podle
+    if effective_sell_podle and settings.lightning.mode == "off":
+        raise ValueError("Selling PoDLE commitments requires [lightning] mode managed or manual")
     # Resolve network settings
     effective_network = network if network is not None else settings.network_config.network
     effective_bitcoin_network = (
@@ -478,6 +482,8 @@ def build_maker_config(
         orderbook_violation_warning_threshold=settings.maker.orderbook_violation_warning_threshold,
         orderbook_violation_severe_threshold=settings.maker.orderbook_violation_severe_threshold,
         orderbook_ban_duration=settings.maker.orderbook_ban_duration,
+        sell_podle=effective_sell_podle,
+        podle_price_sats=settings.maker.podle_price_sats,
         channel_ring=channel_ring_config(
             settings.lightning.mode,
             settings.maker.channel_ring,
@@ -850,6 +856,15 @@ def start(
             ),
         ),
     ] = False,
+    sell_podle: Annotated[
+        bool | None,
+        typer.Option(
+            "--sell-podle/--no-sell-podle",
+            help="Sell PoDLE commitments of the offer mixdepth over the credential market "
+            "(needs [lightning], an owned bond and jm-maker activate-market-ledger). "
+            "Default: maker.sell_podle",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -950,6 +965,7 @@ def start(
             # Pass True only when the flag was explicitly given; False means "not given",
             # so we pass None to let build_maker_config fall back to settings.
             dual_offers=True if dual_offers else None,
+            sell_podle=sell_podle,
         )
     except ValueError as e:
         logger.error(str(e))
@@ -1050,6 +1066,13 @@ def start(
                 # path removes it and stops the maker, and registered after the
                 # buyout so the maker is stopped before the runtime closes.
                 stack.push_async_callback(shutdown_maker, bot)
+                if config.sell_podle:
+                    from maker.podle_sales import PoDLESales
+
+                    # Stopped before the maker, which owns the wallet it sells from.
+                    sales = PoDLESales(settings, bot)
+                    sales.start()
+                    stack.push_async_callback(sales.stop)
 
                 try:
                     # Write nick state file for external tracking and
@@ -1340,6 +1363,81 @@ def ring_records(
             indent=2,
         )
     )
+
+
+@app.command()
+def activate_market_ledger(
+    config_file: Annotated[Path | None, typer.Option(help="Configuration file")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="JoinMarket data directory")] = None,
+    mnemonic_file: Annotated[Path | None, typer.Option(help="Wallet mnemonic file")] = None,
+    prompt_bip39_passphrase: Annotated[
+        bool, typer.Option(help="Prompt for the wallet's BIP39 passphrase")
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Confirm that this data directory holds the wallet's complete PoDLE history",
+        ),
+    ] = False,
+) -> None:
+    """Activate the wallet's market ledger once, so the maker can sell PoDLE commitments.
+
+    The ledger imports this data directory's used-commitment history and from
+    then on records every commitment the wallet uses or sells, so a sold
+    commitment is never reused. It does not sync the wallet or start any service.
+    """
+    from jmcore.market_keys import WalletMarketKeys
+    from jmcore.market_store import MarketStore, MarketStoreError
+    from jmcore.paths import get_market_store_path, get_used_commitments_path
+    from jmcore.process_hardening import harden_current_process
+    from jmwallet.wallet.bip32 import mnemonic_to_seed
+
+    harden_current_process()
+    settings = setup_cli(None, data_dir=data_dir, config_file=config_file)
+    effective_data_dir = data_dir if data_dir is not None else settings.get_data_dir()
+    try:
+        resolved = resolve_mnemonic(
+            settings,
+            mnemonic_file=mnemonic_file,
+            prompt_bip39_passphrase=prompt_bip39_passphrase,
+        )
+        if resolved is None:
+            raise ValueError("ledger activation requires the wallet mnemonic")
+        keys = WalletMarketKeys(
+            mnemonic_to_seed(resolved.mnemonic, resolved.bip39_passphrase),
+            settings.network_config.network.value,
+        )
+        try:
+            wallet_id = keys.ledger_identity()
+        finally:
+            keys.close()
+        store_path = get_market_store_path(effective_data_dir)
+        commitments_path = get_used_commitments_path(effective_data_dir)
+        diagnosis = MarketStore.diagnose_wallet(
+            store_path, wallet_id=wallet_id, commitments_path=commitments_path
+        )
+        if diagnosis["state"] == "ready":
+            typer.echo("The wallet market ledger is already active.")
+            return
+        if not yes:
+            typer.echo(
+                f"Activation imports {commitments_path} as this wallet's complete PoDLE "
+                "commitment history. Only continue if this data directory has been the "
+                "only place this wallet ran as a taker, or it never did, and it is not "
+                "restored from a backup or copy. Afterwards the ledger governs this "
+                "wallet's PoDLE use here, also as a taker: commitments stocked for sale "
+                "are never used locally. It cannot be undone."
+            )
+            if not typer.confirm("Is that history complete?", default=False):
+                raise typer.Exit(1)
+        with MarketStore(store_path, wallet_id=wallet_id) as store:
+            store.activate_wallet(commitments_path, history_confirmed=True)
+    except (ValueError, OSError, MarketStoreError) as exc:
+        logger.error("Market ledger activation failed: {}", exc)
+        raise typer.Exit(1) from exc
+    typer.echo("The wallet market ledger is active.")
 
 
 @app.command()

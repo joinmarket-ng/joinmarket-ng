@@ -72,6 +72,14 @@ def _quantize_relative_cjfee(value: Decimal, rounding: str = ROUND_HALF_EVEN) ->
     return value.quantize(Decimal(1).scaleb(exponent), rounding=rounding)
 
 
+def offer_mixdepth(balances: dict[int, int]) -> int | None:
+    """The mixdepth offers are built from: the largest positive offer balance."""
+    available = {mixdepth: balance for mixdepth, balance in balances.items() if balance > 0}
+    if not available:
+        return None
+    return max(available, key=lambda mixdepth: available[mixdepth])
+
+
 class OfferManager:
     """
     Creates and manages offers for the maker bot.
@@ -106,6 +114,10 @@ class OfferManager:
         # otherwise the un-announced balance would look like the announced one
         # and no rescan would ever retry.
         self.offer_balance: int | None = None
+
+    async def current_offer_mixdepth(self) -> int | None:
+        """The mixdepth offers are built from under the current wallet state."""
+        return offer_mixdepth(await self.get_mixdepth_offer_balances())
 
     async def get_mixdepth_offer_balances(self) -> dict[int, int]:
         """Per-mixdepth balance available for offers under the maker's policy.
@@ -246,9 +258,8 @@ class OfferManager:
             # empty, so a later balance change is detected and re-evaluated.
             self.offer_balance = max(balances.values(), default=0)
 
-            available_mixdepths = {md: bal for md, bal in balances.items() if bal > 0}
-
-            if not available_mixdepths:
+            max_mixdepth = offer_mixdepth(balances)
+            if max_mixdepth is None:
                 logger.warning("No mixdepth with positive balance")
                 return []
 
@@ -256,8 +267,7 @@ class OfferManager:
                 f"Mixdepth balances (excluding fidelity bonds): {balances}"
             )
 
-            max_mixdepth = max(available_mixdepths, key=lambda md: available_mixdepths[md])
-            max_balance = available_mixdepths[max_mixdepth]
+            max_balance = balances[max_mixdepth]
             logger.bind(sensitive=True).info(
                 f"Selected mixdepth {max_mixdepth} with balance {max_balance} sats"
             )

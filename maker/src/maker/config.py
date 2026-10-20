@@ -275,6 +275,9 @@ class MakerConfig(WalletConfig):
         ),
     )
     channel_ring: ChannelRingConfig = Field(default_factory=ChannelRingConfig)
+    # PoDLE sales from the current offer mixdepth ([maker] sell_podle)
+    sell_podle: bool = False
+    podle_price_sats: int | None = Field(default=None, ge=1, le=1_000_000)
 
     # Single offer configuration (legacy, used when offer_configs is empty)
     offer_type: OfferType = Field(

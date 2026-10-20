@@ -146,10 +146,12 @@ class MarketService:
         quote_ttl: int = 300,
         fault_cache: MarketFaultCache | None = None,
         backing_sats: BackingLookup | None = None,
+        require_backing: bool = False,
     ) -> None:
         """``backing_sats`` returns the value of a PoDLE backing outpoint, if known.
 
-        Without it, requests that need a minimum backing are unavailable.
+        Without it, requests that need a minimum backing are unavailable. With
+        ``require_backing``, every PoDLE sale needs a backing the lookup values.
         """
         self.authority = verify_authorization(authorization)
         if not 1 <= quote_ttl <= 900:
@@ -172,6 +174,7 @@ class MarketService:
         self.quote_ttl = quote_ttl
         self.fault_cache = fault_cache
         self.backing_sats = backing_sats
+        self.require_backing = require_backing
         self._verified_until = 0.0
         self._height = 0
         self._next_quote = 0.0
@@ -276,6 +279,7 @@ class MarketService:
                 request_id=quote_request.request_id,
                 min_backing_sats=quote_request.min_backing_sats,
                 backing_sats=self.backing_sats,
+                require_backing=self.require_backing,
             )
             quote_document = (
                 reserved
@@ -370,29 +374,36 @@ def open_delivery(
     return package
 
 
+async def podle_backing_matches(record: ExternalPoDLE, backend: BlockchainBackend) -> bool:
+    """Whether the credential's backing UTXO is unspent, confirmed, with its script and height.
+
+    A backend failure raises: it says nothing about the UTXO.
+    """
+    if backend.requires_neutrino_metadata():
+        result = await backend.verify_utxo_with_metadata(
+            txid=record.outpoint.txid,
+            vout=record.outpoint.vout,
+            scriptpubkey=record.scriptpubkey,
+            blockheight=record.blockheight,
+        )
+        return bool(result.valid and result.scriptpubkey_matches and result.confirmations >= 1)
+    utxo = await backend.get_utxo(record.outpoint.txid, record.outpoint.vout)
+    return not (
+        utxo is None
+        or utxo.confirmations < 1
+        or utxo.scriptpubkey.lower() != record.scriptpubkey
+        or (utxo.height is not None and utxo.height != record.blockheight)
+    )
+
+
 async def verify_podle_backing(record: ExternalPoDLE, backend: BlockchainBackend) -> None:
     """Require the credential's backing UTXO to exist, confirmed, with its script and height."""
     try:
-        if backend.requires_neutrino_metadata():
-            result = await backend.verify_utxo_with_metadata(
-                txid=record.outpoint.txid,
-                vout=record.outpoint.vout,
-                scriptpubkey=record.scriptpubkey,
-                blockheight=record.blockheight,
-            )
-            if not result.valid or not result.scriptpubkey_matches or result.confirmations < 1:
-                raise ValueError
-            return
-        utxo = await backend.get_utxo(record.outpoint.txid, record.outpoint.vout)
-        if (
-            utxo is None
-            or utxo.confirmations < 1
-            or utxo.scriptpubkey.lower() != record.scriptpubkey
-            or (utxo.height is not None and utxo.height != record.blockheight)
-        ):
-            raise ValueError
+        matches = await podle_backing_matches(record, backend)
     except Exception as exc:
         raise MarketError("PoDLE backing UTXO could not be verified") from exc
+    if not matches:
+        raise MarketError("PoDLE backing UTXO could not be verified")
 
 
 def make_bond_credential(

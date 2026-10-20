@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import pytest
 from _taker_market_helpers import FakeHoldInvoices
 from jmcore.credential_market import PaymentTerms
@@ -16,6 +19,7 @@ from taker.market_settlement import (
     CREDENTIAL_GRACE_SECONDS,
     HTLC_SAFETY_BLOCKS,
     RESERVATION_GRACE_SECONDS,
+    InvoiceRefusedError,
     MarketSettlement,
 )
 
@@ -381,3 +385,115 @@ async def test_restarted_wallet_seller_refunds_an_accepted_old_period_quote(tmp_
         assert seller.state(reservation) is InvoiceState.CANCELED
         assert reopened.get_package(reservation.quote_id) is None
         assert seller.holds() == []
+
+
+async def test_sale_check_refunds_an_undeliverable_sale_and_retries_an_unknown_one(
+    seller: Seller,
+) -> None:
+    reservation = await seller.quote()
+    # The store names the credential each hold invoice sells.
+    credential = seller.store.hold_inventory_credential(reservation.payment_hash)
+    assert credential == _podle_credential(0x41)
+    assert seller.store.hold_inventory_credential(b"\x00" * 32) is None
+    answers: list[bool | Exception] = [RuntimeError("backend down"), False]
+
+    async def check(hold: object) -> bool:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    seller.settlement.sale_check = check
+    seller.invoices.pay(reservation.payment_hash, 1_000)
+    await seller.settlement.reconcile_once()
+    # Unknown: neither settled nor refunded.
+    assert seller.state(reservation) is InvoiceState.ACCEPTED
+    assert seller.holds() == ["open"]
+
+    await seller.settlement.reconcile_once()
+    assert seller.state(reservation) is InvoiceState.CANCELED
+    assert seller.store.get_package(reservation.quote_id) is None
+    assert seller.holds() == []
+
+
+async def test_a_settlement_retry_charges_only_for_a_credential_that_still_verifies(
+    seller: Seller, tmp_path: Path
+) -> None:
+    reservation = await seller.quote()
+    answers: list[bool | Exception] = [True, RuntimeError("backend down"), False]
+
+    async def check(hold: object) -> bool:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    seller.settlement.sale_check = check
+    seller.invoices.pay(reservation.payment_hash, 1_000)
+    seller.invoices.fail.add("settle")
+    await seller.settlement.reconcile_once()
+    # The check passed and the delivery is prepared, but settling failed.
+    assert seller.holds() == ["settling"]
+
+    seller.invoices.fail.clear()
+    await seller.settlement.reconcile_once()
+    # Unknown with the HTLC deadline far away: neither settled nor refunded.
+    assert seller.state(reservation) is InvoiceState.ACCEPTED
+    assert seller.holds() == ["settling"]
+
+    await seller.settlement.reconcile_once()
+    assert answers == []
+    assert seller.state(reservation) is InvoiceState.CANCELED
+    assert seller.store.get_delivery(reservation.quote_id) is None
+    assert seller.holds() == []
+    # The prepared allocation stays consumed: the commitment is never sold again.
+    with sqlite3.connect(tmp_path / "market.sqlite") as connection:
+        states = [row[0] for row in connection.execute("SELECT state FROM inventory")]
+    assert states == ["consumed"]
+
+
+async def test_an_undecided_settlement_retry_refunds_before_the_htlc_deadline(
+    seller: Seller,
+) -> None:
+    reservation = await seller.quote()
+    seller.invoices.pay(reservation.payment_hash, 1_000, 1_100)
+    seller.invoices.fail.add("settle")
+    await seller.settlement.reconcile_once()
+    assert seller.holds() == ["settling"]
+
+    async def unknown(hold: object) -> bool:
+        raise RuntimeError("backend down")
+
+    seller.settlement.sale_check = unknown
+    seller.invoices.fail.clear()
+    seller.invoices.height = 1_100 - HTLC_SAFETY_BLOCKS
+    await seller.settlement.reconcile_once()
+    assert seller.state(reservation) is InvoiceState.CANCELED
+    assert seller.holds() == []
+
+
+async def test_an_unroutable_cancel_finishes_only_for_a_never_issued_reservation(
+    seller: Seller, tmp_path: Path
+) -> None:
+    published = await seller.quote(1)
+    unpublished = seller.reserve(2)
+
+    async def refuse(*_args: object, **_kwargs: object) -> str:
+        raise InvoiceRefusedError("No Lightning node may invoice this sale")
+
+    seller.invoices.add_hold_invoice = refuse  # type: ignore[method-assign]
+    # The published quote's invoice is unknown to every node (lost LND data).
+    del seller.invoices.invoices[published.payment_hash]
+    seller.store.begin_hold_cancel(published.quote_id)
+    seller.clock.now = NOW + RESERVATION_GRACE_SECONDS
+    await seller.settlement.reconcile_once()
+
+    # Nobody received the unpublished request, so its inventory returns; a
+    # published quote may still be paid somewhere and stays conservative.
+    assert seller.holds() == ["canceling"]
+    with sqlite3.connect(tmp_path / "market.sqlite") as connection:
+        states = dict(connection.execute("SELECT resource, state FROM inventory"))
+    assert states[str(_podle_credential(0x42)["commitment"])] == "available"
+    assert states[str(_podle_credential(0x41)["commitment"])] == "reserved"
+    assert seller.store.cancel_unpublished_reservation(published.quote_id) is False
+    assert unpublished.payment_hash not in seller.invoices.invoices

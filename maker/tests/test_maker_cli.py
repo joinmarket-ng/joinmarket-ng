@@ -199,6 +199,64 @@ def test_start_expired_certificate_exits_and_cleans_up(
     write_nick_state.assert_any_call(tmp_path, "maker", "J5RotatedMaker")
 
 
+def test_start_runs_podle_sales_beside_the_maker_and_stops_them_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from maker import cli as cli_module
+
+    settings = MagicMock()
+    settings.get_data_dir.return_value = tmp_path
+    config = MakerConfig(
+        mnemonic="test " * 12,
+        directory_servers=["localhost:5222"],
+        network="regtest",
+        data_dir=tmp_path,
+        sell_podle=True,
+    )
+    events: list[str] = []
+    bot = MagicMock()
+    bot.nick = "J5SellingMaker"
+    bot.start = AsyncMock(side_effect=ExpiredFidelityBondCertificateError("stop here"))
+    bot.stop = AsyncMock(side_effect=lambda: events.append("maker stopped"))
+    notifier = MagicMock()
+    notifier.notify_startup = AsyncMock()
+
+    class _Sales:
+        def __init__(self, sales_settings: object, sales_bot: object) -> None:
+            assert sales_settings is settings and sales_bot is bot
+
+        def start(self) -> None:
+            events.append("sales started")
+
+        async def stop(self) -> None:
+            events.append("sales stopped")
+
+    monkeypatch.setattr(cli_module, "setup_cli", lambda *_args, **_kwargs: settings)
+    monkeypatch.setattr(cli_module, "ensure_config_file", lambda _data_dir: None)
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_mnemonic",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            mnemonic="test " * 12,
+            bip39_passphrase="",
+            creation_height=None,
+            mnemonic_file=tmp_path / "m",
+        ),
+    )
+    monkeypatch.setattr(cli_module, "build_maker_config", lambda **_kwargs: config)
+    monkeypatch.setattr(cli_module, "create_wallet_service", lambda _config: MagicMock())
+    monkeypatch.setattr(cli_module, "MakerBot", lambda *_args, **_kwargs: bot)
+    monkeypatch.setattr(cli_module, "get_notifier", lambda *_args, **_kwargs: notifier)
+    monkeypatch.setattr(cli_module, "write_nick_state", MagicMock())
+    monkeypatch.setattr(cli_module, "remove_nick_state", MagicMock())
+    monkeypatch.setattr("maker.podle_sales.PoDLESales", _Sales)
+
+    result = runner.invoke(app, ["start"], prog_name="jm-maker")
+
+    assert result.exit_code == 1
+    assert events == ["sales started", "sales stopped", "maker stopped"]
+
+
 @pytest.mark.parametrize(
     ("address_type", "expected_component"),
     [("p2wpkh", "maker"), ("p2tr", "maker_taproot")],

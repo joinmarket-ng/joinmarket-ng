@@ -1064,6 +1064,24 @@ class MakerSettings(BaseModel):
         ),
     )
     channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
+    sell_podle: bool = Field(
+        default=False,
+        description=(
+            "Sell PoDLE commitments of the current offer mixdepth's confirmed coins "
+            "over the credential market, invoiced from that mixdepth's Lightning node. "
+            "Requires [lightning] (and so P2TR), an owned fidelity bond and an "
+            "activated market ledger (jm-maker activate-market-ledger)."
+        ),
+    )
+    podle_price_sats: int | None = Field(
+        default=None,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "Price per sold PoDLE commitment. Unset: half the taker's default cap, "
+            "the fee of a one-input, one-output P2TR spend at the 3-block fee rate."
+        ),
+    )
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -1835,6 +1853,8 @@ class JoinMarketSettings(BaseSettings):
             raise ValueError(
                 f"lightning.mode = {self.lightning.mode!r} requires wallet.address_type = 'p2tr'"
             )
+        if self.maker.sell_podle and self.lightning.mode == "off":
+            raise ValueError("maker.sell_podle requires lightning.mode = 'managed' or 'manual'")
         if self.taker.external_podle_mode == "prefer" and not taproot:
             raise ValueError(
                 "taker.external_podle_mode = 'prefer' requires wallet.address_type = 'p2tr'"

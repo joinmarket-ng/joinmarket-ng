@@ -984,6 +984,29 @@ class TestBuildMakerConfig:
         )
         assert config.allow_mixdepth_zero_merge is True
 
+    def test_podle_sales_settings_reach_maker_config(self) -> None:
+        """[maker] sell_podle and podle_price_sats are wired; the CLI flag overrides them."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            lightning={"mode": "manual"},
+            maker={"sell_podle": True, "podle_price_sats": 500},
+        )
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.sell_podle is True and config.podle_price_sats == 500
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", sell_podle=False
+        )
+        assert config.sell_podle is False
+
+        plain = JoinMarketSettings()
+        assert build_maker_config(plain, TEST_MNEMONIC, "").sell_podle is False
+        with pytest.raises(ValueError, match="requires \\[lightning\\]"):
+            build_maker_config(plain, TEST_MNEMONIC, "", sell_podle=True)
+
     def test_randomization_factors_passed_from_settings(self) -> None:
         """Randomization factors set in config.toml must propagate to MakerConfig.
 

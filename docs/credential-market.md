@@ -382,7 +382,9 @@ rejected rather than migrated, reset, or released for resale.
 The local Python API `WalletService.activate_market_ledger(history_confirmed=True)`
 binds the wallet's full private identifier to the shared ledger. The equivalent
 authenticated daemon endpoint is `POST /api/v1/wallet/{walletname}/market/ledger/activate`
-with `{"history_confirmed":true}`. Confirmation means the operator has established
+with `{"history_confirmed":true}`, and the command line equivalent is
+`jm-maker activate-market-ledger` (it asks for the confirmation unless `--yes`
+is given, and never syncs the wallet). Confirmation means the operator has established
 complete history, including all allocations and consumption; the API cannot
 establish that fact from a seed, an empty directory, or a structurally valid backup.
 
@@ -489,6 +491,21 @@ revokes capabilities before stopping seller resources; a failed close keeps the
 wallet reserved until cleanup succeeds. Daemon shutdown also revokes market keys
 and stops its seller. Each runtime is bound to one retarget period; stop and start
 it explicitly for a new period. Services do not restart automatically on unlock.
+
+### Maker PoDLE Sales
+
+`[maker] sell_podle = true` (or `jm-maker start --sell-podle`) runs the same
+native seller inside the maker daemon, for PoDLE commitments only. It needs a
+P2TR wallet with `[lightning]` enabled, an owned fidelity bond (the advertised
+one is the seller authority), and an activated ledger. The maker sells the
+three indices of every coin of its current offer mixdepth with at least five
+confirmations and quotes nothing else. Each sale is invoiced from the node of
+the sold coin's mixdepth instead of the `[market]` node, so one buyer never
+learns coins of two mixdepths, and a held payment is refunded instead of
+settled when its coin was spent in the meantime. The seller follows the offer mixdepth, the fee-based default price
+(or `podle_price_sats`) and the retarget period on its own. A missing
+precondition pauses sales with a warning and never stops the maker. See the
+[standard Taproot setup](technical/standard-taproot-setup.md) for the design.
 
 ### Diagnosis, Recovery, and Directory Moves
 

@@ -390,3 +390,40 @@ def test_options_bound_products_prices_and_ttl() -> None:
         WalletMarketSellerOptions(bond=bond, products=["bond"], price_sats=MAX_MONEY + 1)
     with pytest.raises(ValueError):
         WalletMarketSellerOptions(bond=bond, products=["bond"], price_sats=1, quote_ttl=901)
+
+
+@pytest.mark.asyncio
+async def test_supplied_invoices_and_backing_replace_the_market_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wallet, _backend = _wallet(tmp_path)
+    _activate_store(tmp_path, wallet)
+    bound, authorization = _bound_authorization(wallet)
+    wallet.create_market_authorization = AsyncMock(return_value=(bound, authorization))  # type: ignore[method-assign]
+    monkeypatch.setattr(wallet_market, "MarketTransport", _Transport)
+
+    def no_market_node(_settings: object) -> None:
+        raise AssertionError("the [market] node must not be used")
+
+    monkeypatch.setattr(wallet_market, "seller_invoice_client", no_market_node)
+    invoices = _NullInvoices()
+
+    def backing(_txid: str, _vout: int) -> int | None:
+        return None
+
+    seller = WalletMarketSeller(
+        wallet, _settings(tmp_path), _options(), invoices=invoices, backing_sats=backing
+    )
+    try:
+        await seller.start()
+        service = seller._service
+        assert service is not None
+        assert service.backing_sats is backing and service.require_backing
+        seller.set_price_sats(2_500)
+        assert service.price_sats == 2_500
+        with pytest.raises(ValueError):
+            seller.set_price_sats(0)
+        assert service.price_sats == 2_500
+    finally:
+        await seller.stop()
+        await wallet.close()

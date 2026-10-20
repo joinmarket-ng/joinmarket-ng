@@ -680,3 +680,43 @@ def test_minimum_backing_selects_the_first_large_enough_podle(tmp_path: Path) ->
             *arguments, request_id=_request_id(2), min_backing_sats=20_000, backing_sats=lookup
         )
     store.close()
+
+
+def test_required_backing_sells_only_inventory_the_lookup_values(tmp_path: Path) -> None:
+    path = tmp_path / "market.sqlite"
+    store = MarketStore(path)
+    elsewhere, current = (_podle_credential(value) for value in (0x61, 0x62))
+    for credential in (elsewhere, current):
+        store.add_inventory("podle", str(credential["commitment"]), credential)
+    # Only the coin of the mixdepth being sold from has a known value.
+    values = {f"{0x62:02x}" * 32: 30_000}
+
+    def lookup(txid: str, vout: int) -> int | None:
+        return values.get(txid) if vout == 1 else None
+
+    arguments = (
+        _authorization(),
+        _key(0x22),
+        bytes(_buyer_key(0x33).public_key).hex(),
+        "podle",
+        None,
+        "lightning",
+        10_000,
+        1_500,
+        100,
+        1,
+    )
+    store.reserve_hold_quote(
+        *arguments, request_id=_request_id(1), backing_sats=lookup, require_backing=True
+    )
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute("SELECT resource FROM inventory WHERE state = 'reserved'")
+        assert {row[0] for row in rows} == {current["commitment"]}
+    # The older row is never sold while the lookup does not value it.
+    with pytest.raises(MarketStoreUnavailableError, match="inventory"):
+        store.reserve_hold_quote(
+            *arguments, request_id=_request_id(2), backing_sats=lookup, require_backing=True
+        )
+    with pytest.raises(MarketStoreUnavailableError, match="inventory"):
+        store.reserve_hold_quote(*arguments, request_id=_request_id(3), require_backing=True)
+    store.close()

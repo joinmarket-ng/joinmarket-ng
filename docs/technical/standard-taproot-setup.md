@@ -222,10 +222,30 @@ The maker sells commitments for confirmed UTXOs of its current offer
 mixdepth, each with its three NUMS indices. A maker never uses its own
 commitments, and takers do not judge maker inputs by remaining PoDLE indices,
 so selling them costs the maker nothing beyond revealing those UTXOs to the
-buyer. Inventory is refreshed when the UTXO set changes. A sold UTXO is not
-locked: if the maker spends it first, the buyer's commitment fails and the
-buyer buys another, which is rare and cheap. The default price is half the
-taker's default cap.
+buyer. The current offer mixdepth is the one offers are built from (the
+largest offer balance). Its coins are stocked once they have five
+confirmations (the default maker `taker_utxo_age`) and pass the same backing
+check a buyer runs on delivery; bonds and frozen coins are never sold.
+
+Only coins of the current offer mixdepth are quoted. Each invoice comes from
+the node of the sold coin's own mixdepth, derived from the stored reservation
+rather than from the current offer mixdepth, so neither a mixdepth switch nor
+a restart can show a buyer two mixdepths together. Stock of other mixdepths
+stays in the ledger but is not quoted. Earlier invoices settle or cancel on
+the node that holds them, and a lookup that cannot reach every node is
+treated as unknown rather than as absent. Authorization is per retarget
+period, so the seller restarts when the period changes.
+
+A sold UTXO is not locked. Before each attempt to settle a held payment, the
+seller checks the coin's backing again and refunds the payment if the coin
+was spent, keeping a prepared commitment consumed; an unreachable backend
+delays the decision until the HTLC deadline refunds it. A reservation whose
+coin was spent is still canceled on that coin's node.
+A spend after settlement makes the buyer's commitment fail, which is rare
+and cheap. The default price is half the taker's default cap and follows the
+fee rate;
+`podle_price_sats` fixes it. A missing package, bond, ledger, or node pauses
+sales with one warning and is retried; it never stops the maker.
 
 ### Idle Bond Rental
 

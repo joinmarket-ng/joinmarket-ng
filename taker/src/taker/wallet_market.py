@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import AsyncExitStack
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from pathlib import Path
 from typing import Literal
 
@@ -20,7 +20,7 @@ from jmcore.crypto import NickIdentity
 from jmcore.experimental import warn_experimental
 from jmcore.external_podle import ExternalPoDLE
 from jmcore.market_faults import MarketFaultCache
-from jmcore.market_store import MarketStore, MarketStoreUnavailableError
+from jmcore.market_store import BackingLookup, MarketStore, MarketStoreUnavailableError
 from jmcore.paths import get_market_store_path, get_used_commitments_path
 from jmcore.protocol import JM_VERSION, NOT_SERVING_ONION_HOSTNAME
 from jmcore.settings import JoinMarketSettings
@@ -28,7 +28,12 @@ from jmcore.wallet_market import WalletMarketSellerOptions as WalletMarketSeller
 from jmwallet.wallet.service import WalletService
 
 from taker.market_service import MarketService
-from taker.market_settlement import MarketSettlement, seller_invoice_client
+from taker.market_settlement import (
+    HoldInvoiceBackend,
+    MarketSettlement,
+    SaleCheck,
+    seller_invoice_client,
+)
 from taker.market_transport import MarketTransport
 
 
@@ -40,7 +45,17 @@ class WalletMarketSeller:
         wallet: WalletService,
         settings: JoinMarketSettings,
         options: WalletMarketSellerOptions,
+        *,
+        invoices: AbstractAsyncContextManager[HoldInvoiceBackend] | None = None,
+        backing_sats: BackingLookup | None = None,
+        sale_check: SaleCheck | None = None,
     ) -> None:
+        """``invoices`` replaces the ``[market]`` LND node; this seller enters and closes it.
+
+        ``backing_sats`` replaces the wallet-cache backing lookup and restricts
+        PoDLE sales to inventory it values, for example one mixdepth's coins.
+        ``sale_check`` is asked before each held payment is settled.
+        """
         wallet_data_dir = wallet.data_dir
         if not isinstance(wallet_data_dir, Path):
             raise ValueError("Wallet market seller requires an explicit wallet data directory")
@@ -61,6 +76,9 @@ class WalletMarketSeller:
         self._products = tuple(snapshot.products)
         self._price_sats = snapshot.price_sats
         self._quote_ttl = snapshot.quote_ttl
+        self._invoice_client = invoices
+        self._custom_backing = backing_sats
+        self._sale_check = sale_check
 
         self._closed = False
         self._start_attempted = False
@@ -141,7 +159,7 @@ class WalletMarketSeller:
             await self._cleanup_owned_resources()
 
     async def _start_owned_resources(self) -> None:
-        invoices = seller_invoice_client(self.settings)
+        invoice_client = self._invoice_client or seller_invoice_client(self.settings)
         store = MarketStore(
             get_market_store_path(self._data_dir),
             wallet_id=self.wallet.market_wallet_id,
@@ -153,7 +171,7 @@ class WalletMarketSeller:
         store.check_commitments_path(get_used_commitments_path(self._data_dir, create=False))
         # One seller runtime per store owns hold-invoice settlement.
         self._resources.enter_context(store.seller_runtime())
-        await self._resources.enter_async_context(invoices)
+        invoices = await self._resources.enter_async_context(invoice_client)
 
         bound_keys, authorization = await self.wallet.create_market_authorization(self._bond)
         if self._closed:
@@ -171,7 +189,8 @@ class WalletMarketSeller:
             price_sats=self._price_sats,
             quote_ttl=self._quote_ttl,
             fault_cache=fault_cache,
-            backing_sats=self._backing_sats,
+            backing_sats=self._custom_backing or self._backing_sats,
+            require_backing=self._custom_backing is not None,
         )
         self._fault_cache = fault_cache
         self._service = service
@@ -182,6 +201,7 @@ class WalletMarketSeller:
             bound_keys,
             lambda: self.wallet.backend.get_block_height(),
             credential_provider=self._provide_credential,
+            sale_check=self._sale_check,
         )
 
         transport = MarketTransport(
@@ -223,6 +243,15 @@ class WalletMarketSeller:
                     return utxo.value if utxo.confirmations > 0 else None
         return None
 
+    def set_price_sats(self, price_sats: int) -> None:
+        """Price later listings and quotes at ``price_sats``."""
+        snapshot = WalletMarketSellerOptions(
+            bond=self._bond, products=list(self._products), price_sats=price_sats
+        )
+        self._price_sats = snapshot.price_sats
+        if self._service is not None:
+            self._service.price_sats = snapshot.price_sats
+
     def _callbacks_available(self) -> bool:
         return self._running and not self._closed
 
@@ -242,6 +271,14 @@ class WalletMarketSeller:
         if "podle" not in self._products or record.network != self.wallet.network:
             raise MarketError("PoDLE product or network does not match this seller")
         service.store.add_inventory("podle", record.commitment, record.model_dump(mode="json"))
+
+    def sold_podle(self, payment_hash: bytes) -> ExternalPoDLE | None:
+        """The stocked PoDLE credential one of this seller's hold invoices sells, if any."""
+        store = self._store
+        if store is None or self._closed:
+            raise MarketStoreUnavailableError("Wallet market seller is unavailable")
+        credential = store.hold_inventory_credential(payment_hash)
+        return None if credential is None else ExternalPoDLE.model_validate(credential)
 
     def add_bond_inventory(self) -> None:
         service = self._local_service()

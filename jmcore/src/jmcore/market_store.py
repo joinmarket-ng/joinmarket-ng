@@ -729,12 +729,14 @@ class MarketStore:
         request_id: str,
         min_backing_sats: int | None = None,
         backing_sats: BackingLookup | None = None,
+        require_backing: bool = False,
     ) -> SignedDocument | HoldReservation:
         """Reserve inventory and a fresh hold-invoice preimage for one quote request.
 
         ``min_backing_sats`` restricts PoDLE inventory to backing UTXOs worth at
         least that much, as reported by ``backing_sats``; inventory whose value is
-        unknown never qualifies.
+        unknown never qualifies. ``require_backing`` applies that rule to every
+        PoDLE request, so a seller only sells inventory its lookup currently values.
 
         Nothing is signed and no invoice exists yet. The reservation is durable
         before the caller creates the hold invoice, so after a crash the settlement
@@ -820,6 +822,7 @@ class MarketStore:
                 certificate_pubkey,
                 min_backing_sats=min_backing_sats,
                 backing_sats=backing_sats,
+                require_backing=require_backing,
             )
             if inventory_row is None:
                 raise MarketStoreUnavailableError("no matching credential inventory is available")
@@ -1025,6 +1028,27 @@ class MarketStore:
                 for row in rows
             ]
 
+    def hold_inventory_credential(self, payment_hash: bytes) -> dict[str, Any] | None:
+        """Return the stocked credential a hold invoice sells, if it has one.
+
+        PoDLE inventory carries its credential from stocking; bond inventory
+        does not, and an unknown payment hash has none.
+        """
+        if type(payment_hash) is not bytes or len(payment_hash) != 32:
+            raise ValueError("payment_hash must be 32 bytes")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT inventory.credential FROM hold_invoices
+                JOIN inventory ON inventory.id = hold_invoices.inventory_id
+                WHERE hold_invoices.payment_hash = ?
+                """,
+                (payment_hash.hex(),),
+            ).fetchone()
+        if row is None or row["credential"] is None:
+            return None
+        return cast(dict[str, Any], json.loads(bytes(row["credential"])))
+
     def begin_hold_cancel(self, quote_id: str) -> None:
         """Durably record the intent to cancel before calling ``CancelInvoice``.
 
@@ -1072,6 +1096,59 @@ class MarketStore:
                 return False
             connection.execute(
                 "UPDATE hold_invoices SET state = 'canceling' WHERE quote_id = ?", (quote_id,)
+            )
+            return True
+
+    def abandon_settlement(self, quote_id: str) -> bool:
+        """Turn a pending settlement into a refund because its credential stopped verifying.
+
+        The seller checks the credential again before each settlement attempt;
+        a credential that no longer verifies (a spent PoDLE backing coin) must
+        not be charged for. The prepared allocation stays consumed. Returns
+        whether the hold invoice now awaits cancellation.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "canceling":
+                return True
+            if hold["state"] != "settling":
+                return False
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceling' WHERE quote_id = ?", (quote_id,)
+            )
+            return True
+
+    def cancel_unpublished_reservation(self, quote_id: str) -> bool:
+        """Finish canceling a reservation whose quote was never issued, without LND.
+
+        Issuing requires the ``reserved`` state, which a canceling hold never
+        returns to, so its payment request never left this store and nobody can
+        pay an invoice created for it, even one whose creation lands late.
+        Returns whether the hold is now canceled; a published quote is untouched.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] != "canceling" or self._quote_row(connection, quote_id) is not None:
+                return False
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceled' WHERE quote_id = ?", (quote_id,)
+            )
+            connection.execute(
+                """
+                UPDATE inventory SET state = 'available', reservation_quote_id = NULL
+                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
+                """,
+                (int(hold["inventory_id"]), quote_id),
             )
             return True
 
@@ -2392,6 +2469,7 @@ class MarketStore:
         *,
         min_backing_sats: int | None = None,
         backing_sats: BackingLookup | None = None,
+        require_backing: bool = False,
     ) -> sqlite3.Row | None:
         # Unowned rows belong to a standalone store; owned rows require this wallet.
         if product == "podle":
@@ -2407,14 +2485,15 @@ class MarketStore:
                 """,
                 (self.wallet_id,),
             )
-            if min_backing_sats is None:
+            if min_backing_sats is None and not require_backing:
                 return cast(sqlite3.Row | None, rows.fetchone())
             if backing_sats is None:
                 return None
+            minimum = min_backing_sats or 1
             for row in rows:
                 outpoint = json.loads(bytes(row["credential"]))["outpoint"]
                 value = backing_sats(outpoint["txid"], outpoint["vout"])
-                if value is not None and value >= min_backing_sats:
+                if value is not None and value >= minimum:
                     return cast(sqlite3.Row, row)
             return None
         expected_resource = bond_resource(authority.bond, authority.period)

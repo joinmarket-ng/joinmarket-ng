@@ -71,6 +71,21 @@ def purchase_cap_sats(fee_rate_sat_vb: float) -> int:
     return CAP_FEE_MULTIPLE * math.ceil(P2TR_SPEND_VBYTES * max(fee_rate_sat_vb, 1.0))
 
 
+def seller_price_sats(fee_rate_sat_vb: float) -> int:
+    """The default price of a sold PoDLE credential: half the buyer's default cap."""
+    return purchase_cap_sats(fee_rate_sat_vb) // CAP_FEE_MULTIPLE
+
+
+async def market_fee_rate(backend: BlockchainBackend) -> float:
+    """The 3-block fee estimate that prices PoDLE credentials, at least 1 sat/vB."""
+    try:
+        if backend.can_estimate_fee():
+            return max(1.0, float(await backend.estimate_fee(3)))
+    except Exception:
+        logger.debug("Fee estimation failed; pricing PoDLE credentials at 1 sat/vB")
+    return 1.0
+
+
 def min_backing_sats(cj_amount: int, min_percent: int) -> int:
     """The smallest backing UTXO makers accept for this CoinJoin amount."""
     return max(1, math.ceil(cj_amount * min_percent / 100))
@@ -352,7 +367,7 @@ class PoDLEPurchaser:
         except (OSError, ValueError):
             logger.warning("Cannot create the private PoDLE purchase directory")
             return False
-        cap = purchase_cap_sats(await self._fee_rate(backend))
+        cap = purchase_cap_sats(await market_fee_rate(backend))
         max_price = cap - payer.routing_budget(cap)
         minimum = min_backing_sats(cj_amount, min_percent)
         transport = self._transport_factory()
@@ -391,15 +406,6 @@ class PoDLEPurchaser:
         finally:
             with suppress(Exception):
                 await transport.close()
-
-    @staticmethod
-    async def _fee_rate(backend: BlockchainBackend) -> float:
-        try:
-            if backend.can_estimate_fee():
-                return float(await backend.estimate_fee(3))
-        except Exception:
-            logger.debug("Fee estimation failed; pricing PoDLE purchases at 1 sat/vB")
-        return 1.0
 
     async def _candidates(
         self, transport: Any, max_price: int

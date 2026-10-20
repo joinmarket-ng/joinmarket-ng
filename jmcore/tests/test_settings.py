@@ -433,6 +433,18 @@ class TestSettingsDefaults:
         settings = JoinMarketSettings(wallet={"address_type": "p2tr"}, lightning={"mode": mode})
         assert settings.lightning.mode == mode
 
+    def test_selling_podle_commitments_requires_lightning(self) -> None:
+        """A maker invoices PoDLE sales from its nodes, so selling needs [lightning]."""
+        assert JoinMarketSettings().maker.sell_podle is False
+        with pytest.raises(ValidationError, match="sell_podle requires lightning.mode"):
+            JoinMarketSettings(maker={"sell_podle": True})
+        selling = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            lightning={"mode": "managed"},
+            maker={"sell_podle": True, "podle_price_sats": 500},
+        )
+        assert selling.maker.sell_podle and selling.maker.podle_price_sats == 500
+
     def test_lightning_makes_an_unset_podle_source_prefer_the_market(self) -> None:
         """P2TR plus Lightning buys PoDLEs by default; explicit choices are kept."""
         p2tr = {"address_type": "p2tr"}
