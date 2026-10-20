@@ -14,6 +14,7 @@ from typing import Any
 
 from jmcore.bitcoin import ParsedTransaction, scriptpubkey_to_address
 from jmcore.btc_script import mk_freeze_script
+from jmcore.escrow_authorizer import EscrowAuthorizer
 from loguru import logger
 
 from jmwallet.backends.base import BlockchainBackend
@@ -104,6 +105,7 @@ class WalletService(
 
         seed = mnemonic_to_seed(mnemonic, passphrase)
         self.master_key = HDKey.from_seed(seed)
+        self._escrow_authorizer = EscrowAuthorizer(seed, network)
 
         coin_type = 0 if network == "mainnet" else 1
         if address_type not in ("p2wpkh", "p2tr"):
@@ -1098,8 +1100,14 @@ class WalletService(
         """Return a copy of the reserved address -> user label mapping."""
         return dict(self.reserved_address_labels)
 
+    @property
+    def escrow_authorizer(self) -> EscrowAuthorizer:
+        """Return the non-exporting key that authorizes this wallet's channel escrows."""
+        return self._escrow_authorizer
+
     async def close(self) -> None:
         """Close backend connection"""
+        self._escrow_authorizer.close()
         await self.backend.close()
 
     # -- UTXO metadata (Group J) -------------------------------------------

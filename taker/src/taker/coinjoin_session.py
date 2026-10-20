@@ -72,6 +72,8 @@ if TYPE_CHECKING:
     from jmwallet.wallet.service import WalletService
 
     from taker.buyout import ChannelBuyout
+    from taker.channel_ring import TakerRingCoordinator
+    from taker.channel_ring_maker_only import MakerOnlyRingCoordinator
     from taker.config import TakerConfig
     from taker.multi_directory import MultiDirectoryClient
     from taker.taker import Taker
@@ -79,6 +81,24 @@ if TYPE_CHECKING:
 
 # Resend !tx through a directory to a direct-routed maker still silent after this.
 _DIRECT_TX_FALLBACK_SEC = 30.0
+
+
+MAX_IOAUTH_HOLD_SECONDS = 3_600
+
+
+def _ioauth_hold_seconds(fields: list[str], *, ring_enabled: bool) -> int:
+    """Accept legacy no-hold auth only when channel setup cannot follow."""
+    if len(fields) == 5 and not ring_enabled:
+        return 0
+    if len(fields) != 6:
+        raise ValueError(f"expected 6 parts, got {len(fields)}")
+    value = fields[5]
+    if not value or not value.isdigit() or (len(value) > 1 and value.startswith("0")):
+        raise ValueError("invalid hold")
+    seconds = int(value)
+    if seconds > MAX_IOAUTH_HOLD_SECONDS:
+        raise ValueError("invalid hold")
+    return seconds
 
 
 @dataclass(frozen=True)
@@ -134,6 +154,12 @@ class CoinJoinSession:
         # Requested maker count for this round. Replacement runners use this
         # target before falling back to the configured minimum floor.
         self.maker_target_count: int = 0
+        # Roles are selected before !fill and retained through replacements.
+        # The coordinator freezes the corresponding authenticated sessions before
+        # any private ring message or LND action.
+        self.ring_candidate_nicks: set[str] = set()
+        self.ring_maker_sessions: dict[str, MakerSession] = {}
+        self.ordinary_maker_sessions: dict[str, MakerSession] = {}
 
         # PoDLE commitment used for this CoinJoin. Rotated on majority-blacklist.
         self.podle_commitment: ExtendedPoDLECommitment | None = None
@@ -207,6 +233,14 @@ class CoinJoinSession:
         self._fee_rate: float | None = None
         self._randomized_fee_rate: float | None = None
         self._minimum_fee_rate_sat_vb: float | None = None
+        # Co-funded channel ring state for this round. ``strict_maker_count``
+        # pins the exact counterparty count a ring requires.
+        self.ring_coordinator: TakerRingCoordinator | MakerOnlyRingCoordinator | None = None
+        self.strict_maker_count: int | None = None
+        # A channel-ring round freezes paid maker fees after every selected maker
+        # has authenticated. The signed ring plan and post-broadcast history must
+        # retain these exact amounts rather than re-evaluating relative offers.
+        self._frozen_maker_fee_plan: dict[str, int] | None = None
 
     def attach(self, taker: Taker) -> None:
         """Wire the owning ``Taker`` so the session can read persistent deps.
@@ -220,12 +254,26 @@ class CoinJoinSession:
 
     def maker_fee_plan(self) -> dict[str, int]:
         """Return the paid fee plan for the current participating makers."""
-        return calculate_cj_fee_plan(
+        if self._frozen_maker_fee_plan is not None:
+            if set(self._frozen_maker_fee_plan) != set(self.maker_sessions):
+                raise RuntimeError("frozen maker fee plan does not match participating makers")
+            return dict(self._frozen_maker_fee_plan)
+        advertised_plan = calculate_cj_fee_plan(
             (session.offer for session in self.maker_sessions.values()),
             self.cj_amount,
             round_up_cj_fees=self.config.round_up_cj_fees,
             equalize_cj_fees=self.config.equalize_cj_fees,
         )
+        return {
+            nick: advertised_plan[session.offer.counterparty]
+            for nick, session in self.maker_sessions.items()
+        }
+
+    def freeze_maker_fee_plan(self) -> dict[str, int]:
+        """Freeze paid maker fees once authenticated counterparties are final."""
+        if self._frozen_maker_fee_plan is None:
+            self._frozen_maker_fee_plan = self.maker_fee_plan()
+        return dict(self._frozen_maker_fee_plan)
 
     def wallet_funding_required(self, total_required: int) -> int:
         """Keep the mandatory escrow reserve outside spendable wallet funding."""
@@ -250,6 +298,10 @@ class CoinJoinSession:
         self.is_sweep = False
         self.maker_sessions = {}
         self.maker_target_count = 0
+        self.ring_candidate_nicks = set()
+        self.ring_maker_sessions = {}
+        self.ordinary_maker_sessions = {}
+        self._frozen_maker_fee_plan = None
         self.podle_commitment = None
         self.unsigned_tx = b""
         self.tx_metadata = {}
@@ -278,6 +330,19 @@ class CoinJoinSession:
         self._fee_rate = None
         self._randomized_fee_rate = None
         self._minimum_fee_rate_sat_vb = None
+        self.ring_coordinator = None
+        self.strict_maker_count = None
+
+    def remove_maker_session(self, nick: str) -> None:
+        """Drop one session and its mutable pre-freeze role slot together."""
+        self.maker_sessions.pop(nick, None)
+        if not self.ring_maker_sessions and not self.ordinary_maker_sessions:
+            self.ring_candidate_nicks.discard(nick)
+
+    @property
+    def required_maker_count(self) -> int:
+        """Rings need every invited participant, ordinary rounds need the minimum."""
+        return self.strict_maker_count or self.config.minimum_makers
 
     def input_lock_ttl_sec(self) -> float:
         """Cover the remaining protocol plus the pending-broadcast window."""
@@ -400,7 +465,7 @@ class CoinJoinSession:
                 f"Dropping maker {nick} before !fill: peer handshake reports "
                 f"no neutrino_compat support (taker requires it)."
             )
-            del self.maker_sessions[nick]
+            self.remove_maker_session(nick)
         return dropped
 
     def process_pubkey_response(self, nick: str, response_data: str) -> bool:
@@ -528,7 +593,7 @@ class CoinJoinSession:
         # in _phase_auth will catch them later.
         if self.backend.requires_neutrino_metadata():
             incompatible = self._drop_neutrino_incompatible_sessions(pending_nicks)
-            if incompatible and len(self.maker_sessions) < self.config.minimum_makers:
+            if incompatible and len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
                     f"After filtering {len(incompatible)} neutrino-incompatible maker(s), "
                     f"only {len(self.maker_sessions)} remain (need "
@@ -611,26 +676,26 @@ class CoinJoinSession:
                             f"Commitment was blacklisted by {nick} - may need retry with new index"
                         )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
                     continue
 
                 try:
                     response_data = responses[nick]["data"].strip()
                     if not self.process_pubkey_response(nick, response_data):
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                 except Exception as e:
                     logger.warning("Invalid !pubkey response from maker")
                     logger.bind(sensitive=True).warning(
                         "Invalid !pubkey response from {}: {}", nick, e
                     )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
             else:
                 logger.warning(f"No !pubkey response from {nick}")
                 failed_makers.append(nick)
                 silent_makers.append(nick)
-                del self.maker_sessions[nick]
+                self.remove_maker_session(nick)
 
         # If at least one maker explicitly rejected the commitment as
         # blacklisted, treat the silent makers (timeouts) as also-blacklisted.
@@ -667,9 +732,9 @@ class CoinJoinSession:
                         f"advertised features (taker requires extended UTXO metadata)."
                     )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
 
-        if len(self.maker_sessions) < self.config.minimum_makers:
+        if len(self.maker_sessions) < self.required_maker_count:
             logger.error(f"Not enough makers responded: {len(self.maker_sessions)}")
             return PhaseResult(
                 success=False,
@@ -737,13 +802,13 @@ class CoinJoinSession:
                     f"without extended metadata (scriptpubkey + blockheight)."
                 )
                 incompatible_makers.append(nick)
-                del self.maker_sessions[nick]
+                self.remove_maker_session(nick)
 
             pending_nicks = [nick for nick in pending_nicks if nick in self.maker_sessions]
 
             # Report incompatible makers as failed so the replacement loop can
             # ignore them and pick substitutes before any PoDLE proof is revealed.
-            if len(self.maker_sessions) < self.config.minimum_makers:
+            if len(self.maker_sessions) < self.required_maker_count:
                 logger.error(
                     f"Not enough compatible makers: {len(self.maker_sessions)} "
                     f"< {self.config.minimum_makers}. Neutrino takers require makers that "
@@ -816,8 +881,8 @@ class CoinJoinSession:
         unavailable_makers: list[str] = []
 
         # Process responses
-        # Maker sends !ioauth as ENCRYPTED space-separated:
-        # <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
+        # Maker sends !ioauth as ENCRYPTED ASCII space-separated:
+        # <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig> <hold_seconds>
         # where utxo_list can be:
         # - Legacy format: txid:vout,txid:vout,...
         # - Extended format (neutrino_compat): txid:vout:scriptpubkey:blockheight,...
@@ -841,7 +906,7 @@ class CoinJoinSession:
                     # A remote maker controls this error token, so it cannot be
                     # trusted to bypass the persistent failed-maker policy.
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
                     continue
 
                 try:
@@ -849,7 +914,7 @@ class CoinJoinSession:
                     if session.crypto is None:
                         logger.warning(f"No encryption session for {nick}")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Extract encrypted data (first part of response)
@@ -858,24 +923,32 @@ class CoinJoinSession:
                     if not parts:
                         logger.warning(f"Empty !ioauth response from {nick}")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     encrypted_data = parts[0]
 
                     # Decrypt the ioauth message
                     decrypted = session.crypto.decrypt(encrypted_data)
-                    logger.debug(f"Decrypted !ioauth from {nick}: {decrypted[:50]}...")
+                    logger.debug(f"Received encrypted !ioauth from {nick}")
 
-                    # Parse: <utxo_list> <auth_pub> <cj_addr> <change_addr> <btc_sig>
-                    ioauth_parts = decrypted.split()
-                    if len(ioauth_parts) < 5:
-                        logger.warning(
-                            f"Invalid !ioauth format from {nick}: expected 5 parts, "
-                            f"got {len(ioauth_parts)}"
-                        )
+                    # Ring setup requires an explicit maker input hold. Legacy
+                    # makers omit the sixth field, which is only safe for an
+                    # ordinary CoinJoin without channel-ring negotiation.
+                    if not decrypted.isascii():
+                        logger.warning(f"Invalid !ioauth format from {nick}")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
+                        continue
+                    ioauth_parts = decrypted.split()
+                    try:
+                        hold_seconds = _ioauth_hold_seconds(
+                            ioauth_parts, ring_enabled=self.config.channel_ring.enabled
+                        )
+                    except ValueError as exc:
+                        logger.warning(f"Invalid !ioauth from {nick}: {exc}")
+                        failed_makers.append(nick)
+                        self.remove_maker_session(nick)
                         continue
 
                     utxo_list_str = ioauth_parts[0]
@@ -888,12 +961,13 @@ class CoinJoinSession:
                     # malicious directory substitute the maker's encryption key and
                     # MITM the channel, so a failing btc_sig is fatal.
                     btc_sig = ioauth_parts[4]
+                    hold_received_at = time.monotonic()
                     from jmcore.crypto import ecdsa_verify
 
                     if not ecdsa_verify(session.pubkey, btc_sig, bytes.fromhex(auth_pub)):
                         logger.warning(f"btc_sig verification failed from {nick}, dropping")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Parse utxo_list using protocol helper
@@ -915,7 +989,7 @@ class CoinJoinSession:
                             "mining fee for every input, so this would inflate our fee."
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Track if maker sent extended format
@@ -931,7 +1005,7 @@ class CoinJoinSession:
                             unavailable_makers.append(nick)
                         else:
                             failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Every outpoint in the transaction must be unique across ALL
@@ -954,7 +1028,7 @@ class CoinJoinSession:
                             "already used by another participant in this round"
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Reference-taker parity: the maker must fund its CoinJoin
@@ -976,14 +1050,14 @@ class CoinJoinSession:
                             f"the maker change threshold ({DUST_THRESHOLD})"
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     pit_mismatch = self._maker_pit_mismatch(session, cj_addr, change_addr)
                     if pit_mismatch is not None:
                         logger.warning(f"Dropping maker {nick}: {pit_mismatch}")
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     # Tie the authenticated session to on-chain ownership: the
@@ -1000,12 +1074,16 @@ class CoinJoinSession:
                             "Authentication key for {} matches no declared UTXO", nick
                         )
                         failed_makers.append(nick)
-                        del self.maker_sessions[nick]
+                        self.remove_maker_session(nick)
                         continue
 
                     session.cj_address = cj_addr
                     session.change_address = change_addr
                     session.auth_pubkey = auth_pub  # Store for later verification
+                    session.record_hold(
+                        hold_seconds=hold_seconds,
+                        received_at=hold_received_at,
+                    )
                     session.responded_auth = True
                     logger.bind(sensitive=True).debug(
                         f"Processed !ioauth from {nick}: {len(session.utxos)} UTXOs, "
@@ -1017,13 +1095,13 @@ class CoinJoinSession:
                         "Invalid !ioauth response from {}: {}", nick, e
                     )
                     failed_makers.append(nick)
-                    del self.maker_sessions[nick]
+                    self.remove_maker_session(nick)
             else:
                 logger.warning(f"No !ioauth response from {nick}")
                 failed_makers.append(nick)
-                del self.maker_sessions[nick]
+                self.remove_maker_session(nick)
 
-        if len(self.maker_sessions) < self.config.minimum_makers:
+        if len(self.maker_sessions) < self.required_maker_count:
             logger.error(f"Not enough makers sent UTXOs: {len(self.maker_sessions)}")
             return PhaseResult(
                 success=False,
@@ -2349,7 +2427,11 @@ class CoinJoinSession:
         builder = CoinJoinTxBuilder(self.config.network.value)
 
         # Add taker's signatures
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.mark_local_signature_creation()
         taker_sigs = await self._sign_our_inputs()
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.mark_local_signatures(taker_sigs)
         signatures["taker"] = taker_sigs
 
         self.final_tx = builder.add_signatures(
@@ -2357,6 +2439,8 @@ class CoinJoinSession:
             signatures,
             self.tx_metadata,
         )
+        if self.ring_coordinator is not None:
+            self.ring_coordinator.persist_final_transaction(self.final_tx.hex())
 
         logger.bind(sensitive=True).info("Signed tx: {} bytes", len(self.final_tx))
         return True
@@ -2667,6 +2751,14 @@ class CoinJoinSession:
 
         # Build list of broadcast candidates based on policy
         maker_nicks = list(self.maker_sessions.keys())
+
+        if self.ring_coordinator is not None:
+            delivered = await self._broadcast_to_all_makers(maker_nicks, tx_b64)
+            if delivered != len(maker_nicks):
+                logger.warning(
+                    f"Final ring transaction reached {delivered}/{len(maker_nicks)} makers; "
+                    "durable reconciliation remains active"
+                )
 
         if policy == BroadcastPolicy.SELF:
             # Always broadcast via own node
