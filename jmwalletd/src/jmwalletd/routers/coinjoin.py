@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends
@@ -49,6 +50,7 @@ def build_coinjoin_taker_config(
     mnemonic: Any,
     jm_settings: Any,
     taker_config_cls: Any,
+    data_dir: Path | None = None,
     config_overrides: dict[str, dict[str, str]] | None = None,
     passphrase: str = "",
 ) -> Any:
@@ -80,6 +82,7 @@ def build_coinjoin_taker_config(
         jm_settings,
         mnemonic,
         passphrase,
+        data_dir=data_dir,
         amount=body.amount_sats,
         destination=body.destination,
         mixdepth=body.mixdepth,
@@ -218,6 +221,7 @@ async def do_coinjoin(
                     mnemonic=state.wallet_mnemonic,
                     jm_settings=jm_settings,
                     taker_config_cls=TakerConfig,
+                    data_dir=state.data_dir,
                     config_overrides=state.config_overrides,
                     passphrase=state.wallet_bip39_passphrase,
                 )

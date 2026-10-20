@@ -65,40 +65,24 @@ def test_corrupt_commitments_file_is_not_discarded(tmp_path: Path) -> None:
     finally:
         logger.remove(handler_id)
 
-    preserved = [p for p in filepath.parent.iterdir() if p.read_text() == corrupt]
-    assert preserved, "corrupt commitments file was overwritten"
-    assert any(str(preserved[0]) in record for record in records)
-    assert PoDLEManager(data_dir=tmp_path).used_commitments == {"cd" * 32}
+    assert filepath.read_text() == corrupt
+    assert any("external pool disabled" in record for record in records)
+    reopened = PoDLEManager(data_dir=tmp_path)
+    assert not reopened._storage_healthy
+    assert reopened.used_commitments == set()
 
 
-def test_repeated_corruption_in_one_second_keeps_every_backup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("taker.podle_manager.time.time", lambda: 1_700_000_000.0)
+def test_corrupt_state_stays_disabled_after_reload_and_reopen(tmp_path: Path) -> None:
     filepath = PoDLEManager(data_dir=tmp_path).filepath
-    corrupt_contents = ['{"used": [', '{"used": ["' + "ab" * 32 + '", ']
+    corrupt = '{"used": ["' + "ab" * 32 + '", '
+    filepath.write_text(corrupt)
 
-    for contents in corrupt_contents:
-        filepath.write_text(contents)
-        PoDLEManager(data_dir=tmp_path)
+    for _ in range(3):
+        manager = PoDLEManager(data_dir=tmp_path)
+        manager._reload(merge_used=True)
+        manager.used_commitments.add("cd" * 32)
+        manager._save()
+        assert not manager._storage_healthy
+        assert filepath.read_text() == corrupt
 
-    backups = sorted(filepath.parent.glob(f"{filepath.name}.corrupt.*"))
-    assert sorted(p.read_text() for p in backups) == sorted(corrupt_contents)
-    assert not filepath.exists()
-
-
-def test_failed_quarantine_leaves_no_placeholder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    filepath = PoDLEManager(data_dir=tmp_path).filepath
-    filepath.write_text('{"used": [')
-
-    def fail_replace(*_: object) -> None:
-        raise PermissionError("read-only")
-
-    monkeypatch.setattr("taker.podle_manager.os.replace", fail_replace)
-    with pytest.raises(PermissionError):
-        PoDLEManager(data_dir=tmp_path)
-
-    assert filepath.read_text() == '{"used": ['
     assert not list(filepath.parent.glob(f"{filepath.name}.corrupt.*"))

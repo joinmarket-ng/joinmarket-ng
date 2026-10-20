@@ -253,7 +253,10 @@ and Lightning identities. Each ring maker learns its two neighbors and its own
 channel balances. Unannounced channels and SCID aliases do not hide this
 information from the endpoints. Colluding neighbors or a malicious coordinator
 have a stronger view than an on-chain observer. Reusing a fidelity bond across
-pits also lets takers who receive its proofs correlate those maker identities.
+pits also links those maker identities publicly: every orderbook request
+receives the bond proofs, and orderbook watchers republish them. A maker that
+needs unlinked sw0 and tr0 identities must run them from separate wallets with
+separate bonds.
 
 Private channel buyout messages stay between the channel owners, not the
 CoinJoin taker. A cooperative key-path spend avoids explicitly identifying the

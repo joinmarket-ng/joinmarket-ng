@@ -549,6 +549,7 @@ def test_update_locks_cover_an_installed_tumbler() -> None:
     assert _release_file_paths(result.stdout) == [
         "jmcore/requirements.txt",
         "jmwallet/requirements.txt",
+        "jmswap/requirements.txt",
         "maker/requirements.txt",
         "taker/requirements.txt",
         "tumbler/requirements.txt",

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Response
@@ -252,6 +253,7 @@ def build_tumbler_taker_config(
     mnemonic: Any,
     jm_settings: Any,
     taker_config_cls: Any,
+    data_dir: Path | None = None,
     config_overrides: dict[str, dict[str, str]] | None = None,
     passphrase: str = "",
 ) -> Any:
@@ -285,6 +287,7 @@ def build_tumbler_taker_config(
         jm_settings,
         mnemonic,
         passphrase,
+        data_dir=data_dir,
         amount=getattr(phase, "amount", 0) or 0,
         destination="",
         mixdepth=getattr(phase, "mixdepth", 0),
@@ -462,6 +465,7 @@ async def start_plan(
             mnemonic=state.wallet_mnemonic,
             jm_settings=jm_settings,
             taker_config_cls=TakerConfig,
+            data_dir=state.data_dir,
             config_overrides=state.config_overrides,
             passphrase=state.wallet_bip39_passphrase,
         )

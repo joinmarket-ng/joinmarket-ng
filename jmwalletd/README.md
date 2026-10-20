@@ -18,6 +18,9 @@ For full documentation, see
 - WebSocket notifications on `/ws`, `/api/v1/ws`, and `/jmws`
 - JWT auth (access and refresh tokens)
 - Orderbook proxy endpoints under `/obwatch/*`
+- Experimental wallet-native credential seller and explicit ledger maintenance
+  under `/api/v1/wallet/{walletname}/market/*`, documented in the
+  [credential market guide](../docs/credential-market.md#native-seller-operations)
 
 ## Run
 
