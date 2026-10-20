@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
-from jmcore.channel_ring import ChannelRingConfig
 from jmcore.cli_common import resolve_mnemonic, select_mnemonic_source, setup_cli
 from jmcore.cli_help import SortedTyper, version_options
 from jmcore.config import build_tor_control_config
@@ -396,6 +395,8 @@ def build_maker_config(
             "--fidelity-bond-locktime"
         )
 
+    from jmswap.lightning_context import channel_ring_config
+
     return MakerConfig(
         mnemonic=SecretStr(mnemonic),
         passphrase=SecretStr(passphrase),
@@ -477,7 +478,14 @@ def build_maker_config(
         orderbook_violation_warning_threshold=settings.maker.orderbook_violation_warning_threshold,
         orderbook_violation_severe_threshold=settings.maker.orderbook_violation_severe_threshold,
         orderbook_ban_duration=settings.maker.orderbook_ban_duration,
-        channel_ring=ChannelRingConfig.from_settings(settings.maker.channel_ring),
+        channel_ring=channel_ring_config(
+            settings.lightning.mode,
+            settings.maker.channel_ring,
+            mnemonic=mnemonic,
+            passphrase=passphrase,
+            data_dir=effective_data_dir,
+            network=NetworkType(effective_bitcoin_network).value,
+        ),
     )
 
 

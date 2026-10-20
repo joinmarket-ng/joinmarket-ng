@@ -829,6 +829,45 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
         build_taker_config(wrong_offer, mnemonic=sample_mnemonic, passphrase="")
 
 
+def test_managed_lightning_wires_the_taker_ring_to_its_nodes(
+    tmp_path, sample_mnemonic: str
+) -> None:
+    from jmcore.crypto import mnemonic_to_seed
+    from jmcore.settings import JoinMarketSettings
+    from jmswap.lightning_context import wallet_identity_of
+    from jmswap.managed_nodes import (
+        ManagedNodePaths,
+        NodeState,
+        RegistryStore,
+        allocate_node,
+        new_registry,
+    )
+
+    from taker.config_builder import build_taker_config
+
+    identity = wallet_identity_of(mnemonic_to_seed(sample_mnemonic, ""))
+    paths = ManagedNodePaths.for_wallet(tmp_path, "signet", identity)
+    registry = new_registry("signet", identity)
+    node = allocate_node(registry, 1, birthday=1, ports=(21000, 21001))
+    node.state = NodeState.ACTIVE
+    node.onion_endpoint = "a" * 56 + ".onion:9735"
+    RegistryStore(paths).update(lambda current: registry)
+    settings = JoinMarketSettings(
+        network_config={"network": "signet"},
+        wallet={"address_type": "p2tr"},
+        lightning={"mode": "managed"},
+    )
+
+    config = build_taker_config(
+        settings, mnemonic=sample_mnemonic, passphrase="", data_dir=tmp_path
+    )
+
+    assert config.channel_ring.enabled
+    assert config.channel_ring.mixdepth_nodes == {1: node.name}
+    assert config.channel_ring.taker_joins
+    assert config.channel_ring.node_binding_directory == paths.bindings_dir
+
+
 def test_disabled_channel_ring_round_trip_preserves_default_behavior(sample_mnemonic: str) -> None:
     from jmcore.settings import JoinMarketSettings
 

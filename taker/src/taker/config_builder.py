@@ -18,7 +18,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from jmcore.channel_ring import ChannelRingConfig
 from jmcore.models import NetworkType
 from jmcore.settings import DEFAULT_DIRECTORY_SERVERS, JoinMarketSettings
 
@@ -227,6 +226,7 @@ def build_taker_config_kwargs(
         broadcast_policy = BroadcastPolicy.MULTIPLE_PEERS
 
     # Import SecretStr for wrapping sensitive values
+    from jmswap.lightning_context import channel_ring_config
     from pydantic import SecretStr
 
     return {
@@ -303,7 +303,14 @@ def build_taker_config_kwargs(
         "external_podle_mode": settings.taker.external_podle_mode,
         "market_fault_exclusion": settings.taker.market_fault_exclusion,
         "max_maker_utxos": settings.taker.max_maker_utxos,
-        "channel_ring": ChannelRingConfig.from_settings(settings.taker.channel_ring),
+        "channel_ring": channel_ring_config(
+            settings.lightning.mode,
+            settings.taker.channel_ring,
+            mnemonic=mnemonic,
+            passphrase=passphrase,
+            data_dir=effective_data_dir,
+            network=NetworkType(effective_bitcoin_network).value,
+        ),
     }
 
 
