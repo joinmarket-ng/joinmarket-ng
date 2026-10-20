@@ -178,6 +178,9 @@ class ChannelRingConfig(BaseModel):
     max_active_sessions: int = Field(default=4, ge=1, le=16)
     max_verified_sessions: int = Field(default=2, ge=1, le=8)
     persistence_directory: Path | None = None
+    # (minimum, maximum) on-chain reserve that CoinJoin outputs may top a mapped
+    # node up to. Only managed Lightning mode sets it; None never redirects.
+    reserve_funding: tuple[int, int] | None = None
 
     @classmethod
     def from_settings(cls, settings: ChannelRingSettings) -> ChannelRingConfig:
@@ -240,6 +243,10 @@ class ChannelRingConfig(BaseModel):
             raise ValueError("allowed CSV delays must fall within configured bounds")
         if self.max_verified_sessions > self.max_active_sessions:
             raise ValueError("max_verified_sessions cannot exceed max_active_sessions")
+        if self.reserve_funding is not None and not (
+            0 < self.reserve_funding[0] <= self.reserve_funding[1] <= MAX_MONEY
+        ):
+            raise ValueError("reserve_funding must be a positive (minimum, maximum) range")
         required_setup_hold = (
             self.setup_timeout_seconds
             + self.hold_safety_margin_seconds

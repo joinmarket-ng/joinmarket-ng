@@ -10,10 +10,16 @@ transaction still in the mempool must not be repeated.
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 from jmcore.bitcoin import address_to_scriptpubkey_for_network
-from jmcore.channel_ring import ChannelRingNodeSettings
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeSettings
+from loguru import logger
 
 from jmswap.lightning_context import lightning_context
 from jmswap.lnd import LndBackend
@@ -111,3 +117,124 @@ async def managed_reserve_target(
     return await reserve_funding_address(
         endpoint, network=ctx.network, reserve_min_sats=int(settings.lightning.reserve_min_sats)
     )
+
+
+#: How often a long-running maker rereads its nodes' reserves.
+REFRESH_SECONDS = 300.0
+#: A reserve read longer ago than this is unknown and funds nothing.
+STALE_SECONDS = 2 * REFRESH_SECONDS
+#: A claimed address is not offered again, and its node not reread, for this
+#: long: the CoinJoin that pays it may still be negotiating or unconfirmed.
+CLAIM_HOLD_SECONDS = 1800.0
+
+
+@dataclass
+class _Reserve:
+    balance: int
+    address: str | None
+    read_at: float
+    claimed_at: float | None = None
+
+
+class ReserveFunder:
+    """Lets CoinJoin outputs top up the reserves of the mixdepths' nodes.
+
+    Node RPCs only happen in :meth:`refresh`; :meth:`claim` decides from the
+    last reading without I/O, so a maker can answer ``!ioauth`` promptly. An
+    unreachable node or an old reading claims nothing.
+    """
+
+    def __init__(
+        self,
+        nodes: Mapping[int, ChannelRingNodeSettings],
+        *,
+        network: str,
+        reserve_min_sats: int,
+        reserve_max_sats: int,
+        clock: Callable[[], float] = time.monotonic,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        self._nodes = dict(nodes)
+        self._network = network
+        self._min = reserve_min_sats
+        self._max = reserve_max_sats
+        self._clock = clock
+        self._timeout = timeout_seconds
+        self._reserves: dict[int, _Reserve] = {}
+        self._task: asyncio.Task[None] | None = None
+
+    @classmethod
+    def from_ring_config(cls, config: ChannelRingConfig, *, network: str) -> ReserveFunder | None:
+        """The funder of a managed ring config, ``None`` when it funds no reserve."""
+        if config.reserve_funding is None or not config.mixdepth_nodes:
+            return None
+        reserve_min, reserve_max = config.reserve_funding
+        nodes = {mixdepth: config.nodes[name] for mixdepth, name in config.mixdepth_nodes.items()}
+        return cls(
+            nodes, network=network, reserve_min_sats=reserve_min, reserve_max_sats=reserve_max
+        )
+
+    async def refresh(self, mixdepths: Iterable[int] | None = None) -> None:
+        """Reread the reserves of ``mixdepths`` (all mapped ones by default)."""
+        wanted = set(self._nodes if mixdepths is None else mixdepths) & set(self._nodes)
+        await asyncio.gather(*(self._refresh_one(mixdepth) for mixdepth in sorted(wanted)))
+
+    async def _refresh_one(self, mixdepth: int) -> None:
+        now = self._clock()
+        current = self._reserves.get(mixdepth)
+        if (
+            current is not None
+            and current.claimed_at is not None
+            and now < current.claimed_at + CLAIM_HOLD_SECONDS
+        ):
+            return
+        try:
+            balance, address = await reserve_funding_address(
+                self._nodes[mixdepth],
+                network=self._network,
+                reserve_min_sats=self._min,
+                timeout_seconds=self._timeout,
+            )
+        except ReserveError as exc:
+            self._reserves.pop(mixdepth, None)
+            logger.debug(f"Lightning reserve of mixdepth {mixdepth} is unknown: {exc}")
+            return
+        self._reserves[mixdepth] = _Reserve(balance, address, self._clock())
+
+    def claim(self, mixdepth: int, amount_sats: int) -> str | None:
+        """The node address an output of ``amount_sats`` should pay, if any.
+
+        An output only funds a node below its minimum, and only if the node's
+        reserve then lies within ``[reserve_min_sats, reserve_max_sats]``. The
+        address is handed out once; a new one follows a later refresh.
+        """
+        reserve = self._reserves.get(mixdepth)
+        now = self._clock()
+        if (
+            reserve is None
+            or reserve.address is None
+            or reserve.claimed_at is not None
+            or now > reserve.read_at + STALE_SECONDS
+            or not self._min <= reserve.balance + amount_sats <= self._max
+        ):
+            return None
+        reserve.claimed_at = now
+        logger.info(f"A CoinJoin output funds the Lightning reserve of mixdepth {mixdepth}")
+        return reserve.address
+
+    def start(self, interval_seconds: float = REFRESH_SECONDS) -> None:
+        """Keep the readings current in the background."""
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(interval_seconds))
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _run(self, interval_seconds: float) -> None:
+        while True:
+            await self.refresh()
+            await asyncio.sleep(interval_seconds)

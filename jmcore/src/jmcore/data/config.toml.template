@@ -898,7 +898,9 @@
 # lnd_binary = "/usr/local/bin/lnd"
 
 # Managed mode: confirmed node wallet balance kept for force-close fee bumps
-# (advisory), and the largest change or equal output sent to a node to top it up.
+# (advisory), and the largest balance a top-up may reach. A CoinJoin output whose
+# amount lands a node below the minimum within this range pays to that node: the
+# equal output of a CoinJoin to the next mixdepth, or change in its own mixdepth.
 # `jm-wallet fund-reserve MIXDEPTH` tops up one node from its own mixdepth.
 # reserve_min_sats = 25000
 # reserve_max_sats = 150000

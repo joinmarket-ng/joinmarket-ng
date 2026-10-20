@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
 from jmcore.bitcoin import scriptpubkey_to_address
-from jmcore.channel_ring import ChannelRingNodeSettings
+from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig, ChannelRingNodeSettings
 from jmcore.crypto import mnemonic_to_seed
 from jmcore.settings import JoinMarketSettings
 
 from jmswap import lightning_reserve
 from jmswap.lightning_context import wallet_identity_of
 from jmswap.lightning_reserve import (
+    CLAIM_HOLD_SECONDS,
+    STALE_SECONDS,
     ReserveError,
+    ReserveFunder,
     check_reserve_amount,
     default_reserve_amount,
     managed_reserve_target,
@@ -199,3 +203,145 @@ async def test_the_managed_target_is_the_active_node_of_the_mixdepth(
 async def test_no_registry_is_a_reserve_error(tmp_path: Path) -> None:
     with pytest.raises(ReserveError, match="jm-lightning init"):
         await managed_reserve_target(_settings(tmp_path), mnemonic_to_seed(MNEMONIC, ""), 0)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class Readings:
+    """reserve_funding_address double: per-mixdepth balances, fresh addresses."""
+
+    def __init__(self, balances: dict[int, int]) -> None:
+        self.balances = balances
+        self.reads: list[int] = []
+        self.unreachable: set[int] = set()
+
+    async def __call__(
+        self,
+        node: ChannelRingNodeSettings,
+        *,
+        network: str,
+        reserve_min_sats: int,
+        timeout_seconds: float,
+    ) -> tuple[int, str | None]:
+        mixdepth = int(node.lnd_grpc_url.rsplit(":", 1)[1]) - 10_000
+        self.reads.append(mixdepth)
+        if mixdepth in self.unreachable:
+            raise ReserveError("cannot reach the node (it is not running)")
+        balance = self.balances[mixdepth]
+        if balance >= reserve_min_sats:
+            return balance, None
+        program = bytes([mixdepth, len(self.reads)]) + b"\x00" * 30
+        return balance, scriptpubkey_to_address(bytes([0x51, 0x20]) + program, "signet")
+
+
+def _funder(
+    monkeypatch: pytest.MonkeyPatch, balances: dict[int, int]
+) -> tuple[ReserveFunder, Readings, Clock]:
+    readings = Readings(balances)
+    monkeypatch.setattr(lightning_reserve, "reserve_funding_address", readings)
+    clock = Clock()
+    nodes = {
+        mixdepth: NODE.model_copy(update={"lnd_grpc_url": f"https://127.0.0.1:{10_000 + mixdepth}"})
+        for mixdepth in balances
+    }
+    funder = ReserveFunder(
+        nodes,
+        network="signet",
+        reserve_min_sats=25_000,
+        reserve_max_sats=150_000,
+        clock=clock,
+    )
+    return funder, readings, clock
+
+
+async def test_an_output_funds_a_low_node_only_within_the_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    funder, _, _ = _funder(monkeypatch, {0: 5_000, 1: 30_000})
+    await funder.refresh()
+
+    # Too small to reach the minimum, or too large for the maximum.
+    assert funder.claim(0, 19_999) is None
+    assert funder.claim(0, 145_001) is None
+    # A node at its minimum needs nothing; an unmapped mixdepth has no node.
+    assert funder.claim(1, 50_000) is None
+    assert funder.claim(2, 50_000) is None
+    address = funder.claim(0, 20_000)
+    assert address is not None
+    # Each address is handed out once.
+    assert funder.claim(0, 20_000) is None
+
+
+async def test_a_claimed_node_is_not_reread_until_its_hold_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    funder, readings, clock = _funder(monkeypatch, {0: 0})
+    await funder.refresh()
+    first = funder.claim(0, 50_000)
+    assert first is not None
+
+    clock.now += CLAIM_HOLD_SECONDS - 1
+    await funder.refresh()
+    assert readings.reads == [0]
+    assert funder.claim(0, 50_000) is None
+
+    # The paying CoinJoin never happened: a fresh address funds the node.
+    clock.now += 2
+    await funder.refresh()
+    second = funder.claim(0, 50_000)
+    assert second is not None and second != first
+
+    # Once paid (unconfirmed coins count), nothing more is sent.
+    readings.balances[0] = 50_000
+    clock.now += CLAIM_HOLD_SECONDS + 1
+    await funder.refresh()
+    assert funder.claim(0, 50_000) is None
+
+
+async def test_an_unknown_or_old_reading_funds_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    funder, readings, clock = _funder(monkeypatch, {0: 0, 1: 0})
+    await funder.refresh()
+    readings.unreachable.add(1)
+    await funder.refresh([1])
+    assert funder.claim(1, 50_000) is None
+
+    clock.now += STALE_SECONDS + 1
+    assert funder.claim(0, 50_000) is None
+
+
+async def test_the_background_loop_keeps_readings_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    funder, readings, _ = _funder(monkeypatch, {0: 0})
+    funder.start(interval_seconds=0.01)
+    for _ in range(100):
+        if len(readings.reads) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    await funder.stop()
+    assert len(readings.reads) >= 2
+    assert funder.claim(0, 50_000) is not None
+
+
+def test_only_a_managed_ring_config_with_mapped_nodes_funds_reserves() -> None:
+    node = ChannelRingNodeConfig.model_validate(NODE.model_dump())
+    ring = {"nodes": {"n0": node}, "mixdepth_nodes": {0: "n0"}}
+    assert ReserveFunder.from_ring_config(ChannelRingConfig(**ring), network="signet") is None
+    assert (
+        ReserveFunder.from_ring_config(
+            ChannelRingConfig(reserve_funding=(25_000, 150_000)), network="signet"
+        )
+        is None
+    )
+    funder = ReserveFunder.from_ring_config(
+        ChannelRingConfig(**ring, reserve_funding=(25_000, 150_000)), network="signet"
+    )
+    assert funder is not None
+    with pytest.raises(ValueError, match="reserve_funding"):
+        ChannelRingConfig(**ring, reserve_funding=(30_000, 20_000))

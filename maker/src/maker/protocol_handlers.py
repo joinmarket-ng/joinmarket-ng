@@ -725,6 +725,7 @@ class ProtocolHandlersMixin:
             # serves; its durable record, not any in-memory flag, decides
             # whether a second concurrent fill may actually consume it.
             buyout = getattr(self, "buyout", None)
+            reserve_funder = getattr(self, "reserve_funder", None)
 
             session_inner = CoinJoinSession(
                 taker_nick=taker_nick,
@@ -747,6 +748,7 @@ class ProtocolHandlersMixin:
                     minimum_fee_rate if isinstance(minimum_fee_rate, (int, float)) else None
                 ),
                 buyout=buyout,
+                reserve_claim=None if reserve_funder is None else reserve_funder.claim,
             )
             session = MakerSession(inner=session_inner, generation_id=generation_id)
 

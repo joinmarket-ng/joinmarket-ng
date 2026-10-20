@@ -25,13 +25,14 @@ from jmcore.bitcoin import (
     parse_transaction,
     serialize_output,
 )
+from jmcore.constants import BITCOIN_DUST_THRESHOLD
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     estimate_p2wpkh_vsize,
     fee_rate_meets_minimum,
     format_low_fee_error,
 )
-from jmcore.models import NetworkType, Offer, offer_output_script_type
+from jmcore.models import NetworkType, Offer, calculate_cj_fee, offer_output_script_type
 from jmcore.podle import parse_podle_revelation, verify_podle, verify_podle_binding
 from jmcore.protocol import (
     UTXOMetadata,
@@ -122,6 +123,7 @@ class CoinJoinSession:
         mixdepth_selection_policy: MixdepthSelectionPolicy = MixdepthSelectionPolicy.BALANCED,
         allowed_mixdepths: frozenset[int] | None = None,
         buyout: ChannelBuyout | None = None,
+        reserve_claim: Callable[[int, int], str | None] | None = None,
     ):
         self.taker_nick = taker_nick
         self.offer = offer
@@ -165,6 +167,10 @@ class CoinJoinSession:
             if buyout is None
             else bound_buyout_mixdepth(buyout, wallet, backend, self.pit_script_type)
         )
+        # ``reserve_claim(mixdepth, amount)`` names the Lightning node address an
+        # output of this round should pay instead (managed mode only). Node
+        # addresses are Taproot, so only a Taproot pit may use them.
+        self.reserve_claim = reserve_claim if self.pit_script_type == "p2tr" else None
         self.channel_prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
         self.channel_heights: dict[tuple[str, int], int | None] = {}
         self._parent_prevouts: dict[tuple[str, int], tuple[int, bytes]] = {}
@@ -1060,6 +1066,31 @@ class CoinJoinSession:
         self.channel_heights = heights
         return None
 
+    def _claim_reserve(
+        self, source_mixdepth: int, cj_mixdepth: int, selected: list[UTXOInfo]
+    ) -> tuple[str | None, str | None]:
+        """The node addresses of at most one output of this round, (equal, change).
+
+        The equal output, bound for the next mixdepth, is preferred since it is
+        mixed; otherwise the expected change may pay the source mixdepth's own
+        node. Buyout rounds keep their escrow change and fund no reserve.
+        """
+        if self.reserve_claim is None or self.buyout is not None:
+            return None, None
+        cj_reserve = self.reserve_claim(cj_mixdepth, self.amount)
+        if cj_reserve is not None:
+            return cj_reserve, None
+        # The verifier's minimum; the taker may only raise it slightly.
+        change = (
+            sum(utxo.value for utxo in selected)
+            - self.amount
+            - self.offer.txfee
+            + calculate_cj_fee(self.offer.ordertype, self.offer.cjfee, self.amount)
+        )
+        if change <= BITCOIN_DUST_THRESHOLD:
+            return None, None
+        return None, self.reserve_claim(source_mixdepth, change)
+
     async def _select_our_utxos(
         self,
         exclude_utxos: set[tuple[str, int]] | None = None,
@@ -1207,11 +1238,14 @@ class CoinJoinSession:
                 self.buyout.begin_round()
 
             cj_output_mixdepth = (max_mixdepth + 1) % self.wallet.mixdepth_count
-            cj_address = self.wallet.get_new_internal_address(cj_output_mixdepth)
+            cj_reserve, change_reserve = self._claim_reserve(
+                max_mixdepth, cj_output_mixdepth, selected
+            )
+            cj_address = cj_reserve or self.wallet.get_new_internal_address(cj_output_mixdepth)
             change_address = (
                 self.buyout.change_address
                 if self.buyout is not None
-                else self.wallet.get_new_internal_address(max_mixdepth)
+                else change_reserve or self.wallet.get_new_internal_address(max_mixdepth)
             )
 
             logger.info("Selected maker inputs for CoinJoin")

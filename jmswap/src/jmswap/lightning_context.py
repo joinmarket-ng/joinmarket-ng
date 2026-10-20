@@ -74,8 +74,12 @@ def channel_ring_config(
     passphrase: str,
     data_dir: Path,
     network: str,
+    reserve_sats: tuple[int, int] | None = None,
 ) -> ChannelRingConfig:
     """The runtime ring config, wired to the wallet's managed nodes in managed mode.
+
+    ``reserve_sats`` is ``[lightning]`` (reserve_min_sats, reserve_max_sats);
+    only managed nodes get their reserves funded by CoinJoin outputs.
 
     Other modes use the explicit ``[maker/taker.channel_ring]`` settings as they
     are. Managed mode owns the node list: explicit nodes are refused rather than
@@ -111,5 +115,6 @@ def channel_ring_config(
             "nodes": {name: node.model_dump() for name, node in nodes.items()},
             "mixdepth_nodes": mapping,
             "node_binding_directory": paths.bindings_dir,
+            "reserve_funding": reserve_sats if reserve_sats and reserve_sats[0] > 0 else None,
         }
     )

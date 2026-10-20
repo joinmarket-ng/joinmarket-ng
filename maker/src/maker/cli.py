@@ -491,6 +491,7 @@ def build_maker_config(
             passphrase=passphrase,
             data_dir=effective_data_dir,
             network=NetworkType(effective_bitcoin_network).value,
+            reserve_sats=(settings.lightning.reserve_min_sats, settings.lightning.reserve_max_sats),
         ),
     )
 
@@ -1066,6 +1067,17 @@ def start(
                 # path removes it and stops the maker, and registered after the
                 # buyout so the maker is stopped before the runtime closes.
                 stack.push_async_callback(shutdown_maker, bot)
+                if config.channel_ring.reserve_funding is not None:
+                    from jmswap.lightning_reserve import ReserveFunder
+
+                    funder = ReserveFunder.from_ring_config(
+                        config.channel_ring,
+                        network=(config.bitcoin_network or config.network).value,
+                    )
+                    if funder is not None:
+                        bot.reserve_funder = funder
+                        funder.start()
+                        stack.push_async_callback(funder.stop)
                 if config.sell_podle:
                     from maker.podle_sales import PoDLESales
 

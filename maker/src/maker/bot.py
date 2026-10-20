@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     # runtime.
     from jmswap.channel_ring_nodes import ChannelRingNodePool
     from jmswap.coinjoin_funding import ChannelBuyout
+    from jmswap.lightning_reserve import ReserveFunder
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
 MAX_LOG_RATE_LIMIT_ENTRIES = 200000
@@ -175,6 +176,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # nothing to copy per identity. Validated once here so a buyout bound
         # to another wallet, network, mixdepth or backend never reaches a round.
         self.buyout = buyout
+        # Set by the CLI in managed Lightning mode: CoinJoin outputs may then
+        # top up the reserves of the mixdepths' nodes.
+        self.reserve_funder: ReserveFunder | None = None
         self.buyout_mixdepth = (
             -1
             if buyout is None

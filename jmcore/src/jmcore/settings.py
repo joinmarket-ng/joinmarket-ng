@@ -1623,7 +1623,7 @@ class LightningSettings(BaseModel):
         default=150_000,
         ge=0,
         le=10_000_000,
-        description="Managed mode: largest change or equal output sent to a node as its reserve",
+        description="Managed mode: largest node wallet balance a reserve top-up may reach",
     )
 
     @model_validator(mode="after")

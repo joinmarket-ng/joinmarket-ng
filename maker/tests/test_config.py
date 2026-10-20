@@ -1626,13 +1626,14 @@ def test_managed_lightning_wires_the_maker_ring_to_its_nodes(tmp_path: Path) -> 
     settings = JoinMarketSettings(
         network_config={"network": "signet"},
         wallet={"address_type": "p2tr"},
-        lightning={"mode": "managed"},
+        lightning={"mode": "managed", "reserve_min_sats": 20_000, "reserve_max_sats": 90_000},
     )
 
     config = build_maker_config(settings, mnemonic=TEST_MNEMONIC, passphrase="", data_dir=tmp_path)
 
     assert config.channel_ring.enabled
     assert config.channel_ring.mixdepth_nodes == {0: node.name}
+    assert config.channel_ring.reserve_funding == (20_000, 90_000)
     assert config.channel_ring.nodes[node.name].lnd_grpc_url == "https://127.0.0.1:21001"
     assert config.channel_ring.node_binding_directory == paths.bindings_dir
 

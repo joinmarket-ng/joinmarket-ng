@@ -37,9 +37,20 @@ def write_registry(data_dir: Path, *, states: tuple[NodeState, ...]) -> ManagedN
     return paths
 
 
-def build(mode: str, ring: ChannelRingSettings, data_dir: Path) -> ChannelRingConfig:
+def build(
+    mode: str,
+    ring: ChannelRingSettings,
+    data_dir: Path,
+    reserve_sats: tuple[int, int] | None = (25_000, 150_000),
+) -> ChannelRingConfig:
     return channel_ring_config(
-        mode, ring, mnemonic=MNEMONIC, passphrase="", data_dir=data_dir, network="signet"
+        mode,
+        ring,
+        mnemonic=MNEMONIC,
+        passphrase="",
+        data_dir=data_dir,
+        network="signet",
+        reserve_sats=reserve_sats,
     )
 
 
@@ -55,6 +66,15 @@ def test_managed_mode_maps_active_nodes_and_enables_rings(tmp_path: Path) -> Non
     assert config.mixdepth_nodes == {0: registry.nodes[0].name}
     assert set(config.nodes) == {registry.nodes[0].name, registry.nodes[1].name}
     assert config.node_binding_directory == paths.bindings_dir
+    assert config.reserve_funding == (25_000, 150_000)
+
+
+def test_a_zero_reserve_minimum_funds_no_reserve(tmp_path: Path) -> None:
+    write_registry(tmp_path, states=(NodeState.ACTIVE,))
+
+    config = build("managed", ChannelRingSettings(), tmp_path, reserve_sats=(0, 150_000))
+
+    assert config.mixdepth_nodes and config.reserve_funding is None
 
 
 def test_managed_mode_keeps_an_explicit_opt_out(tmp_path: Path) -> None:
@@ -104,3 +124,5 @@ def test_other_modes_use_the_explicit_settings(tmp_path: Path, mode: str) -> Non
     config = build(mode, ChannelRingSettings(enabled=True), tmp_path)
 
     assert config.enabled and not config.nodes and not config.mixdepth_nodes
+    # Only nodes JoinMarket manages get CoinJoin outputs as reserve.
+    assert config.reserve_funding is None
