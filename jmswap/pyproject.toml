@@ -11,6 +11,8 @@ dependencies = [
     "grpcio>=1.84.0",
     "protobuf>=7.35.1,<8",
     "httpx>=0.25.0",
+    "loguru>=0.7.0",
+    "typer>=0.9.0",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +29,7 @@ dev = [
 
 [project.scripts]
 jm-buyout = "jmswap.buyout_cli:main"
+jm-lightning = "jmswap.lightning_cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]

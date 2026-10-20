@@ -20,4 +20,8 @@ release (``lightning.proto``, ``router.proto`` and ``invoices.proto`` from
 ``lnrpc/``, ``lnrpc/routerrpc/`` and ``lnrpc/invoicesrpc/``) with the
 ``grpcio-tools`` version pinned in ``requirements-dev.txt``. Rewrite their
 top-level ``import <name>_pb2`` lines to relative imports the same way.
+
+``walletunlocker.proto`` and ``stateservice.proto`` (from ``lnrpc/`` of
+``v0.21.4-beta``, the release managed nodes run) drive wallet creation and
+unlocking of managed nodes.
 """
