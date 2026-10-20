@@ -15,7 +15,7 @@ from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.crypto import NickIdentity
 from jmcore.mempool_api import MempoolAPI, TxOut
-from jmcore.models import FidelityBond, Offer, OrderBook
+from jmcore.models import FidelityBond, Offer, OrderBook, is_taproot_offer_type
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import JM_VERSION
 from loguru import logger
@@ -27,6 +27,7 @@ from jmwallet.backends.base import BondVerificationRequest
 
 from orderbook_watcher.directory_client import DirectoryClient
 from orderbook_watcher.health_checker import MakerHealthChecker
+from orderbook_watcher.market import MarketListingCache
 
 BOND_CACHE_TTL_SECONDS = 60.0
 BOND_CACHE_MAX_SIZE = 4096
@@ -244,6 +245,7 @@ class OrderbookAggregator:
         self.current_orderbook: OrderBook = OrderBook()
         self._lock = asyncio.Lock()
         self.clients: dict[str, DirectoryClient] = {}
+        self._market_listings = MarketListingCache(network)
         self.listener_tasks: list[asyncio.Task[Any]] = []
         self._bond_calculation_task: asyncio.Task[Any] | None = None
         self._bond_queue = _LatestOrderbookQueue()
@@ -499,6 +501,7 @@ class OrderbookAggregator:
                         stale_nicks = client_nicks - snapshot.nicks
                         for nick in stale_nicks:
                             total_removed += client.remove_offers_for_nick(nick)
+                        self._market_listings.forget_absent_sellers(node_id, snapshot.nicks)
                         logger.bind(sensitive=True).debug(
                             f"Directory {node_id}: {len(snapshot.nicks)} active nicks, "
                             f"removed offers for {len(stale_nicks)} disconnected nicks"
@@ -770,6 +773,9 @@ class OrderbookAggregator:
                 self.clients[node_id] = client
                 task = asyncio.create_task(client.listen_continuously())
                 self.listener_tasks.append(task)
+                self.listener_tasks.append(
+                    asyncio.create_task(self._request_market_listings(client))
+                )
                 logger.bind(sensitive=True).info(
                     f"Successfully reconnected to directory: {node_id}"
                 )
@@ -816,6 +822,9 @@ class OrderbookAggregator:
                 self.clients[node_id] = result
                 task = asyncio.create_task(result.listen_continuously())
                 self.listener_tasks.append(task)
+                self.listener_tasks.append(
+                    asyncio.create_task(self._request_market_listings(result))
+                )
                 logger.bind(sensitive=True).info(f"Started listener task for {node_id}")
             else:
                 retry_task = asyncio.create_task(self._retry_failed_connection(onion_address, port))
@@ -825,6 +834,21 @@ class OrderbookAggregator:
         # Start early feature discovery task - runs once after initial connections settle
         early_feature_task = asyncio.create_task(self._early_feature_discovery())
         self.listener_tasks.append(early_feature_task)
+
+    async def _request_market_listings(self, client: DirectoryClient) -> None:
+        """Ask once per directory connection; sellers push later updates themselves."""
+        try:
+            await asyncio.wait_for(client.send_public_message("mbook"), timeout=10)
+        except Exception:
+            logger.debug("Credential listing discovery request failed")
+
+    def get_market_offers(self) -> dict[str, list[dict[str, Any]]]:
+        """Drain signed public listings without affecting CoinJoin offer state."""
+        now = int(time.time())
+        for directory, client in tuple(self.clients.items()):
+            for seller_nick, raw in client.drain_market_listings():
+                self._market_listings.observe(seller_nick, raw, directory, now)
+        return self._market_listings.snapshot(now)
 
     async def _early_feature_discovery(self) -> None:
         """Run feature discovery shortly after startup to populate features quickly.
@@ -943,7 +967,7 @@ class OrderbookAggregator:
         self, all_offers_with_timestamps: list[tuple[Offer, float, str | None, str]]
     ) -> list[Offer]:
         bond_oid_to_best_offer: dict[
-            tuple[str, int, int | None, str | None],
+            tuple[str, int, int | None, str | None, bool],
             tuple[Offer, float, list[str], str],
         ] = {}
         offers_without_bond: list[Offer] = []
@@ -965,11 +989,13 @@ class OrderbookAggregator:
 
             offers_with_bonds += 1
             bond_data = offer.fidelity_bond_data or {}
+            # Pits never share a CoinJoin, so one bond may back a sw0 and a tr0 nick.
             dedup_key = (
                 bond_utxo_key,
                 offer.oid,
                 bond_data.get("locktime"),
                 bond_data.get("utxo_pub"),
+                is_taproot_offer_type(offer.ordertype),
             )
             existing = bond_oid_to_best_offer.get(dedup_key)
             if existing is None:
@@ -1132,6 +1158,13 @@ class OrderbookAggregator:
         utxo_pub = bond_data.get("utxo_pub") or bond.script
         return f"{bond.utxo_txid}:{bond.utxo_vout}:{bond.locktime}:{utxo_pub}"
 
+    @staticmethod
+    def _offer_bond_claim_key(bond_data: dict[str, Any]) -> str:
+        return (
+            f"{bond_data.get('utxo_txid')}:{bond_data.get('utxo_vout')}:"
+            f"{bond_data.get('locktime')}:{bond_data.get('utxo_pub')}"
+        )
+
     def _get_active_bond_retry(self, cache_key: str) -> tuple[bool | None, float] | None:
         retry_entry = self._bond_retry_cache.get(cache_key)
         if retry_entry is None:
@@ -1220,7 +1253,11 @@ class OrderbookAggregator:
                     self._bond_cache.popitem(last=False)
 
     def _link_bonds_to_offers(self, orderbook: OrderBook) -> None:
+        pits_by_nick: dict[str, set[bool]] = {}
         for offer in orderbook.offers:
+            pits_by_nick.setdefault(offer.counterparty, set()).add(
+                is_taproot_offer_type(offer.ordertype)
+            )
             offer.fidelity_bond_value = 0
             offer.fidelity_bond_verified = None
             offer.fidelity_bond_verification_stale = False
@@ -1237,6 +1274,19 @@ class OrderbookAggregator:
                     and ((bond.fidelity_bond_data or {}).get("utxo_pub") or bond.script)
                     == offer.fidelity_bond_data.get("utxo_pub")
                 ]
+                if not matching_bonds:
+                    # Bond deduplication keeps one bond per claim. A maker may back
+                    # its sw0 and tr0 nicks with the same bond; each offer carries
+                    # its own signed proof, so an offer may use the claim's bond when
+                    # that bond's nick does not compete in the offer's pit.
+                    offer_pit = is_taproot_offer_type(offer.ordertype)
+                    claim_key = self._offer_bond_claim_key(offer.fidelity_bond_data)
+                    matching_bonds = [
+                        bond
+                        for bond in orderbook.fidelity_bonds
+                        if self._bond_claim_key(bond) == claim_key
+                        and offer_pit not in pits_by_nick.get(bond.counterparty, set())
+                    ]
                 if matching_bonds and matching_bonds[0].bond_value is not None:
                     offer.fidelity_bond_value = matching_bonds[0].bond_value
                 if matching_bonds:

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from jmcore.paths import remove_nick_state, write_nick_state
+from jmcore.paths import get_nick_state_component, remove_nick_state, write_nick_state
 from jmcore.settings import get_settings
 from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
 from jmwalletd.errors import (
@@ -43,6 +44,7 @@ def build_coinjoin_taker_config(
     mnemonic: Any,
     jm_settings: Any,
     taker_config_cls: Any,
+    data_dir: Path | None = None,
     config_overrides: dict[str, dict[str, str]] | None = None,
     passphrase: str = "",
 ) -> Any:
@@ -74,6 +76,7 @@ def build_coinjoin_taker_config(
         jm_settings,
         mnemonic,
         passphrase,
+        data_dir=data_dir,
         amount=body.amount_sats,
         destination=body.destination,
         mixdepth=body.mixdepth,
@@ -208,6 +211,7 @@ async def do_coinjoin(
                     mnemonic=state.wallet_mnemonic,
                     jm_settings=jm_settings,
                     taker_config_cls=TakerConfig,
+                    data_dir=state.data_dir,
                     config_overrides=state.config_overrides,
                     passphrase=state.wallet_bip39_passphrase,
                 )
@@ -410,6 +414,10 @@ async def start_maker(
         async def _run_maker() -> None:
             maker: MakerBot | None = None
             backend: Any | None = None
+            # One maker per CoinJoin pit. Default to the SegWit pit so the
+            # cleanup below still targets a real file if config building fails
+            # before the pit is known.
+            nick_component = get_nick_state_component("maker", "p2wpkh")
             try:
                 ws = state.wallet_service
                 backend = await get_backend(
@@ -429,10 +437,11 @@ async def start_maker(
                     tx_fee_contribution=txfee,
                     passphrase=state.wallet_bip39_passphrase,
                 )
+                nick_component = get_nick_state_component("maker", config.address_type)
 
                 def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
                     state.nickname = new_nick
-                    write_nick_state(state.data_dir, "maker", new_nick)
+                    write_nick_state(state.data_dir, nick_component, new_nick)
 
                 maker = MakerBot(
                     wallet=ws,
@@ -442,7 +451,7 @@ async def start_maker(
                 )
                 state._maker_ref = maker
                 state.nickname = maker.nick
-                write_nick_state(state.data_dir, "maker", maker.nick)
+                write_nick_state(state.data_dir, nick_component, maker.nick)
 
                 await maker.start()
                 # NOTE: maker.start() blocks until shutdown (it awaits
@@ -474,7 +483,7 @@ async def start_maker(
                 state.nickname = None
                 state._maker_ref = None
                 state._maker_task = None
-                remove_nick_state(state.data_dir, "maker")
+                remove_nick_state(state.data_dir, nick_component)
 
         state._maker_task = asyncio.create_task(_run_maker())
     except ImportError:

@@ -26,6 +26,7 @@ ARG DEBIAN_SNAPSHOT
 RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-apt-install.sh \
     sh /tmp/docker-apt-install.sh \
     build-essential \
+    cmake \
     git \
     libffi-dev \
     libsodium-dev \
@@ -35,6 +36,10 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
 # When not provided, pip install runs without it (non-reproducible but works)
 # Usage: docker build --build-arg SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) ...
 ARG SOURCE_DATE_EPOCH
+
+# MuSig2 needs a newer native library than the distribution package.
+RUN --mount=type=bind,source=scripts/build_secp256k1.py,target=/tmp/build_secp256k1.py \
+    python /tmp/build_secp256k1.py --prefix /app --build-dir /build/secp256k1
 
 # Stamp the commit/ref into the built wheels (issue #451).
 ARG JOINMARKET_BUILD_COMMIT
@@ -53,6 +58,7 @@ RUN echo "setuptools==${SETUPTOOLS_VERSION}" > /build/constraints.txt && \
 # dependency graph once instead of re-resolving across four sequential calls.
 COPY jmcore/requirements.txt /build/jmcore/requirements.txt
 COPY jmwallet/requirements.txt /build/jmwallet/requirements.txt
+COPY jmswap/requirements.txt /build/jmswap/requirements.txt
 COPY taker/requirements.txt /build/taker/requirements.txt
 COPY maker/requirements.txt /build/maker/requirements.txt
 
@@ -61,6 +67,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
     pip install --prefix=/app \
         -r /build/jmcore/requirements.txt \
         -r /build/jmwallet/requirements.txt \
+        -r /build/jmswap/requirements.txt \
         -r /build/taker/requirements.txt \
         -r /build/maker/requirements.txt
 
@@ -72,6 +79,8 @@ COPY jmcore/pyproject.toml /build/jmcore/
 COPY jmcore/setup.py /build/jmcore/
 COPY jmwallet/src /build/jmwallet/src
 COPY jmwallet/pyproject.toml /build/jmwallet/
+COPY jmswap/src /build/jmswap/src
+COPY jmswap/pyproject.toml /build/jmswap/
 COPY taker/src /build/taker/src
 COPY taker/pyproject.toml /build/taker/
 COPY maker/src /build/maker/src
@@ -84,6 +93,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=jmng-pip-${SETUPTOOLS_VERSION}
     pip install --no-deps --prefix=/app --build-constraint /build/constraints.txt \
         /build/jmcore \
         /build/jmwallet \
+        /build/jmswap \
         /build/taker \
         /build/maker \
         /build/tumbler
@@ -133,7 +143,8 @@ RUN useradd -m -u 1000 jm && \
 
 # Copy Python packages from builder and set permissions
 COPY --from=builder /app /app
-RUN chmod -R a+rX /app
+RUN chmod -R a+rX /app && \
+    printf '/app/lib\n' > /etc/ld.so.conf.d/jmng-secp256k1.conf && ldconfig
 
 # Enable tab completion for the bundled CLIs in interactive shells
 # (docker compose exec taker bash). The bash-completion package is not
@@ -152,6 +163,7 @@ ENV PATH=/app/bin:$PATH
 
 # Make sure packages are in Python PATH
 ENV PYTHONPATH=/app/lib/python${PYTHON_VERSION%.*}/site-packages
+RUN python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig'
 
 # Create data directory for JoinMarket files
 # This includes commitment blacklist, history, and other persistent data

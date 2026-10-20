@@ -111,7 +111,9 @@ def _add_registry_addresses(
     wallet: WalletService,
 ) -> None:
     """Add matching registry addresses, proving ownership for legacy entries."""
-    belongs_to_wallet = make_wallet_ownership_predicate(wallet.master_key, wallet.root_path)
+    belongs_to_wallet = make_wallet_ownership_predicate(
+        wallet.master_key, wallet.fidelity_bond_root_path
+    )
     for bond in bonds:
         if bond.network != network:
             continue

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ class OrderbookServer:
         self.site: web.TCPSite | None = None
         self._update_task: asyncio.Task[Any] | None = None
         self._cached_orderbook: str | None = None
+        self._cached_credential_expiry: int | None = None
         self._cache_lock = asyncio.Lock()
         self._background_update_task: asyncio.Task[Any] | None = None
         self._stopping = False
@@ -77,6 +79,12 @@ class OrderbookServer:
     async def _handle_orderbook_json(self, _request: web.Request) -> web.Response:
         async with self._cache_lock:
             if self._cached_orderbook:
+                now = int(time.time())
+                if (
+                    self._cached_credential_expiry is not None
+                    and self._cached_credential_expiry <= now
+                ):
+                    self._install_cached_orderbook(json.loads(self._cached_orderbook), now=now)
                 return web.Response(text=self._cached_orderbook, content_type="application/json")
 
         orderbook = await self.aggregator.get_live_orderbook()
@@ -84,14 +92,57 @@ class OrderbookServer:
             return web.json_response({"error": "Orderbook not available"}, status=503)
 
         data = self._format_orderbook(orderbook)
-        json_str = json.dumps(data)
 
         async with self._cache_lock:
-            self._cached_orderbook = json_str
+            json_str = self._install_cached_orderbook(data, now=int(time.time()))
 
         return web.Response(text=json_str, content_type="application/json")
 
+    @staticmethod
+    def _credential_offer_expiry(offer: object) -> int | None:
+        if not isinstance(offer, dict):
+            return None
+        listing = offer.get("listing")
+        if not isinstance(listing, dict):
+            return None
+        body = listing.get("body")
+        if not isinstance(body, dict):
+            return None
+        expires_at = body.get("expires_at")
+        if isinstance(expires_at, int) and not isinstance(expires_at, bool):
+            return expires_at
+        return None
+
+    def _install_cached_orderbook(self, data: dict[str, Any], *, now: int) -> str:
+        """Install a serialized response after removing expired credential advertisements.
+
+        The caller must hold ``_cache_lock`` so the serialized response and expiry deadline
+        always describe the same cache entry.
+        """
+        earliest_expiry: int | None = None
+        credential_market = data.get("credential_market")
+        if isinstance(credential_market, dict):
+            for product in ("podle_offers", "bond_offers"):
+                offers = credential_market.get(product)
+                if not isinstance(offers, list):
+                    continue
+
+                active_offers: list[dict[str, Any]] = []
+                for offer in offers:
+                    expires_at = self._credential_offer_expiry(offer)
+                    if not isinstance(offer, dict) or expires_at is None or expires_at <= now:
+                        continue
+                    active_offers.append(offer)
+                    if earliest_expiry is None or expires_at < earliest_expiry:
+                        earliest_expiry = expires_at
+                credential_market[product] = active_offers
+
+        self._cached_orderbook = json.dumps(data)
+        self._cached_credential_expiry = earliest_expiry
+        return self._cached_orderbook
+
     def _format_orderbook(self, orderbook: OrderBook) -> dict[str, Any]:
+        market_offers = self.aggregator.get_market_offers()
         offers_by_directory = orderbook.get_offers_by_directory()
         directory_stats: dict[str, dict[str, Any]] = {}
         for node, offers in offers_by_directory.items():
@@ -200,6 +251,10 @@ class OrderbookServer:
             "timestamp": orderbook.timestamp.isoformat(),
             "current_block_height": orderbook.current_block_height,
             "offers": list(grouped_offers.values()),
+            "credential_market": {
+                "podle_offers": list(market_offers["podle_offers"]),
+                "bond_offers": list(market_offers["bond_offers"]),
+            },
             "fidelitybonds": [
                 {
                     "counterparty": bond.counterparty,
@@ -282,11 +337,11 @@ class OrderbookServer:
             try:
                 orderbook = await self.aggregator.get_live_orderbook()
                 data = self._format_orderbook(orderbook)
-                json_str = json.dumps(data)
 
                 async with self._cache_lock:
-                    if json_str != self._cached_orderbook:
-                        self._cached_orderbook = json_str
+                    previous_json = self._cached_orderbook
+                    json_str = self._install_cached_orderbook(data, now=int(time.time()))
+                    if json_str != previous_json:
                         logger.debug(f"Cache updated: {len(orderbook.offers)} offers")
 
             except Exception as e:
