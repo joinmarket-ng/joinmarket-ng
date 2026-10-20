@@ -207,6 +207,31 @@ async def _select_input_utxos(
     return spendable, mixdepth, locktime_cutoff
 
 
+def _check_fee_options(
+    fee_rate: float | None, block_target: int | None, max_fee_rate: float
+) -> float:
+    """Validate --fee-rate/--block-target and return the effective fee rate cap.
+
+    The cap comes from settings (with hard-coded fallback). It is also enforced
+    after backend fee estimation in _send_transaction, so the estimated path is
+    protected too, not just the manual-rate CLI path.
+    """
+    if fee_rate is not None and block_target is not None:
+        logger.error("Cannot specify both --fee-rate and --block-target")
+        raise typer.Exit(1)
+    if fee_rate is not None:
+        if not math.isfinite(fee_rate) or fee_rate <= 0:
+            logger.error("--fee-rate must be a finite number greater than 0")
+            raise typer.Exit(1)
+        if fee_rate > max_fee_rate:
+            logger.error(
+                f"--fee-rate {fee_rate:.2f} sat/vB exceeds safety maximum "
+                f"({max_fee_rate:.0f} sat/vB)"
+            )
+            raise typer.Exit(1)
+    return max_fee_rate
+
+
 @app.command(no_args_is_help=True)
 def send(
     destination: Annotated[str, typer.Argument(help="Destination address")],
@@ -324,10 +349,7 @@ def send(
     settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
     # Validate mutual exclusivity
-
-    if fee_rate is not None and block_target is not None:
-        logger.error("Cannot specify both --fee-rate and --block-target")
-        raise typer.Exit(1)
+    max_fee_rate = _check_fee_options(fee_rate, block_target, settings.wallet.max_fee_rate_sat_vb)
 
     if select_utxos and input_utxo:
         logger.error("Cannot specify both --select-utxos and --input-utxo")
@@ -340,23 +362,6 @@ def send(
     if amount == 0 and mixdepth is None and not select_utxos:
         logger.error("--mixdepth is required when sweeping (--amount 0)")
         raise typer.Exit(1)
-
-    # Effective cap comes from settings (with hard-coded fallback). The same
-    # cap is also enforced after backend fee estimation in _send_transaction
-    # below, so the estimated path is protected too, not just the manual-rate
-    # CLI path.
-    max_fee_rate = settings.wallet.max_fee_rate_sat_vb
-
-    if fee_rate is not None:
-        if not math.isfinite(fee_rate) or fee_rate <= 0:
-            logger.error("--fee-rate must be a finite number greater than 0")
-            raise typer.Exit(1)
-        if fee_rate > max_fee_rate:
-            logger.error(
-                f"--fee-rate {fee_rate:.2f} sat/vB exceeds safety maximum "
-                f"({max_fee_rate:.0f} sat/vB)"
-            )
-            raise typer.Exit(1)
 
     # Resolve backend settings
     backend_settings = resolve_backend_settings(

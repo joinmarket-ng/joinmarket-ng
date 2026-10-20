@@ -60,6 +60,7 @@ from jmwallet.cli import (  # noqa: E402, F401
     history_cmd,
     identity,
     registry,
+    reserve,
     send,
     sign_psbt,
     wallet,

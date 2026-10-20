@@ -619,6 +619,29 @@ class LndBackend:
             raise LndTimeoutError("WalletBalance timed out") from exc
         return int(response.confirmed_balance)
 
+    async def onchain_balance_sats(self, *, timeout_seconds: float = 10.0) -> int:
+        """Return LND's confirmed plus unconfirmed on-chain wallet balance in sats."""
+        self._ensure()
+        try:
+            response = await asyncio.wait_for(
+                self._stub.WalletBalance(ln.WalletBalanceRequest()), timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("WalletBalance timed out") from exc
+        return int(response.confirmed_balance) + int(response.unconfirmed_balance)
+
+    async def new_taproot_address(self, *, timeout_seconds: float = 10.0) -> str:
+        """Return a fresh Taproot address of LND's on-chain wallet."""
+        self._ensure()
+        try:
+            response = await asyncio.wait_for(
+                self._stub.NewAddress(ln.NewAddressRequest(type=ln.TAPROOT_PUBKEY)),
+                timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise LndTimeoutError("NewAddress timed out") from exc
+        return str(response.address)
+
     async def node_info(self, *, timeout_seconds: float = 10.0) -> LndNodeInfo:
         self._ensure()
         try:

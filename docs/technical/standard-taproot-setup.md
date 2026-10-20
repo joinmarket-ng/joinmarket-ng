@@ -127,8 +127,13 @@ privacy cluster, and one transaction funds at most one node:
 - Equal output in range: when a CoinJoin from mixdepth N-1 has an amount
   within the range and node N is below its minimum, its equal output pays to
   node N. This is the more private path, since the output is mixed.
-- Explicit: `jm-lightning fund-reserve --mixdepth N` sends from mixdepth N.
-  Setup suggests this per mixdepth, never for several mixdepths at once.
+- Explicit: `jm-wallet fund-reserve N` sends from mixdepth N to a fresh
+  Taproot address of node N, and does nothing when the node already holds its
+  minimum. Setup suggests this per mixdepth, never for several mixdepths at
+  once.
+
+Unconfirmed coins count toward the minimum, so a funding transaction still in
+the mempool is not repeated, and no funding raises a node above the maximum.
 
 The reserve is advisory: a ring CoinJoin still runs below the minimum and
 the status output and logs warn.

@@ -899,6 +899,7 @@
 
 # Managed mode: confirmed node wallet balance kept for force-close fee bumps
 # (advisory), and the largest change or equal output sent to a node to top it up.
+# `jm-wallet fund-reserve MIXDEPTH` tops up one node from its own mixdepth.
 # reserve_min_sats = 25000
 # reserve_max_sats = 150000
 
