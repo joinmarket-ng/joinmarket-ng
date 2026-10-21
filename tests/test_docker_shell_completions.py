@@ -63,6 +63,26 @@ def test_loader_is_a_noop_without_completion_scripts(tmp_path: Path) -> None:
     assert "loaded" in result.stdout
 
 
+def test_wallet_signing_completion_has_one_spelling() -> None:
+    result = _run_bash(
+        f'. "{COMPLETIONS_DIR / "jm-wallet.bash"}"; '
+        "COMP_WORDS=(jm-wallet si); COMP_CWORD=1; _jm_wallet_completion; "
+        'printf "%s\\n" "${COMPREPLY[@]}"'
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["sign-psbt"]
+
+
+def test_wallet_signing_completion_offers_offline_flag() -> None:
+    result = _run_bash(
+        f'. "{COMPLETIONS_DIR / "jm-wallet.bash"}"; '
+        "COMP_WORDS=(jm-wallet sign-psbt --no-br); COMP_CWORD=2; _jm_wallet_completion; "
+        'printf "%s\\n" "${COMPREPLY[@]}"'
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["--no-broadcast"]
+
+
 @pytest.mark.parametrize("image", sorted(COMPLETION_IMAGES))
 def test_runtime_image_ships_and_loads_completions(image: str) -> None:
     content = COMPLETION_IMAGES[image].read_text()

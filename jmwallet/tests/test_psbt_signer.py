@@ -16,6 +16,7 @@ from jmcore.bitcoin import (
     create_psbt,
     encode_varint,
     estimate_vsize,
+    parse_transaction_bytes,
     pubkey_to_p2wpkh_script,
     serialize_transaction,
 )
@@ -29,6 +30,8 @@ from jmwallet.wallet.psbt import (
     PSBT_GLOBAL_TX_VERSION,
     PSBT_GLOBAL_VERSION,
     PSBT_IN_BIP32_DERIVATION,
+    PSBT_IN_FINAL_SCRIPTSIG,
+    PSBT_IN_FINAL_SCRIPTWITNESS,
     PSBT_IN_OUTPUT_INDEX,
     PSBT_IN_PARTIAL_SIG,
     PSBT_IN_PREVIOUS_TXID,
@@ -58,6 +61,134 @@ from jmwallet.wallet.signing import (
 
 BOND_LOCKTIME = 1_577_836_800
 HARDENED = 0x80000000
+
+
+@pytest.fixture
+def signed_regular_psbt(wallet_service: WalletService) -> bytes:
+    records, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 100_000)
+    raw = _build_psbt(
+        [TxInput.from_hex("aa" * 32, 0)],
+        [TxOutput(99_000, b"\x00\x14" + b"\x22" * 20)],
+        [records],
+    )
+    return wallet_service.sign_psbt(wallet_service.prepare_psbt_signing(raw, 0)).psbt
+
+
+def test_finalize_regular_preserves_reviewed_transaction(
+    wallet_service: WalletService, signed_regular_psbt: bytes
+) -> None:
+    psbt = parse_psbt(signed_regular_psbt)
+    tx = parse_transaction_bytes(
+        wallet_service.finalize_psbt(
+            signed_regular_psbt, expected_unsigned_tx=psbt.unsigned_tx, scan_range=0
+        )
+    )
+    assert serialize_transaction(tx.version, tx.inputs, tx.outputs, tx.locktime) == psbt.unsigned_tx
+    signature = next(r for r in psbt.input_maps[0].records if r.key[0] == PSBT_IN_PARTIAL_SIG)
+    assert tx.witnesses == [[signature.value, signature.key[1:]]]
+    assert verify_p2wpkh_signature(
+        tx,
+        0,
+        create_p2wpkh_script_code(signature.key[1:]),
+        100_000,
+        signature.value,
+        signature.key[1:],
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["transaction", "unsigned", "signature", "sighash", "scriptsig"]
+)
+def test_finalize_refuses_unsafe_input(
+    wallet_service: WalletService, signed_regular_psbt: bytes, mutation: str
+) -> None:
+    psbt = parse_psbt(signed_regular_psbt)
+    expected = psbt.unsigned_tx
+    records = psbt.input_maps[0].records
+    if mutation == "transaction":
+        expected = b"different reviewed transaction"
+    elif mutation == "unsigned":
+        records[:] = [r for r in records if r.key[0] != PSBT_IN_PARTIAL_SIG]
+    elif mutation in ("signature", "sighash"):
+        for index, record in enumerate(records):
+            if record.key[0] == PSBT_IN_PARTIAL_SIG:
+                signature = b"bad\x01" if mutation == "signature" else record.value[:-1] + b"\x02"
+                records[index] = PSBTKeyValue(record.key, signature)
+    else:
+        psbt.append_input_key_value(0, bytes([PSBT_IN_FINAL_SCRIPTSIG]), b"\x51")
+    with pytest.raises((PSBTError, TransactionSigningError)):
+        wallet_service.finalize_psbt(psbt.serialize(), expected_unsigned_tx=expected, scan_range=0)
+
+
+@pytest.mark.parametrize("mutation", [None, "signature", "pubkey", "extra", "truncated", "sighash"])
+def test_finalize_validates_existing_final_witness(
+    wallet_service: WalletService, signed_regular_psbt: bytes, mutation: str | None
+) -> None:
+    psbt = parse_psbt(signed_regular_psbt)
+    signature_record = next(
+        r for r in psbt.input_maps[0].records if r.key[0] == PSBT_IN_PARTIAL_SIG
+    )
+    signature, pubkey = signature_record.value, signature_record.key[1:]
+    psbt.input_maps[0].records.remove(signature_record)
+    if mutation == "signature":
+        signature = b"bad\x01"
+    elif mutation == "pubkey":
+        pubkey = b"\x02" + b"\x11" * 32
+    elif mutation == "sighash":
+        signature = signature[:-1] + b"\x02"
+    witness = b"\x02" + encode_varint(len(signature)) + signature
+    witness += encode_varint(len(pubkey)) + pubkey
+    if mutation == "extra":
+        witness += b"\x00"
+    elif mutation == "truncated":
+        witness = witness[:1]
+    psbt.append_input_key_value(0, bytes([PSBT_IN_FINAL_SCRIPTWITNESS]), witness)
+    if mutation is None:
+        tx = parse_transaction_bytes(
+            wallet_service.finalize_psbt(
+                psbt.serialize(), expected_unsigned_tx=psbt.unsigned_tx, scan_range=0
+            )
+        )
+        assert tx.witnesses == [[signature, pubkey]]
+    else:
+        with pytest.raises(PSBTError):
+            wallet_service.finalize_psbt(
+                psbt.serialize(), expected_unsigned_tx=psbt.unsigned_tx, scan_range=0
+            )
+
+
+@pytest.mark.parametrize("final_witness", [False, True])
+def test_finalize_fidelity_bond(wallet_service: WalletService, final_witness: bool) -> None:
+    script = wallet_service.get_fidelity_bond_script(0, BOND_LOCKTIME)
+    raw = _build_psbt(
+        [TxInput.from_hex("bb" * 32, 1, sequence=0xFFFFFFFE)],
+        [TxOutput(198_000, b"\x00\x14" + b"\x33" * 20)],
+        [
+            [
+                (
+                    bytes([PSBT_IN_WITNESS_UTXO]),
+                    _witness_utxo(200_000, b"\x00\x20" + sha256(script).digest()),
+                ),
+                (bytes([PSBT_IN_WITNESS_SCRIPT]), script),
+            ]
+        ],
+        locktime=BOND_LOCKTIME,
+    )
+    signed = wallet_service.sign_psbt(wallet_service.prepare_psbt_signing(raw, 0))
+    psbt = parse_psbt(signed.psbt)
+    signature = next(r for r in psbt.input_maps[0].records if r.key[0] == PSBT_IN_PARTIAL_SIG)
+    if final_witness:
+        psbt.input_maps[0].records.remove(signature)
+        witness = b"\x02" + encode_varint(len(signature.value)) + signature.value
+        witness += encode_varint(len(script)) + script
+        psbt.append_input_key_value(0, bytes([PSBT_IN_FINAL_SCRIPTWITNESS]), witness)
+    tx = parse_transaction_bytes(
+        wallet_service.finalize_psbt(
+            psbt.serialize(), expected_unsigned_tx=psbt.unsigned_tx, scan_range=0
+        )
+    )
+    assert tx.witnesses == [[signature.value, script]]
+    assert verify_p2wsh_signature(tx, 0, script, 200_000, signature.value, signature.key[1:])
 
 
 def _pair(key: bytes, value: bytes) -> bytes:

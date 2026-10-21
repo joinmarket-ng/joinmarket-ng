@@ -52,12 +52,31 @@ containing estimates.
 
 ## Signing PSBTs
 
-Use `jm-wallet sign-psbt` to inspect and partially sign wallet-owned PSBT v0 or v2
-inputs without connecting to a blockchain backend or broadcasting:
+Build a PSBT in another wallet, such as Sparrow using your JoinMarket xpubs, then
+paste it directly into `jm-wallet sign-psbt`:
 
 ```bash
-jm-wallet sign-psbt --input unsigned.psbt --output signed.psbt
+jm-wallet sign-psbt '<base64-PSBT>'
 ```
+
+Omit the argument to paste at a prompt instead of putting transaction details in
+shell history. The command prompts for the wallet password when needed, displays
+inputs, outputs, and fees, and asks before signing. It prints the signed PSBT,
+then asks separately before broadcasting through your configured Bitcoin backend.
+Broadcasting requires every input to be wallet-owned and fully signed. Foreign
+inputs must be completed in another wallet. The signed PSBT remains available if
+you decline broadcasting or submission fails. Submission is not confirmation.
+
+For fully offline signing, or to return a collaborative PSBT to another signer:
+
+```bash
+jm-wallet sign-psbt '<base64-PSBT>' --no-broadcast
+jm-wallet sign-psbt --input unsigned.psbt --output signed.psbt --no-broadcast
+```
+
+**Upgrading scripts:** `--yes` now skips both signing and broadcast confirmations.
+Existing offline scripts using `--yes` must add `--no-broadcast`, which prevents
+backend access even with `--yes`.
 
 The signer supports native P2WPKH wallet inputs and canonical JoinMarket
 fidelity bond P2WSH inputs. It requires `witness_utxo` data for every input so
@@ -66,7 +85,7 @@ origins are accepted only as hints: the derivation path is constrained to the
 wallet's BIP84 layout and the derived public key must match the prevout script.
 When key origins are absent, `--scan-range` controls bounded fallback discovery
 for regular wallet inputs. The historical `signpsbt` spelling remains available
-as a compatibility alias.
+as a compatibility alias, but only `sign-psbt` is offered in shell completion.
 
 Collaborative PSBTs may include unrelated P2WSH inputs, such as multisig channel
 funding inputs. These remain unsigned, and a supplied witness script must match
@@ -154,8 +173,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                              address.                                        │
 │ showseed                     Display the BIP39 seed words (mnemonic) of an   │
 │                              existing wallet.                                │
-│ sign-psbt                    Inspect and partially sign wallet-owned native  │
-│                              SegWit PSBT inputs offline.                     │
+│ sign-psbt                    Review and sign a PSBT, then confirm            │
+│                              broadcasting the transaction.                   │
 │ spend-bond                   Generate a PSBT to spend a cold storage         │
 │                              fidelity bond after locktime expires.           │
 │ sync-bonds                   Refresh funded status of bonds already in the   │
@@ -1419,12 +1438,16 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 
  Usage: jm-wallet sign-psbt [OPTIONS] [psbt_base64]
 
- Inspect and partially sign wallet-owned native SegWit PSBT inputs offline.
+ Review and sign a PSBT, then confirm broadcasting the transaction.
 
  Supports regular P2WPKH wallet inputs and canonical JoinMarket fidelity bond
  P2WSH inputs, while leaving unrelated P2WSH inputs unsigned. Every input must
  include witness_utxo data so the complete fee can be reviewed. Accepts PSBT
- v0 and v2. The command never connects to a backend or broadcasts.
+ v0 and v2. Broadcasting requires every input to be wallet-owned and fully
+ signed.
+ Use --no-broadcast for fully offline signing. --yes authorizes broadcasting
+ too;
+ existing offline scripts using --yes must add --no-broadcast.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
 │   psbt_base64      <str>  Base64-encoded PSBT v0 or v2                       │
@@ -1450,6 +1473,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --mnemonic-file         -f      <path>                [env var:              │
 │                                                       MNEMONIC_FILE]         │
 │ --network               -n      <str>                 Bitcoin network        │
+│ --no-broadcast                                        Disable broadcasting   │
+│                                                       and backend access     │
+│                                                       (offline signing)      │
 │ --output                -o      <path>                Write the signed       │
 │                                                       base64 PSBT to a file  │
 │ --prompt-bip39-passph…                                Prompt for BIP39       │
@@ -1458,8 +1484,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                 [0<=x<=1000000]       branch to derive when  │
 │                                                       PSBT key origins are   │
 │                                                       absent                 │
-│ --yes                   -y                            Sign without the       │
-│                                                       confirmation prompt    │
+│ --yes                   -y                            Skip signing AND       │
+│                                                       broadcast              │
+│                                                       confirmations          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

@@ -135,7 +135,7 @@ def introspect_cli(name: str, import_path: str) -> CLIInfo:
         commands: list[CommandInfo] = []
         for cmd_name in click_app.list_commands(ctx):
             cmd = click_app.get_command(ctx, cmd_name)
-            if cmd is None:
+            if cmd is None or cmd.hidden:
                 continue
             commands.append(
                 CommandInfo(

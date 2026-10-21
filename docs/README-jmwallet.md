@@ -87,16 +87,29 @@ is the noninteractive alternative; see `jm-wallet send --help`.
 
 ## Signing PSBTs
 
-`sign-psbt` reviews and partially signs wallet-owned PSBT v0 and v2 inputs offline. It
-does not connect to the configured backend or broadcast a transaction:
+Create a PSBT in Sparrow or another wallet using your JoinMarket xpubs, then sign
+and broadcast it without returning to that wallet:
 
 ```bash
-jm-wallet sign-psbt --input unsigned.psbt --output signed.psbt
+jm-wallet sign-psbt '<base64-PSBT>'
 ```
 
-Review the displayed inputs, outputs, and fee before confirming. Use
-`jm-wallet sign-psbt --help` for supported PSBT input requirements and key
-discovery options.
+Omit the argument to paste at a prompt without adding the PSBT to shell history.
+Review inputs, outputs, and fees before signing, then confirm broadcasting
+separately. The signed PSBT is printed before broadcast and remains available if
+you decline or submission fails. Only fully signed, wallet-owned inputs can be
+broadcast. Submission does not mean the transaction is confirmed.
+
+Use `--no-broadcast` for fully offline signing. Files are optional:
+
+```bash
+jm-wallet sign-psbt --input unsigned.psbt --output signed.psbt --no-broadcast
+```
+
+**Upgrading scripts:** `--yes` now skips both signing and broadcast confirmations;
+add `--no-broadcast` to preserve offline operation. See `jm-wallet sign-psbt --help`
+for supported inputs and key discovery options. The `signpsbt` compatibility alias
+still works, but completion offers only `sign-psbt`.
 
 The signer signs regular wallet P2WPKH inputs and canonical wallet-derived fidelity
 bonds. Unrelated P2WSH inputs, including multisig channel funding inputs, remain

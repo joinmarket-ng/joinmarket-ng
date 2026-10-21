@@ -8,7 +8,7 @@ _jm_wallet_completion() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "address create-bond-address debug-info delete freeze generate generate-bond-address generate-hot-keypair history identity import import-bond import-bond-registration import-certificate info list-bonds prepare-certificate-message reconstruct-history recover-bonds registry-show rescan send showseed sign-psbt signpsbt spend-bond sync-bonds validate verify-password" -- "$cur") )
+        COMPREPLY=( $(compgen -W "address create-bond-address debug-info delete freeze generate generate-bond-address generate-hot-keypair history identity import import-bond import-bond-registration import-certificate info list-bonds prepare-certificate-message reconstruct-history recover-bonds registry-show rescan send showseed sign-psbt spend-bond sync-bonds validate verify-password" -- "$cur") )
         return 0
     fi
 
@@ -84,10 +84,7 @@ _jm_wallet_completion() {
         COMPREPLY=( $(compgen -W "--help --mnemonic-file -f --password -p --numbered --yes -y" -- "$cur") )
         ;;
       sign-psbt)
-        COMPREPLY=( $(compgen -W "--help --input -i --output -o --mnemonic-file -f --prompt-bip39-passphrase --network -n --scan-range --yes -y --data-dir --config-file --log-level -l" -- "$cur") )
-        ;;
-      signpsbt)
-        COMPREPLY=( $(compgen -W "--help --input -i --output -o --mnemonic-file -f --prompt-bip39-passphrase --network -n --scan-range --yes -y --data-dir --config-file --log-level -l" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--help --input -i --output -o --mnemonic-file -f --prompt-bip39-passphrase --network -n --scan-range --yes -y --no-broadcast --data-dir --config-file --log-level -l" -- "$cur") )
         ;;
       spend-bond)
         COMPREPLY=( $(compgen -W "--help --fee-rate -f --master-fingerprint -m --derivation-path -p --output -o --test-unfunded --test-utxo-value --data-dir --wallet-fingerprint --log-level -l" -- "$cur") )

@@ -392,6 +392,7 @@ review the complete transaction and add the bond-key partial signature:
 jm-wallet sign-psbt \
   --input unsigned-bond.psbt \
   --output signed-bond.psbt \
+  --no-broadcast \
   --mnemonic-file <external-wallet.mnemonic>
 python scripts/finalize_bond_psbt.py --file signed-bond.psbt
 ```

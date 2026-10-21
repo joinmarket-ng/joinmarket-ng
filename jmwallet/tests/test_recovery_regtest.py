@@ -1,12 +1,13 @@
-"""Real Bitcoin Core regression coverage for fidelity-bond recovery.
+"""Real Bitcoin Core coverage for wallet recovery and PSBT broadcasting.
 
-These tests require a regtest Bitcoin Core RPC endpoint. They deliberately use
-the public recovery path rather than mocked backend responses, because Core's
-``timestamp="now"`` descriptor behavior is central to the regression.
+These tests require a regtest Bitcoin Core RPC endpoint. They exercise actual
+descriptor recovery behavior and mempool acceptance rather than mocked RPCs.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import os
 import secrets
 from collections.abc import AsyncGenerator
@@ -17,9 +18,13 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import pytest_asyncio
+from jmcore.bitcoin import PSBTInput, TxInput, TxOutput, create_psbt
 from jmcore.timenumber import timenumber_to_timestamp
+from typer.testing import CliRunner
 
 from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+from jmwallet.backends.offline import OfflineBackend
+from jmwallet.cli import app
 from jmwallet.cli.mnemonic import (
     FIDELITY_BOND_RECOVERY_COMPLETE,
     FIDELITY_BOND_RECOVERY_PENDING,
@@ -128,6 +133,67 @@ async def funded_regtest_wallet(
             await _rpc(regtest_rpc_config, "unloadwallet", [wallet_name])
         except Exception:
             pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bond", [False, True])
+async def test_sign_psbt_local_finalize_and_broadcast(
+    funded_regtest_wallet: tuple[dict[str, str], str, str], tmp_path: Path, bond: bool
+) -> None:
+    """Core accepts locally finalized regular and bond spends without a backend wallet."""
+    config, funder_wallet, miner_address = funded_regtest_wallet
+    wallet = WalletService(_MNEMONIC, OfflineBackend(), network="regtest", mixdepth_count=1)
+    locktime = timenumber_to_timestamp(0) if bond else 0
+    address = wallet.get_fidelity_bond_address(0, locktime) if bond else wallet.get_address(0, 0, 0)
+    funding_id = await _fund_bond(config, funder_wallet, miner_address, address)
+    funding = await _rpc(config, "gettransaction", [funding_id], wallet=funder_wallet)
+    decoded = await _rpc(config, "decoderawtransaction", [funding["hex"]])
+    prevout = next(v for v in decoded["vout"] if v["scriptPubKey"].get("address") == address)
+    destination = await _rpc(config, "getaddressinfo", [miner_address], wallet=funder_wallet)
+    raw = create_psbt(
+        version=2,
+        inputs=[TxInput.from_hex(funding_id, prevout["n"], sequence=0xFFFFFFFE)],
+        outputs=[TxOutput(_BOND_AMOUNT_SATS - 1_000, bytes.fromhex(destination["scriptPubKey"]))],
+        locktime=locktime,
+        psbt_inputs=[
+            PSBTInput(
+                witness_utxo_value=_BOND_AMOUNT_SATS,
+                witness_utxo_script=bytes.fromhex(prevout["scriptPubKey"]["hex"]),
+                witness_script=wallet.get_fidelity_bond_script(0, locktime) if bond else b"",
+            )
+        ],
+    )
+    # Use an isolated TOML config, not the user's backend or mnemonic settings.
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        f'[bitcoin]\nbackend_type = "descriptor_wallet"\nrpc_url = "{config["rpc_url"]}"\n'
+        f'rpc_user = "{config["rpc_user"]}"\nrpc_password = "{config["rpc_password"]}"\n'
+    )
+    wallets_before = await _rpc(config, "listwallets")
+    result = await asyncio.to_thread(
+        CliRunner().invoke,
+        app,
+        [
+            "sign-psbt",
+            base64.b64encode(raw).decode(),
+            "--network",
+            "regtest",
+            "--scan-range",
+            "1",
+            "--data-dir",
+            str(tmp_path),
+            "--config-file",
+            str(config_file),
+            "--yes",
+        ],
+        env={"MNEMONIC": _MNEMONIC},
+    )
+    assert result.exit_code == 0, result.output
+    txid = result.stdout.split("Transaction submitted: ", 1)[1].splitlines()[0]
+    assert txid in await _rpc(config, "getrawmempool")
+    assert await _rpc(config, "listwallets") == wallets_before
+    mempool = await _rpc(config, "getmempoolentry", [txid])
+    assert round(mempool["fees"]["base"] * 100_000_000) == 1_000
 
 
 async def _fund_bond(

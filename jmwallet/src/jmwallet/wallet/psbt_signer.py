@@ -320,6 +320,73 @@ class WalletPSBTSigningMixin:
             already_signed_indices=tuple(already_signed_indices),
         )
 
+    def finalize_psbt(
+        self, psbt_bytes: bytes, *, expected_unsigned_tx: bytes, scan_range: int
+    ) -> bytes:
+        """Extract a verified transaction containing only wallet-owned native inputs.
+
+        This deliberately does not finalize foreign scripts. Every input amount
+        must be committed to by a valid wallet SIGHASH_ALL signature before the
+        extracted transaction's fee can be trusted for broadcasting.
+        """
+        plan = self.prepare_psbt_signing(psbt_bytes, scan_range)
+        if plan.psbt.unsigned_tx != expected_unsigned_tx:
+            raise TransactionSigningError("PSBT changed after review; refusing to broadcast")
+        witnesses: list[list[bytes]] = []
+        for input_plan, input_map in zip(plan.inputs, plan.psbt.input_maps, strict=True):
+            index = input_plan.index
+            if not input_plan.owned or input_plan.pubkey is None:
+                raise PSBTError(
+                    f"Cannot broadcast: input {index} is not wallet-owned. "
+                    "Complete the signed PSBT in another wallet or use --no-broadcast."
+                )
+            script_sig = _record_for_type(input_map, PSBT_IN_FINAL_SCRIPTSIG)
+            if script_sig is not None and script_sig.value:
+                raise PSBTError(f"Cannot broadcast: native SegWit input {index} has a scriptSig")
+            witness_script = _record_for_type(input_map, PSBT_IN_WITNESS_SCRIPT)
+            tail = input_plan.pubkey
+            if input_plan.wallet_input_type == "fidelity-bond":
+                if witness_script is None:
+                    raise PSBTError(f"Cannot broadcast: input {index} is missing witness_script")
+                tail = witness_script.value
+
+            final_witness = _record_for_type(input_map, PSBT_IN_FINAL_SCRIPTWITNESS)
+            if final_witness is not None:
+                data = final_witness.value
+                # Both supported scripts require exactly [signature, pubkey/script].
+                # A DER signature plus sighash byte fits in a one-byte CompactSize.
+                if len(data) < 2 or data[0] != 2 or not 1 <= data[1] <= 73:
+                    raise PSBTError(f"Cannot broadcast: malformed final witness for input {index}")
+                signature = data[2 : 2 + data[1]]
+                expected = b"\x02" + encode_varint(len(signature)) + signature
+                expected += encode_varint(len(tail)) + tail
+                if data != expected:
+                    raise PSBTError(f"Cannot broadcast: invalid final witness for input {index}")
+            else:
+                signature_record = next(
+                    (
+                        record
+                        for record in _records_for_type(input_map, PSBT_IN_PARTIAL_SIG)
+                        if record.key == bytes([PSBT_IN_PARTIAL_SIG]) + input_plan.pubkey
+                    ),
+                    None,
+                )
+                if signature_record is None:
+                    raise PSBTError(f"Cannot broadcast: input {index} is not fully signed")
+                signature = signature_record.value
+            _validate_signature(
+                plan.psbt,
+                index,
+                input_plan.witness_utxo,
+                input_plan.pubkey,
+                signature,
+                witness_script=tail if input_plan.wallet_input_type == "fidelity-bond" else None,
+            )
+            witnesses.append([signature, tail])
+
+        tx = plan.psbt.transaction
+        return serialize_transaction(tx.version, tx.inputs, tx.outputs, tx.locktime, witnesses)
+
     def _plan_regular_input_from_origins(
         self,
         psbt: ParsedPSBT,
@@ -587,7 +654,21 @@ def _validate_existing_signature(
     )
     if signature_record is None:
         return False
-    signature = signature_record.value
+    _validate_signature(
+        psbt, index, witness_utxo, pubkey, signature_record.value, witness_script=witness_script
+    )
+    return True
+
+
+def _validate_signature(
+    psbt: ParsedPSBT,
+    index: int,
+    witness_utxo: WitnessUTXO,
+    pubkey: bytes,
+    signature: bytes,
+    *,
+    witness_script: bytes | None = None,
+) -> None:
     if not signature or signature[-1] != 1:
         raise PSBTError(
             f"PSBT input {index} contains an invalid existing signature for this wallet"
@@ -614,4 +695,3 @@ def _validate_existing_signature(
         raise PSBTError(
             f"PSBT input {index} contains an invalid existing signature for this wallet"
         )
-    return True

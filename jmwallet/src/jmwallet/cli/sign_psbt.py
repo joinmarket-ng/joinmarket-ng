@@ -1,15 +1,23 @@
-"""Offline PSBT inspection and signing command."""
+"""PSBT review, signing, and confirmed broadcasting."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 from pathlib import Path
 from typing import Annotated
 
 import typer
-from jmcore.bitcoin import scriptpubkey_to_address
-from jmcore.cli_common import resolve_mnemonic, setup_cli
+from jmcore.bitcoin import calculate_tx_vsize, get_txid, scriptpubkey_to_address
+from jmcore.cli_common import (
+    ResolvedBackendSettings,
+    create_backend,
+    generate_descriptor_wallet_name,
+    resolve_backend_settings,
+    resolve_mnemonic,
+    setup_cli,
+)
 from jmcore.models import NetworkType
 from loguru import logger
 
@@ -22,6 +30,35 @@ from jmwallet.wallet.signing import TransactionSigningError
 from jmwallet.wallet.spend import ExcessiveFeeRateError, enforce_fee_rate_cap
 
 MAX_PSBT_SIZE = 10 * 1024 * 1024
+
+
+async def _broadcast_transaction(
+    tx_hex: str, backend_settings: ResolvedBackendSettings, wallet_name: str
+) -> None:
+    """Verify the configured chain and submit without importing or syncing a wallet."""
+    from jmwallet.backends.neutrino import GENESIS_BLOCK_HASHES
+
+    backend = create_backend(backend_settings, wallet_name=wallet_name)
+    try:
+        expected_genesis = GENESIS_BLOCK_HASHES.get(backend_settings.bitcoin_network)
+        if expected_genesis is None or await backend.get_block_hash(0) != expected_genesis:
+            raise ValueError("Backend chain does not match the reviewed Bitcoin network")
+        txid = get_txid(tx_hex)
+        try:
+            submitted_txid = await backend.broadcast_transaction(tx_hex)
+        except Exception as exc:
+            raise ValueError(
+                f"Broadcast submission outcome unknown for {txid}: {exc}. "
+                "Check the transaction status before retrying. The signed PSBT is preserved."
+            ) from exc
+        if submitted_txid != txid:
+            raise ValueError(
+                f"Broadcast submission outcome unknown for {txid}: "
+                "backend returned a different txid"
+            )
+        typer.echo(f"Transaction submitted: {txid}")
+    finally:
+        await backend.close()
 
 
 def _decode_psbt_text(text: str) -> bytes:
@@ -126,7 +163,7 @@ def _write_result(signed_psbt: bytes, output_file: Path | None) -> None:
     typer.echo(encoded)
 
 
-@app.command("sign-psbt", no_args_is_help=True)
+@app.command("sign-psbt")
 def sign_psbt(
     psbt_base64: Annotated[str | None, typer.Argument(help="Base64-encoded PSBT v0 or v2")] = None,
     input_file: Annotated[
@@ -154,7 +191,13 @@ def sign_psbt(
         ),
     ] = None,
     yes: Annotated[
-        bool, typer.Option("--yes", "-y", help="Sign without the confirmation prompt")
+        bool, typer.Option("--yes", "-y", help="Skip signing AND broadcast confirmations")
+    ] = False,
+    no_broadcast: Annotated[
+        bool,
+        typer.Option(
+            "--no-broadcast", help="Disable broadcasting and backend access (offline signing)"
+        ),
     ] = False,
     data_dir: Annotated[
         Path | None,
@@ -174,15 +217,19 @@ def sign_psbt(
     ] = None,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l", help="Log level")] = None,
 ) -> None:
-    """Inspect and partially sign wallet-owned native SegWit PSBT inputs offline.
+    """Review and sign a PSBT, then confirm broadcasting the transaction.
 
     Supports regular P2WPKH wallet inputs and canonical JoinMarket fidelity bond
     P2WSH inputs, while leaving unrelated P2WSH inputs unsigned. Every input must
     include witness_utxo data so the complete fee can be reviewed. Accepts PSBT
-    v0 and v2. The command never connects to a backend or broadcasts.
+    v0 and v2. Broadcasting requires every input to be wallet-owned and fully signed.
+    Use --no-broadcast for fully offline signing. --yes authorizes broadcasting too;
+    existing offline scripts using --yes must add --no-broadcast.
     """
     settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
     try:
+        if psbt_base64 is None and input_file is None:
+            psbt_base64 = typer.prompt("Paste base64 PSBT")
         raw_psbt = _load_psbt(psbt_base64, input_file)
         resolved = resolve_mnemonic(
             settings,
@@ -192,7 +239,10 @@ def sign_psbt(
         if resolved is None:
             raise ValueError("No mnemonic provided")
 
-        resolved_network = NetworkType(network or settings.network_config.network.value).value
+        configured_network = (
+            settings.network_config.bitcoin_network or settings.network_config.network
+        )
+        resolved_network = NetworkType(network or configured_network.value).value
         resolved_scan_range = settings.wallet.scan_range if scan_range is None else scan_range
         wallet = WalletService(
             mnemonic=resolved.mnemonic,
@@ -226,12 +276,38 @@ def sign_psbt(
             f"Signed {len(result.signed_indices)} input(s); "
             f"{len(result.already_signed_indices)} already had valid wallet signatures."
         )
+        if no_broadcast:
+            return
+        tx_bytes = wallet.finalize_psbt(
+            result.psbt,
+            expected_unsigned_tx=plan.psbt.unsigned_tx,
+            scan_range=resolved_scan_range,
+        )
+        vsize = calculate_tx_vsize(tx_bytes)
+        fee_rate = plan.fee / vsize
+        enforce_fee_rate_cap(fee_rate, settings.wallet.max_fee_rate_sat_vb, source="PSBT final")
+        tx_hex = tx_bytes.hex()
+        txid = get_txid(tx_hex)
+        typer.echo(f"\nBitcoin network: {resolved_network}")
+        typer.echo(f"Fee: {plan.fee:,} sats ({fee_rate:.2f} sat/vB, {vsize} vB)")
+        typer.echo(f"Transaction ID: {txid}")
+        if not yes and not typer.confirm("Broadcast this transaction?", default=False):
+            typer.echo("Not broadcast. The signed PSBT is available above or in the output file.")
+            return
+        backend_settings = resolve_backend_settings(settings, network=resolved_network)
+        if backend_settings.bitcoin_network != resolved_network:
+            raise ValueError("Configured Bitcoin network does not match the reviewed network")
+        wallet_name = generate_descriptor_wallet_name(
+            resolved.mnemonic, resolved_network, resolved.bip39_passphrase
+        )
+        asyncio.run(_broadcast_transaction(tx_hex, backend_settings, wallet_name))
     except (
         ExcessiveFeeRateError,
         FileNotFoundError,
         PSBTError,
         TransactionSigningError,
         ValueError,
+        OSError,
     ) as exc:
         logger.error(str(exc))
         raise typer.Exit(1) from exc
