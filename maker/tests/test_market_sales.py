@@ -22,9 +22,9 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 from typer.testing import CliRunner
 
-from maker import cli, podle_sales
+from maker import cli, market_sales
+from maker.market_sales import MarketSales, MarketSalesUnavailableError
 from maker.offers import offer_mixdepth
-from maker.podle_sales import PoDLESales, PoDLESalesUnavailableError
 
 MNEMONIC = "abandon " * 11 + "about"
 TIP = 1_000
@@ -134,7 +134,7 @@ def _coin(
 
 def _sales(
     tmp_path: Path, *, price: int | None = None
-) -> tuple[PoDLESales, SimpleNamespace, _Seller, _Backend]:
+) -> tuple[MarketSales, SimpleNamespace, _Seller, _Backend]:
     wallet, backend = _wallet(tmp_path)
     config = SimpleNamespace(
         channel_ring=SimpleNamespace(nodes={}, mixdepth_nodes={0: "n0", 1: "n1"}),
@@ -147,7 +147,7 @@ def _sales(
         fidelity_bond=None,
         offer_manager=_OfferManager(),
     )
-    sales = PoDLESales(JoinMarketSettings(data_dir=tmp_path), bot)  # type: ignore[arg-type]
+    sales = MarketSales(JoinMarketSettings(data_dir=tmp_path), bot)  # type: ignore[arg-type]
     seller = _Seller()
     sales._seller = seller  # type: ignore[assignment]
     return sales, bot, seller, backend
@@ -270,24 +270,24 @@ async def test_default_price_follows_the_fee_rate(tmp_path: Path) -> None:
 async def test_missing_preconditions_pause_sales_with_a_reason(tmp_path: Path) -> None:
     sales, bot, *_ = _sales(tmp_path)
     sales._seller = None
-    with pytest.raises(PoDLESalesUnavailableError, match="owned fidelity bond"):
+    with pytest.raises(MarketSalesUnavailableError, match="owned fidelity bond"):
         await sales._ensure_seller()
     bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0)
-    with pytest.raises(PoDLESalesUnavailableError, match="activate-market-ledger"):
+    with pytest.raises(MarketSalesUnavailableError, match="activate-market-ledger"):
         await sales._ensure_seller()
     assert not get_market_store_path(tmp_path).exists()
 
     commitments = get_used_commitments_path(tmp_path)
     with MarketStore(get_market_store_path(tmp_path), wallet_id=bot.wallet.market_wallet_id) as s:
         s.activate_wallet(commitments, history_confirmed=True)
-    with pytest.raises(PoDLESalesUnavailableError, match="no Lightning node"):
+    with pytest.raises(MarketSalesUnavailableError, match="no Lightning node"):
         await sales._ensure_seller()
 
 
 async def test_run_warns_once_and_keeps_retrying(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(podle_sales, "RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(market_sales, "RETRY_SECONDS", 0.01)
     sales, *_ = _sales(tmp_path)
     sales._seller = None
     warnings: list[str] = []
@@ -399,7 +399,7 @@ async def test_started_seller_gets_the_routed_invoices_backing_and_sale_check(
 
     [kwargs] = started
     assert isinstance(kwargs["invoices"], MultiNodeHoldInvoices)
-    assert set(kwargs["invoices"]._clients) == {"n1", podle_sales.MARKET_NODE}
+    assert set(kwargs["invoices"]._clients) == {"n1", market_sales.MARKET_NODE}
     assert kwargs["invoices"]._route == sales._invoice_node
     assert kwargs["backing_sats"] == sales._backing_sats
     assert kwargs["sale_check"] == sales._sale_check

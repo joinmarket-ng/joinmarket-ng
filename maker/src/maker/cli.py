@@ -1079,10 +1079,10 @@ def start(
                         funder.start()
                         stack.push_async_callback(funder.stop)
                 if config.sell_podle:
-                    from maker.podle_sales import PoDLESales
+                    from maker.market_sales import MarketSales
 
                     # Stopped before the maker, which owns the wallet it sells from.
-                    sales = PoDLESales(settings, bot)
+                    sales = MarketSales(settings, bot)
                     sales.start()
                     stack.push_async_callback(sales.stop)
 

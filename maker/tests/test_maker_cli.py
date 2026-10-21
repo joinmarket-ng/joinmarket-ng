@@ -249,7 +249,7 @@ def test_start_runs_podle_sales_beside_the_maker_and_stops_them_first(
     monkeypatch.setattr(cli_module, "get_notifier", lambda *_args, **_kwargs: notifier)
     monkeypatch.setattr(cli_module, "write_nick_state", MagicMock())
     monkeypatch.setattr(cli_module, "remove_nick_state", MagicMock())
-    monkeypatch.setattr("maker.podle_sales.PoDLESales", _Sales)
+    monkeypatch.setattr("maker.market_sales.MarketSales", _Sales)
 
     result = runner.invoke(app, ["start"], prog_name="jm-maker")
 

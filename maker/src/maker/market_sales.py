@@ -47,7 +47,7 @@ RETRY_SECONDS = 300.0
 MARKET_NODE = "[market]"
 
 
-class PoDLESalesUnavailableError(Exception):
+class MarketSalesUnavailableError(Exception):
     """A precondition for selling is missing; making continues without sales."""
 
 
@@ -93,7 +93,7 @@ def _invoice_client(node: ChannelRingNodeConfig) -> LndInvoiceClient:
     )
 
 
-class PoDLESales:
+class MarketSales:
     """Runs the wallet's PoDLE seller beside a maker and keeps it on the offer mixdepth.
 
     A missing precondition (no owned bond, no activated ledger, no node for the
@@ -148,7 +148,7 @@ class PoDLESales:
     def _warn(self, exc: Exception) -> None:
         known = isinstance(
             exc,
-            PoDLESalesUnavailableError | MarketError | MarketStoreError | OSError | ValueError,
+            MarketSalesUnavailableError | MarketError | MarketStoreError | OSError | ValueError,
         )
         reason = str(exc) if known else type(exc).__name__
         message = f"PoDLE sales paused: {reason}; retrying in {RETRY_SECONDS:.0f}s"
@@ -170,16 +170,16 @@ class PoDLESales:
             from taker.podle_purchase import market_fee_rate, seller_price_sats
             from taker.wallet_market import WalletMarketSeller, WalletMarketSellerOptions
         except ImportError as exc:
-            raise PoDLESalesUnavailableError("selling needs the jm-taker package") from exc
+            raise MarketSalesUnavailableError("selling needs the jm-taker package") from exc
         bond = self._bot.fidelity_bond
         if bond is None:
-            raise PoDLESalesUnavailableError(
+            raise MarketSalesUnavailableError(
                 "selling needs an owned fidelity bond as seller authority"
             )
         self._require_ledger(wallet)
         nodes = self._bot.config.channel_ring.nodes
         if not nodes:
-            raise PoDLESalesUnavailableError("no Lightning node is configured")
+            raise MarketSalesUnavailableError("no Lightning node is configured")
         price = self._bot.config.podle_price_sats or seller_price_sats(
             await market_fee_rate(wallet.backend)
         )
@@ -213,14 +213,14 @@ class PoDLESales:
     def _require_ledger(self, wallet: WalletService) -> None:
         data_dir = wallet.data_dir
         if data_dir is None:
-            raise PoDLESalesUnavailableError("selling needs a wallet data directory")
+            raise MarketSalesUnavailableError("selling needs a wallet data directory")
         diagnosis = MarketStore.diagnose_wallet(
             get_market_store_path(data_dir),
             wallet_id=wallet.market_wallet_id,
             commitments_path=get_used_commitments_path(data_dir, create=False),
         )
         if diagnosis["state"] != "ready":
-            raise PoDLESalesUnavailableError(
+            raise MarketSalesUnavailableError(
                 f"the wallet market ledger is {diagnosis['state']} ({diagnosis['reason']}); "
                 "activate it once with jm-maker activate-market-ledger"
             )
@@ -330,7 +330,7 @@ class PoDLESales:
 
         seller = self._seller
         if seller is None:
-            raise PoDLESalesUnavailableError("the PoDLE seller stopped")
+            raise MarketSalesUnavailableError("the PoDLE seller stopped")
         credential = seller.sold_podle(hold.payment_hash)
         if credential is None:
             return hold.product != "podle"
