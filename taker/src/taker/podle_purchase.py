@@ -26,7 +26,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from jmcore.channel_ring import ChannelRingNodeConfig
 from jmcore.credential_market import (
@@ -99,6 +99,9 @@ PayOutcome = Literal["paid", "shown", "failed"]
 # Missing history and an empty stream both leave the outcome unknown.
 PaymentState = Literal["succeeded", "failed", "pending"]
 
+if TYPE_CHECKING:
+    from jmswap.managed_payments import ManagedPaymentSource
+
 
 @dataclass(frozen=True)
 class PaymentIdentity:
@@ -147,12 +150,16 @@ class NodePayer:
 
     def __init__(
         self,
-        node: ChannelRingNodeConfig,
+        node: ChannelRingNodeConfig | None = None,
         fallback: InvoicePayer | None = None,
         *,
         purpose: str = "a PoDLE credential",
+        managed: ManagedPaymentSource | None = None,
     ) -> None:
+        if (node is None) == (managed is None):
+            raise ValueError("provide either an explicit node or a managed payment source")
         self.node = node
+        self._managed = managed
         self.fallback = fallback
         self.purpose = purpose
 
@@ -162,16 +169,28 @@ class NodePayer:
     def _client(self) -> Any:
         from jmswap.lnd_peer import LndPeerClient
 
+        assert self.node is not None
         return LndPeerClient(
             self.node.lnd_grpc_url.removeprefix("https://"),
             self.node.lnd_tls_cert_path.expanduser().read_bytes(),
             self.node.lnd_macaroon_path.expanduser().read_bytes(),
         )
 
+    def _new_payment_client(self) -> tuple[Any, str | None, str | None]:
+        if self._managed is None:
+            return self._client(), None, None
+        endpoint = self._managed.active_endpoint()
+        return endpoint.client(), endpoint.identity_pubkey, endpoint.network
+
     async def identify(self, bolt11: str) -> PaymentIdentity:
         """Identify the paying node and invoice before recording the payment intent."""
-        async with self._client() as client:
+        client, expected_payer, network = self._new_payment_client()
+        async with client:
             node = await client.node_info()
+            if expected_payer is not None and (
+                node.identity_pubkey != expected_payer or node.network != network
+            ):
+                raise ValueError("managed payment node identity or network changed")
             invoice = await client.inspect_invoice(bolt11)
         return PaymentIdentity(node.identity_pubkey, invoice.payment_hash.hex())
 
@@ -179,8 +198,16 @@ class NodePayer:
         """Look up the payment only at its original node; missing history stays pending."""
         from jmswap.lnd_peer import PaymentStatus
 
-        async with self._client() as client:
-            if (await client.node_info()).identity_pubkey != identity.payer:
+        if self._managed is None:
+            client, network = self._client(), None
+        else:
+            endpoint = self._managed.historical_endpoint(identity.payer)
+            client, network = endpoint.client(), endpoint.network
+        async with client:
+            node = await client.node_info()
+            if node.identity_pubkey != identity.payer or (
+                network is not None and node.network != network
+            ):
                 raise ValueError("bond payment lookup requires its original paying node")
             result = await client.track_payment(bytes.fromhex(identity.payment_hash))
         if result is None:
@@ -200,14 +227,36 @@ class NodePayer:
         expires_at: int,
         expected_payer: str | None = None,
     ) -> PayOutcome:
+        """Pay once for a fresh intent; reconcile ambiguous attempts through ``status``."""
         from jmswap.lnd_peer import PaymentStatus
 
+        if self._managed is not None:
+            from jmswap.managed_nodes import ManagedNodeError
+
+            try:
+                client, authorized_payer, network = self._new_payment_client()
+            except (ManagedNodeError, OSError, ValueError):
+                # This invocation has not sent a payment RPC. Never apply this
+                # conversion to reconciliation or an ambiguous prior attempt.
+                logger.warning("Managed payment admission unavailable; no new payment attempted")
+                return "failed"
+            if expected_payer is not None and expected_payer != authorized_payer:
+                logger.warning("Managed payment source changed before payment; nothing attempted")
+                return "failed"
+        else:
+            client, authorized_payer, network = self._new_payment_client()
         timeout = max(1, min(60, expires_at - int(time.time()) - 5))
-        async with self._client() as client:
-            if expected_payer is not None:
-                if (await client.node_info()).identity_pubkey != expected_payer:
+        async with client:
+            if authorized_payer is not None or expected_payer is not None:
+                node = await client.node_info()
+                if authorized_payer is not None and (
+                    node.identity_pubkey != authorized_payer or node.network != network
+                ):
+                    logger.warning("Managed payment identity or network changed; nothing attempted")
+                    return "failed"
+                if expected_payer is not None and node.identity_pubkey != expected_payer:
                     raise ValueError("bond payment requires its recorded paying node")
-                if self.fallback is not None:
+                if expected_payer is not None and self.fallback is not None:
                     raise ValueError("tracked bond payments cannot use an external payer")
             result = await client.pay(
                 bolt11,
@@ -274,6 +323,7 @@ def payer_for_mixdepth(
     mixdepth_nodes: dict[int, str],
     *,
     interactive: bool,
+    managed_source: Callable[[int], ManagedPaymentSource] | None = None,
 ) -> Callable[[int], InvoicePayer | None]:
     """Pay from the source mixdepth's node, else (interactively) by invoice, else not at all.
 
@@ -283,6 +333,11 @@ def payer_for_mixdepth(
 
     def payer(mixdepth: int) -> InvoicePayer | None:
         fallback = InteractivePayer() if interactive else None
+        if managed_source is not None:
+            # Construct even without an ACTIVE mapping: original-node history
+            # must remain reachable while retiring or recovering. Admission is
+            # checked separately and cannot use the missing-node QR fallback.
+            return NodePayer(managed=managed_source(mixdepth), fallback=fallback)
         name = mixdepth_nodes.get(mixdepth)
         if name is not None and name in ring_nodes:
             return NodePayer(ring_nodes[name], fallback)

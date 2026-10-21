@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bitcointx.core.key import CKey
@@ -59,6 +60,7 @@ def _bond(*, owned: bool = False, cert_expiry: int | None = 2) -> FidelityBondIn
 
 class _Bot:
     def __init__(self, bond: FidelityBondInfo | None, height: int) -> None:
+        self.wallet: Any = None
         self.fidelity_bond = bond
         self.running = True
         self.backend = SimpleNamespace(
@@ -146,6 +148,53 @@ async def test_leasing_needs_a_node_for_mixdepth_0() -> None:
     buyer = BondLeaseBuyer(JoinMarketSettings(), bot)  # type: ignore[arg-type]
     with pytest.raises(bond_lease_buyer.BondLeaseUnavailableError, match="mixdepth 0"):
         await buyer.check()
+
+
+async def test_managed_buyer_can_track_original_payment_without_an_active_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jmswap.lnd_peer import PaymentResult, PaymentStatus
+    from jmswap.managed_nodes import NodeState, allocate_node, new_registry
+    from jmswap.managed_payments import ManagedPaymentEndpoint, ManagedPaymentSource
+    from taker.podle_purchase import PaymentIdentity
+
+    source = ManagedPaymentSource.for_wallet(tmp_path, "regtest", bytes(OWNER.pub), 0)
+    registry = new_registry("regtest", source.wallet_identity)
+    original = allocate_node(registry, 0, birthday=1, ports=(20001, 20002))
+    original.state = NodeState.RETIRING
+    original.identity_pubkey = bytes(CERTIFICATE.pub).hex()
+    source.store.update(lambda current: registry)
+    bot = _Bot(None, 1)
+    bot.wallet = SimpleNamespace(
+        data_dir=tmp_path,
+        network="regtest",
+        wallet_fingerprint="deadbeef",
+        master_key=SimpleNamespace(get_public_key_bytes=lambda: bytes(OWNER.pub)),
+    )
+    settings: Any = SimpleNamespace(
+        lightning=SimpleNamespace(mode="managed"),
+        get_data_dir=lambda: tmp_path,
+        network_config=SimpleNamespace(
+            bitcoin_network=None, network=SimpleNamespace(value="regtest")
+        ),
+    )
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.node_info = AsyncMock(
+        return_value=SimpleNamespace(identity_pubkey=original.identity_pubkey, network="regtest")
+    )
+    client.track_payment = AsyncMock(
+        return_value=PaymentResult(PaymentStatus.SUCCEEDED, b"\x42" * 32, None, 0)
+    )
+    monkeypatch.setattr(ManagedPaymentEndpoint, "client", lambda endpoint: client)
+    purchaser = BondLeaseBuyer(settings, bot)._get_purchaser()  # type: ignore[arg-type]
+    assert (
+        await purchaser._payer.status(PaymentIdentity(original.identity_pubkey, "42" * 32))
+        == "succeeded"
+    )
+    client.track_payment.assert_awaited_once_with(b"\x42" * 32)
 
 
 async def test_run_waits_for_the_maker_and_keeps_retrying(

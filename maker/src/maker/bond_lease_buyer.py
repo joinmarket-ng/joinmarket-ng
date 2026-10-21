@@ -142,17 +142,34 @@ class BondLeaseBuyer:
             from taker.podle_purchase import NodePayer
         except ImportError as exc:
             raise BondLeaseUnavailableError("leasing needs the jm-taker package") from exc
-        ring = self._bot.config.channel_ring
-        name = ring.mixdepth_nodes.get(FIDELITY_BOND_MIXDEPTH)
-        node = None if name is None else ring.nodes.get(name)
-        if node is None:
-            raise BondLeaseUnavailableError("no Lightning node for mixdepth 0 to pay leases")
+        if self._settings.lightning.mode == "managed":
+            from jmswap.managed_payments import ManagedPaymentSource
+
+            wallet = self._bot.wallet
+            if wallet.data_dir is None:
+                raise BondLeaseUnavailableError("the wallet has no managed node data directory")
+            source = ManagedPaymentSource.for_wallet(
+                wallet.data_dir,
+                wallet.network,
+                wallet.master_key.get_public_key_bytes(),
+                FIDELITY_BOND_MIXDEPTH,
+            )
+            # History remains queryable without an ACTIVE replacement. Only
+            # fresh payment admission depends on the current active node.
+            payer = NodePayer(managed=source, purpose="a fidelity bond lease")
+        else:
+            ring = self._bot.config.channel_ring
+            name = ring.mixdepth_nodes.get(FIDELITY_BOND_MIXDEPTH)
+            node = None if name is None else ring.nodes.get(name)
+            if node is None:
+                raise BondLeaseUnavailableError("no Lightning node for mixdepth 0 to pay leases")
+            payer = NodePayer(node, purpose="a fidelity bond lease")
         fingerprint = self._bot.wallet.wallet_fingerprint
         if fingerprint is None:
             raise BondLeaseUnavailableError("the wallet has no fingerprint for its bond registry")
         self._purchaser = BondPurchaser(
             self._settings,
-            NodePayer(node, purpose="a fidelity bond lease"),
+            payer,
             wallet_fingerprint=fingerprint,
         )
         return self._purchaser

@@ -559,7 +559,11 @@ def _external_podle_mode(value: str, config: TakerConfig) -> Literal["disabled",
 
 
 def _podle_purchaser(
-    settings: JoinMarketSettings, config: TakerConfig, *, interactive: bool
+    settings: JoinMarketSettings,
+    config: TakerConfig,
+    *,
+    interactive: bool,
+    wallet: WalletService | None = None,
 ) -> PoDLEPurchaser | None:
     """The automatic PoDLE buyer of a "prefer" taker: pays from the source mixdepth's node."""
     if config.external_podle_mode != "prefer":
@@ -567,7 +571,24 @@ def _podle_purchaser(
     from taker.podle_purchase import PoDLEPurchaser, payer_for_mixdepth
 
     ring = config.channel_ring
-    payer_for = payer_for_mixdepth(ring.nodes, ring.mixdepth_nodes, interactive=interactive)
+    managed_source = None
+    if settings.lightning.mode == "managed":
+        if wallet is None or wallet.data_dir is None:
+            raise ValueError(
+                "managed payments require the actual wallet data directory and identity"
+            )
+        from jmswap.managed_payments import ManagedPaymentSource
+
+        data_dir = wallet.data_dir
+        public_key = wallet.master_key.get_public_key_bytes()
+        network = wallet.network
+
+        def managed_source(mixdepth: int) -> ManagedPaymentSource:
+            return ManagedPaymentSource.for_wallet(data_dir, network, public_key, mixdepth)
+
+    payer_for = payer_for_mixdepth(
+        ring.nodes, ring.mixdepth_nodes, interactive=interactive, managed_source=managed_source
+    )
     return PoDLEPurchaser(settings, payer_for)
 
 
@@ -675,7 +696,10 @@ async def _run_coinjoin(
         config,
         confirmation_callback=confirmation_callback,
         podle_purchaser=_podle_purchaser(
-            settings, config, interactive=not skip_confirmation and sys.stdin.isatty()
+            settings,
+            config,
+            interactive=not skip_confirmation and sys.stdin.isatty(),
+            wallet=wallet,
         ),
     )
 

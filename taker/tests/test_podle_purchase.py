@@ -128,6 +128,7 @@ class _Payer:
 def _settings(tmp_path: Path) -> Any:
     return SimpleNamespace(
         get_data_dir=lambda: tmp_path,
+        lightning=SimpleNamespace(mode="off"),
         network_config=SimpleNamespace(bitcoin_network=None, network=NetworkType.REGTEST),
     )
 

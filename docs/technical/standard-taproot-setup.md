@@ -196,8 +196,8 @@ All market payments go through the nodes and stay inside one mixdepth's
 privacy cluster:
 
 - A taker pays from the node of the mixdepth its CoinJoin spends.
-- A maker pays (bond rent) and invoices (sales) from the node of its current
-  offer mixdepth.
+- A maker invoices PoDLE sales from its current offer mixdepth's node.
+- Bond leases are paid and invoiced from mixdepth 0's node, where bonds live.
 
 There is no automatic fallback to another mixdepth's node. Ring channels are
 private and their peers usually have no public channels, so invoices carry
@@ -205,6 +205,22 @@ explicit route hints for the node's incoming ring channels. When the node
 cannot pay (no route or liquidity), an interactive run shows the invoice as
 text and a terminal QR code for an external wallet; a non-interactive run
 skips the purchase.
+
+Managed payments resolve the current `active` node of the same mixdepth for
+each fresh attempt and verify its public key and network before paying. A
+retiring, recovering, missing, or unreadable source does not authorize new
+payments and does not trigger the external-invoice fallback. That fallback
+remains available after an authorized active node reports a definite routing
+failure. Manual-node behavior is unchanged.
+
+Outstanding tracked payments are looked up by their saved original payer
+public key and payment hash, even when there is no active replacement. The
+lookup never crosses mixdepths or substitutes the replacement's history.
+Previously validated endpoint snapshots remain usable if metadata becomes
+unreadable during that process; after restart an authoritative binding is
+required. Missing history stays unknown, never failed. Retain the original
+LND history and application settlement monitors until outcomes are terminal.
+These admission checks alone do not prove retirement quiescence.
 
 ## Taker: Automatic PoDLE Purchase
 
