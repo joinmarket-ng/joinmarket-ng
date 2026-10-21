@@ -257,8 +257,26 @@ class ManagedLnd:
             return await getattr(stub, method)(request, timeout=timeout)
 
     async def stop(self, *, timeout: float = 60.0) -> None:
+        """Stop and reap an owned child before propagating caller cancellation.
+
+        Repeated cancellation must not abandon an unlocked child while its
+        process lock and scoped keys are being released by the caller.
+        """
         if not self.running:
             return
+        cleanup = asyncio.create_task(self._stop_owned_child(timeout=timeout))
+        cancellation: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+        cleanup.result()
+        if cancellation is not None:
+            raise cancellation
+
+    async def _stop_owned_child(self, *, timeout: float) -> None:
         assert self._process is not None
         from jmswap.lndrpc import lightning_pb2
 
@@ -269,11 +287,13 @@ class ManagedLnd:
             await asyncio.wait_for(self._process.wait(), timeout)
         except TimeoutError:
             logger.warning("lnd for {} did not stop in time; terminating it", self.node.name)
-            self._process.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                self._process.terminate()
             try:
                 await asyncio.wait_for(self._process.wait(), 15)
             except TimeoutError:
-                self._process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    self._process.kill()
                 await self._process.wait()
 
 

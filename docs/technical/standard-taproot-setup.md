@@ -105,7 +105,10 @@ seed under its own SLIP-21 label (`"lightning unlock v1"`, scoped like the node
 key), so no LND password is stored on disk or passed on a command line. The
 supervisor keeps only these scoped derivation capabilities, not the seed. It
 restarts crashed nodes with backoff, keeps the static channel backups current,
-and stops the nodes cleanly. `jm-lightning install-lnd` downloads the upstream release and
+and stops the nodes cleanly. Once owned shutdown begins, caller cancellation
+is deferred until the child is stopped and reaped. This is process cleanup,
+not proof that payments or channel obligations have resolved.
+`jm-lightning install-lnd` downloads the upstream release and
 checks it against SHA-256 digests pinned in the source. Operators who prefer
 Docker use manual mode instead.
 
