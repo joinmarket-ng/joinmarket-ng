@@ -771,14 +771,27 @@ refresh_installer() (
             exit 1
         fi
     fi
-    local args=("$@")
+    # Optional setup belongs to this outer owner, not the authenticated child.
+    # Older signed installers do not understand these UI-only flags.
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-setup|--skip-setup) shift ;;
+            --venv|--version|--min-sigs)
+                args+=("$1" "$2")
+                shift 2
+                ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
     [[ "$MODE" == "update" ]] && args+=(--update)
     [[ "$AUTO_YES" == "true" ]] && args+=(--yes)
     # Preserve an explicit application version. Otherwise install the same
     # release selected here, not a second unauthenticated 'latest' response.
     [[ -z "$INSTALL_VERSION" ]] && args+=(--version "$version")
     JOINMARKET_DATA_DIR="$DATA_DIR" JMNG_VENV_DIR="$VENV_DIR" \
-        JMNG_VERIFIED_INSTALLER="$candidate" bash "$candidate" "${args[@]}"
+        JMNG_SETUP_DEFER_TO_PARENT=1 JMNG_VERIFIED_INSTALLER="$candidate" \
+        bash "$candidate" "${args[@]}"
 )
 
 save_trusted_installer() {
@@ -2120,6 +2133,75 @@ print_completion() {
     echo ""
 }
 
+# Optional UI only, after installation success. This never establishes wallet
+# freshness and never forwards installer auto-confirm to the wallet wizard.
+offer_guided_setup() {
+    if [[ "${JMNG_SETUP_DEFER_TO_PARENT:-}" == "1" || "$SETUP_ACTION" == "skip" ]]; then
+        return 0
+    fi
+    local venv="$VENV_DIR" data="$DATA_DIR" command prior_int status=0
+    [[ "$venv" == /* ]] || venv="$PWD/$venv"
+    [[ "$data" == /* ]] || data="$PWD/$data"
+    local args=("$venv/bin/jm-ng" setup --data-dir "$data" --config-file "$data/config.toml")
+    printf -v command '%q ' "${args[@]}"
+    if [[ "$MODE" == "update" || "$VENV_PRESENT_BEFORE_INSTALL" == "true" ]]; then
+        if [[ "$SETUP_ACTION" == "run" ]]; then
+            print_warning "Installation succeeded; setup not run on updates or reused paths." >&2
+            printf 'Run separately: %s\n' "$command"
+        fi
+        return 0
+    fi
+    if [[ ! -t 0 || ! -t 1 || ( "$AUTO_YES" == "true" && "$SETUP_ACTION" != "run" ) ]]; then
+        print_warning "Installation succeeded; setup not run without an interactive setup choice." >&2
+        printf 'Run separately: %s\n' "$command"
+        return 0
+    fi
+    prior_int=$(trap -p INT)
+    # Catch, do not ignore: foreground children must still receive Ctrl-C.
+    local setup_interrupted=false
+    trap 'setup_interrupted=true' INT
+    local run_setup=true
+    if [[ "$SETUP_ACTION" != "run" ]]; then
+        local answer
+        # Bash can resume its builtin read after a caught INT. Leave this
+        # function explicitly instead of waiting for a newline after Ctrl-C.
+        trap '
+            trap - INT
+            if [[ -n "$prior_int" ]]; then eval "$prior_int"; fi
+            print_warning "Installation succeeded; optional setup canceled." >&2
+            return 0
+        ' INT
+        read -r -p "Run guided wallet setup now? [y/N] " answer || answer=""
+        trap 'setup_interrupted=true' INT
+        if [[ "$setup_interrupted" == "true" || ( "$answer" != [yY] && "$answer" != [yY][eE][sS] ) ]]; then
+            run_setup=false
+        fi
+    fi
+    # Do not speculate against older launchers that might ignore 'setup'.
+    # Both entrypoints come from this installed environment, never PATH.
+    if [[ "$run_setup" == "true" ]]; then
+        if [[ ! -x "$venv/bin/jm-ng" || ! -x "$venv/bin/python" ]] || \
+            ! "$venv/bin/python" -I -c 'from jmwallet.onboarding import main' >/dev/null 2>&1; then
+            print_warning "Installation succeeded; this release lacks guided setup support. Setup not run." >&2
+        elif [[ "$setup_interrupted" == "true" ]]; then
+            print_warning "Installation succeeded; optional setup canceled." >&2
+        elif (unset JMNG_SETUP_DEFER_TO_PARENT; exec "${args[@]}"); then
+            status=0
+        else
+            status=$?
+        fi
+    fi
+    trap - INT
+    if [[ -n "$prior_int" ]]; then
+        eval "$prior_int"
+    fi
+    if (( status != 0 )); then
+        print_warning "Installation succeeded; optional setup incomplete (status $status). Preserve any wallet/node state." >&2
+        printf 'Inspect before retrying: %s\n' "$command"
+    fi
+    return 0
+}
+
 # Show help
 show_help() {
     cat << 'EOF'
@@ -2157,6 +2239,9 @@ Options:
                       version-pins WITHOUT hash verification (still
                       preventing silent upstream upgrades).
   --venv PATH         Custom virtual environment path
+  --run-setup         Attempt optional guided setup after a fresh software install
+                      (interactive terminal required; skipped setup still exits 0)
+  --skip-setup        Do not offer guided setup
 
 Note: When piped from curl, auto-confirm is enabled by default for Tor
       configuration and other prompts. Use --skip-tor to skip Tor setup.
@@ -2166,6 +2251,9 @@ Note: When piped from curl, auto-confirm is enabled by default for Tor
       The first bootstrap trusts GitHub/HTTPS. Verified installs save a trusted
       copy at <data-dir>/install.sh for future updates. Unverified runs do not
       replace it. Older installations migrate with one final bootstrap run.
+      Installer --yes and piped input never authorize wallet/node/ledger effects.
+      Setup is not offered on updates or reused venv paths. Optional setup
+      failure does not undo a completed installation or change its success status.
 
 Examples:
   # Install the complete profile (default)
@@ -2201,6 +2289,7 @@ parse_args() {
     INSTALL_ORDERBOOK_WATCHER=""
     INSTALL_JMWALLETD=false
     AUTO_YES=false
+    SETUP_ACTION="offer"
     SKIP_TOR=false
     INSTALL_VERSION=""
     EXPLICIT_COMPONENTS=false
@@ -2220,6 +2309,16 @@ parse_args() {
                 ;;
             --update)
                 MODE="update"
+                shift
+                ;;
+            --run-setup|--skip-setup)
+                local selected_setup="run"
+                [[ "$1" == "--skip-setup" ]] && selected_setup="skip"
+                if [[ "$SETUP_ACTION" != "offer" && "$SETUP_ACTION" != "$selected_setup" ]]; then
+                    print_error "Choose --run-setup or --skip-setup, not both"
+                    exit 1
+                fi
+                SETUP_ACTION="$selected_setup"
                 shift
                 ;;
             --maker)
@@ -2315,6 +2414,11 @@ main() {
     echo ""
 
     parse_args "$@"
+    # This classifies software only. Existing config/wallet/history is unknown.
+    VENV_PRESENT_BEFORE_INSTALL=false
+    if [[ -e "$VENV_DIR" || -L "$VENV_DIR" ]]; then
+        VENV_PRESENT_BEFORE_INSTALL=true
+    fi
 
     # This marker is passed only by the locally trusted parent after signature
     # verification. Local environment control is outside the download threat
@@ -2376,7 +2480,8 @@ main() {
             check_system_dependencies
         fi
         refresh_installer "$@"
-        exit $?
+        offer_guided_setup
+        exit 0
     fi
 
     trap cleanup_install EXIT
@@ -2419,6 +2524,7 @@ main() {
     create_shell_integration
     save_trusted_installer
     print_completion
+    offer_guided_setup
 }
 
 # Only run main when this file is executed directly, not when sourced.

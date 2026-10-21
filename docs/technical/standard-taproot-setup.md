@@ -516,8 +516,20 @@ admission can stop while recovery monitors continue running.
 
 Role guidance prints separate actor commands and mixdepth-specific reserve
 funding instructions; it never submits a reserve transaction or starts actors.
-The fresh-install offer remains to be connected. Stopped initialized nodes are
-not reported as a running Lightning service.
+After a fresh software installation, the installer offers guided setup with a
+default-no prompt. `--run-setup` attempts it only with an interactive terminal;
+`--skip-setup` suppresses the offer. Installer `--yes` and piped input never
+authorize wallet, ledger, or node effects. Noninteractive runs print the exact
+installed command instead. Updates and any pre-existing virtual-environment
+path, including a file or dangling alias, never receive automatic setup.
+Software freshness says nothing about existing wallet or history state.
+
+Setup runs only after installation succeeds, using that installation's
+entrypoint and explicit data/config paths. Older releases without onboarding
+support are not invoked speculatively. Setup failure or cancellation preserves
+the completed installation and any partial wallet/node state; installer success
+does not mean setup succeeded. Inspect partial state before retrying. Stopped
+initialized nodes are not reported as a running Lightning service.
 
 `jm-wallet info` shows a Lightning section per mixdepth: node identity and
 generation, sync state, reserve against its range, channel count, and

@@ -340,6 +340,48 @@ def test_refresh_accepts_distinct_trusted_signing_subkeys(
     assert not Path(values["verified"][0]).exists()
 
 
+@pytest.mark.parametrize("setup_flag", ["--run-setup", "--skip-setup"])
+def test_authenticated_older_parser_receives_no_parent_setup_flags(
+    tmp_path: Path,
+    signing_keys: tuple[SigningKey, SigningKey, SigningKey],
+    setup_flag: str,
+) -> None:
+    trusted_keys = signing_keys[:2]
+    # Previous protocol-1 installers reject unknown options. Preserve option
+    # values even when a value has the same spelling as a parent-owned flag.
+    candidate = (
+        _candidate_script()
+        + r"""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --venv|--version) shift 2 ;;
+        --maker|--yes|--update) shift ;;
+        *) exit 71 ;;
+    esac
+done
+[[ "$JMNG_SETUP_DEFER_TO_PARENT" == 1 ]]
+"""
+    )
+    release = _create_release_fixture(tmp_path, trusted_keys, candidate)
+    _sign_with_trusted_quorum(release, trusted_keys)
+    result, marker = _run_refresh(
+        tmp_path,
+        release,
+        trusted_keys,
+        args=(setup_flag, "--maker", "--venv", "--run-setup"),
+    )
+    assert "EXIT:0" in result.stdout, result.stdout + result.stderr
+    assert _marker_values(marker)["arg"] == [
+        "--maker",
+        "--venv",
+        "--run-setup",
+        "--update",
+        "--yes",
+        "--version",
+        "v1.2.3",
+    ]
+
+
 def test_tampered_authenticated_installer_never_executes(
     tmp_path: Path, signing_keys: tuple[SigningKey, SigningKey, SigningKey]
 ) -> None:
