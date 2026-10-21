@@ -37,8 +37,8 @@ class TestHiddenServiceDoSConfig:
         assert config.pow_queue_rate == 25
         assert config.pow_queue_burst == 250
 
-        # No stream limit by default
-        assert config.max_streams is None
+        # Streams per rendezvous circuit are capped by default (sybil multiplexing)
+        assert config.max_streams == 10
         assert config.max_streams_close_circuit is True
 
     def test_custom_values(self) -> None:
@@ -455,6 +455,7 @@ class TestTorControlClient:
 
             hs = await client.create_ephemeral_hidden_service(
                 ports=[(27183, "127.0.0.1:27183")],
+                max_streams=dos_config.max_streams,
                 dos_config=dos_config,
             )
 
@@ -477,6 +478,9 @@ class TestTorControlClient:
             # These should NOT be in the command (not supported for ephemeral HS)
             assert "HiddenServiceEnableIntroDoSDefense" not in add_onion_call
             assert "HiddenServicePoWDefensesEnabled" not in add_onion_call
+            # A circuit that multiplexes too many streams is torn down
+            assert "MaxStreams=10" in add_onion_call.split()
+            assert "Flags=MaxStreamsCloseCircuit" in add_onion_call.split()
 
             await client.close()
 
@@ -522,10 +526,12 @@ class TestTorControlClient:
                 pow_enabled=True,
                 pow_queue_rate=100,
                 pow_queue_burst=500,
+                max_streams_close_circuit=False,
             )
 
             hs = await client.create_ephemeral_hidden_service(
                 ports=[(27183, "127.0.0.1:27183")],
+                max_streams=dos_config.max_streams,
                 dos_config=dos_config,
             )
 
@@ -544,6 +550,9 @@ class TestTorControlClient:
             assert "PoWDefensesEnabled" not in add_onion_call
             assert "PoWQueueRate" not in add_onion_call
             assert "PoWQueueBurst" not in add_onion_call
+            # The stream cap works on every version; excess streams are only refused here
+            assert "MaxStreams=10" in add_onion_call.split()
+            assert "MaxStreamsCloseCircuit" not in add_onion_call
 
             await client.close()
 

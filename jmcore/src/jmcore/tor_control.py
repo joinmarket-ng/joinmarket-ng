@@ -81,7 +81,9 @@ class HiddenServiceDoSConfig:
             Lower values provide more protection but may delay legitimate connections.
         pow_queue_burst: Burst size for processing from PoW queue.
         max_streams: Maximum concurrent streams per rendezvous circuit.
-            None for unlimited. Works on all Tor versions.
+            None for unlimited. Works on all Tor versions. Honest peers open one
+            stream per circuit; a flood multiplexed over a few circuits bypasses
+            PoW, which only prices new circuits.
         max_streams_close_circuit: If True, exceeding max_streams tears down the circuit.
             If False, excess stream requests are silently ignored.
     """
@@ -100,8 +102,9 @@ class HiddenServiceDoSConfig:
     pow_queue_rate: int = 25  # Rendezvous requests processed per second
     pow_queue_burst: int = 250  # Burst size for PoW queue
 
-    # Stream limits per circuit
-    max_streams: int | None = None
+    # Stream limits per circuit. Ten leaves headroom for several bots sharing one
+    # Tor client without stream isolation.
+    max_streams: int | None = 10
     max_streams_close_circuit: bool = True
 
 
@@ -565,6 +568,12 @@ class TorControlClient:
             flags.append("Detach")
         if await_publication:
             flags.append("AwaitPublication")
+        if (
+            max_streams is not None
+            and dos_config is not None
+            and dos_config.max_streams_close_circuit
+        ):
+            flags.append("MaxStreamsCloseCircuit")
 
         # Build command
         cmd_parts = [f"ADD_ONION {key_type}:{key_blob}"]
