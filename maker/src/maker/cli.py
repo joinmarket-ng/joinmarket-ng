@@ -137,6 +137,7 @@ def build_maker_config(
     dual_offers: bool | None = None,
     sell_podle: bool | None = None,
     rent_bonds: bool | None = None,
+    lease_bond: bool | None = None,
 ) -> MakerConfig:
     """
     Build MakerConfig from unified settings with CLI overrides.
@@ -149,6 +150,9 @@ def build_maker_config(
     effective_rent_bonds = settings.maker.rent_bonds if rent_bonds is None else rent_bonds
     if effective_rent_bonds and settings.lightning.mode == "off":
         raise ValueError("Renting out fidelity bonds requires [lightning] mode managed or manual")
+    effective_lease_bond = settings.maker.lease_bond if lease_bond is None else lease_bond
+    if effective_lease_bond and settings.lightning.mode == "off":
+        raise ValueError("Leasing a fidelity bond requires [lightning] mode managed or manual")
     # Resolve network settings
     effective_network = network if network is not None else settings.network_config.network
     effective_bitcoin_network = (
@@ -490,6 +494,9 @@ def build_maker_config(
         podle_price_sats=settings.maker.podle_price_sats,
         rent_bonds=effective_rent_bonds,
         bond_rent_rate=settings.maker.bond_rent_rate,
+        lease_bond=effective_lease_bond,
+        lease_bond_max_sats=settings.maker.lease_bond_max_sats,
+        lease_bond_max_rate=settings.maker.lease_bond_max_rate,
         channel_ring=channel_ring_config(
             settings.lightning.mode,
             settings.maker.channel_ring,
@@ -881,6 +888,15 @@ def start(
             "jm-maker activate-market-ledger). Default: maker.rent_bonds",
         ),
     ] = None,
+    lease_bond: Annotated[
+        bool | None,
+        typer.Option(
+            "--lease-bond/--no-lease-bond",
+            help="Without a usable fidelity bond, lease one each retarget period over the "
+            "credential market (needs [lightning] and a node for mixdepth 0). "
+            "Default: maker.lease_bond",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -983,6 +999,7 @@ def start(
             dual_offers=True if dual_offers else None,
             sell_podle=sell_podle,
             rent_bonds=rent_bonds,
+            lease_bond=lease_bond,
         )
     except ValueError as e:
         logger.error(str(e))
@@ -1101,6 +1118,14 @@ def start(
                     sales = MarketSales(settings, bot)
                     sales.start()
                     stack.push_async_callback(sales.stop)
+                if config.lease_bond and config.no_fidelity_bond:
+                    logger.warning("--no-fidelity-bond is set: no fidelity bond is leased")
+                elif config.lease_bond:
+                    from maker.bond_lease_buyer import BondLeaseBuyer
+
+                    buyer = BondLeaseBuyer(settings, bot)
+                    buyer.start()
+                    stack.push_async_callback(buyer.stop)
 
                 try:
                     # Write nick state file for external tracking and

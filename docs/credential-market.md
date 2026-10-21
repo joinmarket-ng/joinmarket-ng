@@ -519,6 +519,16 @@ two periods after the maker first runs with this version. The price is
 `bond_rent_rate` per year on the locked amount for the rest of the period. See
 the [standard Taproot setup](technical/standard-taproot-setup.md#idle-bond-rental).
 
+### Maker Bond Leasing
+
+`[maker] lease_bond = true` (or `jm-maker start --lease-bond`) makes a maker
+without a usable bond lease one for the rest of each retarget period, paid
+from its mixdepth 0 node within `lease_bond_max_sats` and
+`lease_bond_max_rate`, and advertise it. It needs `[lightning]` and a node for
+mixdepth 0, but no market ledger. An expired leased or cold certificate is
+replaced by a new lease instead of stopping the maker. See the
+[standard Taproot setup](technical/standard-taproot-setup.md#renting-a-bond).
+
 ### Diagnosis, Recovery, and Directory Moves
 
 `GET /ledger` does not create directories or files, change permissions, repair

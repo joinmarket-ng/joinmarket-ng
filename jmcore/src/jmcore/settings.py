@@ -1099,6 +1099,29 @@ class MakerSettings(BaseModel):
             "of the period a lease is sold in."
         ),
     )
+    lease_bond: bool = Field(
+        default=False,
+        description=(
+            "While the maker has no usable fidelity bond, lease one for the rest of each "
+            "retarget period over the credential market, paid from mixdepth 0's "
+            "Lightning node. Requires [lightning] (and so P2TR)."
+        ),
+    )
+    lease_bond_max_sats: int = Field(
+        default=50_000,
+        ge=1,
+        le=10_000_000,
+        description="Most one lease may cost, Lightning routing fees included.",
+    )
+    lease_bond_max_rate: float = Field(
+        default=0.02,
+        gt=0,
+        le=1,
+        description=(
+            "Most one lease may cost as an annual rate on the leased bond's locked "
+            "amount, for the rest of the period."
+        ),
+    )
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -1874,6 +1897,8 @@ class JoinMarketSettings(BaseSettings):
             raise ValueError("maker.sell_podle requires lightning.mode = 'managed' or 'manual'")
         if self.maker.rent_bonds and self.lightning.mode == "off":
             raise ValueError("maker.rent_bonds requires lightning.mode = 'managed' or 'manual'")
+        if self.maker.lease_bond and self.lightning.mode == "off":
+            raise ValueError("maker.lease_bond requires lightning.mode = 'managed' or 'manual'")
         if self.taker.external_podle_mode == "prefer" and not taproot:
             raise ValueError(
                 "taker.external_podle_mode = 'prefer' requires wallet.address_type = 'p2tr'"

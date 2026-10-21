@@ -61,6 +61,13 @@ jm-maker start --sell-podle   # or [maker] sell_podle = true
 jm-maker start --rent-bonds   # or [maker] rent_bonds = true
 ```
 
+A maker without a usable bond can instead lease one each retarget period,
+paid from its mixdepth 0 node within a price cap:
+
+```bash
+jm-maker start --lease-bond   # or [maker] lease_bond = true
+```
+
 Each buyer learns the sold coin, never coins of another mixdepth. The
 advertised bond is never rented. Sales pause with a warning when a
 precondition is missing; the maker keeps running. See

@@ -281,6 +281,10 @@ class MakerConfig(WalletConfig):
     # Idle fidelity bond rental ([maker] rent_bonds)
     rent_bonds: bool = False
     bond_rent_rate: float = Field(default=0.01, gt=0, le=1)
+    # Fidelity bond leases for a maker without a usable bond ([maker] lease_bond)
+    lease_bond: bool = False
+    lease_bond_max_sats: int = Field(default=50_000, ge=1, le=10_000_000)
+    lease_bond_max_rate: float = Field(default=0.02, gt=0, le=1)
 
     # Single offer configuration (legacy, used when offer_configs is empty)
     offer_type: OfferType = Field(

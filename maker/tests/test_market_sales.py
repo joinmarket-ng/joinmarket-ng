@@ -297,7 +297,11 @@ async def test_missing_preconditions_pause_sales_with_a_reason(tmp_path: Path) -
     sales._seller = None
     with pytest.raises(MarketSalesUnavailableError, match="owned fidelity bond"):
         await sales._ensure_seller()
-    bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0)
+    # A leased (or cold-certificate) bond cannot authorize sales: no owner key.
+    bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0, private_key=None)
+    with pytest.raises(MarketSalesUnavailableError, match="owned fidelity bond"):
+        await sales._ensure_seller()
+    bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0, private_key=object())
     with pytest.raises(MarketSalesUnavailableError, match="activate-market-ledger"):
         await sales._ensure_seller()
     assert not get_market_store_path(tmp_path).exists()
@@ -390,7 +394,7 @@ async def test_started_seller_gets_the_routed_invoices_backing_and_sale_check(
 
     sales, bot, *_ = _sales(tmp_path)
     sales._seller = None
-    bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0)
+    bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0, private_key=object())
     with MarketStore(get_market_store_path(tmp_path), wallet_id=bot.wallet.market_wallet_id) as s:
         s.activate_wallet(get_used_commitments_path(tmp_path), history_confirmed=True)
     (tmp_path / "tls.cert").write_bytes(b"cert")
@@ -640,7 +644,7 @@ async def test_each_rented_bond_gets_its_own_authority_and_changes_rebuild_the_s
     assert len(started) == 2 and started[1][1]["additional"] == []
     # With PoDLE sales too, the advertised bond sells PoDLEs and the others are rented.
     bot.config.sell_podle = True
-    bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0)
+    bot.fidelity_bond = SimpleNamespace(txid="11" * 32, vout=0, private_key=object())
     await sales._ensure_seller()
     args, kwargs = started[2]
     assert (args[2].bond.txid, args[2].products) == ("11" * 32, ["podle"])

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -1317,9 +1317,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                         f"Selected fidelity bond {sel_txid[:16]}...:{sel_vout} is leased, "
                         "falling back to best available"
                     )
-                    self.fidelity_bond = await get_best_fidelity_bond(
-                        self.wallet, current_block_height=self.current_block_height, exclude=leased
-                    )
+                    self.fidelity_bond = await self._best_fidelity_bond(leased)
                 elif self.fidelity_bond:
                     logger.bind(sensitive=True).info(
                         f"Using selected fidelity bond: {sel_txid[:16]}...:{sel_vout}, "
@@ -1334,14 +1332,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                         f"Selected fidelity bond {sel_txid[:16]}...:{sel_vout} not found, "
                         "falling back to best available"
                     )
-                    self.fidelity_bond = await get_best_fidelity_bond(
-                        self.wallet, current_block_height=self.current_block_height, exclude=leased
-                    )
+                    self.fidelity_bond = await self._best_fidelity_bond(leased)
             else:
                 # Auto-select the best (largest bond value) fidelity bond
-                self.fidelity_bond = await get_best_fidelity_bond(
-                    self.wallet, current_block_height=self.current_block_height, exclude=leased
-                )
+                self.fidelity_bond = await self._best_fidelity_bond(leased)
+            if self.fidelity_bond is not None and self.config.lease_bond:
+                try:
+                    ensure_fidelity_bond_certificate_valid(
+                        self.fidelity_bond, self.current_block_height
+                    )
+                except ExpiredFidelityBondCertificateError:
+                    self.release_expired_bond()
             if self.fidelity_bond:
                 ensure_fidelity_bond_certificate_valid(
                     self.fidelity_bond,
@@ -1552,7 +1553,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             rescan_task = asyncio.create_task(self._periodic_rescan())
             self.listen_tasks.append(rescan_task)
 
-            if self.bond_lease_guard is not None and self.fidelity_bond is not None:
+            if self.bond_lease_guard is not None and (
+                self.fidelity_bond is not None or self.config.lease_bond
+            ):
                 self.listen_tasks.append(
                     asyncio.create_task(
                         self.bond_lease_guard.run(
@@ -1948,10 +1951,15 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.current_block_height = await self.backend.get_block_height()
         logger.debug(f"Updated block height: {self.current_block_height}")
         if self.fidelity_bond is not None:
-            ensure_fidelity_bond_certificate_valid(
-                self.fidelity_bond,
-                self.current_block_height,
-            )
+            try:
+                ensure_fidelity_bond_certificate_valid(
+                    self.fidelity_bond,
+                    self.current_block_height,
+                )
+            except ExpiredFidelityBondCertificateError:
+                if not self.config.lease_bond:
+                    raise
+                self.release_expired_bond()
 
         # Update pending history immediately after sync (in case of restart)
         await self._update_pending_history()
@@ -2189,6 +2197,50 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         delivery = generation.offer_delivery
         delivery.queue(clients, self._public_offer_payloads(generation.current_offers))
         await delivery.flush(clients)
+
+    async def _best_fidelity_bond(
+        self, exclude: Collection[tuple[str, int]]
+    ) -> FidelityBondInfo | None:
+        """The best usable bond; with ``lease_bond``, None when every certificate expired."""
+        try:
+            return await get_best_fidelity_bond(
+                self.wallet, current_block_height=self.current_block_height, exclude=exclude
+            )
+        except ExpiredFidelityBondCertificateError:
+            if not self.config.lease_bond:
+                raise
+            logger.warning("Every fidelity bond certificate has expired; leasing a bond instead")
+            return None
+
+    def release_expired_bond(self) -> None:
+        """Stop advertising a bond whose certificate expired, so one can be leased.
+
+        Only with ``lease_bond``: otherwise an expired certificate stops the maker.
+        """
+        logger.warning(
+            "The fidelity bond certificate has expired; offers carry no bond proof "
+            "until a new lease is bought"
+        )
+        self.fidelity_bond = None
+
+    async def adopt_leased_bond(self, bond: FidelityBondInfo, height: int) -> None:
+        """Advertise a newly leased bond while no other bond is advertised.
+
+        Owned bonds are chosen only at startup, so this never replaces one.
+        """
+        if self.fidelity_bond is not None:
+            raise ValueError("a fidelity bond is already advertised")
+        self.fidelity_bond = bond
+        if self.bond_lease_guard is not None:
+            # Proofs wait until the guard has recorded the bond as advertised.
+            await self.bond_lease_guard.refresh([bond], height, advertising=bond)
+        logger.info(
+            f"Advertising a leased fidelity bond until block {(bond.cert_expiry or 0) * 2016}"
+        )
+        logger.bind(sensitive=True).info(
+            f"Leased fidelity bond {bond.txid[:16]}...:{bond.vout}, value={bond.value:,} sats, "
+            f"bond_value={bond.bond_value:,}"
+        )
 
     def _advertised_bond(self) -> FidelityBondInfo | None:
         """The selected bond, unless the lease guard forbids advertising it now."""

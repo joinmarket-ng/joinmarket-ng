@@ -225,7 +225,14 @@ class MarketSales:
         config = self._bot.config
         height = await wallet.backend.get_block_height()
         period = period_at_height(height)
-        podle_bond = self._bot.fidelity_bond if config.sell_podle else None
+        # Only the owner key of the advertised bond can authorize sales: never
+        # a leased bond or one advertised with a cold certificate.
+        advertised = self._bot.fidelity_bond
+        podle_bond = (
+            advertised
+            if config.sell_podle and advertised is not None and advertised.private_key is not None
+            else None
+        )
         rentals = await self._rentals(height) if config.rent_bonds else []
         served = (
             None if podle_bond is None else (podle_bond.txid, podle_bond.vout),
@@ -252,7 +259,9 @@ class MarketSales:
                 else "no idle fidelity bond can be rented now"
             )
         if config.sell_podle and podle_bond is None:
-            self._note("PoDLE sales need an advertised fidelity bond; only renting bonds")
+            self._note(
+                "PoDLE sales need an advertised bond owned by this wallet; only renting bonds"
+            )
         self._require_ledger(wallet)
         nodes = config.channel_ring.nodes
         if not nodes:

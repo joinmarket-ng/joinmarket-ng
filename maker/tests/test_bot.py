@@ -1541,6 +1541,83 @@ class TestWalletRescanAndOfferUpdate:
 
         maker_bot.offer_manager.create_offers.assert_not_awaited()
 
+    @staticmethod
+    def _leased_bond(test_private_key, test_pubkey, *, cert_expiry: int = 400) -> FidelityBondInfo:
+        return FidelityBondInfo(
+            txid="c" * 64,
+            vout=2,
+            value=50_000_000,
+            locktime=2_000_000_000,
+            confirmation_time=1_700_000_000,
+            bond_value=25_000,
+            pubkey=test_pubkey,
+            cert_pubkey=test_pubkey,
+            cert_privkey=test_private_key,
+            cert_signature=b"certificate-signature",
+            cert_expiry=cert_expiry,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resync_with_lease_bond_stops_advertising_an_expired_certificate(
+        self, maker_bot, test_private_key, test_pubkey
+    ):
+        maker_bot.config.lease_bond = True
+        maker_bot.fidelity_bond = self._leased_bond(test_private_key, test_pubkey)
+
+        await maker_bot._resync_wallet_and_update_offers()
+
+        assert maker_bot.fidelity_bond is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("all_expired", [False, True])
+    async def test_start_with_lease_bond_runs_without_an_expired_certificate(
+        self, maker_bot, mock_wallet, test_private_key, test_pubkey, tmp_path, all_expired
+    ):
+        from jmwallet.wallet.bond_registry import BondRegistry
+
+        maker_bot.config.data_dir = tmp_path
+        maker_bot.config.lease_bond = True
+        mock_wallet.data_dir = tmp_path
+        mock_wallet.wallet_fingerprint = "deadbeef"
+        expired = self._leased_bond(test_private_key, test_pubkey)
+        best = (
+            AsyncMock(side_effect=ExpiredFidelityBondCertificateError("expired"))
+            if all_expired
+            else AsyncMock(return_value=expired)
+        )
+        maker_bot.offer_manager.create_offers = AsyncMock(side_effect=RuntimeError("offers"))
+
+        with (
+            patch("jmwallet.wallet.bond_registry.load_registry", return_value=BondRegistry()),
+            patch("maker.bot.get_best_fidelity_bond", new=best),
+        ):
+            with pytest.raises(RuntimeError, match="offers"):
+                await maker_bot.start()
+
+        # Offers are created without a bond, for the lease buyer to fill in.
+        maker_bot.offer_manager.create_offers.assert_awaited()
+        assert maker_bot.fidelity_bond is None
+
+    @pytest.mark.asyncio
+    async def test_a_leased_bond_is_adopted_only_without_a_bond_and_recorded_first(
+        self, maker_bot, test_private_key, test_pubkey, tmp_path
+    ):
+        from maker.bond_leases import BondLeaseGuard, read_advertisements
+
+        guard = BondLeaseGuard(tmp_path / "market" / "seller.sqlite", "regtest")
+        (tmp_path / "market").mkdir()
+        maker_bot.bond_lease_guard = guard
+        bond = self._leased_bond(test_private_key, test_pubkey)
+
+        await maker_bot.adopt_leased_bond(bond, 4033)
+
+        assert maker_bot.fidelity_bond is bond
+        record = read_advertisements(guard.record_path)
+        assert record is not None and record.through((bond.txid, bond.vout)) == 3
+        assert maker_bot._advertised_bond() is bond
+        with pytest.raises(ValueError, match="already advertised"):
+            await maker_bot.adopt_leased_bond(bond, 4033)
+
     @pytest.mark.asyncio
     async def test_start_filters_registry_bonds_by_wallet_network(
         self,
