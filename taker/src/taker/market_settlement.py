@@ -19,7 +19,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from bitcointx.core.key import CKey
 from jmcore.credential_market import MarketError
@@ -180,6 +180,11 @@ SaleCheck = Callable[[HoldInvoice], Awaitable[bool]]
 """Whether a held sale is still deliverable; ``False`` refunds it, raising retries later."""
 
 
+SellerKey: TypeAlias = CKey | BoundMarketKeys
+SellerKeyResolver: TypeAlias = Callable[[HoldInvoice], SellerKey]
+"""The key of the seller authority that quoted a hold, for a runtime serving several."""
+
+
 class MarketSettlement:
     """Reconcile every unfinished hold invoice of one store with its LND node.
 
@@ -190,7 +195,7 @@ class MarketSettlement:
         self,
         store: MarketStore,
         invoices: HoldInvoiceBackend,
-        seller_key: CKey | BoundMarketKeys,
+        seller_key: SellerKey | SellerKeyResolver,
         block_height: Callable[[], Awaitable[int]],
         *,
         credential_provider: CredentialProvider | None = None,
@@ -200,6 +205,10 @@ class MarketSettlement:
         self.store = store
         self.invoices = invoices
         self.seller_key = seller_key
+        if isinstance(seller_key, CKey | BoundMarketKeys):
+            self._seller_key_for: SellerKeyResolver = lambda _hold: seller_key
+        else:
+            self._seller_key_for = seller_key
         self.block_height = block_height
         self.credential_provider = credential_provider
         self.sale_check = sale_check
@@ -292,7 +301,7 @@ class MarketSettlement:
                 # refund deadline below still applies.
                 logger.warning("Market credential provider failed: {}", type(exc).__name__)
         try:
-            self.store.finalize(hold.quote_id, self.seller_key, self._now(), height)
+            self.store.finalize(hold.quote_id, self._seller_key_for(hold), self._now(), height)
         except MarketStoreExpiredError:
             await self._refund(hold, "quote can no longer be delivered")
             return

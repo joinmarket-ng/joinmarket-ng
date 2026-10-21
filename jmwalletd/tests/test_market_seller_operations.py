@@ -20,7 +20,7 @@ import taker.wallet_market as wallet_market
 from jmcore.bitcoin import hash160
 from jmcore.btc_script import derive_bond_address
 from jmcore.constants import GENESIS_BLOCK_HASHES
-from jmcore.credential_market import BondCredential, SignedDocument
+from jmcore.credential_market import BondCredential, MarketError, SignedDocument
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_store import MarketStore, MarketStoreError
 from jmcore.models import NetworkType
@@ -643,3 +643,92 @@ async def test_settlement_cannot_finalize_after_lifecycle_change(
 
     backend.close.assert_not_awaited()
     backend.broadcast_transaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_additional_bond_authority_sells_a_lease_of_its_own_bond(
+    tmp_path: Path,
+) -> None:
+    """One runtime serves two bonds; each hold settles under the authority that quoted it."""
+    wallet, _backend, advertised = _wallet(tmp_path)
+    idle_locktime = _LOCKTIME + 31 * 86_400  # the next month start
+    idle = ExternalPoDLEOutpoint(txid="22" * 32, vout=0)
+    idle_key = wallet.get_fidelity_bond_key(0, idle_locktime)
+    address = derive_bond_address(
+        idle_key.get_public_key_bytes(compressed=True), idle_locktime, "regtest"
+    )
+    wallet.utxo_cache[0].append(
+        UTXOInfo(
+            txid=idle.txid,
+            vout=idle.vout,
+            value=_BOND_VALUE,
+            address=address.address,
+            confirmations=6,
+            scriptpubkey=address.scriptpubkey.hex(),
+            path=f"{wallet.root_path}/0'/2/{timestamp_to_timenumber(idle_locktime)}",
+            mixdepth=0,
+            locktime=idle_locktime,
+            frozen=True,
+        )
+    )
+    _activate_ledger(wallet)
+    options = wallet_market.WalletMarketSellerOptions
+    seller = WalletMarketSeller(
+        wallet,
+        _settings(tmp_path),
+        options(bond=advertised, products=["podle"], price_sats=_PRICE_SATS),
+        additional=[options(bond=idle, products=["bond"], price_sats=_PRICE_SATS)],
+    )
+    with pytest.raises(ValueError, match="own bond"):
+        WalletMarketSeller(
+            wallet,
+            _settings(tmp_path),
+            options(bond=advertised, products=["podle"], price_sats=1),
+            additional=[options(bond=advertised, products=["bond"], price_sats=1)],
+        )
+    try:
+        await seller.start()
+        # Each authority relays under its own nick.
+        assert len(_MemoryTransport.instances) == 2
+        [record] = seller._additional
+        assert record.transport is _MemoryTransport.instances[1]
+        with pytest.raises(MarketError, match="Bond product"):
+            seller.add_bond_inventory()  # the first authority sells PoDLEs only
+        seller.add_bond_inventory(idle)
+
+        renter_certificate = bytes(CKey(b"\x03" * 32).pub).hex()
+        responder = _MemoryTransport.instances[1].kwargs["responder"]
+        response = await responder(  # type: ignore[operator]
+            "synthetic-buyer",
+            {
+                "action": "quote",
+                "request_id": "01" * 16,
+                "buyer_pubkey": bytes(PrivateKey.generate().public_key).hex(),
+                "product": "bond",
+                "certificate_pubkey": renter_certificate,
+                "rail": "lightning",
+                "max_price_sats": _PRICE_SATS,
+            },
+        )
+        quote = SignedDocument.model_validate(response["quote"])
+        assert seller.pending_quotes() == [quote]
+
+        [invoices] = _INVOICES
+        payment_hash = invoices.pay(quote)
+        await _settle_pass(seller)
+        assert invoices.invoices[payment_hash].state is InvoiceState.SETTLED
+        assert seller._service is not None
+        package = seller._service.store.get_package(str(quote.body["quote_id"]))
+        assert package is not None
+        credential = package.verify()
+        assert isinstance(credential, BondCredential)
+        lease = credential.verify()
+        assert credential.cert_pubkey == renter_certificate
+        assert lease.bond == credential.bond
+        assert (credential.bond.outpoint, credential.bond.locktime) == (idle, idle_locktime)
+
+        await seller.stop()
+        assert [transport.close_calls for transport in _MemoryTransport.instances] == [1, 1]
+    finally:
+        await seller.stop()
+        await wallet.close()

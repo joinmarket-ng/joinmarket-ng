@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from jmcore import experimental
 from jmcore.credential_market import (
+    MarketAuthorization,
     MarketError,
     MarketQuote,
     SignedDocument,
@@ -18,9 +22,16 @@ from jmcore.credential_market import (
 )
 from jmcore.crypto import NickIdentity
 from jmcore.experimental import warn_experimental
-from jmcore.external_podle import ExternalPoDLE
+from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_faults import MarketFaultCache
-from jmcore.market_store import BackingLookup, MarketStore, MarketStoreUnavailableError
+from jmcore.market_keys import BoundMarketKeys
+from jmcore.market_store import (
+    BackingLookup,
+    HoldInvoice,
+    MarketStore,
+    MarketStoreError,
+    MarketStoreUnavailableError,
+)
 from jmcore.paths import get_market_store_path, get_used_commitments_path
 from jmcore.protocol import JM_VERSION, NOT_SERVING_ONION_HOSTNAME
 from jmcore.settings import JoinMarketSettings
@@ -37,8 +48,24 @@ from taker.market_settlement import (
 from taker.market_transport import MarketTransport
 
 
+@dataclass
+class _Authority:
+    """One additional bond authority: its own service and its own relay nick."""
+
+    options: WalletMarketSellerOptions
+    keys: BoundMarketKeys
+    service: MarketService
+    transport: MarketTransport
+
+
 class WalletMarketSeller:
-    """Own one seller runtime without taking ownership of its wallet or backend."""
+    """Own one seller runtime without taking ownership of its wallet or backend.
+
+    The runtime serves ``options`` and any ``additional`` bond authorities, each
+    under its own nick, over one store, one invoice client, and one settlement
+    reconciler, which finalizes each hold with the key of the authority that
+    quoted it.
+    """
 
     def __init__(
         self,
@@ -49,12 +76,14 @@ class WalletMarketSeller:
         invoices: AbstractAsyncContextManager[HoldInvoiceBackend] | None = None,
         backing_sats: BackingLookup | None = None,
         sale_check: SaleCheck | None = None,
+        additional: Sequence[WalletMarketSellerOptions] = (),
     ) -> None:
         """``invoices`` replaces the ``[market]`` LND node; this seller enters and closes it.
 
         ``backing_sats`` replaces the wallet-cache backing lookup and restricts
         PoDLE sales to inventory it values, for example one mixdepth's coins.
         ``sale_check`` is asked before each held payment is settled.
+        ``additional`` lists further bonds to serve, one authority and nick each.
         """
         wallet_data_dir = wallet.data_dir
         if not isinstance(wallet_data_dir, Path):
@@ -69,6 +98,13 @@ class WalletMarketSeller:
             raise ValueError("Wallet and market seller must use the same network")
 
         snapshot = WalletMarketSellerOptions.model_validate(options.model_dump(mode="json"))
+        extra = tuple(
+            WalletMarketSellerOptions.model_validate(option.model_dump(mode="json"))
+            for option in additional
+        )
+        bonds = [snapshot.bond, *(option.bond for option in extra)]
+        if len({(bond.txid, bond.vout) for bond in bonds}) != len(bonds):
+            raise ValueError("Each seller authority needs its own bond")
         self.wallet = wallet
         self.settings = settings
         self._data_dir = wallet_data_dir.resolve()
@@ -76,6 +112,7 @@ class WalletMarketSeller:
         self._products = tuple(snapshot.products)
         self._price_sats = snapshot.price_sats
         self._quote_ttl = snapshot.quote_ttl
+        self._additional_options = extra
         self._invoice_client = invoices
         self._custom_backing = backing_sats
         self._sale_check = sale_check
@@ -90,6 +127,8 @@ class WalletMarketSeller:
         self._store: MarketStore | None = None
         self._service: MarketService | None = None
         self._transport: MarketTransport | None = None
+        self._keys: BoundMarketKeys | None = None
+        self._additional: list[_Authority] = []
         self._fault_cache: MarketFaultCache | None = None
         self._nickname: str | None = None
         self._seller_public_key: str | None = None
@@ -178,33 +217,93 @@ class WalletMarketSeller:
             raise RuntimeError("Wallet market seller stopped during startup")
 
         fault_cache = MarketFaultCache(self._data_dir)
-        service = MarketService(
-            store,
-            authorization,
-            bound_keys,
-            bound_keys,
-            self.wallet.backend,
-            invoices,
+        self._fault_cache = fault_cache
+        primary = WalletMarketSellerOptions(
+            bond=self._bond,
             products=list(self._products),
             price_sats=self._price_sats,
             quote_ttl=self._quote_ttl,
-            fault_cache=fault_cache,
-            backing_sats=self._custom_backing or self._backing_sats,
-            require_backing=self._custom_backing is not None,
         )
-        self._fault_cache = fault_cache
+        service = self._new_service(
+            store, invoices, fault_cache, authorization, bound_keys, primary
+        )
         self._service = service
+        self._keys = bound_keys
         self._seller_public_key = bound_keys.signing_public_key().hex()
         settlement = MarketSettlement(
             store,
             invoices,
-            bound_keys,
+            self._seller_key_for,
             lambda: self.wallet.backend.get_block_height(),
             credential_provider=self._provide_credential,
             sale_check=self._sale_check,
         )
 
-        transport = MarketTransport(
+        transport = self._new_transport(bound_keys, self._listing_callback, self._respond_callback)
+        self._transport = transport
+        self._nickname = transport.nick
+        for options in self._additional_options:
+            keys, document = await self.wallet.create_market_authorization(options.bond)
+            if self._closed:
+                raise RuntimeError("Wallet market seller stopped during startup")
+            extra = self._new_service(store, invoices, fault_cache, document, keys, options)
+            self._additional.append(
+                _Authority(
+                    options=options,
+                    keys=keys,
+                    service=extra,
+                    transport=self._new_transport(
+                        keys,
+                        functools.partial(self._listing_for, extra),
+                        functools.partial(self._respond_for, extra),
+                    ),
+                )
+            )
+        warn_experimental([experimental.CREDENTIAL_MARKET], str(self.wallet.network))
+
+        # The configured timeout governs Tor relay connection setup. Wallet bond
+        # verification remains outside this window so it completes its full chain check.
+        for relay in [transport, *(record.transport for record in self._additional)]:
+            async with asyncio.timeout(self.settings.tor.connection_timeout):
+                await relay.start()
+            if self._closed:
+                raise RuntimeError("Wallet market seller stopped during startup")
+        self._running = True
+        self._settlement = settlement
+        self._settlement_task = asyncio.create_task(settlement.run())
+
+    def _new_service(
+        self,
+        store: MarketStore,
+        invoices: HoldInvoiceBackend,
+        fault_cache: MarketFaultCache,
+        authorization: SignedDocument,
+        keys: BoundMarketKeys,
+        options: WalletMarketSellerOptions,
+    ) -> MarketService:
+        return MarketService(
+            store,
+            authorization,
+            keys,
+            keys,
+            self.wallet.backend,
+            invoices,
+            products=list(options.products),
+            price_sats=options.price_sats,
+            quote_ttl=options.quote_ttl,
+            fault_cache=fault_cache,
+            backing_sats=self._custom_backing or self._backing_sats,
+            require_backing=self._custom_backing is not None,
+        )
+
+    def _new_transport(
+        self,
+        keys: BoundMarketKeys,
+        listing: Callable[[], Awaitable[bytes]],
+        responder: Callable[[str, dict[str, object]], Awaitable[dict[str, object]]],
+    ) -> MarketTransport:
+        """A relay-only transport under a fresh nick, so authorities stay unlinked."""
+        return MarketTransport(
             directory_servers=self.settings.get_directory_servers(),
             network=self.settings.network_config.network.value,
             nick_identity=NickIdentity(JM_VERSION),
@@ -214,26 +313,13 @@ class WalletMarketSeller:
             stream_isolation=True,
             nick_auth_mode=self.settings.network_config.nick_auth_mode,
             nick_auth_directory_ids=self.settings.network_config.nick_auth_directory_ids,
-            encryption_private_key=bound_keys,
-            listing_callback=self._listing_callback,
-            responder=self._respond_callback,
+            encryption_private_key=keys,
+            listing_callback=listing,
+            responder=responder,
             on_fault=self._fault_callback,
             direct_location=NOT_SERVING_ONION_HOSTNAME,
             allow_clearnet_connections=self.settings.network_config.allow_clearnet_connections,
         )
-        self._transport = transport
-        self._nickname = transport.nick
-        warn_experimental([experimental.CREDENTIAL_MARKET], str(self.wallet.network))
-
-        # The configured timeout governs Tor relay connection setup. Wallet bond
-        # verification remains outside this window so it completes its full chain check.
-        async with asyncio.timeout(self.settings.tor.connection_timeout):
-            await transport.start()
-        if self._closed:
-            raise RuntimeError("Wallet market seller stopped during startup")
-        self._running = True
-        self._settlement = settlement
-        self._settlement_task = asyncio.create_task(settlement.run())
 
     def _backing_sats(self, txid: str, vout: int) -> int | None:
         """The value of a confirmed wallet UTXO backing a PoDLE, from the wallet cache."""
@@ -243,14 +329,30 @@ class WalletMarketSeller:
                     return utxo.value if utxo.confirmations > 0 else None
         return None
 
-    def set_price_sats(self, price_sats: int) -> None:
-        """Price later listings and quotes at ``price_sats``."""
-        snapshot = WalletMarketSellerOptions(
-            bond=self._bond, products=list(self._products), price_sats=price_sats
+    def set_price_sats(self, price_sats: int, *, bond: ExternalPoDLEOutpoint | None = None) -> None:
+        """Price later listings and quotes of ``bond``'s authority (the first by default)."""
+        if bond is None or (bond.txid, bond.vout) == (self._bond.txid, self._bond.vout):
+            snapshot = WalletMarketSellerOptions(
+                bond=self._bond, products=list(self._products), price_sats=price_sats
+            )
+            self._price_sats = snapshot.price_sats
+            if self._service is not None:
+                self._service.price_sats = snapshot.price_sats
+            return
+        record = self._additional_authority(bond)
+        record.options = WalletMarketSellerOptions(
+            bond=bond,
+            products=list(record.options.products),
+            price_sats=price_sats,
+            quote_ttl=record.options.quote_ttl,
         )
-        self._price_sats = snapshot.price_sats
-        if self._service is not None:
-            self._service.price_sats = snapshot.price_sats
+        record.service.price_sats = record.options.price_sats
+
+    def _additional_authority(self, bond: ExternalPoDLEOutpoint) -> _Authority:
+        for record in self._additional:
+            if (record.options.bond.txid, record.options.bond.vout) == (bond.txid, bond.vout):
+                return record
+        raise MarketError("This seller does not serve that bond")
 
     def _callbacks_available(self) -> bool:
         return self._running and not self._closed
@@ -263,6 +365,17 @@ class WalletMarketSeller:
             get_used_commitments_path(self._data_dir, create=False)
         )
         return self._service
+
+    def _services(self) -> list[MarketService]:
+        """Every served authority's service, the first one first."""
+        primary = self._local_service()
+        return [primary, *(record.service for record in self._additional)]
+
+    def _served(self, authority: MarketAuthorization) -> MarketService | None:
+        for service in self._services():
+            if service.authority == authority:
+                return service
+        return None
 
     def add_podle_inventory(self, credential: ExternalPoDLE) -> None:
         """Record an externally supplied opening without exposing a spending key."""
@@ -280,22 +393,53 @@ class WalletMarketSeller:
         credential = store.hold_inventory_credential(payment_hash)
         return None if credential is None else ExternalPoDLE.model_validate(credential)
 
-    def add_bond_inventory(self) -> None:
+    def add_bond_inventory(self, bond: ExternalPoDLEOutpoint | None = None) -> None:
+        """Stock one lease of ``bond``'s authority (the first by default) for its period."""
         service = self._local_service()
-        if "bond" not in self._products:
+        if bond is not None and (bond.txid, bond.vout) != (self._bond.txid, self._bond.vout):
+            record = self._additional_authority(bond)
+            record.service._validate_bound_keys()
+            products: Sequence[str] = record.options.products
+            service = record.service
+        else:
+            products = self._products
+        if "bond" not in products:
             raise MarketError("Bond product is unavailable")
         service.store.add_inventory(
             "bond", bond_resource(service.authority.bond, service.authority.period), None
         )
 
     def pending_quotes(self) -> list[SignedDocument]:
-        service = self._local_service()
+        services = self._services()
+        authorities = [service.authority for service in services]
         return [
             document
-            for document in service.store.pending(int(time.time()))
+            for document in services[0].store.pending(int(time.time()))
             if verify_authorization(MarketQuote.model_validate(document.body).authorization)
-            == service.authority
+            in authorities
         ]
+
+    def _seller_key_for(self, hold: HoldInvoice) -> BoundMarketKeys:
+        """The key of the authority that quoted ``hold``.
+
+        A quote of an authority not served now (an earlier period or run) gets
+        the first authority's key, so the store still refunds an expired one.
+        """
+        keys, store = self._keys, self._store
+        if keys is None or store is None:
+            raise MarketStoreUnavailableError("Wallet market seller is unavailable")
+        if self._additional:
+            try:
+                document = store.get_quote(hold.quote_id)
+                authority = verify_authorization(
+                    MarketQuote.model_validate(document.body).authorization
+                )
+            except (MarketError, MarketStoreError, ValueError):
+                return keys
+            for record in self._additional:
+                if record.service.authority == authority:
+                    return record.keys
+        return keys
 
     async def _provide_credential(self, quote_id: str) -> None:
         """Sign the bond lease for an accepted bond quote with this wallet.
@@ -303,34 +447,45 @@ class WalletMarketSeller:
         Called by the settlement reconciler once the buyer's payment is held.
         Every await is followed by runtime, key, and ledger validation.
         """
-        service = self._local_service()
-        quote = service.store.get_quote(quote_id).verified(
-            MarketQuote, service.authority.seller_pubkey
-        )
+        store = self._local_service().store
+        document = store.get_quote(quote_id)
+        authority = verify_authorization(MarketQuote.model_validate(document.body).authorization)
+        quote = document.verified(MarketQuote, authority.seller_pubkey)
         if quote.product != "bond":
             return
-        if verify_authorization(quote.authorization) != service.authority:
+        service = self._served(authority)
+        if service is None:
             raise MarketError("Quote does not belong to this seller authority")
+        service._validate_bound_keys()
         if quote.certificate_pubkey is None:
             raise MarketError("Bond quote has no renter certificate key")
         credential = await self.wallet.create_market_bond_credential(
             quote.authorization, quote.certificate_pubkey
         )
         self._local_service()
-        service.store.attach_credential(quote_id, credential.model_dump(mode="json"))
+        service._validate_bound_keys()
+        store.attach_credential(quote_id, credential.model_dump(mode="json"))
 
     async def _listing_callback(self) -> bytes:
-        if not self._callbacks_available() or self._service is None:
+        return await self._listing_for(self._service)
+
+    async def _listing_for(self, service: MarketService | None) -> bytes:
+        if not self._callbacks_available() or service is None:
             raise MarketError("Wallet market seller is unavailable")
-        listing = await self._service.listing()
+        listing = await service.listing()
         if not self._callbacks_available():
             raise MarketError("Wallet market seller is unavailable")
         return listing
 
     async def _respond_callback(self, sender: str, body: dict[str, object]) -> dict[str, object]:
-        if not self._callbacks_available() or self._service is None:
+        return await self._respond_for(self._service, sender, body)
+
+    async def _respond_for(
+        self, service: MarketService | None, sender: str, body: dict[str, object]
+    ) -> dict[str, object]:
+        if not self._callbacks_available() or service is None:
             return {"error": "unavailable"}
-        response = await self._service.respond(sender, body)
+        response = await service.respond(sender, body)
         if not self._callbacks_available():
             return {"error": "unavailable"}
         return response
@@ -340,7 +495,7 @@ class WalletMarketSeller:
             self._fault_cache.ingest(raw)
 
     async def _cleanup_owned_resources(self) -> None:
-        """Stop settlement, close transport then store, keeping failed closes for retry."""
+        """Stop settlement, close transports then store, keeping failed closes for retry."""
         async with self._cleanup_lock:
             close_error: BaseException | None = None
             settlement_task, self._settlement_task = self._settlement_task, None
@@ -356,6 +511,14 @@ class WalletMarketSeller:
                         close_error = exc
                     else:
                         self._transport = None
+                failed: list[_Authority] = []
+                for record in self._additional:
+                    try:
+                        await record.transport.close()
+                    except BaseException as exc:
+                        close_error = close_error or exc
+                        failed.append(record)
+                self._additional = failed
             finally:
                 try:
                     # Release the invoice client and the seller-runtime lock.
@@ -371,8 +534,9 @@ class WalletMarketSeller:
                             close_error = exc
                     else:
                         self._store = None
-            if self._transport is None and self._store is None:
+            if self._transport is None and not self._additional and self._store is None:
                 self._service = None
+                self._keys = None
                 self._fault_cache = None
             if close_error is not None:
                 raise close_error
