@@ -163,6 +163,14 @@ server's vendored `torrc` enables introduction-point rate limiting
 unconditionally and ships the PoW options commented out, because Tor refuses
 to start when they are set on a build without the module.
 
+Introduction limits and PoW only price new rendezvous circuits. A client can
+open any number of connections over one circuit, so a sybil flood can hold
+thousands of directory peers on a handful of circuits without paying either
+cost. Both the maker's ephemeral onion and the directory's vendored `torrc`
+therefore cap concurrent streams per rendezvous circuit at ten and close a
+circuit that exceeds it. Honest peers open one connection per circuit; the
+headroom covers several bots sharing one Tor client without stream isolation.
+
 ### Wallet Daemon Admission
 
 Create, recover, and unlock share a serialized lifecycle with at most eight

@@ -12,6 +12,12 @@ HiddenServicePort 5222 directory_server:5222
 HiddenServiceEnableIntroDoSDefense 1
 HiddenServiceEnableIntroDoSRatePerSec 25
 HiddenServiceEnableIntroDoSBurstPerSec 200
+# Streams per rendezvous circuit: honest peers open one connection per
+# circuit, while a sybil flood can multiplex thousands of connections over a
+# few circuits and so bypass introduction limits and PoW. Exceeding the limit
+# closes the whole circuit, forcing the client to pay for a new introduction.
+HiddenServiceMaxStreams 10
+HiddenServiceMaxStreamsCloseCircuit 1
 
 # Proof of work (Tor 0.4.8+): clients must solve a puzzle whose effort scales
 # with the rendezvous backlog, so a flood costs the attacker CPU. The effort
