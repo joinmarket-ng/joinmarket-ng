@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import sys
 import tomllib
 from enum import StrEnum
 from pathlib import Path
@@ -16,9 +17,9 @@ from jmcore.config_file import ConfigFileError, ConfigScalar, update_config_valu
 from jmcore.constants import BITCOIN_RPC_PORTS
 from jmcore.models import NetworkType
 from jmcore.paths import get_default_data_dir
-from jmcore.secure_files import read_sensitive_file
-from jmcore.settings import validate_config_document
-from pydantic import ValidationError
+from jmcore.secure_files import read_private_file, read_sensitive_file
+from jmcore.settings import JoinMarketSettings, validate_config_document
+from pydantic import SecretStr, ValidationError
 
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
 
@@ -27,6 +28,12 @@ class LightningMode(StrEnum):
     OFF = "off"
     MANAGED = "managed"
     MANUAL = "manual"
+
+
+class WalletAction(StrEnum):
+    EXISTING = "existing"
+    GENERATE = "generate"
+    IMPORT = "import"
 
 
 def _config_path(data_dir: Path | None, config_file: Path | None) -> Path:
@@ -117,11 +124,48 @@ def setup(
         bool,
         typer.Option("--configure-only", help="Configure only; do not create wallets or nodes"),
     ] = False,
+    wallet_action: Annotated[
+        WalletAction | None,
+        typer.Option("--wallet-action", help="Explicit existing, generate, or import selection"),
+    ] = None,
+    wallet_file: Annotated[
+        Path | None, typer.Option("--wallet-file", help="Selected mnemonic file or new destination")
+    ] = None,
+    wallet_password_file: Annotated[
+        Path | None,
+        typer.Option("--wallet-password-file", help="Private file holding the encryption password"),
+    ] = None,
+    import_mnemonic_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--import-mnemonic-file", help="Private plaintext BIP39 source for explicit import"
+        ),
+    ] = None,
+    resume_wallet_publication: Annotated[
+        bool,
+        typer.Option(
+            "--resume-wallet-publication", help="Resume a matching setup journal; never regenerate"
+        ),
+    ] = False,
+    confirm_import_recovery: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-import-recovery",
+            help="Allow missing import metadata to be published as recovery pending",
+        ),
+    ] = False,
+    show_generated_seed: Annotated[
+        bool,
+        typer.Option(
+            "--show-generated-seed",
+            help="Explicitly disclose a completed generated seed, including to redirected output",
+        ),
+    ] = False,
 ) -> None:
     """Configure the standard setup without assuming wallet freshness.
 
-    This stage creates no wallet or node and performs no backend or credential
-    lookup. Existing values remain authoritative unless selected for editing.
+    Configure-only and dry-run never access wallet secrets. Wallet creation or
+    import requires an explicit choice; this stage never starts Lightning nodes.
     """
     path = _config_path(data_dir, config_file)
     try:
@@ -228,7 +272,221 @@ def setup(
     if configure_only:
         typer.echo("Configuration only; wallet and node state unchanged.")
         return
-    typer.echo("Configuration stage complete; wallet and Lightning provisioning was not performed.")
+    if wallet_action is None:
+        if yes:
+            typer.echo(
+                "Configuration stage complete; no wallet action selected. "
+                "Wallet and nodes unchanged."
+            )
+            return
+        wallet_action = WalletAction(
+            typer.prompt(
+                "Wallet action (existing/generate/import)",
+                default=WalletAction.EXISTING.value,
+                type=Choice([item.value for item in WalletAction]),
+            )
+        )
+    _wallet_stage(
+        path,
+        planned,
+        wallet_action,
+        wallet_file=wallet_file,
+        password_file=wallet_password_file,
+        import_file=import_mnemonic_file,
+        resume=resume_wallet_publication,
+        confirm_import_recovery=confirm_import_recovery,
+        show_seed=show_generated_seed,
+        interactive=not yes,
+        data_dir=data_dir,
+    )
+    typer.echo("Wallet stage complete; Lightning provisioning was not performed.")
+
+
+def _wallet_password(path: Path | None, *, interactive: bool, confirm: bool) -> SecretStr:
+    if path is not None:
+        value = read_private_file(path.expanduser()).decode("utf-8").rstrip("\r\n")
+    elif interactive:
+        value = typer.prompt("Wallet encryption password", hide_input=True, show_default=False)
+        if confirm and value != typer.prompt("Confirm wallet encryption password", hide_input=True):
+            raise ValueError("password confirmation differs")
+    else:
+        raise ValueError("provide a wallet password file")
+    if not value:
+        raise ValueError("wallet password must not be empty")
+    return SecretStr(value)
+
+
+def _wallet_stage(
+    config_path: Path,
+    settings: JoinMarketSettings,
+    action: WalletAction,
+    *,
+    wallet_file: Path | None,
+    password_file: Path | None,
+    import_file: Path | None,
+    resume: bool,
+    confirm_import_recovery: bool,
+    show_seed: bool,
+    interactive: bool,
+    data_dir: Path | None,
+) -> None:
+    from jmwallet.cli.mnemonic import decrypt_mnemonic, validate_mnemonic
+    from jmwallet.setup_wallet import SetupWalletError, publish_setup_wallet
+
+    # Configured relative paths retain ordinary wallet-loader semantics (CWD),
+    # not an invented config-relative location. Environment seed overrides are
+    # deliberately not used to select the wallet in this explicit setup stage.
+    selected = wallet_file or (
+        Path(settings.wallet.mnemonic_file)
+        if settings.wallet.mnemonic_file
+        else (data_dir.expanduser() if data_dir is not None else settings.get_data_dir())
+        / "wallets"
+        / "default.mnemonic"
+    )
+    # Only CLI paths expand ~, just as ordinary explicit CLI path selection.
+    selected = (selected.expanduser() if wallet_file is not None else selected).absolute()
+    published = False
+    config_commit_started = False
+    generated = False
+    phrase: SecretStr | None = None
+    try:
+        target = config_path.resolve(strict=False)
+        original = _contents(config_path)
+        if original is None:
+            raise ValueError("configuration disappeared")
+        candidate = tomllib.loads(original.decode("utf-8"))
+        if validate_config_document(candidate).model_dump() != settings.model_dump():
+            raise ConfigFileError("configuration changed between setup stages")
+        if action is WalletAction.EXISTING and (
+            resume or import_file is not None or confirm_import_recovery
+        ):
+            raise ValueError("existing wallet selection cannot resume or import")
+        if action is not WalletAction.IMPORT and (
+            import_file is not None or confirm_import_recovery
+        ):
+            raise ValueError("import options require explicit import selection")
+        if confirm_import_recovery and not resume:
+            raise ValueError("recovery confirmation only applies to an interrupted import")
+        if resume and import_file is not None:
+            raise ValueError("resume uses the published wallet, not a new import source")
+
+        configured = settings.wallet.mnemonic_file
+        different_wallet = action is not WalletAction.EXISTING or (
+            configured is None or selected != Path(configured).absolute()
+        )
+        if different_wallet and (
+            settings.wallet.mnemonic_password is not None
+            or settings.wallet.bip39_passphrase is not None
+        ):
+            typer.echo(
+                "Wallet selection blocked: explicitly resolve configured mnemonic_password and "
+                "bip39_passphrase settings before switching wallets; no wallet was created.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        candidate.setdefault("wallet", {})["mnemonic_file"] = str(selected)
+        validate_config_document(candidate)
+
+        if action is WalletAction.EXISTING:
+            contents = read_sensitive_file(selected)
+            try:
+                plaintext = contents.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                plaintext = ""
+            if validate_mnemonic(plaintext):
+                phrase = SecretStr(plaintext)
+                typer.echo("WARNING: Existing wallet is plaintext; it was not rewritten.")
+            else:
+                password = (
+                    _wallet_password(password_file, interactive=interactive, confirm=False)
+                    if password_file is not None or settings.wallet.mnemonic_password is None
+                    else settings.wallet.mnemonic_password
+                )
+                phrase = SecretStr(decrypt_mnemonic(contents, password.get_secret_value()))
+                if not validate_mnemonic(phrase.get_secret_value()):
+                    raise ValueError("invalid mnemonic")
+        else:
+            password = _wallet_password(password_file, interactive=interactive, confirm=not resume)
+            imported = None
+            if action is WalletAction.IMPORT and not resume:
+                if import_file is not None:
+                    words = read_private_file(import_file.expanduser()).decode("utf-8")
+                elif interactive:
+                    words = typer.prompt("BIP39 words to import (hidden)", hide_input=True)
+                else:
+                    raise ValueError("explicit import requires a source file")
+                imported = SecretStr(" ".join(words.split()))
+            result = publish_setup_wallet(
+                selected,
+                password,
+                operation="generate" if action is WalletAction.GENERATE else "import",
+                mnemonic=imported,
+                resume=resume,
+                confirm_import_recovery=confirm_import_recovery,
+            )
+            published = True
+            if not result.complete:
+                typer.echo(
+                    "Wallet publication exists but setup metadata is incomplete. "
+                    "Retain files and journal; no wallet selection or seed disclosure performed.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            phrase = result.mnemonic
+            generated = result.origin == "generated"
+
+        if config_path.resolve(strict=False) != target or _contents(config_path) != original:
+            raise ConfigFileError("configuration changed during wallet setup")
+        config_commit_started = True
+        update_config_values(
+            config_path,
+            {"wallet": {"mnemonic_file": str(selected)}},
+            validate=validate_config_document,
+        )
+    except (OSError, RuntimeError, ValueError, ConfigFileError, SetupWalletError):
+        if config_commit_started:
+            message = (
+                "Wallet verified; configuration update could not be confirmed. "
+                "Inspect configuration; wallet contents are preserved."
+            )
+        elif published:
+            message = (
+                "Wallet saved; configuration selection was not updated. Retain wallet and journal; "
+                "inspect or explicitly resume, never regenerate."
+            )
+        elif action is not WalletAction.EXISTING:
+            message = (
+                "Wallet publication may exist; retain files and journal. Configuration selection "
+                "was not updated; inspect or explicitly resume, never regenerate."
+            )
+        else:
+            message = (
+                "Existing wallet could not be verified; wallet metadata and configuration "
+                "selection unchanged."
+            )
+        typer.echo(message, err=True)
+        raise typer.Exit(1) from None
+    typer.echo(
+        "Wallet verified and selected. No recovery scan, identity registration, "
+        "or node creation performed."
+    )
+    if generated:
+        disclose = show_seed
+        if not disclose and interactive and sys.stdin.isatty() and sys.stdout.isatty():
+            disclose = typer.confirm(
+                "Display seed for private backup? Stop recordings and screen sharing first",
+                default=False,
+            )
+        if disclose:
+            assert phrase is not None
+            typer.echo("PRIVATE BACKUP: never share or include these words in recordings.")
+            typer.echo(phrase.get_secret_value())
+        else:
+            typer.echo(
+                "Seed not displayed. Encrypted wallet preserved; "
+                "private seed backup remains pending."
+            )
 
 
 def main(args: list[str] | None = None) -> None:

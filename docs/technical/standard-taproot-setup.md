@@ -406,20 +406,33 @@ choices before one atomic replacement, and supports a no-write preview.
 Taproot remains explicit opt-in. Every prompt has a flag, and `--yes` accepts
 configuration defaults without asserting wallet freshness or creating nodes.
 
-The remaining onboarding stages are backend/Tor readiness, explicit wallet
-creation or import, managed-node installation and initialization, reserve
-guidance, and role/market options. The fresh-install offer will invoke the
-complete flow once those stages are available; configuration alone is not
-reported as wallet or Lightning provisioning.
+The wallet stage requires an explicit existing/generate/import choice.
+Noninteractive use selects `--wallet-action` and supplies new-wallet passwords
+through `--wallet-password-file`; imports use `--import-mnemonic-file`.
+`--yes` alone never creates a wallet. New wallets require encryption and never
+overwrite existing files or metadata. Newly supplied passwords and seed words
+are not stored in configuration. Switching wallets is refused until any configured
+mnemonic password or BIP39 passphrase is deliberately resolved.
 
-The wallet-publication foundation requires an explicit generate/import choice
-and a nonempty encryption password. It does not overwrite a wallet or its
-metadata. Its versioned setup journal distinguishes intent, prepared encrypted
-bytes, and completed publication. An interrupted setup never regenerates a
+The versioned setup journal distinguishes intent, prepared encrypted bytes,
+and completed publication. `--resume-wallet-publication` never regenerates a
 missing wallet or infers that an existing wallet is unused. Resume preserves
-changed recovery metadata; missing import metadata needs explicit recovery
-confirmation. Durable setup publication currently supports POSIX filesystems.
-This foundation is not yet connected to the setup prompts.
+changed recovery metadata; missing import metadata needs explicit
+`--confirm-import-recovery`. Durable setup publication currently supports
+POSIX filesystems. If configuration selection fails afterward, retain the
+saved wallet and journal rather than generating again.
+
+Generation does not authorize disclosing seed words into redirected output,
+logs, or screencasts. Seed display requires a private-backup confirmation on a
+terminal or explicit `--show-generated-seed`; stop recording first. Without
+disclosure, the encrypted wallet is preserved and seed backup remains pending.
+Existing-wallet selection does not rewrite recovery metadata or register an
+identity.
+
+The remaining onboarding stages are backend/Tor readiness, managed-node
+installation and initialization, reserve guidance, and role/market options.
+The fresh-install offer will invoke the complete flow once those stages are
+available; wallet setup alone is not reported as Lightning provisioning.
 
 `jm-wallet info` shows a Lightning section per mixdepth: node identity and
 generation, sync state, reserve against its range, channel count, and
