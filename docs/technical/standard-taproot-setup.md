@@ -286,6 +286,21 @@ until it can be read again. This guard is defense in depth: a reading can be
 obsolete as soon as it is taken, so the rental supervisor itself never stocks
 or leases the advertised bond.
 
+The opposite direction needs a record, because a restart can select another
+bond. Before its first proof, and on every refresh, the maker durably records
+the advertised bond as advertised through the next period (a proof can be
+sent just after a period boundary, before the maker sees the new block). The
+record is created when first needed, and every bond counts as advertised
+through the period after that one, which covers earlier runs and versions that
+kept no record, with the same boundary margin. A bond is admitted for a period
+only after every period it may have been advertised in. If the record cannot
+be written, or is corrupt, offers carry no bond proof and no bond is newly
+admitted; deleting a corrupt record is safe and only pauses rental for two
+periods at most. The record is kept even
+with rental off, so turning rental on later is safe. Running an older version
+on the same data directory is not: it neither reads leases nor writes the
+record.
+
 ### Renting a Bond
 
 A maker without a usable bond can rent one at startup and before its lease
@@ -315,6 +330,7 @@ also as JSON.
 | Backups: registry copy and static channel backups | `lightning/<fingerprint>/backup/` | Nothing to restore from |
 | Ring node bindings | existing `node-bindings.json` | Managed init writes them for its own new nodes |
 | Market ledger, store, leases | existing wallet market ledger | No sales or leases |
+| Advertised bonds per period | `market/advertised-bonds.json` | Created when first needed; every bond counts as advertised through the next period |
 | Rented bond with derived certificate key | existing bond registry, new entry kind | No rental; older entries keep raw keys |
 
 A data directory without a market store is treated as one that never sold a

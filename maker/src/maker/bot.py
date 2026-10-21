@@ -1347,6 +1347,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                     self.fidelity_bond,
                     self.current_block_height,
                 )
+                if self.bond_lease_guard is not None:
+                    # Record the advertised bond before the first proof is sent.
+                    await self.bond_lease_guard.refresh(
+                        [self.fidelity_bond],
+                        self.current_block_height,
+                        advertising=self.fidelity_bond,
+                    )
                 logger.bind(sensitive=True).info(
                     f"Fidelity bond found: {self.fidelity_bond.txid[:16]}..., "
                     f"value={self.fidelity_bond.value:,} sats, "
