@@ -11,7 +11,7 @@ from loguru import logger
 
 from jmswap.lnd_config import LndEnvironment
 from jmswap.managed_lnd import ManagedLnd
-from jmswap.managed_nodes import ManagedNodeError, NodeState, RegistryStore
+from jmswap.managed_nodes import ManagedNodeError, NodeRegistry, NodeState, RegistryStore
 from jmswap.managed_provision import provision_node
 
 MIN_BACKOFF_SECONDS = 5.0
@@ -60,27 +60,60 @@ class Supervisor:
         self.poll_seconds = poll_seconds
         self.backup_seconds = backup_seconds
         self.processes: dict[str, ManagedLnd] = {}
+        self._wallet_identity: str | None = None
 
     async def run(self, stop: asyncio.Event) -> None:
         with self.store.exclusive_processes():
             await self._run(stop)
 
     async def _run(self, stop: asyncio.Event) -> None:
+        registry = self._load_registry()
+        if not registry.runnable():
+            raise ManagedNodeError("the registry has no runnable managed nodes")
+        # Keep completed names: a missing established wallet is not repaired or
+        # repeatedly started just because discovery runs again. Explicit recovery
+        # requires stopping this supervisor and restarting it afterward.
+        tasks: dict[str, asyncio.Task[None]] = {}
+        previous_problem: str | None = None
+        try:
+            while not stop.is_set():
+                try:
+                    registry = self._load_registry()
+                except (ManagedNodeError, OSError) as exc:
+                    problem = str(exc)
+                    if problem != previous_problem:
+                        logger.warning(
+                            "Managed node discovery paused: {}; existing nodes keep running",
+                            problem,
+                        )
+                    previous_problem = problem
+                else:
+                    previous_problem = None
+                    for node in registry.runnable():
+                        if node.name not in tasks:
+                            tasks[node.name] = asyncio.create_task(
+                                self._keep_running(node.name, stop)
+                            )
+                await _sleep_or_stop(stop, self.poll_seconds)
+        finally:
+            # Also required on cancellation: gathering workers without notifying
+            # them would wait forever for a stop event nobody will set.
+            stop.set()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    def _load_registry(self) -> NodeRegistry:
+        """Pin wallet ownership at startup and reject a different authority on reload."""
         registry = self.store.load()
         if registry is None:
             raise ManagedNodeError("no managed nodes; run `jm-lightning init` first")
-        names = [node.name for node in registry.runnable()]
-        if not names:
-            raise ManagedNodeError("the registry has no runnable managed nodes")
-        tasks = [asyncio.create_task(self._keep_running(name, stop)) for name in names]
-        try:
-            await stop.wait()
-        finally:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._wallet_identity is None:
+            self._wallet_identity = registry.wallet_identity
+        elif registry.wallet_identity != self._wallet_identity:
+            raise ManagedNodeError("managed node registry belongs to a different wallet")
+        return registry
 
     async def _start(self, name: str) -> ManagedLnd | None:
-        registry = self.store.load()
-        assert registry is not None
+        registry = self._load_registry()
         node = registry.find(name)
         if node.state not in (
             NodeState.PROVISIONING,
@@ -122,6 +155,8 @@ class Supervisor:
                 self.processes[name] = lnd
                 backoff = MIN_BACKOFF_SECONDS
                 await self._watch(lnd, stop)
+                # Normal completion means explicit retirement or service shutdown.
+                return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep supervising the others
@@ -138,9 +173,26 @@ class Supervisor:
 
     async def _watch(self, lnd: ManagedLnd, stop: asyncio.Event) -> None:
         elapsed = self.backup_seconds
+        previous_problem: str | None = None
         while not stop.is_set():
             if not lnd.running:
                 raise ManagedNodeError(f"lnd exited with code {lnd.returncode}")
+            try:
+                node = self._load_registry().find(lnd.node.name)
+            except (ManagedNodeError, OSError) as exc:
+                problem = str(exc)
+                if problem != previous_problem:
+                    logger.warning(
+                        "Cannot read lifecycle state for {}: {}; keeping LND and backups running",
+                        lnd.node.name,
+                        problem,
+                    )
+                previous_problem = problem
+            else:
+                previous_problem = None
+                if node.state is NodeState.RETIRED:
+                    logger.info("Stopping explicitly retired managed node {}", node.name)
+                    return
             if elapsed >= self.backup_seconds:
                 elapsed = 0.0
                 try:

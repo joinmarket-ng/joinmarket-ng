@@ -109,6 +109,16 @@ and stops the nodes cleanly. `jm-lightning install-lnd` downloads the upstream r
 checks it against SHA-256 digests pinned in the source. Operators who prefer
 Docker use manual mode instead.
 
+The supervisor discovers explicitly registered runnable nodes while it runs,
+so a replacement can start beside a retiring node. Registry changes stop an
+owned process only for an explicit `retired` entry for the same wallet and
+node identity. Missing,
+unreadable, or unsupported registry state pauses discovery but leaves existing
+LND processes and their backup loops running. This does not replace the maker
+or taker settlement monitors, which must also remain running until their
+outcomes are known. An established node missing its wallet still requires
+explicit recovery and a supervisor restart; polling never reinitializes it.
+
 ### Wallet Reserve
 
 Anchor channels need confirmed wallet coins to fee-bump a force close. LND
