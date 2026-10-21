@@ -115,9 +115,16 @@ class NodePayer:
     interactive payer) may show the invoice instead.
     """
 
-    def __init__(self, node: ChannelRingNodeConfig, fallback: InvoicePayer | None = None) -> None:
+    def __init__(
+        self,
+        node: ChannelRingNodeConfig,
+        fallback: InvoicePayer | None = None,
+        *,
+        purpose: str = "a PoDLE credential",
+    ) -> None:
         self.node = node
         self.fallback = fallback
+        self.purpose = purpose
 
     def routing_budget(self, cap_sats: int) -> int:
         return max(1, cap_sats // 5)
@@ -152,7 +159,7 @@ class NodePayer:
                 expires_at=expires_at,
             )
         logger.info(
-            "Paid {} sats for a PoDLE credential (routing {} sats)", amount_sats, result.fee_sat
+            "Paid {} sats for {} (routing {} sats)", amount_sats, self.purpose, result.fee_sat
         )
         return "paid"
 
@@ -255,7 +262,7 @@ def load_records(directory: Path) -> list[PurchaseRecord]:
             if data.get("version") != 1 or not isinstance(data.get("state"), str):
                 raise ValueError
         except (OSError, ValueError):
-            logger.warning("Ignoring unreadable PoDLE purchase record {}", path.name)
+            logger.warning("Ignoring unreadable market purchase record {}", path.name)
             continue
         records.append(PurchaseRecord(path, data))
     return records
@@ -292,6 +299,28 @@ def _finish(record: PurchaseRecord, state: str, **data: Any) -> None:
     record.advance(state, **data)
 
 
+def buyer_transport(settings: JoinMarketSettings, cache: MarketFaultCache) -> MarketTransport:
+    """A market transport for one purchase, under a fresh nick and stream isolation."""
+
+    def receive_fault(raw: bytes) -> None:
+        cache.ingest(raw)
+
+    # A fresh nick per purchase: the seller cannot link it to any CoinJoin nick.
+    return MarketTransport(
+        directory_servers=settings.get_directory_servers(),
+        network=settings.network_config.network.value,
+        nick_identity=NickIdentity(JM_VERSION),
+        socks_host=settings.tor.socks_host,
+        socks_port=settings.tor.socks_port,
+        connection_timeout=settings.tor.connection_timeout,
+        stream_isolation=True,
+        nick_auth_mode=settings.network_config.nick_auth_mode,
+        nick_auth_directory_ids=settings.network_config.nick_auth_directory_ids,
+        allow_clearnet_connections=settings.network_config.allow_clearnet_connections,
+        on_fault=receive_fault,
+    )
+
+
 class PoDLEPurchaser:
     """Buys one external PoDLE credential for a CoinJoin round that has none.
 
@@ -322,26 +351,7 @@ class PoDLEPurchaser:
         return self._payer_for(mixdepth) is not None
 
     def _new_transport(self) -> MarketTransport:
-        settings = self._settings
-        cache = self._fault_cache
-
-        def receive_fault(raw: bytes) -> None:
-            cache.ingest(raw)
-
-        # A fresh nick per purchase: the seller cannot link it to the CoinJoin nick.
-        return MarketTransport(
-            directory_servers=settings.get_directory_servers(),
-            network=settings.network_config.network.value,
-            nick_identity=NickIdentity(JM_VERSION),
-            socks_host=settings.tor.socks_host,
-            socks_port=settings.tor.socks_port,
-            connection_timeout=settings.tor.connection_timeout,
-            stream_isolation=True,
-            nick_auth_mode=settings.network_config.nick_auth_mode,
-            nick_auth_directory_ids=settings.network_config.nick_auth_directory_ids,
-            allow_clearnet_connections=settings.network_config.allow_clearnet_connections,
-            on_fault=receive_fault,
-        )
+        return buyer_transport(self._settings, self._fault_cache)
 
     async def buy(
         self,

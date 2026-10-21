@@ -21,7 +21,6 @@ from typing import Any, cast
 
 from bitcointx.core.key import CKey, CPubKey  # type: ignore[import-not-found]
 from jmcore import experimental
-from jmcore.btc_script import derive_bond_address
 from jmcore.cli_common import resolve_backend_settings, setup_cli
 from jmcore.credential_market import (
     MAX_MARKET_BYTES,
@@ -974,53 +973,12 @@ def _import_bond_credential(
     data_dir: Path,
     fingerprint: str,
 ) -> bool:
-    if bytes(certificate.pub).hex() != credential.cert_pubkey:
-        raise MarketCLIError("certificate key does not match delivered bond credential")
-    from jmwallet.wallet.bond_registry import create_bond_info, load_registry, save_registry
+    from taker.bond_purchase import BondImportError, import_bond_credential
 
-    address = derive_bond_address(
-        bytes.fromhex(credential.bond.pubkey), credential.bond.locktime, credential.bond.network
-    )
     try:
-        registry = load_registry(
-            data_dir,
-            fingerprint,
-            allow_legacy_fallback=False,
-            fail_closed=True,
-        )
-    except ValueError as exc:
-        raise MarketCLIError("could not safely load bond registry") from exc
-    existing = registry.get_bond_by_address(address.address)
-    if existing is not None:
-        if (
-            existing.pubkey != credential.bond.pubkey
-            or existing.locktime != credential.bond.locktime
-            or existing.network != credential.bond.network
-            or existing.cert_pubkey != credential.cert_pubkey
-            or existing.cert_privkey != certificate.secret_bytes.hex()
-            or existing.cert_signature != credential.cert_signature
-            or existing.cert_expiry != credential.cert_expiry
-            or (existing.txid is not None and existing.txid != credential.bond.outpoint.txid)
-            or (existing.vout is not None and existing.vout != credential.bond.outpoint.vout)
-        ):
-            raise MarketCLIError("existing bond registry entry conflicts with delivered credential")
-        return False
-    imported = create_bond_info(
-        address=address.address,
-        locktime=credential.bond.locktime,
-        index=-1,
-        path="external",
-        pubkey_hex=credential.bond.pubkey,
-        witness_script=address.witness_script,
-        network=credential.bond.network,
-    )
-    imported.cert_pubkey = credential.cert_pubkey
-    imported.cert_privkey = certificate.secret_bytes.hex()
-    imported.cert_signature = credential.cert_signature
-    imported.cert_expiry = credential.cert_expiry
-    registry.add_bond(imported)
-    save_registry(registry, data_dir, fingerprint)
-    return True
+        return import_bond_credential(credential, certificate, data_dir, fingerprint)
+    except BondImportError as exc:
+        raise MarketCLIError(str(exc)) from exc
 
 
 def _require_quote_binding(

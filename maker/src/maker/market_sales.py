@@ -30,7 +30,14 @@ from typing import TYPE_CHECKING
 
 from jmcore.bitcoin import scriptpubkey_to_address
 from jmcore.channel_ring import ChannelRingNodeConfig
-from jmcore.credential_market import MARKET_PODLE_RETRIES, MarketError, period_at_height
+from jmcore.credential_market import (
+    BLOCKS_PER_PERIOD,
+    BLOCKS_PER_YEAR,
+    MARKET_PODLE_RETRIES,
+    MarketError,
+    lease_blocks,
+    period_at_height,
+)
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_store import (
     MarketStore,
@@ -68,8 +75,7 @@ REFRESH_SECONDS = 60.0
 RETRY_SECONDS = 300.0
 #: The ``[market]`` seller node, probed for earlier invoices but never routed to.
 MARKET_NODE = "[market]"
-RETARGET_BLOCKS = 2016
-BLOCKS_PER_YEAR = 52_560
+RETARGET_BLOCKS = BLOCKS_PER_PERIOD
 #: A rented bond must stay locked this many blocks past its lease, for slow blocks.
 LEASE_LOCK_MARGIN_BLOCKS = 2016
 #: Bonds live in mixdepth 0, whose node invoices their leases.
@@ -110,11 +116,6 @@ def podle_credential(
             "blockheight": blockheight,
         }
     )
-
-
-def lease_blocks(height: int) -> int:
-    """Blocks a lease sold at ``height`` lasts: the rest of the current period."""
-    return (period_at_height(height) + 1) * RETARGET_BLOCKS - height + 1
 
 
 def lease_price_sats(value: int, annual_rate: float, height: int) -> int:

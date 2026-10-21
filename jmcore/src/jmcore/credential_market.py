@@ -125,6 +125,15 @@ def period_at_height(height: int) -> int:
     return (height - 1) // 2016
 
 
+#: Blocks per year at the target interval, for annual lease rates.
+BLOCKS_PER_YEAR = 52_560
+
+
+def lease_blocks(height: int) -> int:
+    """Blocks a bond lease sold at ``height`` lasts: the rest of its retarget period."""
+    return (period_at_height(height) + 1) * BLOCKS_PER_PERIOD - height + 1
+
+
 class SignedDocument(MarketModel):
     body: dict[str, Any]
     signature: Signature

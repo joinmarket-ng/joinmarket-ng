@@ -635,7 +635,9 @@ The wallet fingerprint is the eight-character fingerprint of the hot JoinMarket
 wallet registry, printed by `jm-wallet info`. Bond import verifies the owner
 authorization and chain stake, refuses collateral with locally verified fault
 evidence, then stores the certificate as an external registry entry with
-`index = -1` and path `external`. The renter certificate key remains local.
+`index = -1` and path `external`. The renter certificate key remains local. A
+lease of the same bond for a later period renews that entry's certificate; any
+other difference from an existing entry is refused.
 
 ### Bond Rental Limits
 
