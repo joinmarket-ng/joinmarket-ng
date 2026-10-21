@@ -78,3 +78,72 @@ def test_console_setup_publishes_encrypted_wallet_without_seed_output(
     assert config["wallet"]["address_type"] == "p2wpkh"
     assert config["lightning"]["mode"] == "off"
     assert "Seed not displayed" in result.stdout
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="durable setup publication currently supports POSIX"
+)
+def test_console_market_setup_activates_only_explicit_fresh_ledger_without_disclosure(
+    tmp_path: Path,
+) -> None:
+    from jmcore.crypto import mnemonic_to_seed
+    from jmcore.market_keys import WalletMarketKeys
+    from jmcore.market_store import MarketStore
+    from jmcore.paths import get_market_store_path, get_used_commitments_path
+    from jmwallet.cli.mnemonic import load_mnemonic_file
+
+    directory = tmp_path / "private market setup"
+    password = tmp_path / "password"
+    password.write_text("launcher-market-encryption-password")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from jmcore.tui import main; main()",
+            "setup",
+            "--data-dir",
+            str(directory),
+            "--yes",
+            "--network",
+            "regtest",
+            "--taproot",
+            "--lightning",
+            "manual",
+            "--wallet-action",
+            "generate",
+            "--wallet-password-file",
+            str(password),
+            "--role",
+            "maker",
+            "--sell-podle",
+            "--rent-bonds",
+            "--no-lease-bond",
+            "--activate-market-ledger",
+            "--market-history-excluded-since-generation",
+            "--no-bip39-passphrase",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    wallet = directory / "wallets/default.mnemonic"
+    phrase = load_mnemonic_file(wallet, "launcher-market-encryption-password")
+    assert phrase not in result.stdout + result.stderr
+    assert "launcher-market-encryption-password" not in result.stdout + result.stderr
+    keys = WalletMarketKeys(mnemonic_to_seed(phrase, ""), "regtest")
+    try:
+        assert (
+            MarketStore.diagnose_wallet(
+                get_market_store_path(directory),
+                wallet_id=keys.ledger_identity(),
+                commitments_path=get_used_commitments_path(directory, create=False),
+            )["state"]
+            == "ready"
+        )
+    finally:
+        keys.close()
+    config = tomllib.loads((directory / "config.toml").read_text())
+    assert config["maker"]["sell_podle"] and config["maker"]["rent_bonds"]
+    assert config["maker"]["lease_bond"] is False
+    assert "no seller service started" in result.stdout

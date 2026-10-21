@@ -569,8 +569,10 @@
 # EXPERIMENTAL (docs/credential-market.md). Sell PoDLE commitments of the current
 # offer mixdepth's confirmed coins (all three indices), invoiced from that
 # mixdepth's Lightning node. Needs [lightning] mode managed or manual, an owned
-# fidelity bond as seller authority and a one-time
-# `jm-maker activate-market-ledger`. A buyer learns the sold coin. Missing
+# fidelity bond as seller authority and a ready wallet market ledger. Guided
+# setup can activate only an uninterrupted fresh wallet; older wallets need
+# explicit history verification via `jm-maker activate-market-ledger`.
+# A buyer learns the sold coin. Missing
 # preconditions pause sales with a warning; the maker keeps running.
 # Equivalent to --sell-podle on jm-maker start.
 # sell_podle = false
@@ -582,8 +584,9 @@
 # EXPERIMENTAL (docs/credential-market.md). Rent out owned fidelity bonds other
 # than the advertised one, one retarget period at a time, each under its own
 # seller nick and invoiced from mixdepth 0's Lightning node. Needs [lightning]
-# mode managed or manual, a node for mixdepth 0 and a one-time
-# `jm-maker activate-market-ledger`. A bond is rented only after every period
+# mode managed or manual, a node for mixdepth 0 and a ready wallet market ledger
+# (fresh guided setup or explicit verified-history activation). A bond is rented
+# only after every period
 # this data directory may have advertised it in, and new leases are stocked
 # only in the first half of a period. Equivalent to --rent-bonds on
 # jm-maker start.

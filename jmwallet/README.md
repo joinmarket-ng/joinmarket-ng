@@ -26,6 +26,12 @@ supervisor or activate markets. Existing or interrupted node state requires
 explicit inspection rather than automatic replacement. See the
 [standard setup guide](../docs/technical/standard-taproot-setup.md) and CLI help.
 
+Role options can prepare a fresh maker ledger before seed disclosure, but only
+with separate activation consent and continuous consumer/history exclusion.
+Existing, imported, and resumed wallets never gain fresh authority from missing
+files or a saved origin marker. Seller startup still requires eligible owned
+bonds, available coins, and running Lightning nodes.
+
 ## Imported Wallet History
 
 After a seed import, `jm-wallet` reconstructs confirmed transaction history on the

@@ -447,6 +447,43 @@ disclosure, the encrypted wallet is preserved and seed backup remains pending.
 Existing-wallet selection does not rewrite recovery metadata or register an
 identity.
 
+`--role` selects wallet, maker, taker, or both for guided options and command
+guidance, not service startup. Maker sales, idle owned-bond rental, and paid
+bond leasing are independent choices. Paid leasing remains opt-in and uses the
+configured cost/rate caps. Taker commitment sourcing uses the existing policy
+for the selected pit. Existing preferences are preserved unless selected for
+editing; role selection never turns on Taproot implicitly.
+
+In the full flow, new buying/leasing permissions and caps wait for verified
+wallet identity rather than applying to whichever wallet was previously
+configured. Seller-enabling settings additionally wait for ledger readiness.
+
+Seller-enabling settings in the full flow wait for a verified ledger binding.
+`--activate-market-ledger` is separate consent, not supplied by `--yes` or a
+seller-role choice. Guided activation is limited to uninterrupted generation in
+the current invocation, with no existing `market` or `cmtdata` entry, even an
+empty directory or dangling alias. Generation is necessary but not sufficient:
+`--market-history-excluded-since-generation` affirms that all wallet consumers
+and shared-history writers, including restarts, have remained excluded since
+generation and will stay excluded through activation. This is an operator
+precondition, not a technical admission barrier. It is explained before keys
+are generated and must not be confused with node-initialization quiescence.
+
+BIP39 identity is resolved before local activation and reused for node setup.
+Only the public prompt preference is recorded, never the passphrase. Fresh
+activation precedes seed disclosure and backend/node activity. Refusal, failure,
+or disclosure ends that invocation's automatic activation eligibility; private
+seed backup remains available. Preserve any partial ledger and use explicit
+history inspection/recovery, never generate a replacement as rollback.
+
+Imported, existing, and resumed wallets receive already-ready binding checks
+only. Missing, disabled, standalone, activating, recovery-required, or unavailable
+state supplies no fresh authority and receives no implicit activation. A ready
+binding is not clearance of old payment obligations. Configuration-only and
+preview modes perform no ledger or wallet-secret access; configured flags are
+not a claim that history is ready. Live seller startup revalidates its binding
+and eligibility independently.
+
 After wallet selection, `--create-managed-nodes` requests fresh managed node
 identities, not restoration. `--install-lnd` separately authorizes a missing
 pinned release to be downloaded through Tor. Existing verified binaries are
@@ -477,9 +514,10 @@ taker, or market. Persistent LND supervision does not replace application
 settlement monitors. Automatic maker-owned supervision remains deferred until
 admission can stop while recovery monitors continue running.
 
-Reserve guidance and role/market choices remain unfinished. The fresh-install
-offer will invoke the complete flow once those stages are available; stopped
-initialized nodes are not reported as a running Lightning service.
+Role guidance prints separate actor commands and mixdepth-specific reserve
+funding instructions; it never submits a reserve transaction or starts actors.
+The fresh-install offer remains to be connected. Stopped initialized nodes are
+not reported as a running Lightning service.
 
 `jm-wallet info` shows a Lightning section per mixdepth: node identity and
 generation, sync state, reserve against its range, channel count, and

@@ -8,10 +8,10 @@ import os
 import shlex
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import urlsplit
 
 import typer
@@ -26,6 +26,9 @@ from pydantic import SecretStr, ValidationError
 
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
 
+if TYPE_CHECKING:
+    from jmwallet.setup_wallet import SetupWalletPublication
+
 
 class LightningMode(StrEnum):
     OFF = "off"
@@ -39,13 +42,48 @@ class WalletAction(StrEnum):
     IMPORT = "import"
 
 
-@dataclass(frozen=True)
+class SetupRole(StrEnum):
+    WALLET = "wallet"
+    MAKER = "maker"
+    TAKER = "taker"
+    BOTH = "both"
+
+
+class PodleMode(StrEnum):
+    DISABLED = "disabled"
+    ONLY = "only"
+    PREFER = "prefer"
+
+
+@dataclass
 class _SelectedWallet:
     path: Path
     mnemonic: SecretStr
-    newly_created: bool
+    publication: SetupWalletPublication | None
     config_target: Path
     config_digest: str
+    identity_passphrase_required: bool = False
+    _fresh_market_available: bool = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._fresh_market_available = bool(
+            self.publication is not None
+            and self.publication.complete
+            and self.publication.newly_created
+            and self.publication.origin == "generated"
+        )
+
+    @property
+    def newly_created(self) -> bool:
+        return self.publication is not None and self.publication.newly_created
+
+    def claim_market_publication(self) -> SetupWalletPublication | None:
+        value = self.publication if self._fresh_market_available else None
+        self._fresh_market_available = False
+        return value
+
+    def revoke_fresh_activation(self) -> None:
+        self._fresh_market_available = False
 
 
 def _config_path(data_dir: Path | None, config_file: Path | None) -> Path:
@@ -84,6 +122,91 @@ def _endpoint(value: str) -> tuple[str, int]:
         return parsed.hostname, parsed.port
     except ValueError:
         raise typer.BadParameter("Tor endpoints must be HOST:PORT or [IPv6]:PORT") from None
+
+
+def _role_options(
+    defaults: JoinMarketSettings,
+    role: SetupRole | None,
+    *,
+    sell: bool | None,
+    rent: bool | None,
+    lease: bool | None,
+    external: PodleMode | None,
+    taproot: bool,
+    lightning: LightningMode,
+    interactive: bool,
+    max_sats: int | None,
+    max_rate: float | None,
+) -> tuple[SetupRole | None, dict[str, dict[str, ConfigScalar]]]:
+    if role is None and interactive:
+        role = SetupRole(
+            typer.prompt(
+                "Use this setup for (wallet/maker/taker/both)",
+                default=SetupRole.WALLET.value,
+                type=Choice([item.value for item in SetupRole]),
+            )
+        )
+    allowed = taproot and lightning is not LightningMode.OFF
+    updates: dict[str, dict[str, ConfigScalar]] = {}
+    if role in {SetupRole.MAKER, SetupRole.BOTH} and interactive and allowed:
+        if sell is None:
+            default = (
+                defaults.maker.sell_podle
+                if "sell_podle" in defaults.maker.model_fields_set
+                else True
+            )
+            sell = typer.confirm(
+                "Sell PoDLE from the offer mixdepth when an owned bond and ready ledger permit?",
+                default=default,
+            )
+        if rent is None:
+            default = (
+                defaults.maker.rent_bonds
+                if "rent_bonds" in defaults.maker.model_fields_set
+                else True
+            )
+            rent = typer.confirm(
+                "Rent eligible idle owned bonds (never the advertised bond)?", default=default
+            )
+        if lease is None:
+            cap = max_sats if max_sats is not None else defaults.maker.lease_bond_max_sats
+            rate = max_rate if max_rate is not None else defaults.maker.lease_bond_max_rate
+            lease = typer.confirm(
+                f"Pay automatically for a bond lease when needed, capped at {cap:,} sats "
+                f"and {rate:.2%} annual rate?",
+                default=defaults.maker.lease_bond,
+            )
+    for name, value in (
+        ("sell_podle", sell),
+        ("rent_bonds", rent),
+        ("lease_bond", lease),
+        ("lease_bond_max_sats", max_sats),
+        ("lease_bond_max_rate", max_rate),
+    ):
+        if value is not None:
+            updates.setdefault("maker", {})[name] = value
+    if role in {SetupRole.TAKER, SetupRole.BOTH} and interactive and allowed and external is None:
+        if "external_podle_mode" in defaults.taker.model_fields_set:
+            default_mode = defaults.taker.external_podle_mode
+        else:
+            # Ask the canonical schema for the selected pit's computed default,
+            # rather than duplicating the automatic-sourcing policy here.
+            default_mode = validate_config_document(
+                {
+                    "wallet": {"address_type": "p2tr"},
+                    "lightning": {"mode": lightning.value},
+                }
+            ).taker.external_podle_mode
+        external = PodleMode(
+            typer.prompt(
+                "Taker PoDLE sourcing (disabled/only/prefer)",
+                default=default_mode,
+                type=Choice([item.value for item in PodleMode]),
+            )
+        )
+    if external is not None:
+        updates["taker"] = {"external_podle_mode": external.value}
+    return role, updates
 
 
 @app.command()
@@ -208,6 +331,59 @@ def setup(
             help="Explicitly use no BIP39 passphrase for managed-node identities",
         ),
     ] = False,
+    role: Annotated[
+        SetupRole | None,
+        typer.Option("--role", help="Wallet, maker, taker, or both; never starts actors"),
+    ] = None,
+    sell_podle: Annotated[
+        bool | None,
+        typer.Option(
+            "--sell-podle/--no-sell-podle",
+            help="Configure maker PoDLE sales, gated by seller-ledger readiness",
+        ),
+    ] = None,
+    rent_bonds: Annotated[
+        bool | None,
+        typer.Option(
+            "--rent-bonds/--no-rent-bonds", help="Configure eligible idle owned-bond rental"
+        ),
+    ] = None,
+    lease_bond: Annotated[
+        bool | None,
+        typer.Option(
+            "--lease-bond/--no-lease-bond",
+            help="Separate paid bond-leasing opt-in with configured caps",
+        ),
+    ] = None,
+    lease_bond_max_sats: Annotated[
+        int | None,
+        typer.Option(
+            "--lease-bond-max-sats", help="Maximum total bond-lease cost including routing"
+        ),
+    ] = None,
+    lease_bond_max_rate: Annotated[
+        float | None,
+        typer.Option("--lease-bond-max-rate", help="Maximum annual bond-lease rate as a fraction"),
+    ] = None,
+    external_podle_mode: Annotated[
+        PodleMode | None,
+        typer.Option("--external-podle-mode", help="Configure taker automatic commitment sourcing"),
+    ] = None,
+    activate_market_ledger: Annotated[
+        bool | None,
+        typer.Option(
+            "--activate-market-ledger/--no-activate-market-ledger",
+            help="Separate consent to fresh-only seller-ledger activation",
+        ),
+    ] = None,
+    market_history_excluded_since_generation: Annotated[
+        bool,
+        typer.Option(
+            "--market-history-excluded-since-generation",
+            help="Affirm no wallet/shared-history consumers or restarts "
+            "since generation and through activation",
+        ),
+    ] = False,
 ) -> None:
     """Configure the standard setup without assuming wallet freshness.
 
@@ -299,11 +475,53 @@ def setup(
             control_enabled=True, control_host=host, control_port=port
         )
 
+    role, role_updates = _role_options(
+        defaults,
+        SetupRole.WALLET if role is None and wallet_action is not None else role,
+        sell=sell_podle,
+        rent=rent_bonds,
+        lease=lease_bond,
+        external=external_podle_mode,
+        taproot=selected_taproot,
+        lightning=selected_lightning,
+        interactive=not yes and not configure_only and not dry_run,
+        max_sats=lease_bond_max_sats,
+        max_rate=lease_bond_max_rate,
+    )
+    deferred_sellers: dict[str, ConfigScalar] = {
+        name: value
+        for name, value in role_updates.get("maker", {}).items()
+        if name in {"sell_podle", "rent_bonds"} and value is True
+    }
+    all_updates = copy.deepcopy(updates)
+    for section, values in role_updates.items():
+        all_updates.setdefault(section, {}).update(values)
+    initial_updates = copy.deepcopy(all_updates)
+    deferred_roles: dict[str, dict[str, ConfigScalar]] = {}
+    if not configure_only:
+        for section, values in role_updates.items():
+            for name, value in values.items():
+                reducing = value is False or (
+                    section == "taker"
+                    and name == "external_podle_mode"
+                    and value in {"disabled", "only"}
+                )
+                if not reducing:
+                    initial_updates.get(section, {}).pop(name, None)
+                    deferred_roles.setdefault(section, {})[name] = value
     candidate = copy.deepcopy(document)
-    for section, values in updates.items():
+    for section, values in all_updates.items():
         candidate.setdefault(section, {}).update(values)
+    initial_candidate = copy.deepcopy(document)
+    for section, values in initial_updates.items():
+        initial_candidate.setdefault(section, {}).update(values)
     try:
         planned = validate_config_document(candidate)
+        initially_applied = validate_config_document(initial_candidate)
+        if activate_market_ledger is True and (
+            planned.wallet.address_type != "p2tr" or planned.lightning.mode == "off"
+        ):
+            raise ValueError("market activation requires Taproot and enabled Lightning")
         if planned.lightning.mode == "managed" and (
             planned.bitcoin.backend_type != "descriptor_wallet" or not planned.tor.control_enabled
         ):
@@ -311,6 +529,13 @@ def setup(
         typer.echo(f"Wallet pit: {planned.wallet.address_type}")
         typer.echo(f"Lightning: {planned.lightning.mode}")
         typer.echo(f"Network: {planned.network_config.network.value}; blockchain: {chain.value}")
+        if role is not None:
+            typer.echo(f"Role options: {role.value}; no actor will be started.")
+        if deferred_roles and not configure_only:
+            typer.echo(
+                "New role permissions wait for wallet identity and any required ledger readiness; "
+                "preview is not authorization."
+            )
         if dry_run:
             typer.echo("Preview only; no files written.")
             return
@@ -320,7 +545,7 @@ def setup(
         # Do not apply decisions based on a config edited during prompting.
         if path.resolve(strict=False) != target or _contents(path) != original:
             raise ConfigFileError("configuration changed while choosing setup options")
-        update_config_values(path, updates, validate=validate_config_document)
+        update_config_values(path, initial_updates, validate=validate_config_document)
     except (ConfigFileError, OSError, RuntimeError, ValueError, ValidationError):
         typer.echo(
             "Configuration could not be safely applied; "
@@ -331,9 +556,20 @@ def setup(
     typer.echo(f"Configuration saved: {path}")
     if configure_only:
         typer.echo("Configuration only; wallet and node state unchanged.")
+        if deferred_sellers or activate_market_ledger is True:
+            typer.echo(
+                "Market options configured only; no ledger activation or readiness was verified."
+            )
         return
     if wallet_action is None:
         if yes:
+            if deferred_roles or activate_market_ledger is True:
+                typer.echo(
+                    "Market setup requires explicit --wallet-action selection; "
+                    "no ledger activated.",
+                    err=True,
+                )
+                raise typer.Exit(1)
             if create_managed_nodes or install_lnd:
                 typer.echo(
                     "Node initialization requires explicit --wallet-action selection; "
@@ -353,44 +589,109 @@ def setup(
                 type=Choice([item.value for item in WalletAction]),
             )
         )
+    maker_requested = (
+        role in {SetupRole.MAKER, SetupRole.BOTH}
+        or sell_podle is not None
+        or rent_bonds is not None
+    )
+    needs_ledger = activate_market_ledger is True or (
+        maker_requested and (planned.maker.sell_podle or planned.maker.rent_bonds)
+    )
+    if wallet_action is WalletAction.GENERATE and not resume_wallet_publication and needs_ledger:
+        typer.echo(
+            "Before generation: automatic fresh-ledger activation requires excluding all wallet "
+            "consumers and shared-history writers, including automatic restarts, from generation "
+            "through activation. No seed disclosure alone proves this. "
+            "Retain existing settlement monitors."
+        )
     selected_wallet = _wallet_stage(
         path,
-        planned,
+        initially_applied,
         wallet_action,
         wallet_file=wallet_file,
         password_file=wallet_password_file,
         import_file=import_mnemonic_file,
         resume=resume_wallet_publication,
         confirm_import_recovery=confirm_import_recovery,
-        show_seed=show_generated_seed,
         interactive=not yes,
         data_dir=data_dir,
     )
-    create = create_managed_nodes
-    if create is None and planned.lightning.mode == "managed" and not yes:
-        create = typer.confirm(
-            "Create fresh managed node identities (not restore lost nodes)?", default=False
-        )
-    if not create:
-        if install_lnd:
-            typer.echo(
-                "--install-lnd requires --create-managed-nodes here; "
-                "use jm-lightning install-lnd separately for installation only.",
-                err=True,
+    try:
+        identity: SecretStr | None = None
+        if needs_ledger or deferred_roles:
+            identity = _role_market_stage(
+                path,
+                selected_wallet,
+                data_dir=data_dir,
+                role_updates=deferred_roles,
+                needs_ledger=needs_ledger,
+                activate=activate_market_ledger,
+                history_excluded=market_history_excluded_since_generation,
+                passphrase_file=bip39_passphrase_file,
+                no_passphrase=no_bip39_passphrase,
+                interactive=not yes,
             )
-            raise typer.Exit(1)
-        typer.echo("Wallet stage complete; Lightning provisioning was not performed.")
-        return
-    _managed_node_stage(
-        path,
-        selected_wallet,
-        data_dir=data_dir,
-        install_lnd=install_lnd,
-        consumers_excluded=applications_quiesced,
-        passphrase_file=bip39_passphrase_file,
-        no_passphrase=no_bip39_passphrase,
-        interactive=not yes,
-    )
+        create = create_managed_nodes
+        if create is None and planned.lightning.mode == "managed" and not yes:
+            create = typer.confirm(
+                "Create fresh managed node identities (not restore lost nodes)?", default=False
+            )
+        if not create:
+            if install_lnd:
+                typer.echo(
+                    "--install-lnd requires --create-managed-nodes here; "
+                    "use jm-lightning install-lnd separately for installation only.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            if identity is None and (bip39_passphrase_file is not None or no_bip39_passphrase):
+                from jmwallet.setup_wallet import SetupWalletError
+
+                try:
+                    _, _, settings = _selected_configuration(path, selected_wallet)
+                    identity = _select_wallet_identity(
+                        settings,
+                        selected_wallet,
+                        passphrase_file=bip39_passphrase_file,
+                        no_passphrase=no_bip39_passphrase,
+                        interactive=not yes,
+                    )
+                    _record_identity_preference(path, selected_wallet, identity)
+                except (
+                    SetupWalletError,
+                    ConfigFileError,
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                ) as exc:
+                    typer.echo(
+                        str(exc)
+                        if isinstance(exc, SetupWalletError)
+                        else "Wallet identity selection could not be confirmed; "
+                        "inspect configuration.",
+                        err=True,
+                    )
+                    raise typer.Exit(1) from None
+            typer.echo("Wallet stage complete; Lightning provisioning was not performed.")
+            _role_instructions(path, selected_wallet, role=role, data_dir=data_dir)
+            return
+        # Backend activity ends any unused fresh authority.
+        selected_wallet.revoke_fresh_activation()
+        identity = _managed_node_stage(
+            path,
+            selected_wallet,
+            data_dir=data_dir,
+            install_lnd=install_lnd,
+            consumers_excluded=applications_quiesced,
+            passphrase_file=bip39_passphrase_file,
+            no_passphrase=no_bip39_passphrase,
+            interactive=not yes,
+            resolved_passphrase=identity,
+        )
+        _record_identity_preference(path, selected_wallet, identity)
+        _role_instructions(path, selected_wallet, role=role, data_dir=data_dir)
+    finally:
+        _disclose_generated_seed(selected_wallet, show=show_generated_seed, interactive=not yes)
 
 
 def _wallet_password(path: Path | None, *, interactive: bool, confirm: bool) -> SecretStr:
@@ -417,7 +718,6 @@ def _wallet_stage(
     import_file: Path | None,
     resume: bool,
     confirm_import_recovery: bool,
-    show_seed: bool,
     interactive: bool,
     data_dir: Path | None,
 ) -> _SelectedWallet:
@@ -438,8 +738,7 @@ def _wallet_stage(
     selected = (selected.expanduser() if wallet_file is not None else selected).absolute()
     published = False
     config_commit_started = False
-    generated = False
-    newly_created = False
+    publication = None
     phrase: SecretStr | None = None
     try:
         target = config_path.resolve(strict=False)
@@ -526,8 +825,7 @@ def _wallet_stage(
                 )
                 raise typer.Exit(1)
             phrase = result.mnemonic
-            generated = result.origin == "generated"
-            newly_created = result.newly_created
+            publication = result
 
         if config_path.resolve(strict=False) != target or _contents(config_path) != original:
             raise ConfigFileError("configuration changed during wallet setup")
@@ -574,25 +872,356 @@ def _wallet_stage(
         "Wallet verified and selected. No recovery scan, identity registration, "
         "or node creation performed."
     )
-    if generated:
-        disclose = show_seed
+    assert phrase is not None
+    return _SelectedWallet(
+        selected, phrase, publication, target, hashlib.sha256(committed).hexdigest()
+    )
+
+
+def _disclose_generated_seed(wallet: _SelectedWallet, *, show: bool, interactive: bool) -> None:
+    # Disclosure, refusal and flow completion all end automatic fresh authority.
+    # A completed/resumed publication may still be backed up, never reactivated.
+    wallet.revoke_fresh_activation()
+    if wallet.publication is not None and wallet.publication.origin == "generated":
+        if wallet.identity_passphrase_required:
+            typer.echo(
+                "This identity uses a separate BIP39 passphrase; "
+                "preserve it privately with the mnemonic backup."
+            )
+        disclose = show
         if not disclose and interactive and sys.stdin.isatty() and sys.stdout.isatty():
             disclose = typer.confirm(
                 "Display seed for private backup? Stop recordings and screen sharing first",
                 default=False,
             )
         if disclose:
-            assert phrase is not None
             typer.echo("PRIVATE BACKUP: never share or include these words in recordings.")
-            typer.echo(phrase.get_secret_value())
+            typer.echo(wallet.mnemonic.get_secret_value())
         else:
             typer.echo(
                 "Seed not displayed. Encrypted wallet preserved; "
                 "private seed backup remains pending."
             )
-    assert phrase is not None
-    return _SelectedWallet(
-        selected, phrase, newly_created, target, hashlib.sha256(committed).hexdigest()
+
+
+def _select_wallet_identity(
+    settings: JoinMarketSettings,
+    wallet: _SelectedWallet,
+    *,
+    passphrase_file: Path | None,
+    no_passphrase: bool,
+    interactive: bool,
+) -> SecretStr:
+    from jmwallet.setup_wallet import SetupWalletError, verify_setup_wallet_identity
+
+    try:
+        if passphrase_file is not None and no_passphrase:
+            raise SetupWalletError(
+                "Choose a BIP39 passphrase file or explicit no-passphrase, not both"
+            )
+        if passphrase_file is not None:
+            passphrase = SecretStr(
+                read_private_file(passphrase_file.expanduser()).decode("utf-8").rstrip("\r\n")
+            )
+        elif no_passphrase:
+            if (
+                settings.wallet.bip39_passphrase is not None
+                and settings.wallet.bip39_passphrase.get_secret_value()
+            ):
+                raise SetupWalletError(
+                    "Resolve the configured BIP39 passphrase before selecting no passphrase"
+                )
+            passphrase = SecretStr("")
+        elif settings.wallet.bip39_passphrase is not None:
+            passphrase = settings.wallet.bip39_passphrase
+        elif interactive:
+            passphrase = SecretStr(
+                typer.prompt(
+                    "BIP39 wallet passphrase (hidden; empty means none)",
+                    default="",
+                    show_default=False,
+                    hide_input=True,
+                )
+            )
+        else:
+            raise SetupWalletError(
+                "Select --bip39-passphrase-file or --no-bip39-passphrase explicitly"
+            )
+        if (
+            settings.wallet.bip39_passphrase is not None
+            and passphrase != settings.wallet.bip39_passphrase
+        ):
+            raise SetupWalletError(
+                "Resolve the configured BIP39 passphrase before choosing a different value"
+            )
+        if (
+            "BIP39_PASSPHRASE" in os.environ
+            and os.environ["BIP39_PASSPHRASE"] != passphrase.get_secret_value()
+        ):
+            raise SetupWalletError(
+                "Resolve the conflicting BIP39_PASSPHRASE environment override "
+                "before initialization"
+            )
+        verify_setup_wallet_identity(wallet.path, wallet.mnemonic, passphrase)
+        if "EXPECTED_FINGERPRINT" in os.environ:
+            from jmcore.wallet_metadata import WalletIdentity
+
+            from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+            expected = WalletIdentity.validate_fingerprint(os.environ["EXPECTED_FINGERPRINT"])
+            if (
+                get_mnemonic_fingerprint(
+                    wallet.mnemonic.get_secret_value(), passphrase.get_secret_value()
+                )
+                != expected
+            ):
+                raise SetupWalletError(
+                    "Selected wallet does not match EXPECTED_FINGERPRINT; "
+                    "resolve staged credentials"
+                )
+        wallet.identity_passphrase_required = bool(passphrase.get_secret_value())
+        return passphrase
+    except SetupWalletError:
+        raise
+    except Exception:
+        raise SetupWalletError(
+            "Wallet identity input could not be verified; inspect credentials and identity metadata"
+        ) from None
+
+
+def _selected_configuration(
+    path: Path,
+    wallet: _SelectedWallet,
+) -> tuple[bytes, dict[str, Any], JoinMarketSettings]:
+    raw = _contents(path)
+    if (
+        raw is None
+        or path.resolve(strict=False) != wallet.config_target
+        or hashlib.sha256(raw).hexdigest() != wallet.config_digest
+    ):
+        raise ConfigFileError(
+            "Configuration changed after wallet selection; inspect before continuing"
+        )
+    document = tomllib.loads(raw.decode("utf-8"))
+    return raw, document, validate_config_document(document)
+
+
+def _commit_selected_options(
+    path: Path,
+    wallet: _SelectedWallet,
+    updates: dict[str, dict[str, ConfigScalar]],
+) -> None:
+    raw, document, _ = _selected_configuration(path, wallet)
+    expected = copy.deepcopy(document)
+    for section, values in updates.items():
+        expected.setdefault(section, {}).update(values)
+    expected_settings = validate_config_document(expected)
+    if _contents(path) != raw or path.resolve(strict=False) != wallet.config_target:
+        raise ConfigFileError("Configuration changed while choosing role options")
+    update_config_values(path, updates, validate=validate_config_document)
+    result = _contents(path)
+    if (
+        result is None
+        or path.resolve(strict=False) != wallet.config_target
+        or (
+            validate_config_document(tomllib.loads(result.decode("utf-8"))).model_dump()
+            != expected_settings.model_dump()
+        )
+    ):
+        raise ConfigFileError("Configuration role update could not be confirmed")
+    wallet.config_digest = hashlib.sha256(result).hexdigest()
+
+
+def _identity_preference(
+    document: dict[str, Any], passphrase: SecretStr
+) -> dict[str, ConfigScalar]:
+    value = bool(passphrase.get_secret_value())
+    updates: dict[str, ConfigScalar] = {"bip39_passphrase_enabled": value}
+    if "wallet_with_passphrase" in document.get("wallet", {}):
+        updates["wallet_with_passphrase"] = value
+    return updates
+
+
+def _record_identity_preference(path: Path, wallet: _SelectedWallet, passphrase: SecretStr) -> None:
+    try:
+        _, document, _ = _selected_configuration(path, wallet)
+        _commit_selected_options(
+            path, wallet, {"wallet": _identity_preference(document, passphrase)}
+        )
+    except (ConfigFileError, OSError, RuntimeError, ValueError):
+        typer.echo(
+            "Wallet identity preference update could not be confirmed; "
+            "preserve wallet/node state and inspect configuration.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+
+
+def _role_market_stage(
+    config_path: Path,
+    wallet: _SelectedWallet,
+    *,
+    data_dir: Path | None,
+    role_updates: dict[str, dict[str, ConfigScalar]],
+    needs_ledger: bool,
+    activate: bool | None,
+    history_excluded: bool,
+    passphrase_file: Path | None,
+    no_passphrase: bool,
+    interactive: bool,
+) -> SecretStr:
+    from jmwallet.setup_market import SetupMarketError, prepare_seller_ledger
+    from jmwallet.setup_wallet import SetupWalletError
+
+    # Consume eligibility before any refusal/failure; no subsequent disclosure
+    # or automatic retry can restore this invocation's fresh authority.
+    publication = wallet.claim_market_publication()
+    ledger_touched = False
+    try:
+        _, document, settings = _selected_configuration(config_path, wallet)
+        passphrase = _select_wallet_identity(
+            settings,
+            wallet,
+            passphrase_file=passphrase_file,
+            no_passphrase=no_passphrase,
+            interactive=interactive,
+        )
+        requested = activate is True
+        if needs_ledger and activate is None and publication is not None and interactive:
+            requested = typer.confirm(
+                "Activate the private seller ledger for this newly generated wallet "
+                "before seed display?",
+                default=True,
+            )
+        if (
+            needs_ledger
+            and requested
+            and publication is not None
+            and not history_excluded
+            and interactive
+        ):
+            history_excluded = typer.confirm(
+                "Affirm no wallet consumers or shared-history writers, including automatic "
+                "restarts, have used these paths SINCE GENERATION and will remain excluded "
+                "THROUGH ACTIVATION?",
+                default=False,
+            )
+        pending = copy.deepcopy(role_updates)
+        pending["wallet"] = _identity_preference(document, passphrase)
+        candidate = copy.deepcopy(document)
+        for section, values in pending.items():
+            candidate.setdefault(section, {}).update(values)
+        validate_config_document(candidate)
+        _selected_configuration(config_path, wallet)
+        actual_data_dir = data_dir if data_dir is not None else settings.get_data_dir()
+        created = False
+        if needs_ledger:
+            ledger_touched = requested and publication is not None
+            created = prepare_seller_ledger(
+                settings,
+                wallet.mnemonic,
+                passphrase,
+                data_dir=actual_data_dir,
+                wallet_file=wallet.path,
+                publication=publication,
+                activate=requested,
+                history_excluded_since_generation=history_excluded,
+            )
+        _commit_selected_options(config_path, wallet, pending)
+        if needs_ledger:
+            typer.echo(
+                "Fresh seller ledger activated locally; no seller service started."
+                if created
+                else "Existing seller-ledger binding checked; live startup will revalidate it."
+            )
+            typer.echo(
+                "Sales still require eligible owned bonds, available coins, "
+                "and running Lightning nodes."
+            )
+        else:
+            typer.echo(
+                "Role options applied to the verified wallet identity; "
+                "no payment or service started."
+            )
+        return passphrase
+    except (
+        SetupMarketError,
+        SetupWalletError,
+        ConfigFileError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        message = (
+            str(exc)
+            if isinstance(exc, (SetupMarketError, SetupWalletError))
+            else ("Seller setup or its configuration update could not be confirmed.")
+        )
+        typer.echo(message, err=True)
+        if ledger_touched:
+            typer.echo(
+                "A ledger may already exist; preserve it and inspect explicitly. "
+                "No automatic retry or rollback.",
+                err=True,
+            )
+        typer.echo(
+            "Wallet preserved; role/market setup incomplete. Keep consumers excluded "
+            "and existing settlement monitors running.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+
+
+def _role_instructions(
+    config_path: Path,
+    wallet: _SelectedWallet,
+    *,
+    role: SetupRole | None,
+    data_dir: Path | None,
+) -> None:
+    if role is None or role is SetupRole.WALLET:
+        return
+    try:
+        _, _, settings = _selected_configuration(config_path, wallet)
+    except (ConfigFileError, OSError, RuntimeError, ValueError):
+        typer.echo(
+            "Role instructions could not be confirmed; inspect the changed configuration.", err=True
+        )
+        raise typer.Exit(1) from None
+    directory = (
+        (data_dir if data_dir is not None else settings.get_data_dir())
+        .expanduser()
+        .resolve(strict=False)
+    )
+    if settings.lightning.mode == "managed":
+        typer.echo(
+            "Before starting consumers, keep the persistent LND supervisor running "
+            "and verify jm-lightning status."
+        )
+        typer.echo(
+            "After funding the wallet, jm-wallet fund-reserve MIXDEPTH funds only "
+            "that mixdepth's node; never fund several mixdepths automatically."
+        )
+    common = [
+        "--data-dir",
+        str(directory),
+        "--config-file",
+        str(config_path),
+        "--mnemonic-file",
+        str(wallet.path),
+    ]
+    if wallet.identity_passphrase_required:
+        common.append("--prompt-bip39-passphrase")
+    if role in {SetupRole.MAKER, SetupRole.BOTH}:
+        typer.echo("When funded and node readiness is verified, start the maker separately:")
+        typer.echo(shlex.join([str(Path(sys.executable).with_name("jm-maker")), "start", *common]))
+    if role in {SetupRole.TAKER, SetupRole.BOTH}:
+        typer.echo(
+            "For a taker run, use jm-taker coinjoin --help with this wallet/config "
+            "and choose the amount and destination explicitly."
+        )
+    typer.echo(
+        "No maker, taker, market listener, or reserve-funding transaction was started by setup."
     )
 
 
@@ -606,7 +1235,8 @@ def _managed_node_stage(
     passphrase_file: Path | None,
     no_passphrase: bool,
     interactive: bool,
-) -> None:
+    resolved_passphrase: SecretStr | None = None,
+) -> SecretStr:
     try:
         from jmwallet.setup_lightning import SetupLightningError, initialize_managed_nodes
     except ModuleNotFoundError as exc:
@@ -648,69 +1278,22 @@ def _managed_node_stage(
                 "Affirm --applications-quiesced; "
                 "initialization does not stop or drain other applications"
             )
-        if passphrase_file is not None and no_passphrase:
-            raise SetupLightningError(
-                "Choose a BIP39 passphrase file or explicit no-passphrase, not both"
-            )
-        if passphrase_file is not None:
-            passphrase = SecretStr(
-                read_private_file(passphrase_file.expanduser()).decode("utf-8").rstrip("\r\n")
-            )
-        elif no_passphrase:
-            if (
-                settings.wallet.bip39_passphrase is not None
-                and settings.wallet.bip39_passphrase.get_secret_value()
-            ):
-                raise SetupLightningError(
-                    "Resolve the configured BIP39 passphrase before selecting no passphrase"
-                )
-            passphrase = SecretStr("")
-        elif settings.wallet.bip39_passphrase is not None:
-            passphrase = settings.wallet.bip39_passphrase
-        elif interactive:
-            passphrase = SecretStr(
-                typer.prompt(
-                    "BIP39 passphrase for node identities (hidden; empty means none)",
-                    default="",
-                    show_default=False,
-                    hide_input=True,
-                )
-            )
-        else:
-            raise SetupLightningError(
-                "Select --bip39-passphrase-file or --no-bip39-passphrase explicitly"
-            )
-        if (
-            settings.wallet.bip39_passphrase is not None
-            and passphrase != settings.wallet.bip39_passphrase
-        ):
-            raise SetupLightningError(
-                "Resolve the configured BIP39 passphrase before choosing a different value"
-            )
-        if (
-            "BIP39_PASSPHRASE" in os.environ
-            and os.environ["BIP39_PASSPHRASE"] != passphrase.get_secret_value()
-        ):
-            raise SetupLightningError(
-                "Resolve the conflicting BIP39_PASSPHRASE environment override "
-                "before initialization"
-            )
-        if "EXPECTED_FINGERPRINT" in os.environ:
-            from jmcore.wallet_metadata import WalletIdentity
+        from jmwallet.setup_wallet import SetupWalletError
 
-            from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
-
-            expected = WalletIdentity.validate_fingerprint(os.environ["EXPECTED_FINGERPRINT"])
-            if (
-                get_mnemonic_fingerprint(
-                    wallet.mnemonic.get_secret_value(), passphrase.get_secret_value()
+        try:
+            passphrase = (
+                resolved_passphrase
+                if resolved_passphrase is not None
+                else _select_wallet_identity(
+                    settings,
+                    wallet,
+                    passphrase_file=passphrase_file,
+                    no_passphrase=no_passphrase,
+                    interactive=interactive,
                 )
-                != expected
-            ):
-                raise SetupLightningError(
-                    "Selected wallet does not match EXPECTED_FINGERPRINT; "
-                    "resolve staged credentials"
-                )
+            )
+        except SetupWalletError as exc:
+            raise SetupLightningError(str(exc)) from None
         if (
             _contents(config_path) != document
             or config_path.resolve(strict=False) != wallet.config_target
@@ -777,6 +1360,7 @@ def _managed_node_stage(
         "LND supervision does not replace application settlement monitors. "
         "No markets were activated."
     )
+    return passphrase
 
 
 def main(args: list[str] | None = None) -> None:

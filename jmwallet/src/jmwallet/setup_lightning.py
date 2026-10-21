@@ -15,17 +15,18 @@ from pathlib import Path
 
 import httpx
 from jmcore.constants import GENESIS_BLOCK_HASHES
-from jmcore.crypto import mnemonic_to_seed, validate_bip39_checksum
+from jmcore.crypto import mnemonic_to_seed
 from jmcore.lightning_keys import WalletLightningKeys
 from jmcore.secure_files import read_sensitive_file
 from jmcore.settings import JoinMarketSettings
 from jmcore.tor_control import TorControlClient
-from jmcore.wallet_metadata import selected_identity
 from jmswap.lightning_context import LightningContext, lightning_context
 from jmswap.lnd_release import default_lnd_binary, download_and_install, is_installed
 from jmswap.managed_nodes import ManagedNodeError, NodeRegistry, NodeState
 from jmswap.managed_provision import create_nodes
 from pydantic import SecretStr
+
+from jmwallet.setup_wallet import SetupWalletError, verify_setup_wallet_identity
 
 
 class SetupLightningError(Exception):
@@ -133,24 +134,10 @@ def initialize_managed_nodes(
         )
     phase = "wallet identity verification"
     try:
-        if not validate_bip39_checksum(mnemonic.get_secret_value()):
-            raise SetupLightningError(
-                "Managed-node initialization requires a verified BIP39 mnemonic"
-            )
-        identity = selected_identity(wallet_file)
-        if identity is not None:
-            from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
-
-            fingerprint = get_mnemonic_fingerprint(
-                mnemonic.get_secret_value(),
-                passphrase.get_secret_value(),
-            )
-            if fingerprint != identity.fingerprint or (
-                identity.bip39 == "required" and not passphrase.get_secret_value()
-            ):
-                raise SetupLightningError(
-                    "BIP39 selection does not match the registered wallet identity"
-                )
+        try:
+            verify_setup_wallet_identity(wallet_file, mnemonic, passphrase)
+        except SetupWalletError as exc:
+            raise SetupLightningError(str(exc)) from None
         seed = mnemonic_to_seed(mnemonic.get_secret_value(), passphrase.get_secret_value())
         phase = "managed launch configuration"
         runtime = settings.model_copy(

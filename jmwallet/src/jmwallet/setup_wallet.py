@@ -20,7 +20,7 @@ from jmcore.secure_files import (
     read_private_file,
     sync_parent_directories,
 )
-from jmcore.wallet_metadata import encode_mnemonic_meta, meta_path
+from jmcore.wallet_metadata import encode_mnemonic_meta, meta_path, selected_identity
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from jmwallet.cli.mnemonic import (
@@ -69,6 +69,32 @@ class SetupWalletPublication:
     origin: Literal["generated", "imported"]
     newly_created: bool
     complete: bool
+    ciphertext_sha256: str
+
+
+def verify_setup_wallet_identity(path: Path, mnemonic: SecretStr, passphrase: SecretStr) -> None:
+    """Verify the explicit derivation against stored identity hints without adopting them."""
+    try:
+        if not validate_mnemonic(mnemonic.get_secret_value()):
+            raise SetupWalletError("Setup requires a verified BIP39 mnemonic")
+        identity = selected_identity(path)
+        if identity is not None:
+            from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+            if get_mnemonic_fingerprint(
+                mnemonic.get_secret_value(), passphrase.get_secret_value()
+            ) != identity.fingerprint or (
+                identity.bip39 == "required" and not passphrase.get_secret_value()
+            ):
+                raise SetupWalletError(
+                    "BIP39 selection does not match the registered wallet identity"
+                )
+    except SetupWalletError:
+        raise
+    except Exception:
+        raise SetupWalletError(
+            "Wallet identity metadata cannot be verified; inspect it explicitly"
+        ) from None
 
 
 def _present(path: Path) -> bool:
@@ -162,6 +188,7 @@ def _resume(
         "generated" if operation == "generate" else "imported",
         newly_created=False,
         complete=matches,
+        ciphertext_sha256=_digest(encrypted),
     )
 
 
@@ -283,4 +310,5 @@ def _publish_new(
         "generated" if operation == "generate" else "imported",
         newly_created=operation == "generate",
         complete=True,
+        ciphertext_sha256=_digest(encrypted),
     )
