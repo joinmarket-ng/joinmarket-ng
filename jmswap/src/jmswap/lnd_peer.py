@@ -692,6 +692,73 @@ class LndPeerClient:
             raise _response_error("payment update is for a different payment hash")
         return result
 
+    async def payment_history(self) -> tuple[PaymentResult, ...]:
+        """Enumerate all recorded attempts, including pending payments, without filters.
+
+        This proves RPC enumeration, not database continuity, original ownership,
+        or retirement eligibility. An empty result or a missing hash must never
+        be treated independently as evidence that a payment failed. Call only
+        for an explicit audit: histories may be large and each page is fetched.
+        Concurrent additions, malformed pages, and incomplete enumeration raise.
+        """
+        offset = 0
+        total: int | None = None
+        results: list[PaymentResult] = []
+        seen: set[bytes] = set()
+        while True:
+            page = await self._call(
+                "ListPayments",
+                pb.ListPaymentsRequest(
+                    include_incomplete=True,
+                    index_offset=offset,
+                    max_payments=1_000,
+                    count_total_payments=True,
+                    reversed=False,
+                ),
+            )
+            count = _history_position(page.total_num_payments)
+            if total is None:
+                total = count
+            elif count != total:
+                raise _response_error("payment history changed during enumeration")
+            first = _history_position(page.first_index_offset)
+            last = _history_position(page.last_index_offset)
+            payments = list(page.payments)
+            if not payments:
+                if len(results) != total or first != 0 or last != 0:
+                    raise _response_error("payment history ended before its recorded total")
+                return tuple(results)
+            if len(payments) > 1_000 or len(results) + len(payments) > total:
+                raise _response_error("payment history count is inconsistent")
+            if first != payments[0].payment_index or last != payments[-1].payment_index:
+                raise _response_error("payment history cursor does not match its entries")
+            for item in payments:
+                index = _history_position(item.payment_index)
+                if index <= offset:
+                    raise _response_error("payment history cursor did not advance")
+                result = _payment_result(item)
+                if result.payment_hash in seen:
+                    raise _response_error("payment history repeats a payment")
+                if any(
+                    attempt.status
+                    not in {
+                        pb.HTLCAttempt.IN_FLIGHT,
+                        pb.HTLCAttempt.SUCCEEDED,
+                        pb.HTLCAttempt.FAILED,
+                    }
+                    for attempt in item.htlcs
+                ):
+                    raise _response_error("payment history reports an unknown attempt state")
+                if result.status is not PaymentStatus.IN_FLIGHT and any(
+                    attempt.status == pb.HTLCAttempt.IN_FLIGHT for attempt in item.htlcs
+                ):
+                    raise _response_error("terminal payment retains an unresolved attempt")
+                seen.add(result.payment_hash)
+                results.append(result)
+                offset = index
+            if len(results) == total:
+                return tuple(results)
+
     async def close_channel(self, point: Outpoint, force: bool) -> None:
         """Start closing a channel and return once the node accepted the close.
 
@@ -758,6 +825,12 @@ _PAYMENT_STATUS: Final[dict[int, PaymentStatus]] = {
     pb.Payment.PaymentStatus.SUCCEEDED: PaymentStatus.SUCCEEDED,
     pb.Payment.PaymentStatus.FAILED: PaymentStatus.FAILED,
 }
+
+
+def _history_position(value: Any) -> int:
+    if type(value) is not int or not 0 <= value <= (1 << 64) - 1:
+        raise _response_error("payment history reports an invalid cursor or count")
+    return value
 
 
 def _payment_result(update: Any) -> PaymentResult:

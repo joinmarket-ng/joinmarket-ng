@@ -958,6 +958,154 @@ class TestPaymentRouteHints:
             hop().chan_id = 2
 
 
+class _PaymentPages(RecordingStub):
+    def __init__(self, pages: list[Any]) -> None:
+        super().__init__()
+        self.pages = list(pages)
+
+    async def ListPayments(  # noqa: N802
+        self, request: Any, *, timeout: float, credentials: Any
+    ) -> Any:
+        assert self.pages, "history requested an unexpected extra page"
+        self.results["ListPayments"] = self.pages.pop(0)
+        return await self.__getattr__("ListPayments")(
+            request, timeout=timeout, credentials=credentials
+        )
+
+
+class TestPaymentHistory:
+    @staticmethod
+    def pending(index: int, byte: int = 0x22) -> pb.Payment:
+        return payment(
+            payment_index=index,
+            payment_hash=f"{byte:02x}" * 32,
+            status=pb.Payment.IN_FLIGHT,
+            payment_preimage="",
+            fee_sat=0,
+        )
+
+    async def test_every_page_includes_unresolved_payments_without_date_filters(self) -> None:
+        stub = _PaymentPages(
+            [
+                pb.ListPaymentsResponse(
+                    payments=[
+                        payment(payment_index=1),
+                        payment(
+                            payment_index=2,
+                            payment_hash="44" * 32,
+                            status=pb.Payment.FAILED,
+                            payment_preimage="",
+                            fee_sat=0,
+                        ),
+                    ],
+                    first_index_offset=1,
+                    last_index_offset=2,
+                    total_num_payments=4,
+                ),
+                pb.ListPaymentsResponse(
+                    payments=[self.pending(4), self.pending(9, 0x33)],
+                    first_index_offset=4,
+                    last_index_offset=9,
+                    total_num_payments=4,
+                ),
+            ]
+        )
+        stub.pages[1].payments[1].status = pb.Payment.INITIATED
+        async with peer_client(stub) as client:
+            results = await client.payment_history()
+        assert [item.status for item in results] == [
+            PaymentStatus.SUCCEEDED,
+            PaymentStatus.FAILED,
+            PaymentStatus.IN_FLIGHT,
+            PaymentStatus.IN_FLIGHT,
+        ]
+        assert [call.request.index_offset for call in stub.calls] == [0, 2]
+        assert all(
+            call.request.include_incomplete
+            and call.request.count_total_payments
+            and not call.request.reversed
+            and call.request.creation_date_start == call.request.creation_date_end == 0
+            for call in stub.calls
+        )
+
+    async def test_empty_history_is_an_empty_enumeration_not_a_failure_claim(self) -> None:
+        stub = _PaymentPages([pb.ListPaymentsResponse()])
+        async with peer_client(stub) as client:
+            assert await client.payment_history() == ()
+
+    @pytest.mark.parametrize("bad", ["total", "truncated", "cursor", "repeat-index", "repeat-hash"])
+    async def test_changed_or_incomplete_pages_are_not_returned_as_a_complete_history(
+        self, bad: str
+    ) -> None:
+        first = pb.ListPaymentsResponse(
+            payments=[self.pending(1)],
+            first_index_offset=1,
+            last_index_offset=1,
+            total_num_payments=2,
+        )
+        second = pb.ListPaymentsResponse(
+            payments=[self.pending(2, 0x33)],
+            first_index_offset=2,
+            last_index_offset=2,
+            total_num_payments=2,
+        )
+        if bad == "total":
+            second.total_num_payments = 3
+        elif bad == "truncated":
+            second.ClearField("payments")
+            second.first_index_offset = second.last_index_offset = 0
+        elif bad == "cursor":
+            second.last_index_offset = 5
+        elif bad == "repeat-index":
+            second.payments[0].payment_index = 1
+            second.first_index_offset = second.last_index_offset = 1
+        else:
+            second.payments[0].payment_hash = first.payments[0].payment_hash
+        async with peer_client(_PaymentPages([first, second])) as client:
+            with pytest.raises(LndPeerResponseError):
+                await client.payment_history()
+
+    @pytest.mark.parametrize(
+        "bad", ["count", "empty-cursor", "unresolved-attempt", "unknown-attempt"]
+    )
+    async def test_inconsistent_payment_evidence_is_rejected(self, bad: str) -> None:
+        page = pb.ListPaymentsResponse(
+            payments=[payment(payment_index=1)],
+            first_index_offset=1,
+            last_index_offset=1,
+            total_num_payments=1,
+        )
+        if bad == "count":
+            page.total_num_payments = 0
+        elif bad == "empty-cursor":
+            page.ClearField("payments")
+            page.total_num_payments = 0
+        else:
+            page.payments[0].htlcs.add(
+                status=pb.HTLCAttempt.IN_FLIGHT if bad == "unresolved-attempt" else 999
+            )
+        async with peer_client(_PaymentPages([page])) as client:
+            with pytest.raises(LndPeerResponseError):
+                await client.payment_history()
+
+    async def test_a_later_rpc_failure_does_not_return_partial_results(self) -> None:
+        stub = _PaymentPages(
+            [
+                pb.ListPaymentsResponse(
+                    payments=[self.pending(1)],
+                    first_index_offset=1,
+                    last_index_offset=1,
+                    total_num_payments=2,
+                ),
+                rpc_error(grpc.StatusCode.UNAVAILABLE, "private backend detail"),
+            ]
+        )
+        async with peer_client(stub) as client:
+            with pytest.raises(LndPeerRpcError) as error:
+                await client.payment_history()
+        assert "private backend detail" not in str(error.value)
+
+
 class TestTrackPayment:
     async def test_returns_the_current_result(self) -> None:
         stream = _Stream(
