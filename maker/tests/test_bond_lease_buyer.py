@@ -101,6 +101,7 @@ async def test_a_lease_is_switched_in_with_its_chain_value() -> None:
 
     assert await buyer.check()
 
+    assert lease.await_args is not None
     assert lease.await_args.kwargs == {"cap_sats": 40_000, "max_rate": 0.03}
     ((bond, height),) = bot.adopted
     assert height == 4040

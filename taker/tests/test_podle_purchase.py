@@ -29,6 +29,7 @@ from taker import podle_purchase
 from taker.podle_purchase import (
     InteractivePayer,
     NodePayer,
+    PaymentIdentity,
     PoDLEPurchaser,
     foreign_commitments,
     min_backing_sats,
@@ -194,6 +195,57 @@ def test_invoices_are_paid_only_by_the_source_mixdepth_node(tmp_path: Path) -> N
     node_payer = attended(0)
     assert isinstance(node_payer, NodePayer)
     assert isinstance(node_payer.fallback, InteractivePayer)
+
+
+@pytest.mark.asyncio
+async def test_node_payer_reports_what_its_node_knows_of_a_payment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jmswap.lnd_peer import PaymentResult, PaymentStatus
+
+    payment_hash = b"\x11" * 32
+    tracked: list[bytes] = []
+
+    class _Client:
+        result: PaymentResult | None = None
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        async def inspect_invoice(self, bolt11: str) -> Any:
+            assert bolt11 == "lnbcrt1"
+            return SimpleNamespace(payment_hash=payment_hash)
+
+        async def node_info(self) -> Any:
+            return SimpleNamespace(identity_pubkey="original")
+
+        async def track_payment(self, value: bytes) -> PaymentResult | None:
+            tracked.append(value)
+            return self.result
+
+    client = _Client()
+    payer = NodePayer(Mock())
+    monkeypatch.setattr(payer, "_client", lambda: client)
+    identity = await payer.identify("lnbcrt1")
+    assert identity == PaymentIdentity("original", payment_hash.hex())
+    # Missing history and empty streams are not proof of failure.
+    assert await payer.status(identity) == "pending"
+    for status, expected in (
+        (PaymentStatus.IN_FLIGHT, "pending"),
+        (PaymentStatus.SUCCEEDED, "succeeded"),
+        (PaymentStatus.FAILED, "failed"),
+    ):
+        client.result = PaymentResult(
+            status=status, payment_hash=payment_hash, preimage=None, fee_sat=0
+        )
+        assert await payer.status(identity) == expected
+    assert tracked == [payment_hash] * 4
+    with pytest.raises(ValueError, match="original paying node"):
+        await payer.status(PaymentIdentity("replacement", payment_hash.hex()))
+    assert tracked == [payment_hash] * 4
 
 
 @pytest.mark.asyncio

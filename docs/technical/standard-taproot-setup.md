@@ -325,15 +325,39 @@ with leasing on. Leases are paid from mixdepth 0's node, where bonds live.
 Listings are tried from the highest price within `lease_bond_max_sats`
 (routing fees included) down. Listings carry no bond value, so a quote is
 accepted only when its price is within `lease_bond_max_rate` a year of the
-quoted bond's locked amount, checked on chain before paying: under the rate
-cap a higher price means a larger bond. Each purchase is recorded under
-`market/bond-purchases/` with fresh random buyer and renter certificate keys
-before the request is sent, so a paid lease is collected after a crash, and no
-other seller is paid while a payment may be in flight. Deriving the renter
-key from the seed would not help recovery, since the owner's certificate
-signature cannot be recovered from the seed either. A delivered lease is imported into the bond
-registry as an external entry, and a lease of the same bond for a later
-period renews its certificate there.
+quoted bond's locked amount, checked on chain before paying. Selection is by
+price: under the rate cap a higher price only raises the smallest bond it can
+buy, it does not guarantee the largest one.
+
+Each purchase is recorded under `market/bond-purchases/` with fresh random
+buyer and renter certificate keys before the request is sent, so a paid lease
+is collected after a crash. At most one lease is paid for per period:
+
+- A payment stays unresolved until mixdepth 0's node reports it succeeded or
+  failed, and no other seller is paid until then, even across a period
+  boundary: a held payment can settle until its HTLC times out, and an
+  expired certificate does not change that. Delivery (valid or invalid) is
+  independent of settlement. The original paying node's identity and payment
+  hash are saved before paying, and checked during recovery. A changed node,
+  missing history, or an empty status response never proves payment failure.
+  Retain authoritative LND history and keep settlement monitors running;
+  incomplete outcomes intentionally remain fail-closed.
+- A lease paid for in the current period blocks another purchase in that
+  period, whether it was delivered usable or not. A seller whose paid lease
+  proved unusable is not bought from again.
+- A delivered lease keeps its certificate key in its record through its
+  period (and until payment resolves), so a maker that could not switch it in
+  gets it again instead of buying a second one.
+- An unreadable or unknown record blocks every purchase until it is reviewed,
+  since it proves neither that nothing was paid nor that a payment resolved.
+
+Deriving the renter key from the seed would not help recovery, since the
+owner's certificate signature cannot be recovered from the seed either. A
+delivered lease is imported into the bond registry as an external entry. A
+lease of the same bond for a later period renews the certificate only of an
+entry whose current certificate was leased here, as the purchase records
+prove; a cold owner's own certificate or a `jm-market import` entry is never
+replaced.
 
 ## Setup and Status
 
@@ -359,7 +383,7 @@ also as JSON.
 | Ring node bindings | existing `node-bindings.json` | Managed init writes them for its own new nodes |
 | Market ledger, store, leases | existing wallet market ledger | No sales or leases |
 | Advertised bonds per period | `market/advertised-bonds.json` | Created when first needed; every bond counts as advertised through the next period |
-| Bond lease purchases with their keys until delivered | `market/bond-purchases/` | No lease in flight; the next one is bought when needed |
+| Bond lease purchases, with their keys until their period ends or as evidence of an unusable paid lease | `market/bond-purchases/` | No lease paid here; nothing blocks the next purchase, and no registry entry counts as leased here |
 | Rented bond with derived certificate key | existing bond registry, new entry kind | No rental; older entries keep raw keys |
 
 A data directory without a market store is treated as one that never sold a

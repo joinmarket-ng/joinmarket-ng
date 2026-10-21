@@ -526,7 +526,8 @@ without a usable bond lease one for the rest of each retarget period, paid
 from its mixdepth 0 node within `lease_bond_max_sats` and
 `lease_bond_max_rate`, and advertise it. It needs `[lightning]` and a node for
 mixdepth 0, but no market ledger. An expired leased or cold certificate is
-replaced by a new lease instead of stopping the maker. See the
+replaced by a new lease instead of stopping the maker. At most one lease is
+paid for per period, and none while an earlier payment is unresolved. See the
 [standard Taproot setup](technical/standard-taproot-setup.md#renting-a-bond).
 
 ### Diagnosis, Recovery, and Directory Moves
@@ -645,9 +646,10 @@ The wallet fingerprint is the eight-character fingerprint of the hot JoinMarket
 wallet registry, printed by `jm-wallet info`. Bond import verifies the owner
 authorization and chain stake, refuses collateral with locally verified fault
 evidence, then stores the certificate as an external registry entry with
-`index = -1` and path `external`. The renter certificate key remains local. A
-lease of the same bond for a later period renews that entry's certificate; any
-other difference from an existing entry is refused.
+`index = -1` and path `external`. The renter certificate key remains local.
+Any difference from an existing entry is refused; only automatic
+[maker bond leasing](#maker-bond-leasing) renews the certificate of an entry
+it leased itself.
 
 ### Bond Rental Limits
 

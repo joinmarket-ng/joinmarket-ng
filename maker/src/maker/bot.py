@@ -2219,7 +2219,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """
         logger.warning(
             "The fidelity bond certificate has expired; offers carry no bond proof "
-            "until a new lease is bought"
+            "until a new lease is bought. For a cold storage bond of your own, sign a "
+            "new certificate instead (jm-wallet prepare-certificate-message, then "
+            "jm-wallet import-certificate) and restart the maker."
         )
         self.fidelity_bond = None
 

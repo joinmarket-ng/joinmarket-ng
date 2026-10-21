@@ -15,8 +15,10 @@ is still collected on the next run.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import math
+import os
 import secrets
 import sys
 import time
@@ -94,6 +96,16 @@ def min_backing_sats(cj_amount: int, min_percent: int) -> int:
 #: "paid": the node paid (or may have paid); "shown": a person was asked to pay;
 #: "failed": certainly nothing was paid.
 PayOutcome = Literal["paid", "shown", "failed"]
+# Missing history and an empty stream both leave the outcome unknown.
+PaymentState = Literal["succeeded", "failed", "pending"]
+
+
+@dataclass(frozen=True)
+class PaymentIdentity:
+    """The original paying node and the invoice's payment hash."""
+
+    payer: str
+    payment_hash: str
 
 
 class InvoicePayer(Protocol):
@@ -105,6 +117,24 @@ class InvoicePayer(Protocol):
 
     async def pay(
         self, bolt11: str, *, amount_sats: int, fee_limit_sats: int, expires_at: int
+    ) -> PayOutcome: ...
+
+
+class TrackedPayer(InvoicePayer, Protocol):
+    """A payer that can later tell whether an earlier payment of an invoice resolved."""
+
+    async def identify(self, bolt11: str) -> PaymentIdentity: ...
+
+    async def status(self, identity: PaymentIdentity) -> PaymentState: ...
+
+    async def pay(
+        self,
+        bolt11: str,
+        *,
+        amount_sats: int,
+        fee_limit_sats: int,
+        expires_at: int,
+        expected_payer: str | None = None,
     ) -> PayOutcome: ...
 
 
@@ -129,19 +159,56 @@ class NodePayer:
     def routing_budget(self, cap_sats: int) -> int:
         return max(1, cap_sats // 5)
 
-    async def pay(
-        self, bolt11: str, *, amount_sats: int, fee_limit_sats: int, expires_at: int
-    ) -> PayOutcome:
-        from jmswap.lnd_peer import LndPeerClient, PaymentStatus
+    def _client(self) -> Any:
+        from jmswap.lnd_peer import LndPeerClient
 
-        endpoint = self.node.lnd_grpc_url.removeprefix("https://")
-        timeout = max(1, min(60, expires_at - int(time.time()) - 5))
-        client = LndPeerClient(
-            endpoint,
+        return LndPeerClient(
+            self.node.lnd_grpc_url.removeprefix("https://"),
             self.node.lnd_tls_cert_path.expanduser().read_bytes(),
             self.node.lnd_macaroon_path.expanduser().read_bytes(),
         )
-        async with client:
+
+    async def identify(self, bolt11: str) -> PaymentIdentity:
+        """Identify the paying node and invoice before recording the payment intent."""
+        async with self._client() as client:
+            node = await client.node_info()
+            invoice = await client.inspect_invoice(bolt11)
+        return PaymentIdentity(node.identity_pubkey, invoice.payment_hash.hex())
+
+    async def status(self, identity: PaymentIdentity) -> PaymentState:
+        """Look up the payment only at its original node; missing history stays pending."""
+        from jmswap.lnd_peer import PaymentStatus
+
+        async with self._client() as client:
+            if (await client.node_info()).identity_pubkey != identity.payer:
+                raise ValueError("bond payment lookup requires its original paying node")
+            result = await client.track_payment(bytes.fromhex(identity.payment_hash))
+        if result is None:
+            return "pending"
+        if result.status is PaymentStatus.SUCCEEDED:
+            return "succeeded"
+        if result.status is PaymentStatus.FAILED:
+            return "failed"
+        return "pending"
+
+    async def pay(
+        self,
+        bolt11: str,
+        *,
+        amount_sats: int,
+        fee_limit_sats: int,
+        expires_at: int,
+        expected_payer: str | None = None,
+    ) -> PayOutcome:
+        from jmswap.lnd_peer import PaymentStatus
+
+        timeout = max(1, min(60, expires_at - int(time.time()) - 5))
+        async with self._client() as client:
+            if expected_payer is not None:
+                if (await client.node_info()).identity_pubkey != expected_payer:
+                    raise ValueError("bond payment requires its recorded paying node")
+                if self.fallback is not None:
+                    raise ValueError("tracked bond payments cannot use an external payer")
             result = await client.pay(
                 bolt11,
                 fee_limit_sat=fee_limit_sats,
@@ -249,23 +316,44 @@ class PurchaseRecord:
     def save(self) -> None:
         encoded = json.dumps(self.data, sort_keys=True, separators=(",", ":")).encode()
         atomic_write_private(self.path, encoded)
+        # The rename itself must survive a host crash, not only the contents.
+        try:
+            fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+
+
+def read_records(directory: Path) -> tuple[list[PurchaseRecord], list[Path]]:
+    """Persisted purchases, and the files (kept in place) that cannot be read."""
+    records: list[PurchaseRecord] = []
+    unreadable: list[Path] = []
+    if not directory.is_dir():
+        return records, unreadable
+    for path in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(path.read_bytes())
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+                or not isinstance(data.get("state"), str)
+            ):
+                raise ValueError
+        except (OSError, ValueError):
+            logger.warning("Ignoring unreadable market purchase record {}", path.name)
+            unreadable.append(path)
+            continue
+        records.append(PurchaseRecord(path, data))
+    return records, unreadable
 
 
 def load_records(directory: Path) -> list[PurchaseRecord]:
     """Persisted purchases, skipping (and keeping) any file that cannot be read."""
-    records: list[PurchaseRecord] = []
-    if not directory.is_dir():
-        return records
-    for path in sorted(directory.glob("*.json")):
-        try:
-            data = json.loads(path.read_bytes())
-            if data.get("version") != 1 or not isinstance(data.get("state"), str):
-                raise ValueError
-        except (OSError, ValueError):
-            logger.warning("Ignoring unreadable market purchase record {}", path.name)
-            continue
-        records.append(PurchaseRecord(path, data))
-    return records
+    return read_records(directory)[0]
 
 
 def purchases_dir(data_dir: Path) -> Path:
