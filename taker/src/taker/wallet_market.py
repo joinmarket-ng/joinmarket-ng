@@ -120,6 +120,10 @@ class WalletMarketSeller:
         self._closed = False
         self._start_attempted = False
         self._running = False
+        self._admission_closed = False
+        self._active_admissions = 0
+        self._admissions_idle = asyncio.Event()
+        self._admissions_idle.set()
         self._starting_task: asyncio.Task[object] | None = None
         self._stop_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
@@ -140,6 +144,39 @@ class WalletMarketSeller:
     def running(self) -> bool:
         """Whether this runtime is currently able to publish seller responses."""
         return self._running and not self._closed
+
+    @property
+    def accepting(self) -> bool:
+        """Whether callbacks can allocate new quotes or generate listings."""
+        return self.running and not self._admission_closed
+
+    async def close_admission(self) -> None:
+        """Stop new callback allocations and await previously admitted callbacks.
+
+        The sticky boundary takes effect when this method executes, not when
+        its coroutine is created. Canceling this wait never cancels admitted
+        callbacks or settlement. Startup does not reopen admission.
+
+        Transport caches may replay old quotes, and publication may follow a
+        callback's completion. Existing quotes remain payable; unresolved RPC
+        effects remain unknown. This is neither financial quiescence nor
+        clearance to stop nodes, release ownership, or remove history.
+        """
+        self._admission_closed = True
+        await self._admissions_idle.wait()
+
+    def _admit_callback(self) -> bool:
+        if not self.accepting:
+            return False
+        # No await separates the gate from registration on this event loop.
+        self._active_admissions += 1
+        self._admissions_idle.clear()
+        return True
+
+    def _admission_finished(self) -> None:
+        self._active_admissions -= 1
+        if self._active_admissions == 0:
+            self._admissions_idle.set()
 
     def status(self) -> dict[str, str | None]:
         """Return only public seller runtime information."""
@@ -477,12 +514,15 @@ class WalletMarketSeller:
         return await self._listing_for(self._service)
 
     async def _listing_for(self, service: MarketService | None) -> bytes:
-        if not self._callbacks_available() or service is None:
+        if service is None or not self._admit_callback():
             raise MarketError("Wallet market seller is unavailable")
-        listing = await service.listing()
-        if not self._callbacks_available():
-            raise MarketError("Wallet market seller is unavailable")
-        return listing
+        try:
+            listing = await service.listing()
+            if not self._callbacks_available():
+                raise MarketError("Wallet market seller is unavailable")
+            return listing
+        finally:
+            self._admission_finished()
 
     async def _respond_callback(self, sender: str, body: dict[str, object]) -> dict[str, object]:
         return await self._respond_for(self._service, sender, body)
@@ -492,10 +532,17 @@ class WalletMarketSeller:
     ) -> dict[str, object]:
         if not self._callbacks_available() or service is None:
             return {"error": "unavailable"}
-        response = await service.respond(sender, body)
-        if not self._callbacks_available():
+        admission = body.get("action") != "delivery"
+        if admission and not self._admit_callback():
             return {"error": "unavailable"}
-        return response
+        try:
+            response = await service.respond(sender, body)
+            if not self._callbacks_available():
+                return {"error": "unavailable"}
+            return response
+        finally:
+            if admission:
+                self._admission_finished()
 
     def _fault_callback(self, raw: bytes) -> None:
         if self._callbacks_available() and self._fault_cache is not None:

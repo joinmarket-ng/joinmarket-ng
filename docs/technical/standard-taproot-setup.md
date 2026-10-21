@@ -514,6 +514,16 @@ taker, or market. Persistent LND supervision does not replace application
 settlement monitors. Automatic maker-owned supervision remains deferred until
 admission can stop while recovery monitors continue running.
 
+The seller runtime's admission-only boundary can stop new listing/quote
+callbacks while keeping the same ledger ownership, keys, invoice clients, and
+settlement task alive. It waits for already-admitted callbacks without
+canceling them; canceling that wait leaves admission closed. Transport caches
+may still replay existing quotes, and existing quotes remain payable. Callback
+completion does not resolve uncertain external RPC effects. This transient
+boundary is not integrated into automatic maintenance and never authorizes
+node shutdown or history removal. Restart retains the existing startup behavior
+and creates a new admission-open runtime, not durable maintenance exclusion.
+
 Role guidance prints separate actor commands and mixdepth-specific reserve
 funding instructions; it never submits a reserve transaction or starts actors.
 After a fresh software installation, the installer offers guided setup with a
