@@ -60,6 +60,7 @@ class ManagedLnd:
     async def start(self) -> None:
         if self.running:
             return
+        self.env.validate_for_launch()
         if not self.env.lnd_binary.is_file():
             raise LndProcessError(
                 f"lnd not found at {self.env.lnd_binary}; run `jm-lightning install-lnd`"

@@ -1,7 +1,8 @@
 """Generated LND configuration for managed nodes.
 
-Tor only, Bitcoin Core in RPC polling mode (no ZMQ), private production Taproot
-channels with SCID aliases, no REST listener, no bootstrapping to random peers.
+Tor Lightning peer traffic, direct HTTP Bitcoin Core RPC polling (no ZMQ),
+private production Taproot channels with SCID aliases, no REST listener, and
+no bootstrapping to random peers. Tor activation does not protect Core RPC.
 """
 
 from __future__ import annotations
@@ -14,6 +15,46 @@ from urllib.parse import urlsplit
 from jmcore.constants import BITCOIN_RPC_PORTS
 
 from jmswap.managed_nodes import ManagedNode, ManagedNodeError, NodeState
+
+
+def _rpc_target(value: str, default_port: int) -> tuple[str, str | None]:
+    """Translate the representable address and retain only a static launch refusal.
+
+    Read-only node RPC clients do not use this Core transport. Keeping a
+    representable unsupported target inspectable must never approve a launch.
+    """
+    rejection = None
+    if any(ord(char) < 33 or ord(char) == 127 or char == "\\" for char in value):
+        rejection = (
+            "Bitcoin Core RPC endpoint contains unsupported whitespace or control characters"
+        )
+    try:
+        parsed = urlsplit(value if "://" in value else f"http://{value}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ManagedNodeError(
+            "Bitcoin Core RPC endpoint has malformed host or port syntax"
+        ) from None
+    if not host:
+        raise ManagedNodeError("bitcoin.rpc_url has no host")
+    if parsed.scheme != "http":
+        rejection = "Managed LND uses direct HTTP Core RPC, not HTTPS or a SOCKS URL; use a secured local tunnel or manual mode"
+    elif parsed.username is not None or parsed.password is not None:
+        rejection = "Managed LND requires separate Bitcoin RPC user/password settings or a cookie; URL credentials are unsupported"
+    elif parsed.path not in {"", "/"} or "?" in value or "#" in value:
+        rejection = "Managed LND cannot preserve Bitcoin RPC URL paths, queries, or fragments"
+    elif host.lower().rstrip(".").endswith(".onion"):
+        rejection = "Managed LND Core RPC does not use Tor; supply a direct secured tunnel endpoint instead of an onion hostname"
+    elif port == 0 or parsed.netloc.endswith(":"):
+        rejection = "Bitcoin Core RPC endpoint requires a port in 1..65535 when specified"
+    return _host_port(host, default_port if port is None else port), rejection
+
+
+def _host_port(host: str, port: int) -> str:
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        host = f"[{host}]"
+    return f"{host}:{port}"
 
 
 @dataclass(frozen=True)
@@ -29,22 +70,38 @@ class LndEnvironment:
     tor_socks: str = "127.0.0.1:9050"
     tor_control: str = "127.0.0.1:9051"
     tor_password: str | None = field(default=None, repr=False)
+    _rpc_launch_error: str | None = field(default=None, repr=False)
+
+    def validate_for_launch(self) -> None:
+        """Approve only supported launch transport, not unrelated existing-node reads."""
+        if self._rpc_launch_error is not None:
+            raise ManagedNodeError(self._rpc_launch_error)
+        # Also check manually constructed environments. No stored refusal does
+        # not by itself establish that this structured target is representable.
+        if any(character in self.bitcoind_host for character in "/?#@"):
+            raise ManagedNodeError(
+                "Managed LND Core RPC target must be a hostname and optional port"
+            )
+        default_port = BITCOIN_RPC_PORTS.get(self.network)
+        if default_port is None:
+            raise ManagedNodeError("unsupported managed Bitcoin network")
+        _, error = _rpc_target(self.bitcoind_host, default_port)
+        if error is not None:
+            raise ManagedNodeError(error)
 
     @classmethod
     def from_settings(cls, settings: Any, *, network: str, lnd_binary: Path) -> LndEnvironment:
-        """Derive the environment from ``JoinMarketSettings``."""
+        """Describe settings; launch/render must additionally validate_for_launch.
+
+        Unsupported future-launch transport does not disable authenticated RPC
+        inspection of an already-running node using its recorded credentials.
+        """
         bitcoin = settings.bitcoin
         if bitcoin.backend_type == "neutrino":
             raise ManagedNodeError("managed Lightning nodes need a Bitcoin Core backend")
-        parsed = urlsplit(
-            bitcoin.rpc_url if "://" in bitcoin.rpc_url else f"http://{bitcoin.rpc_url}"
-        )
-        if not parsed.hostname:
-            raise ManagedNodeError("bitcoin.rpc_url has no host")
-        host = parsed.hostname
-        if ":" in host:
-            host = f"[{host}]"
-        port = parsed.port or BITCOIN_RPC_PORTS[network]
+        target, rejection = _rpc_target(bitcoin.rpc_url, BITCOIN_RPC_PORTS[network])
+        if bitcoin.backend_type != "descriptor_wallet":
+            rejection = "managed Lightning nodes need the supported Bitcoin Core backend"
         tor = settings.tor
         if not tor.control_enabled:
             raise ManagedNodeError(
@@ -56,13 +113,14 @@ class LndEnvironment:
         return cls(
             network=network,
             lnd_binary=lnd_binary,
-            bitcoind_host=f"{host}:{port}",
+            bitcoind_host=target,
             bitcoind_cookie=cookie,
             bitcoind_user=bitcoin.rpc_user if cookie is None else None,
             bitcoind_password=password,
-            tor_socks=f"{tor.socks_host}:{tor.socks_port}",
-            tor_control=f"{tor.control_host}:{tor.control_port}",
+            tor_socks=_host_port(tor.socks_host, tor.socks_port),
+            tor_control=_host_port(tor.control_host, tor.control_port),
             tor_password=tor_password or None,
+            _rpc_launch_error=rejection,
         )
 
 
@@ -74,6 +132,7 @@ def _value(value: str) -> str:
 
 def render_lnd_conf(node: ManagedNode, env: LndEnvironment, *, quarantined: bool = False) -> str:
     """The complete ``lnd.conf`` of one managed node."""
+    env.validate_for_launch()
     refuse_inbound = quarantined or node.state in {NodeState.RETIRING, NodeState.RECOVERING}
     sections: dict[str, list[str]] = {
         "Application Options": [

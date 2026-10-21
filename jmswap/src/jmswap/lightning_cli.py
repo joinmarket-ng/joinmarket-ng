@@ -103,6 +103,10 @@ def init(
 ) -> None:
     """Create one fresh managed node per mixdepth, or finish an interrupted creation."""
     ctx = _context(mnemonic_file, prompt_bip39_passphrase, data_dir, config_file, log_level)
+    try:
+        ctx.env.validate_for_launch()
+    except ManagedNodeError as exc:
+        raise _fail(str(exc)) from None
     if not is_installed(ctx.env.lnd_binary) and not ctx.env.lnd_binary.is_file():
         raise _fail("lnd is not installed; run `jm-lightning install-lnd` first")
     from jmswap.managed_provision import allocate_missing, create_nodes, resume
@@ -146,6 +150,10 @@ def run(
     from jmswap.managed_supervisor import Supervisor
 
     assert ctx.keys is not None
+    try:
+        ctx.env.validate_for_launch()
+    except ManagedNodeError as exc:
+        raise _fail(str(exc)) from None
     supervisor = Supervisor(ctx.store, ctx.keys, ctx.env)
 
     async def main() -> None:

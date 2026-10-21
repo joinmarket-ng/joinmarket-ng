@@ -94,7 +94,7 @@ Old and new nodes run side by side during this; they are distinct identities.
 `jm-lightning run` is the long-running service. It starts the pinned
 upstream `lnd` binary once per active node with a generated configuration:
 
-- Tor only, with a per-node onion service for the ring endpoint.
+- Lightning peer traffic through Tor, with a per-node onion ring endpoint.
 - Bitcoin Core backend in RPC polling mode, so no ZMQ setup is needed.
 - Private production Taproot channels and SCID aliases (the ring
   requirements), no public announcements, no REST listener.
@@ -108,6 +108,21 @@ restarts crashed nodes with backoff, keeps the static channel backups current,
 and stops the nodes cleanly. `jm-lightning install-lnd` downloads the upstream release and
 checks it against SHA-256 digests pinned in the source. Operators who prefer
 Docker use manual mode instead.
+
+LND's Bitcoin Core RPC is direct plaintext HTTP, not Tor or HTTPS. Use loopback
+or an explicitly secured tunnel; `tor.active` protects peer traffic, not this
+RPC connection. Managed launches reject HTTPS, onion RPC hostnames, inline URL
+credentials, and URL routing components that LND cannot preserve. Supply RPC
+credentials separately or use the cookie path. This does not restrict the
+ordinary wallet backend's supported transports or change explicit remote HTTP
+operator choices.
+
+Rejected but parseable Core transport settings do not prevent authenticated
+reads of existing managed nodes using recorded TLS and macaroon credentials.
+Other invalid settings can still prevent construction of that read context.
+Launch refusal happens before stopping a stale process, modifying node data,
+or spawning a replacement. It does not retroactively secure an already-running
+node's RPC connection; correct that node's backend configuration deliberately.
 
 The supervisor discovers explicitly registered runnable nodes while it runs,
 so a replacement can start beside a retiring node. Registry changes stop an

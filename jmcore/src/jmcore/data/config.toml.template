@@ -917,6 +917,9 @@
 # and market payments to them. "manual": the same automation with your own
 # LND endpoints from the channel ring sections.
 # Requires [wallet] address_type = "p2tr". See docs/technical/standard-taproot-setup.md.
+# Managed LND's Core RPC is direct plaintext HTTP, not Tor or HTTPS. Use loopback
+# or a secured tunnel. HTTPS/onion RPC URLs, URL credentials, paths, queries, and
+# fragments cannot be preserved; use separate RPC credentials or a cookie file.
 # mode = "off"
 
 # Managed mode: lnd executable. Defaults to the pinned, digest-verified release
