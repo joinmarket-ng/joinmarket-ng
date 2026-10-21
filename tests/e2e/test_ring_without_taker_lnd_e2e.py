@@ -20,6 +20,7 @@ from tests.e2e.ring_fixture import (
     TAKER_MNEMONIC,
     bitcoin_rpc,
     compose,
+    exercise_maker_channels,
     lncli,
     mine_and_sync,
     taker_config,
@@ -116,5 +117,6 @@ async def test_three_maker_ring_without_taker_lnd() -> None:
             str(item["channel_point"]) for items in channels.values() for item in items
         } == (expected_points)
         assert all(item["private"] for items in channels.values() for item in items)
+        await exercise_maker_channels(record, destination)
     finally:
         await taker.stop()

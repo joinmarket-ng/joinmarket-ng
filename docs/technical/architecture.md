@@ -276,6 +276,12 @@ scripts/run-ring-e2e.sh ring
 scripts/run-ring-e2e.sh ring-no-taker
 ```
 
+Readiness authenticates every possible directed LND peer connection before
+enrollment, since the selected cycle is not known yet. The maker-only fixture
+checks channel activation, an exact-channel payment on each edge, and confirmed
+cooperative closure at both endpoints. This does not cover buyout settlement
+or automatic timeout-split fee bumping (which remains unsupported).
+
 A failed or interrupted fixture keeps its chain, journals, and channels for
 review. `E2E_RESET=1` deletes one reviewed fixture; it is never a retry of an
 uncertain signed round.

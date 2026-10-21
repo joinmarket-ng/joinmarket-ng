@@ -274,7 +274,15 @@ def test_authenticated_onion_readiness_precedes_enrollment_and_tests(
     result = run(env, "ring-no-taker")
     assert result.returncode == 0, result.stderr
     commands = log.read_text()
-    assert commands.count("listpeers") == 3
+    assert commands.count("listpeers") == 6
+    # Any selected three-maker cycle must be covered, including maker3 -> maker2.
+    for source in (1, 2, 3):
+        for destination in (1, 2, 3):
+            if source != destination:
+                assert (
+                    f"LND onion ready: lnd-maker{source} -> lnd-maker{destination}"
+                    in result.stdout
+                )
     assert commands.index("listpeers") < commands.index("RING_NODE_ENROLLMENT_PUBKEY")
     assert Path(env["FAKE_PYTEST_LOG"]).exists()
 

@@ -277,8 +277,8 @@ ring_lnd_cli() {
 wait_for_ring_onions() {
     # Bootstrap and hostname files do not prove descriptor publication. Exercise
     # every destination through Tor and require LND's authenticated peer identity
-    # before creating any funding intent. One source plus a reverse edge covers
-    # all services without building a full mesh of test connections.
+    # before creating any funding intent. The cycle is selected only later, so
+    # test every possible directed edge, not just a star from the first node.
     local -a nodes=("$@")
     local budget=${RING_E2E_PEER_READY_TIMEOUT_SECONDS:-600}
     if [[ ! "$budget" =~ ^[1-9][0-9]*$ ]] || [ "$budget" -gt 1800 ]; then
@@ -287,42 +287,43 @@ wait_for_ring_onions() {
     fi
     local deadline=$((SECONDS + budget))
     local destination source identity onion remaining attempt_timeout
-    for destination in "${nodes[@]}"; do
-        source=${nodes[0]}
-        [ "$destination" != "$source" ] || source=${nodes[1]}
-        identity=$(ring_lnd_cli "$destination" 15 getinfo | python -c 'import json,sys
+    for source in "${nodes[@]}"; do
+        for destination in "${nodes[@]}"; do
+            [ "$destination" != "$source" ] || continue
+            identity=$(ring_lnd_cli "$destination" 15 getinfo | python -c 'import json,sys
 key = json.load(sys.stdin)["identity_pubkey"]
 if not isinstance(key, str) or len(key) != 66 or key[:2] not in ("02", "03"):
     raise ValueError("invalid authenticated LND identity")
 bytes.fromhex(key)
 print(key)') || return 1
-        onion=$(ring_compose exec -T ring-tor cat "/var/lib/tor/lnd-$destination/hostname")
-        onion=$(printf '%s' "$onion" | tr -d '\r\n')
-        if [[ ! "$onion" =~ ^[a-z2-7]{56}\.onion$ ]]; then
-            echo "invalid onion hostname for lnd-$destination" >&2
-            return 1
-        fi
-        while true; do
-            remaining=$((deadline - SECONDS))
-            if [ "$remaining" -le 0 ]; then
-                echo "LND onion readiness failed: lnd-$source -> lnd-$destination" >&2
-                ring_compose logs --no-color --tail 100 ring-tor "lnd-$source" >&2
+            onion=$(ring_compose exec -T ring-tor cat "/var/lib/tor/lnd-$destination/hostname")
+            onion=$(printf '%s' "$onion" | tr -d '\r\n')
+            if [[ ! "$onion" =~ ^[a-z2-7]{56}\.onion$ ]]; then
+                echo "invalid onion hostname for lnd-$destination" >&2
                 return 1
             fi
-            attempt_timeout=$((remaining < 30 ? remaining : 30))
-            ring_lnd_cli "$source" "$((attempt_timeout + 5))" \
-                connect "$identity@$onion:9735" --timeout "${attempt_timeout}s" \
-                >/dev/null 2>&1 || true
-            # Already-connected replies and failed connects are not evidence.
-            # Read the authenticated peer set independently in both cases.
-            if ring_lnd_cli "$source" 15 listpeers | python -c 'import json,sys
+            while true; do
+                remaining=$((deadline - SECONDS))
+                if [ "$remaining" -le 0 ]; then
+                    echo "LND onion readiness failed: lnd-$source -> lnd-$destination" >&2
+                    ring_compose logs --no-color --tail 100 ring-tor "lnd-$source" >&2
+                    return 1
+                fi
+                attempt_timeout=$((remaining < 30 ? remaining : 30))
+                ring_lnd_cli "$source" "$((attempt_timeout + 5))" \
+                    connect "$identity@$onion:9735" --timeout "${attempt_timeout}s" \
+                    >/dev/null 2>&1 || true
+                # Already-connected replies and failed connects are not evidence.
+                # Read the authenticated peer set independently in both cases.
+                if ring_lnd_cli "$source" 15 listpeers | python -c 'import json,sys
 peers = json.load(sys.stdin)["peers"]
 sys.exit(0 if any(peer.get("pub_key") == sys.argv[1] for peer in peers) else 1)' \
-                "$identity"; then
-                echo "LND onion ready: lnd-$source -> lnd-$destination"
-                break
-            fi
-            sleep 1
+                    "$identity"; then
+                    echo "LND onion ready: lnd-$source -> lnd-$destination"
+                    break
+                fi
+                sleep 1
+            done
         done
     done
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -284,6 +285,190 @@ async def wait_for_ring_channels(
         if asyncio.get_running_loop().time() >= deadline:
             raise RuntimeError(f"ring channels did not become active: {channels}")
         await asyncio.sleep(2)
+
+
+async def exercise_maker_channels(record: Any, mining_address: str) -> None:
+    """Prove each created maker edge carries a payment and closes cooperatively.
+
+    This is an ordinary channel lifecycle, not an escrow buyout or timeout split.
+    Never reset payment history or stop the makers while an outcome is unknown.
+    """
+    services = ("lnd-maker1", "lnd-maker2", "lnd-maker3")
+
+    async def rpc(service: str, *args: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(lncli, service, *args)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Command arguments can contain invoices and preimages.
+            raise RuntimeError(
+                f"{service} lifecycle {args[0]} failed; retain LND history"
+            ) from None
+
+    by_node = {
+        (await rpc(service, "getinfo"))["identity_pubkey"]: service
+        for service in services
+    }
+    by_key = {peer.participant_key: peer.node_id for peer in record.participants}
+    assert record.manifest is not None
+    points: dict[str, tuple[str, str]] = {}
+
+    async def channel(service: str, point: str) -> dict[str, Any]:
+        items = (await rpc(service, "listchannels"))["channels"]
+        matches = [item for item in items if item["channel_point"] == point]
+        assert len(matches) == 1, f"{service} does not have the expected channel"
+        return matches[0]
+
+    for ordinal, edge in enumerate(record.manifest.edges):
+        opener, fundee = (
+            by_node[by_key[edge.opener_key]],
+            by_node[by_key[edge.acceptor_key]],
+        )
+        point = f"{record.manifest.unsigned_txid}:{edge.output_index}"
+        points[point] = (opener, fundee)
+        before = await channel(opener, point)
+        received_before = await channel(fundee, point)
+        for state, peer in (
+            (before, edge.acceptor_key),
+            (received_before, edge.opener_key),
+        ):
+            assert state["remote_pubkey"] == by_key[peer]
+            assert state["private"] and state["active"]
+            assert (
+                int(state["capacity"]) == edge.capacity and not state["pending_htlcs"]
+            )
+        amount = 1_000
+        invoice = await rpc(
+            fundee, "addinvoice", f"--amt={amount}", f"--memo=maker-edge-{ordinal}"
+        )
+        decoded = await rpc(fundee, "decodepayreq", invoice["payment_request"])
+        assert decoded["route_hints"] == []
+        assert decoded["destination"] == by_key[edge.acceptor_key]
+        assert decoded["payment_hash"] == invoice["r_hash"]
+        assert int(decoded["num_satoshis"]) == amount
+        # Derive the public SCID from the actual funding block. Private/alias
+        # channel IDs reported by ListChannels are not always usable by BuildRoute.
+        funding = await bitcoin_rpc(
+            "getrawtransaction", [record.manifest.unsigned_txid, True]
+        )
+        block = await bitcoin_rpc("getblock", [funding["blockhash"], 1])
+        scid = (
+            (int(block["height"]) << 40)
+            | (block["tx"].index(record.manifest.unsigned_txid) << 16)
+            | edge.output_index
+        )
+        built = await rpc(
+            opener,
+            "buildroute",
+            f"--amt={amount}",
+            f"--final_cltv_delta={decoded['cltv_expiry']}",
+            f"--hops={decoded['destination']}",
+            f"--outgoing_chan_id={scid}",
+        )
+        hops = built["route"]["hops"]
+        assert len(hops) == 1 and int(hops[0]["chan_id"]) == scid
+        assert hops[0]["pub_key"] == decoded["destination"]
+        assert int(hops[0]["amt_to_forward_msat"]) == amount * 1_000
+        assert int(hops[0]["fee_msat"]) == 0
+        hops[0]["mpp_record"] = {
+            "payment_addr": decoded["payment_addr"],
+            "total_amt_msat": str(amount * 1_000),
+        }
+        hops[0]["tlv_payload"] = True
+        sent = await rpc(
+            opener,
+            "sendtoroute",
+            f"--payment_hash={invoice['r_hash']}",
+            json.dumps(built),
+        )
+        assert sent["status"] == "SUCCEEDED" and not sent.get("failure")
+        assert (
+            hashlib.sha256(bytes.fromhex(sent["preimage"])).hexdigest()
+            == invoice["r_hash"]
+        )
+        assert [int(hop["chan_id"]) for hop in sent["route"]["hops"]] == [scid]
+        settled = await rpc(fundee, "lookupinvoice", invoice["r_hash"])
+        assert (
+            settled["state"] == "SETTLED"
+            and int(settled["amt_paid_msat"]) == amount * 1_000
+        )
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            after, received_after = (
+                await channel(opener, point),
+                await channel(fundee, point),
+            )
+            if (
+                int(after["total_satoshis_sent"])
+                == int(before["total_satoshis_sent"]) + amount
+                and int(received_after["total_satoshis_received"])
+                == int(received_before["total_satoshis_received"]) + amount
+                and not after["pending_htlcs"]
+                and not received_after["pending_htlcs"]
+            ):
+                break
+            assert asyncio.get_running_loop().time() < deadline, (
+                f"edge {ordinal} payment incomplete"
+            )
+            await asyncio.sleep(1)
+        assert int(after["local_balance"]) < int(before["local_balance"])
+        assert int(received_after["local_balance"]) > int(
+            received_before["local_balance"]
+        )
+
+    # Close only after every payment is terminal; never force close as a shortcut.
+    for point, (opener, _) in points.items():
+        txid, vout = point.split(":")
+        await rpc(
+            opener, "closechannel", f"--funding_txid={txid}", f"--output_index={vout}"
+        )
+    deadline = asyncio.get_running_loop().time() + 120
+    while True:
+        complete = True
+        confirmations = 1
+        for service in services:
+            closed = {
+                item["channel_point"]: item
+                for item in (await rpc(service, "closedchannels"))["channels"]
+            }
+            for point, endpoints in points.items():
+                if service not in endpoints:
+                    continue
+                if point not in closed:
+                    complete = False
+                else:
+                    summary = closed[point]
+                    assert summary["close_type"] == "COOPERATIVE_CLOSE"
+                    assert int(summary["close_height"]) > 0
+                    assert int(summary["time_locked_balance"]) == 0
+            assert not any(
+                item.get("pending_htlcs")
+                for item in (await rpc(service, "listchannels"))["channels"]
+            )
+            pending = await rpc(service, "pendingchannels")
+            for group in (
+                "pending_open_channels",
+                "pending_closing_channels",
+                "pending_force_closing_channels",
+                "waiting_close_channels",
+            ):
+                for item in pending.get(group, []):
+                    if item["channel"]["channel_point"] in points:
+                        complete = False
+                        confirmations = max(
+                            confirmations,
+                            int(item.get("blocks_til_close_confirmed", 1)),
+                        )
+        if complete:
+            break
+        assert asyncio.get_running_loop().time() < deadline, (
+            "maker channel cooperative closure incomplete"
+        )
+        await mine_and_sync(
+            min(10, max(1, confirmations)), mining_address, services=services
+        )
+        await asyncio.sleep(1)
+    for service in services:
+        assert (await rpc(service, "listchannels"))["channels"] == []
 
 
 async def mine_and_sync(
