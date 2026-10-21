@@ -395,6 +395,8 @@ async def test_sale_check_refunds_an_undeliverable_sale_and_retries_an_unknown_o
     credential = seller.store.hold_inventory_credential(reservation.payment_hash)
     assert credential == _podle_credential(0x41)
     assert seller.store.hold_inventory_credential(b"\x00" * 32) is None
+    assert seller.store.hold_product(reservation.payment_hash) == "podle"
+    assert seller.store.hold_product(b"\x00" * 32) is None
     answers: list[bool | Exception] = [RuntimeError("backend down"), False]
 
     async def check(hold: object) -> bool:

@@ -715,6 +715,8 @@ async def test_an_additional_bond_authority_sells_a_lease_of_its_own_bond(
 
         [invoices] = _INVOICES
         payment_hash = invoices.pay(quote)
+        assert seller.sold_product(payment_hash) == "bond"
+        assert seller.sold_podle(payment_hash) is None
         await _settle_pass(seller)
         assert invoices.invoices[payment_hash].state is InvoiceState.SETTLED
         assert seller._service is not None

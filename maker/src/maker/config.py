@@ -278,6 +278,9 @@ class MakerConfig(WalletConfig):
     # PoDLE sales from the current offer mixdepth ([maker] sell_podle)
     sell_podle: bool = False
     podle_price_sats: int | None = Field(default=None, ge=1, le=1_000_000)
+    # Idle fidelity bond rental ([maker] rent_bonds)
+    rent_bonds: bool = False
+    bond_rent_rate: float = Field(default=0.01, gt=0, le=1)
 
     # Single offer configuration (legacy, used when offer_configs is empty)
     offer_type: OfferType = Field(

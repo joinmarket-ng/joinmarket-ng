@@ -49,19 +49,21 @@ consolidation nor randomness guarantees privacy. Existing policy names now use
 these revised rules on future rounds, without a wallet migration or startup sweep.
 See [selection rules and privacy tradeoffs](../docs/technical/wallet.md#utxo-selection).
 
-## Experimental PoDLE Sales
+## Experimental PoDLE Sales and Bond Rental
 
 A Taproot maker with `[lightning]` enabled and an owned fidelity bond can sell
-PoDLE commitments of its current offer mixdepth to takers. Activate the wallet
-market ledger once, then enable sales:
+PoDLE commitments of its current offer mixdepth to takers, and rent out its
+other bonds. Activate the wallet market ledger once, then enable either:
 
 ```bash
 jm-maker activate-market-ledger
 jm-maker start --sell-podle   # or [maker] sell_podle = true
+jm-maker start --rent-bonds   # or [maker] rent_bonds = true
 ```
 
-Each buyer learns the sold coin, never coins of another mixdepth. Sales pause
-with a warning when a precondition is missing; the maker keeps running. See
+Each buyer learns the sold coin, never coins of another mixdepth. The
+advertised bond is never rented. Sales pause with a warning when a
+precondition is missing; the maker keeps running. See
 [the credential market](../docs/credential-market.md#maker-podle-sales).
 
 ## Experimental Channel Buyout Funding

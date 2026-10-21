@@ -149,6 +149,29 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def bond_references(bonds: Iterable[FidelityBondInfo], network: str) -> list[BondReference]:
+    """The market's identities of ``bonds``, skipping any that cannot be one.
+
+    Holds still match such a bond by outpoint, only stock matching needs it.
+    """
+    references: list[BondReference] = []
+    for bond in bonds:
+        if bond.pubkey is None:
+            continue
+        try:
+            references.append(
+                BondReference(
+                    network=network,  # type: ignore[arg-type]
+                    outpoint=ExternalPoDLEOutpoint(txid=bond.txid, vout=bond.vout),
+                    pubkey=bond.pubkey.hex(),
+                    locktime=bond.locktime,
+                )
+            )
+        except (ValidationError, ValueError):
+            continue
+    return references
+
+
 class BondLeaseGuard:
     """Cached view of which owned bonds are leased, read from the market store.
 
@@ -175,23 +198,6 @@ class BondLeaseGuard:
         self._recorded: Outpoint | None = None
         self._status = ""
 
-    def _reference(self, bond: FidelityBondInfo) -> BondReference | None:
-        """The market's identity of ``bond``; None when it cannot be one.
-
-        Holds still match such a bond by outpoint, only stock matching needs it.
-        """
-        if bond.pubkey is None:
-            return None
-        try:
-            return BondReference(
-                network=self.network,  # type: ignore[arg-type]
-                outpoint=ExternalPoDLEOutpoint(txid=bond.txid, vout=bond.vout),
-                pubkey=bond.pubkey.hex(),
-                locktime=bond.locktime,
-            )
-        except (ValidationError, ValueError):
-            return None
-
     async def refresh(
         self,
         bonds: Iterable[FidelityBondInfo],
@@ -204,7 +210,7 @@ class BondLeaseGuard:
         ``advertising`` is the bond about to be advertised: unless it is
         blocked, it is recorded before :meth:`allows` can admit it.
         """
-        references = [ref for bond in bonds if (ref := self._reference(bond)) is not None]
+        references = bond_references(bonds, self.network)
         self._recorded = None
         try:
             blocked = await asyncio.to_thread(

@@ -136,6 +136,7 @@ def build_maker_config(
     no_fidelity_bond: bool = False,
     dual_offers: bool | None = None,
     sell_podle: bool | None = None,
+    rent_bonds: bool | None = None,
 ) -> MakerConfig:
     """
     Build MakerConfig from unified settings with CLI overrides.
@@ -145,6 +146,9 @@ def build_maker_config(
     effective_sell_podle = settings.maker.sell_podle if sell_podle is None else sell_podle
     if effective_sell_podle and settings.lightning.mode == "off":
         raise ValueError("Selling PoDLE commitments requires [lightning] mode managed or manual")
+    effective_rent_bonds = settings.maker.rent_bonds if rent_bonds is None else rent_bonds
+    if effective_rent_bonds and settings.lightning.mode == "off":
+        raise ValueError("Renting out fidelity bonds requires [lightning] mode managed or manual")
     # Resolve network settings
     effective_network = network if network is not None else settings.network_config.network
     effective_bitcoin_network = (
@@ -484,6 +488,8 @@ def build_maker_config(
         orderbook_ban_duration=settings.maker.orderbook_ban_duration,
         sell_podle=effective_sell_podle,
         podle_price_sats=settings.maker.podle_price_sats,
+        rent_bonds=effective_rent_bonds,
+        bond_rent_rate=settings.maker.bond_rent_rate,
         channel_ring=channel_ring_config(
             settings.lightning.mode,
             settings.maker.channel_ring,
@@ -866,6 +872,15 @@ def start(
             "Default: maker.sell_podle",
         ),
     ] = None,
+    rent_bonds: Annotated[
+        bool | None,
+        typer.Option(
+            "--rent-bonds/--no-rent-bonds",
+            help="Rent out owned fidelity bonds other than the advertised one over the "
+            "credential market (needs [lightning], a node for mixdepth 0 and "
+            "jm-maker activate-market-ledger). Default: maker.rent_bonds",
+        ),
+    ] = None,
     log_level: Annotated[
         str | None,
         typer.Option("--log-level", "-l", help="Log level"),
@@ -967,6 +982,7 @@ def start(
             # so we pass None to let build_maker_config fall back to settings.
             dual_offers=True if dual_offers else None,
             sell_podle=sell_podle,
+            rent_bonds=rent_bonds,
         )
     except ValueError as e:
         logger.error(str(e))
@@ -1078,7 +1094,7 @@ def start(
                         bot.reserve_funder = funder
                         funder.start()
                         stack.push_async_callback(funder.stop)
-                if config.sell_podle:
+                if config.sell_podle or config.rent_bonds:
                     from maker.market_sales import MarketSales
 
                     # Stopped before the maker, which owns the wallet it sells from.

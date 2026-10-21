@@ -393,6 +393,13 @@ class WalletMarketSeller:
         credential = store.hold_inventory_credential(payment_hash)
         return None if credential is None else ExternalPoDLE.model_validate(credential)
 
+    def sold_product(self, payment_hash: bytes) -> str | None:
+        """The product one of this seller's hold invoices sells, if any."""
+        store = self._store
+        if store is None or self._closed:
+            raise MarketStoreUnavailableError("Wallet market seller is unavailable")
+        return store.hold_product(payment_hash)
+
     def add_bond_inventory(self, bond: ExternalPoDLEOutpoint | None = None) -> None:
         """Stock one lease of ``bond``'s authority (the first by default) for its period."""
         service = self._local_service()

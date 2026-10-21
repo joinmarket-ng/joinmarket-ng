@@ -1082,6 +1082,23 @@ class MakerSettings(BaseModel):
             "the fee of a one-input, one-output P2TR spend at the 3-block fee rate."
         ),
     )
+    rent_bonds: bool = Field(
+        default=False,
+        description=(
+            "Rent out owned fidelity bonds other than the advertised one, one retarget "
+            "period at a time, invoiced from mixdepth 0's Lightning node. Requires "
+            "[lightning] (and so P2TR) and an activated market ledger."
+        ),
+    )
+    bond_rent_rate: float = Field(
+        default=0.01,
+        gt=0,
+        le=1,
+        description=(
+            "Annual rent as a fraction of a bond's locked amount, charged for the rest "
+            "of the period a lease is sold in."
+        ),
+    )
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -1855,6 +1872,8 @@ class JoinMarketSettings(BaseSettings):
             )
         if self.maker.sell_podle and self.lightning.mode == "off":
             raise ValueError("maker.sell_podle requires lightning.mode = 'managed' or 'manual'")
+        if self.maker.rent_bonds and self.lightning.mode == "off":
+            raise ValueError("maker.rent_bonds requires lightning.mode = 'managed' or 'manual'")
         if self.taker.external_podle_mode == "prefer" and not taproot:
             raise ValueError(
                 "taker.external_podle_mode = 'prefer' requires wallet.address_type = 'p2tr'"

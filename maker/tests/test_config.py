@@ -1007,6 +1007,31 @@ class TestBuildMakerConfig:
         with pytest.raises(ValueError, match="requires \\[lightning\\]"):
             build_maker_config(plain, TEST_MNEMONIC, "", sell_podle=True)
 
+    def test_bond_rental_settings_reach_maker_config(self) -> None:
+        """[maker] rent_bonds and bond_rent_rate are wired; the CLI flag overrides them."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            lightning={"mode": "manual"},
+            maker={"rent_bonds": True, "bond_rent_rate": 0.02},
+        )
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.rent_bonds is True and config.bond_rent_rate == 0.02
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", rent_bonds=False
+        )
+        assert config.rent_bonds is False
+
+        plain = JoinMarketSettings()
+        assert build_maker_config(plain, TEST_MNEMONIC, "").rent_bonds is False
+        with pytest.raises(ValueError, match="requires \\[lightning\\]"):
+            build_maker_config(plain, TEST_MNEMONIC, "", rent_bonds=True)
+        with pytest.raises(ValueError, match="rent_bonds requires lightning"):
+            JoinMarketSettings(maker={"rent_bonds": True})
+
     def test_randomization_factors_passed_from_settings(self) -> None:
         """Randomization factors set in config.toml must propagate to MakerConfig.
 

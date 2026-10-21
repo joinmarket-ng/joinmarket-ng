@@ -579,6 +579,19 @@
 # follows the fee rate.
 # podle_price_sats = 500
 
+# EXPERIMENTAL (docs/credential-market.md). Rent out owned fidelity bonds other
+# than the advertised one, one retarget period at a time, each under its own
+# seller nick and invoiced from mixdepth 0's Lightning node. Needs [lightning]
+# mode managed or manual, a node for mixdepth 0 and a one-time
+# `jm-maker activate-market-ledger`. A bond is rented only after every period
+# this data directory may have advertised it in, and new leases are stocked
+# only in the first half of a period. Equivalent to --rent-bonds on
+# jm-maker start.
+# rent_bonds = false
+# Annual rent as a fraction of a bond's locked amount, charged for the rest of
+# the period a lease is sold in.
+# bond_rent_rate = 0.01
+
 # EXPERIMENTAL private Taproot channel ring, see docs/experimental-ring-market.md.
 # Disabled means no new rings or
 # capability advertisement. Configured nodes can still recover retained rings.

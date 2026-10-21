@@ -267,10 +267,21 @@ sales with one warning and is retried; it never stops the maker.
 
 ### Idle Bond Rental
 
-The maker advertises its highest-value bond and rents its other owned bonds
-for one retarget period at a time. A leased bond is never advertised by its
-owner during the lease, which would be certificate equivocation. The default
-price is a rate on the locked amount for the remaining duration of the lease.
+With `[maker] rent_bonds`, the maker advertises its highest-value bond and
+rents its other owned bonds for one retarget period at a time. A leased bond
+is never advertised by its owner during the lease, which would be certificate
+equivocation. The seller runtime of the PoDLE sales serves each rented bond
+under its own seller authority and nick, so listings never link two bonds,
+and invoices leases from mixdepth 0's node, where bonds live. The price is an
+annual rate on the locked amount (`bond_rent_rate`) for the rest of the
+period, repriced as the period runs down. New bonds are admitted only in the
+first half of a period, so a maker starting late waits for the next one, and
+only bonds whose key is in the wallet and that stay locked well past the lease
+are admitted. The margin is a full period at the target block interval, so a
+timelock can only end before its lease if the lease's blocks average more
+than twice that interval. A bond served or stocked in a period stays served by
+its own authority until the period ends, even if it would no longer be
+admitted, so a held payment for its lease is always settled or refunded.
 
 Before choosing a bond, and every 30 seconds while making, the maker reads
 the market store of its data directory (read-only). A bond is blocked from

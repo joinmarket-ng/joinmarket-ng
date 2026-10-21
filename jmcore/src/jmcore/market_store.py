@@ -1107,6 +1107,21 @@ class MarketStore:
             return None
         return cast(dict[str, Any], json.loads(bytes(row["credential"])))
 
+    def hold_product(self, payment_hash: bytes) -> Product | None:
+        """Return the product a hold invoice sells; None for an unknown payment hash."""
+        if type(payment_hash) is not bytes or len(payment_hash) != 32:
+            raise ValueError("payment_hash must be 32 bytes")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT inventory.product FROM hold_invoices
+                JOIN inventory ON inventory.id = hold_invoices.inventory_id
+                WHERE hold_invoices.payment_hash = ?
+                """,
+                (payment_hash.hex(),),
+            ).fetchone()
+        return None if row is None else cast(Product, str(row["product"]))
+
     def begin_hold_cancel(self, quote_id: str) -> None:
         """Durably record the intent to cancel before calling ``CancelInvoice``.
 

@@ -507,6 +507,18 @@ settled when its coin was spent in the meantime. The seller follows the offer mi
 precondition pauses sales with a warning and never stops the maker. See the
 [standard Taproot setup](technical/standard-taproot-setup.md) for the design.
 
+### Maker Bond Rental
+
+`[maker] rent_bonds = true` (or `jm-maker start --rent-bonds`) rents out the
+maker's other owned bonds through the same seller, one period at a time and
+each under its own nick, with the same preconditions plus a Lightning node for
+mixdepth 0, which invoices the leases. The advertised bond is never rented,
+and a bond is rented only after every period the data directory may have
+advertised it in (`market/advertised-bonds.json`), so the first rental starts
+two periods after the maker first runs with this version. The price is
+`bond_rent_rate` per year on the locked amount for the rest of the period. See
+the [standard Taproot setup](technical/standard-taproot-setup.md#idle-bond-rental).
+
 ### Diagnosis, Recovery, and Directory Moves
 
 `GET /ledger` does not create directories or files, change permissions, repair
