@@ -36,10 +36,12 @@ Environment Variable Naming:
 
 from __future__ import annotations
 
+import copy
 import importlib.resources
 import json
 import os
 import re
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
@@ -295,6 +297,10 @@ class BitcoinSettings(BaseModel):
         ),
     )
 
+    # Internal validation policy, never a configurable field. Candidate-only
+    # models retain credential paths without consulting external file state.
+    _load_credential_files: ClassVar[bool] = True
+
     @model_validator(mode="after")
     def _load_rpc_cookie_from_file(self) -> Self:
         """Read rpc_user/rpc_password from Bitcoin Core .cookie file.
@@ -305,6 +311,8 @@ class BitcoinSettings(BaseModel):
         explicitly provided, the cookie file is parsed and the
         credentials are populated automatically.
         """
+        if not self._load_credential_files:
+            return self
         if self.rpc_cookie_file is not None:
             cookie_path = Path(self.rpc_cookie_file).expanduser()
             # Only override if user hasn't explicitly set credentials
@@ -338,6 +346,8 @@ class BitcoinSettings(BaseModel):
         CLI layer (``resolve_backend_settings``) which knows the resolved data
         directory and can join the path correctly.
         """
+        if not self._load_credential_files:
+            return self
         if self.neutrino_auth_token is None and self.neutrino_auth_token_file is not None:
             raw = self.neutrino_auth_token_file
             if raw.startswith("~") or Path(raw).is_absolute():
@@ -1924,6 +1934,46 @@ class JoinMarketSettings(BaseSettings):
     def get_neutrino_add_peers(self) -> list[str]:
         """Get the configured neutrino add peers."""
         return self.bitcoin.neutrino_add_peers
+
+
+class _ConfigDocumentBitcoinSettings(BitcoinSettings):
+    _load_credential_files: ClassVar[bool] = False
+
+
+class _ConfigDocumentSettings(JoinMarketSettings):
+    """The existing schema and defaults, with no ambient settings sources."""
+
+    bitcoin: _ConfigDocumentBitcoinSettings = Field(default_factory=_ConfigDocumentBitcoinSettings)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            InitSettingsSource(settings_cls, _normalize_wallet_preference_source(init_settings())),
+        )
+
+
+def validate_config_document(document: Mapping[str, Any]) -> JoinMarketSettings:
+    """Validate decoded TOML alone, without files, environment overrides, or writes.
+
+    Schema defaults apply only to the returned model, never to the document.
+    Unknown TOML names keep the normal forward-compatible ignore policy. In
+    particular they cannot become BaseSettings constructor controls such as
+    ``_env_file``. Use with ``update_config_values`` for safe displayed errors;
+    raw Pydantic errors may contain sensitive configuration inputs.
+    """
+    values = {
+        name: copy.deepcopy(value)
+        for name, value in document.items()
+        if name in JoinMarketSettings.model_fields
+    }
+    return _ConfigDocumentSettings(**values)
 
 
 def _warn_unknown_settings(

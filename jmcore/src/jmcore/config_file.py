@@ -284,7 +284,7 @@ def update_config_values(
     path: Path,
     updates: Mapping[str, Mapping[str, ConfigScalar]],
     *,
-    validate: Callable[[Mapping[str, Any]], None],
+    validate: Callable[[Mapping[str, Any]], object],
 ) -> None:
     """Validate and atomically replace one complete candidate of coupled edits.
 
