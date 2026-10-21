@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from jmswap.managed_nodes import ManagedNode, ManagedNodeError, NodeState
+from jmcore.constants import BITCOIN_RPC_PORTS
 
-_DEFAULT_RPC_PORTS = {"mainnet": 8332, "testnet": 18332, "signet": 38332, "regtest": 18443}
+from jmswap.managed_nodes import ManagedNode, ManagedNodeError, NodeState
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class LndEnvironment:
         host = parsed.hostname
         if ":" in host:
             host = f"[{host}]"
-        port = parsed.port or _DEFAULT_RPC_PORTS[network]
+        port = parsed.port or BITCOIN_RPC_PORTS[network]
         tor = settings.tor
         if not tor.control_enabled:
             raise ManagedNodeError(

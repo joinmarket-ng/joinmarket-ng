@@ -17,6 +17,14 @@ GENESIS_BLOCK_HASHES: dict[str, str] = {
     "regtest": "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
 }
 
+# Bitcoin Core's standard RPC endpoints, shared by onboarding and managed LND.
+BITCOIN_RPC_PORTS: dict[str, int] = {
+    "mainnet": 8332,
+    "testnet": 18332,
+    "signet": 38332,
+    "regtest": 18443,
+}
+
 # Bitcoin network dust limits
 # Standard P2PKH dust limit in Bitcoin Core
 STANDARD_DUST_LIMIT = 546  # satoshis

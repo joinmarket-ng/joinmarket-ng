@@ -400,12 +400,17 @@ replaced.
 
 ## Setup and Status
 
-`jm-ng setup` is the interactive onboarding: backend and Tor checks, wallet
-creation or import, the Taproot switch, managed nodes (install LND, create
-the nodes, suggest reserve funding), role, and market options with
-recommended defaults. Every prompt has a flag, and `--yes` accepts the
-defaults for scripted use. The installer offers to run it after a fresh
-installation.
+`jm-ng setup --configure-only` provides the configuration stage without the
+shell menu or whiptail. It preserves unrelated settings, validates coupled
+choices before one atomic replacement, and supports a no-write preview.
+Taproot remains explicit opt-in. Every prompt has a flag, and `--yes` accepts
+configuration defaults without asserting wallet freshness or creating nodes.
+
+The remaining onboarding stages are backend/Tor readiness, explicit wallet
+creation or import, managed-node installation and initialization, reserve
+guidance, and role/market options. The fresh-install offer will invoke the
+complete flow once those stages are available; configuration alone is not
+reported as wallet or Lightning provisioning.
 
 `jm-wallet info` shows a Lightning section per mixdepth: node identity and
 generation, sync state, reserve against its range, channel count, and
