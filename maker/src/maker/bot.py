@@ -54,6 +54,7 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from maker.background_tasks import BackgroundTasksMixin
+from maker.bond_leases import BondLeaseGuard
 from maker.coinjoin import bound_buyout_mixdepth
 from maker.config import MakerConfig
 from maker.direct_connection import DirectConnectionMixin, DirectConnectionState
@@ -219,6 +220,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self._active_podle_outpoints: dict[tuple[str, int], MakerSession] = {}
         self.current_offers: list[Offer] = []
         self.fidelity_bond: FidelityBondInfo | None = None
+        # Installed by start(); gates every bond proof on the market's lease history.
+        self.bond_lease_guard: BondLeaseGuard | None = None
         self.current_block_height: int = 0  # Cached block height for bond proof generation
 
         self.running = False
@@ -1278,7 +1281,23 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             )
 
             # Find fidelity bond for proof generation
-            # If a specific bond is selected in config, use it; otherwise use the best one
+            # If a specific bond is selected in config, use it; otherwise use the best one.
+            # A bond this data directory leased to another maker is never selected.
+            leased: frozenset[tuple[str, int]] = frozenset()
+            if not self.config.no_fidelity_bond:
+                from jmcore.paths import get_market_store_path
+
+                self.bond_lease_guard = BondLeaseGuard(
+                    get_market_store_path(resolved_data_dir),
+                    (self.config.bitcoin_network or self.config.network).value,
+                )
+                # Unknown history selects as before; the guard then suppresses proofs.
+                leased = (
+                    await self.bond_lease_guard.refresh(
+                        await find_fidelity_bonds(self.wallet), self.current_block_height
+                    )
+                    or frozenset()
+                )
             if self.config.no_fidelity_bond:
                 self.fidelity_bond = None
                 logger.warning("Fidelity bond disabled (offers will have no bond proof)")
@@ -1289,7 +1308,19 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 self.fidelity_bond = next(
                     (b for b in bonds if b.txid == sel_txid and b.vout == sel_vout), None
                 )
-                if self.fidelity_bond:
+                if self.fidelity_bond and (sel_txid, sel_vout) in leased:
+                    logger.warning(
+                        "Selected fidelity bond is leased to another maker, "
+                        "falling back to best available"
+                    )
+                    logger.bind(sensitive=True).warning(
+                        f"Selected fidelity bond {sel_txid[:16]}...:{sel_vout} is leased, "
+                        "falling back to best available"
+                    )
+                    self.fidelity_bond = await get_best_fidelity_bond(
+                        self.wallet, current_block_height=self.current_block_height, exclude=leased
+                    )
+                elif self.fidelity_bond:
                     logger.bind(sensitive=True).info(
                         f"Using selected fidelity bond: {sel_txid[:16]}...:{sel_vout}, "
                         f"value={self.fidelity_bond.value:,} sats, "
@@ -1304,12 +1335,12 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                         "falling back to best available"
                     )
                     self.fidelity_bond = await get_best_fidelity_bond(
-                        self.wallet, current_block_height=self.current_block_height
+                        self.wallet, current_block_height=self.current_block_height, exclude=leased
                     )
             else:
                 # Auto-select the best (largest bond value) fidelity bond
                 self.fidelity_bond = await get_best_fidelity_bond(
-                    self.wallet, current_block_height=self.current_block_height
+                    self.wallet, current_block_height=self.current_block_height, exclude=leased
                 )
             if self.fidelity_bond:
                 ensure_fidelity_bond_certificate_valid(
@@ -1513,6 +1544,15 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # Start periodic wallet rescan task
             rescan_task = asyncio.create_task(self._periodic_rescan())
             self.listen_tasks.append(rescan_task)
+
+            if self.bond_lease_guard is not None and self.fidelity_bond is not None:
+                self.listen_tasks.append(
+                    asyncio.create_task(
+                        self.bond_lease_guard.run(
+                            lambda: self.fidelity_bond, lambda: self.current_block_height
+                        )
+                    )
+                )
 
             # Start periodic rate limit status logging task
             status_task = asyncio.create_task(self._periodic_rate_limit_status())
@@ -2143,6 +2183,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         delivery.queue(clients, self._public_offer_payloads(generation.current_offers))
         await delivery.flush(clients)
 
+    def _advertised_bond(self) -> FidelityBondInfo | None:
+        """The selected bond, unless the lease guard forbids advertising it now."""
+        bond = self.fidelity_bond
+        if bond is None or self.bond_lease_guard is None or self.bond_lease_guard.allows(bond):
+            return bond
+        return None
+
     def _format_offer_announcement(self, offer: Offer, include_bond: bool = False) -> str:
         """Format offer for announcement.
 
@@ -2168,11 +2215,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         )
 
         # Append fidelity bond proof ONLY for private responses
-        if include_bond and self.fidelity_bond is not None:
+        if include_bond and (bond := self._advertised_bond()) is not None:
             # For private response, we use the requesting taker's nick
             # The ownership signature proves we control the UTXO
             bond_proof = create_fidelity_bond_proof(
-                bond=self.fidelity_bond,
+                bond=bond,
                 maker_nick=self.nick,
                 taker_nick=self.nick,  # Will be updated when sending to specific taker
                 current_block_height=self.current_block_height,

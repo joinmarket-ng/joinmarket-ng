@@ -376,6 +376,8 @@ class ProtocolHandlersMixin:
                 else generation.current_offers
             )
             responses: list[tuple[str, str]] = []
+            # One lease-guard decision per response.
+            bond = self._advertised_bond()
             for offer in offers:
                 # Format offer data (parameters without the command)
                 order_type_str = offer.ordertype.value
@@ -383,9 +385,9 @@ class ProtocolHandlersMixin:
 
                 # Append fidelity bond proof if we have one
                 # CRITICAL: The bond proof must be signed with the taker's nick
-                if self.fidelity_bond is not None:
+                if bond is not None:
                     bond_proof = create_fidelity_bond_proof(
-                        bond=self.fidelity_bond,
+                        bond=bond,
                         maker_nick=generation.nick_identity.nick,
                         taker_nick=taker_nick,  # Sign for THIS specific taker
                         current_block_height=self.current_block_height,
@@ -471,15 +473,17 @@ class ProtocolHandlersMixin:
                 if generation_id == self.current_generation_id
                 else generation.current_offers
             )
+            # One lease-guard decision per response.
+            bond = self._advertised_bond()
             for offer in offers:
                 # Format offer data (parameters without the command)
                 order_type_str = offer.ordertype.value
                 data = f"{offer.oid} {offer.minsize} {offer.maxsize} {offer.txfee} {offer.cjfee}"
 
                 # Append fidelity bond proof if we have one
-                if self.fidelity_bond is not None:
+                if bond is not None:
                     bond_proof = create_fidelity_bond_proof(
-                        bond=self.fidelity_bond,
+                        bond=bond,
                         maker_nick=generation.nick_identity.nick,
                         taker_nick=taker_nick,
                         current_block_height=self.current_block_height,

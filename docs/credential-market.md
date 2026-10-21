@@ -637,6 +637,10 @@ authorization. The owner can still
 sign another certificate, but a distinct owner-signed hot key observed on an
 ordinary maker offer during N can support an owner-equivocation report. Renewing
 the leased hot key is not a conflict. Ordinary JoinMarket proofs remain unchanged.
+A `jm-maker` using the seller's data directory never advertises a bond that
+directory's market store has leased or stocked for rent, and advertises no
+bond while that history is unreadable; a maker running from another data
+directory cannot know about the lease.
 
 While the lease is live, the renter can inspect ordinary offers and save evidence:
 

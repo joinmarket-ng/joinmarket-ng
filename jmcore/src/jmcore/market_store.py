@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 import stat
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +31,7 @@ from jmcore.credential_market import (
     MARKET_PODLE_RETRIES,
     Allocation,
     BondCredential,
+    BondReference,
     CredentialPackage,
     Delivery,
     MarketAuthorization,
@@ -353,6 +354,63 @@ class MarketStore:
         return cls._finish_wallet_diagnosis(
             path, intent_path, database_before, intent_before, diagnosis
         )
+
+    @classmethod
+    def _scan_bond_leases(
+        cls, path: Path, bonds: list[BondReference], height: int
+    ) -> frozenset[tuple[str, int]]:
+        """:func:`blocked_bond_outpoints` over a read-only connection."""
+        period = period_at_height(height)
+        blocked: set[tuple[str, int]] = set()
+        try:
+            connection = sqlite3.connect(
+                path.absolute().as_uri() + "?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+        except sqlite3.Error as exc:
+            raise MarketStoreCorruptError("could not read the market store") from exc
+        try:
+            connection.row_factory = sqlite3.Row
+            inspection = cls.__new__(cls)
+            inspection.path = path
+            inspection.wallet_id = None
+            inspection._connection = connection
+            inspection._closed = False
+            inspection._lock = threading.RLock()
+            # One snapshot: a reservation moves inventory and hold together.
+            connection.execute("BEGIN")
+            inspection._verify_schema(readonly=True)
+            states = {str(row[0]) for row in connection.execute("SELECT state FROM wallet_ledger")}
+            if states - {"ready", "disabled"}:
+                raise MarketStoreError("the wallet ledger's lease history is not confirmed")
+            for row in connection.execute(
+                "SELECT authorization FROM hold_invoices "
+                "WHERE product = 'bond' AND state != 'canceled'"
+            ):
+                document = cls._signed_document_from_storage(bytes(row[0]))
+                try:
+                    authority = MarketAuthorization.model_validate(document.body)
+                except ValidationError as exc:
+                    raise MarketStoreCorruptError("stored bond authorization is invalid") from exc
+                if height <= (authority.period + 1) * 2016:
+                    blocked.add((authority.bond.outpoint.txid, authority.bond.outpoint.vout))
+            for bond in bonds:
+                if connection.execute(
+                    "SELECT 1 FROM inventory WHERE product = 'bond' AND resource IN (?, ?)",
+                    (bond_resource(bond, period), bond_resource(bond, period + 1)),
+                ).fetchone():
+                    blocked.add((bond.outpoint.txid, bond.outpoint.vout))
+        except sqlite3.Error as exc:
+            raise MarketStoreCorruptError("could not read the market store") from exc
+        finally:
+            with suppress(sqlite3.Error):
+                connection.rollback()
+            with suppress(sqlite3.Error):
+                connection.close()
+        return frozenset(blocked)
 
     @classmethod
     def _finish_wallet_diagnosis(
@@ -2641,3 +2699,33 @@ class MarketStore:
         except (TypeError, ValueError) as exc:
             raise MarketStoreError("could not seal credential package") from exc
         return base64.b64encode(bytes(ciphertext)).decode("ascii")
+
+
+def blocked_bond_outpoints(
+    path: Path, bonds: Iterable[BondReference], height: int
+) -> frozenset[tuple[str, int]]:
+    """Outpoints of bonds their owner must not advertise at ``height``.
+
+    A leased bond advertised by its owner during the lease would equivocate its
+    certificate. A bond is blocked from the reservation of a hold for its lease
+    until the invoice is confirmed canceled or the lease ends, through block
+    ``(period + 1) * 2016`` where its certificate still verifies, whatever state
+    the hold is in; later leases block it already. Stocking a lease of one of
+    ``bonds`` for this period or the next designates that bond for rent and
+    blocks it too, even before a sale, so a seller in another process can only
+    lease a bond that is already blocked. Holds match by outpoint, stock by the
+    full bond reference.
+
+    The store is only read. No store means no lease was ever recorded for this
+    data directory (a store deleted without its ledger intent is not detected).
+    Raises :class:`MarketStoreError` when the lease history is unknown: an
+    unreadable or invalid store, a ledger intent without its store, or a
+    wallet ledger that is activating, rebinding or needs recovery.
+    """
+    if path.is_symlink():
+        raise MarketStoreError("market store path must not be a symlink")
+    if not path.exists():
+        if os.path.lexists(path.with_name(f"{path.name}.wallet-ledger")):
+            raise MarketStoreCorruptError("wallet ledger intent exists without its market store")
+        return frozenset()
+    return MarketStore._scan_bond_leases(path, list(bonds), height)

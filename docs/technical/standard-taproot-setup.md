@@ -270,8 +270,21 @@ sales with one warning and is retried; it never stops the maker.
 The maker advertises its highest-value bond and rents its other owned bonds
 for one retarget period at a time. A leased bond is never advertised by its
 owner during the lease, which would be certificate equivocation. The default
-price per period is an annual rate on the bond amount, prorated to 2016
-blocks.
+price is a rate on the locked amount for the remaining duration of the lease.
+
+Before choosing a bond, and every 30 seconds while making, the maker reads
+the market store of its data directory (read-only). A bond is blocked from
+the reservation of a hold for its lease until the invoice is confirmed
+canceled or the lease ends (its certificate verifies through block
+`(period + 1) * 2016`), and a bond stocked for rent in this period or the
+next is blocked too, even before a sale. A blocked bond is never selected; a
+configured bond that is blocked falls back to the best other one. When the
+lease history is unknown (an unreadable store, a ledger intent without its
+store, or a wallet ledger that is activating, rebinding or needs recovery),
+or the last reading is older than three minutes, offers carry no bond proof
+until it can be read again. This guard is defense in depth: a reading can be
+obsolete as soon as it is taken, so the rental supervisor itself never stocks
+or leases the advertised bond.
 
 ### Renting a Bond
 
@@ -303,6 +316,12 @@ also as JSON.
 | Ring node bindings | existing `node-bindings.json` | Managed init writes them for its own new nodes |
 | Market ledger, store, leases | existing wallet market ledger | No sales or leases |
 | Rented bond with derived certificate key | existing bond registry, new entry kind | No rental; older entries keep raw keys |
+
+A data directory without a market store is treated as one that never sold a
+lease, so existing makers keep advertising their bond. This is a
+compatibility policy, not a proof: a store deleted together with its wallet
+ledger intent (or a standalone store, which has none) is not detected, and
+leases sold from another data directory never are.
 
 The registry is versioned; an unknown version or a malformed file is refused,
 never treated as absent. Its writes are atomic. Backups live outside the LND

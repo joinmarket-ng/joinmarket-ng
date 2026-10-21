@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import os
 import struct
+from collections.abc import Collection
 from typing import cast
 
 from bitcointx.core.key import CKey  # type: ignore[import-not-found]
@@ -485,6 +486,7 @@ async def get_best_fidelity_bond(
     wallet: WalletService,
     mixdepth: int = FIDELITY_BOND_MIXDEPTH,
     current_block_height: int | None = None,
+    exclude: Collection[tuple[str, int]] = (),
 ) -> FidelityBondInfo | None:
     """
     Get the best (highest value) fidelity bond from the wallet.
@@ -493,11 +495,16 @@ async def get_best_fidelity_bond(
         wallet: WalletService instance
         mixdepth: Mixdepth to search
         current_block_height: When provided, exclude expired pre-signed certificates.
+        exclude: Outpoints that must not be selected (for example leased bonds).
 
     Returns:
         Best FidelityBondInfo or None if no bonds found
     """
-    bonds = await find_fidelity_bonds(wallet, mixdepth)
+    bonds = [
+        bond
+        for bond in await find_fidelity_bonds(wallet, mixdepth)
+        if (bond.txid, bond.vout) not in exclude
+    ]
     if current_block_height is not None:
         valid_bonds: list[FidelityBondInfo] = []
         expiry_error: ExpiredFidelityBondCertificateError | None = None

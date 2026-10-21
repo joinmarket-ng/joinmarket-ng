@@ -38,6 +38,7 @@ from jmcore.market_store import (
     MarketStoreError,
     MarketStoreExpiredError,
     MarketStoreUnavailableError,
+    blocked_bond_outpoints,
 )
 from jmcore.podle import generate_podle
 from nacl.public import PrivateKey, SealedBox
@@ -720,3 +721,92 @@ def test_required_backing_sells_only_inventory_the_lookup_values(tmp_path: Path)
     with pytest.raises(MarketStoreUnavailableError, match="inventory"):
         store.reserve_hold_quote(*arguments, request_id=_request_id(3), require_backing=True)
     store.close()
+
+
+def _bond_hold(store: MarketStore, bond: BondReference, request: int) -> str:
+    store.add_inventory("bond", bond_resource(bond, 0), None)
+    quote = hold_quote(
+        store,
+        _authorization(bond),
+        _key(0x22),
+        bytes(_buyer_key(0x33).public_key).hex(),
+        "bond",
+        _pubkey(_key(0x44)),
+        "lightning",
+        10_000,
+        100,
+        1,
+        request_id=_request_id(request),
+    )
+    return str(quote.body["quote_id"])
+
+
+def test_no_store_records_no_lease_but_a_lone_ledger_intent_is_unknown(tmp_path: Path) -> None:
+    path = tmp_path / "seller.sqlite"
+    assert blocked_bond_outpoints(path, [_bond()], 1) == frozenset()
+    path.with_name("seller.sqlite.wallet-ledger").write_text("{}", encoding="utf-8")
+    with pytest.raises(MarketStoreCorruptError, match="intent"):
+        blocked_bond_outpoints(path, [_bond()], 1)
+
+
+def test_a_bond_hold_blocks_its_outpoint_through_the_lease_expiry(tmp_path: Path) -> None:
+    path = tmp_path / "seller.sqlite"
+    store = MarketStore(path)
+    bond = _bond()
+    quote_id = _bond_hold(store, bond, 1)
+    outpoint = (bond.outpoint.txid, bond.outpoint.vout)
+    # Without candidates only the hold matches: it blocks while the period 0
+    # certificate verifies (through block 2016), whatever the hold state.
+    assert blocked_bond_outpoints(path, [], 1) == {outpoint}
+    store.attach_credential(quote_id, _bond_credential(bond, _key(0x44)))
+    settle_quote(store, quote_id, _key(0x22), 101, 1)
+    assert blocked_bond_outpoints(path, [], 2016) == {outpoint}
+    assert blocked_bond_outpoints(path, [], 2017) == frozenset()
+    # The stocked lease for period 0 no longer matters once period 1 starts.
+    assert blocked_bond_outpoints(path, [bond], 2017) == frozenset()
+    store.close()
+
+
+def test_only_an_authoritative_cancel_releases_a_hold(tmp_path: Path) -> None:
+    path = tmp_path / "seller.sqlite"
+    store = MarketStore(path)
+    bond = _bond()
+    quote_id = _bond_hold(store, bond, 1)
+    store.begin_hold_cancel(quote_id)
+    assert blocked_bond_outpoints(path, [], 1) == {(bond.outpoint.txid, bond.outpoint.vout)}
+    store.complete_hold_cancel(quote_id)
+    assert blocked_bond_outpoints(path, [], 1) == frozenset()
+    # Its inventory returned to stock, which still designates the bond for rent.
+    assert blocked_bond_outpoints(path, [bond], 1) == {(bond.outpoint.txid, bond.outpoint.vout)}
+    store.close()
+
+
+@pytest.mark.parametrize(("period", "blocked"), [(0, True), (1, True), (2, False)])
+def test_stocked_lease_of_this_or_the_next_period_blocks_the_bond(
+    tmp_path: Path, period: int, blocked: bool
+) -> None:
+    path = tmp_path / "seller.sqlite"
+    store = MarketStore(path)
+    bond, other = _bond(0xAA), _bond(0xBB)
+    store.add_inventory("bond", bond_resource(bond, period), None)
+    expected = {(bond.outpoint.txid, bond.outpoint.vout)} if blocked else set()
+    assert blocked_bond_outpoints(path, [bond, other], 1) == expected
+    store.close()
+
+
+def test_unknown_lease_history_raises(tmp_path: Path) -> None:
+    path = tmp_path / "seller.sqlite"
+    commitments = tmp_path / "commitments.json"
+    commitments.write_text('{"external_v1": {}, "used": []}', encoding="utf-8")
+    store = MarketStore(path, wallet_id="a1" * 32)
+    store.activate_wallet(commitments, history_confirmed=True)
+    assert blocked_bond_outpoints(path, [_bond()], 1) == frozenset()
+    store.mark_recovery_required()
+    with pytest.raises(MarketStoreError, match="not confirmed"):
+        blocked_bond_outpoints(path, [_bond()], 1)
+    store.close()
+
+    corrupt = tmp_path / "corrupt.sqlite"
+    corrupt.write_bytes(b"not a database" * 100)
+    with pytest.raises(MarketStoreCorruptError):
+        blocked_bond_outpoints(corrupt, [_bond()], 1)
