@@ -3455,6 +3455,7 @@ class TestSyncAllAddressPreregistration:
 
         # Stub out network calls
         backend.get_block_height = AsyncMock(return_value=100)
+        backend.get_address_usage = AsyncMock(return_value=set())
 
         ensure_force_values: list[bool] = []
         ensure_batches: list[list[str]] = []
