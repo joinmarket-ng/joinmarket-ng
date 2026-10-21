@@ -524,6 +524,17 @@ boundary is not integrated into automatic maintenance and never authorizes
 node shutdown or history removal. Restart retains the existing startup behavior
 and creates a new admission-open runtime, not durable maintenance exclusion.
 
+The maker sales supervisor can also latch producer closure so refresh, retry,
+or period changes cannot reopen admission or replace the retained seller.
+Closure first closes the owned seller's gate, then quiesces producer work;
+canceling the wait does not reopen either gate, but requires retrying the
+producer boundary. Explicit terminal stop remains separate. Teardown already
+started before closure, or a failing startup's own cleanup, cannot be undone
+and does not prove monitoring coverage. This is not ring admission control or
+automatic node maintenance, and adds no durable exclusion across restarts.
+Independently canceled worker threads may still finish existing writes; this
+boundary is not a filesystem-write barrier.
+
 Role guidance prints separate actor commands and mixdepth-specific reserve
 funding instructions; it never submits a reserve transaction or starts actors.
 After a fresh software installation, the installer offers guided setup with a

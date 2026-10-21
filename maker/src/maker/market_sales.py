@@ -168,6 +168,8 @@ class MarketSales:
         self._rented: list[FidelityBondInfo] = []
         self._stocked_bonds: set[tuple[str, int]] = set()
         self._task: asyncio.Task[None] | None = None
+        self._admission_closed = False
+        self._producer_lock = asyncio.Lock()
         self._last_warning: str | None = None
         self._last_note: str | None = None
 
@@ -177,23 +179,47 @@ class MarketSales:
         return self._mixdepth
 
     def start(self) -> None:
-        if self._task is None:
+        if not self._admission_closed and self._task is None:
             self._task = asyncio.create_task(self.run(), name="maker-market-sales")
+
+    async def close_admission(self) -> None:
+        """Close seller admission and quiesce producers without stopping settlement.
+
+        Cancellation leaves the gates closed, but completing the producer
+        boundary still requires a successful retry. Never hold the producer
+        lock while waiting for admitted callbacks: explicit terminal stop must
+        remain possible. Previously begun teardown or failing startup cannot
+        be undone, and no monitoring coverage or retirement clearance follows
+        from this boundary. Restart does not retain this transient exclusion.
+        Independently canceled worker threads may still finish filesystem
+        writes; this is not a filesystem-write barrier.
+        """
+        self._admission_closed = True
+        seller = self._seller
+        if seller is not None:
+            await seller.close_admission()
+        async with self._producer_lock:
+            seller = self._seller
+        if seller is not None:
+            await seller.close_admission()
 
     async def stop(self) -> None:
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        await self._stop_seller()
+        async with self._producer_lock:
+            await self._stop_seller()
 
     async def run(self) -> None:
         """Sell while the maker runs: wait for its bond and offers, then refresh."""
         # The maker runs only once it selected and recorded its advertised bond,
         # so no rental is chosen before that bond is known.
         while not self._bot.running:
+            if self._admission_closed:
+                return
             await asyncio.sleep(1.0)
-        while True:
+        while not self._admission_closed:
             try:
                 await self._ensure_seller()
                 await self.refresh()
@@ -201,9 +227,14 @@ class MarketSales:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._warn(exc)
-                await self._stop_seller()
+                async with self._producer_lock:
+                    if self._admission_closed:
+                        return
+                    self._warn(exc)
+                    await self._stop_seller()
                 delay = RETRY_SECONDS
+            if self._admission_closed:
+                return
             await asyncio.sleep(delay)
 
     def _warn(self, exc: Exception) -> None:
@@ -221,9 +252,17 @@ class MarketSales:
 
     async def _ensure_seller(self) -> None:
         """Start a seller, or replace one whose period or served bonds changed."""
+        async with self._producer_lock:
+            if not self._admission_closed:
+                await self._ensure_seller_owned()
+
+    async def _ensure_seller_owned(self) -> None:
+        """Replace only while the producer lock is held and admission stays open."""
         wallet = self._bot.wallet
         config = self._bot.config
         height = await wallet.backend.get_block_height()
+        if self._admission_closed:
+            return
         period = period_at_height(height)
         # Only the owner key of the advertised bond can authorize sales: never
         # a leased bond or one advertised with a cold certificate.
@@ -234,6 +273,8 @@ class MarketSales:
             else None
         )
         rentals = await self._rentals(height) if config.rent_bonds else []
+        if self._admission_closed:
+            return
         served = (
             None if podle_bond is None else (podle_bond.txid, podle_bond.vout),
             tuple((bond.txid, bond.vout) for bond in rentals),
@@ -246,6 +287,8 @@ class MarketSales:
         ):
             return
         await self._stop_seller()
+        if self._admission_closed:
+            return
         try:
             from taker.market_settlement import MultiNodeHoldInvoices, seller_invoice_client
             from taker.podle_purchase import market_fee_rate, seller_price_sats
@@ -272,6 +315,8 @@ class MarketSales:
             price = config.podle_price_sats or seller_price_sats(
                 await market_fee_rate(wallet.backend)
             )
+            if self._admission_closed:
+                return
             options.append(_seller_options(podle_bond, "podle", price))
         options.extend(
             _seller_options(
@@ -299,6 +344,8 @@ class MarketSales:
         self._stocked.clear()
         self._stocked_bonds.clear()
         await seller.start()
+        if self._admission_closed:
+            return
         self._period = period
         self._served = served
         self._rented = rentals
@@ -333,6 +380,8 @@ class MarketSales:
             for bond in await find_fidelity_bonds(wallet, BOND_MIXDEPTH)
             if bond.private_key is not None and (bond.txid, bond.vout) != skip
         ]
+        if self._admission_closed:
+            return []
         kept = {(b.txid, b.vout) for b in self._rented} if self._period == period else set()
         try:
             kept |= await asyncio.to_thread(
@@ -343,6 +392,8 @@ class MarketSales:
             )
         except MarketStoreError:
             pass
+        if self._admission_closed:
+            return []
         admitted: set[tuple[str, int]] = set()
         try:
             # Created when absent, counting every bond as advertised through the
@@ -392,16 +443,23 @@ class MarketSales:
 
     async def refresh(self) -> None:
         """Follow the offer mixdepth, reprice, and stock new coins and leases."""
+        async with self._producer_lock:
+            if not self._admission_closed:
+                await self._refresh_owned()
+
+    async def _refresh_owned(self) -> None:
         seller = self._seller
         if seller is None:
             return
         if self._podle_served:
             await self._refresh_podle(seller)
-        if self._rented:
+        if self._rented and not self._admission_closed:
             await self._refresh_leases(seller)
 
     async def _refresh_podle(self, seller: WalletMarketSeller) -> None:
         offer_mixdepth = await self._bot.offer_manager.current_offer_mixdepth()
+        if self._admission_closed:
+            return
         mapping = self._bot.config.channel_ring.mixdepth_nodes
         has_node = offer_mixdepth is not None and offer_mixdepth in mapping
         target = offer_mixdepth if has_node else None
@@ -415,15 +473,18 @@ class MarketSales:
         if self._bot.config.podle_price_sats is None:
             from taker.podle_purchase import market_fee_rate, seller_price_sats
 
-            seller.set_price_sats(
-                seller_price_sats(await market_fee_rate(self._bot.wallet.backend))
-            )
+            price = seller_price_sats(await market_fee_rate(self._bot.wallet.backend))
+            if self._admission_closed:
+                return
+            seller.set_price_sats(price)
         if target is not None:
             await self._stock(seller, target)
 
     async def _refresh_leases(self, seller: WalletMarketSeller) -> None:
         """Reprice each rented bond for the rest of the period and stock its lease once."""
         height = await self._bot.wallet.backend.get_block_height()
+        if self._admission_closed:
+            return
         for bond in self._rented:
             outpoint = ExternalPoDLEOutpoint(txid=bond.txid, vout=bond.vout)
             seller.set_price_sats(
@@ -454,6 +515,8 @@ class MarketSales:
             if height is None:
                 if tip is None:
                     tip = await wallet.backend.get_block_height()
+                    if self._admission_closed:
+                        return
                 height = tip - utxo.confirmations + 1
             secret = key.get_private_key_bytes()
             credentials = [
@@ -464,8 +527,12 @@ class MarketSales:
                 # The buyer runs this exact check on delivery: never sell what fails it.
                 await verify_podle_backing(credentials[0], wallet.backend)
             except MarketError:
+                if self._admission_closed:
+                    return
                 logger.debug("A coin's backing does not verify yet; it is stocked later")
                 continue
+            if self._admission_closed:
+                return
             for credential in credentials:
                 with suppress(MarketStoreConflictError):
                     seller.add_podle_inventory(credential)
