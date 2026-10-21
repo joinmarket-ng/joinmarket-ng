@@ -447,10 +447,39 @@ disclosure, the encrypted wallet is preserved and seed backup remains pending.
 Existing-wallet selection does not rewrite recovery metadata or register an
 identity.
 
-The remaining onboarding stages are backend/Tor readiness, managed-node
-installation and initialization, reserve guidance, and role/market options.
-The fresh-install offer will invoke the complete flow once those stages are
-available; wallet setup alone is not reported as Lightning provisioning.
+After wallet selection, `--create-managed-nodes` requests fresh managed node
+identities, not restoration. `--install-lnd` separately authorizes a missing
+pinned release to be downloaded through Tor. Existing verified binaries are
+reused. The stage checks the configured Core genesis and sync state, plus Tor
+control authentication and bootstrap, before allocating nodes. These checks
+do not import JoinMarket descriptors or trigger wallet recovery.
+
+`--applications-quiesced` affirms that consumers of these nodes and automatic
+restarts are excluded during initialization. Setup does not stop or drain other
+applications; retain monitors for existing obligations. Noninteractive runs
+must also choose `--bip39-passphrase-file` or `--no-bip39-passphrase` explicitly
+unless the same selected wallet already has a configured passphrase. Neither
+assertion is supplied by `--yes`.
+
+Do not concurrently edit configuration, mnemonic contents, identity selection,
+or data-directory aliases during initialization. Snapshot checks detect common
+conflicts; they are not transactional exclusion from other writers.
+
+Guided creation refuses existing registries, partial provisioning, backups,
+bindings, and orphaned node data. Preserve them for explicit inspection and
+recovery rather than creating replacements. Individual nodes and bindings are
+published durably before the group completes; a partial result is not rolled
+back. Keep consumers excluded until interrupted initialization is recovered.
+
+Successful initialization stops its new nodes and prints a separately invoked
+foreground supervisor command. It does not start a temporary supervisor, maker,
+taker, or market. Persistent LND supervision does not replace application
+settlement monitors. Automatic maker-owned supervision remains deferred until
+admission can stop while recovery monitors continue running.
+
+Reserve guidance and role/market choices remain unfinished. The fresh-install
+offer will invoke the complete flow once those stages are available; stopped
+initialized nodes are not reported as a running Lightning service.
 
 `jm-wallet info` shows a Lightning section per mixdepth: node identity and
 generation, sync state, reserve against its range, channel count, and

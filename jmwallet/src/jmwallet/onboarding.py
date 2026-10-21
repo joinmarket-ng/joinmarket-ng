@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
+import shlex
 import sys
 import tomllib
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -34,6 +37,15 @@ class WalletAction(StrEnum):
     EXISTING = "existing"
     GENERATE = "generate"
     IMPORT = "import"
+
+
+@dataclass(frozen=True)
+class _SelectedWallet:
+    path: Path
+    mnemonic: SecretStr
+    newly_created: bool
+    config_target: Path
+    config_digest: str
 
 
 def _config_path(data_dir: Path | None, config_file: Path | None) -> Path:
@@ -161,6 +173,41 @@ def setup(
             help="Explicitly disclose a completed generated seed, including to redirected output",
         ),
     ] = False,
+    create_managed_nodes: Annotated[
+        bool | None,
+        typer.Option(
+            "--create-managed-nodes/--no-create-managed-nodes",
+            help="Explicit fresh managed identities, not restoration or service startup",
+        ),
+    ] = None,
+    install_lnd: Annotated[
+        bool,
+        typer.Option(
+            "--install-lnd",
+            help="Authorize downloading the pinned LND release through Tor when needed",
+        ),
+    ] = False,
+    applications_quiesced: Annotated[
+        bool,
+        typer.Option(
+            "--applications-quiesced",
+            help="Affirm consumers and automatic restarts are excluded during node initialization",
+        ),
+    ] = False,
+    bip39_passphrase_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--bip39-passphrase-file",
+            help="Private optional BIP39 passphrase input for node identities",
+        ),
+    ] = None,
+    no_bip39_passphrase: Annotated[
+        bool,
+        typer.Option(
+            "--no-bip39-passphrase",
+            help="Explicitly use no BIP39 passphrase for managed-node identities",
+        ),
+    ] = False,
 ) -> None:
     """Configure the standard setup without assuming wallet freshness.
 
@@ -224,9 +271,22 @@ def setup(
             hide_input=True,
         )
     updates["bitcoin"] = {"rpc_url": selected_url}
-    if rpc_cookie_file is not None:
+    selected_cookie = rpc_cookie_file
+    if (
+        selected_cookie is None
+        and not yes
+        and selected_taproot
+        and selected_lightning is LightningMode.MANAGED
+        and defaults.bitcoin.backend_type == "descriptor_wallet"
+        and not defaults.bitcoin.rpc_cookie_file
+        and not (defaults.bitcoin.rpc_user and defaults.bitcoin.rpc_password.get_secret_value())
+    ):
+        selected_cookie = Path(
+            typer.prompt("Bitcoin Core RPC cookie file (path only; not read now)")
+        )
+    if selected_cookie is not None:
         updates["bitcoin"].update(
-            rpc_cookie_file=str(rpc_cookie_file.expanduser().absolute()),
+            rpc_cookie_file=str(selected_cookie.expanduser().absolute()),
             rpc_user="",
             rpc_password="",
         )
@@ -274,6 +334,13 @@ def setup(
         return
     if wallet_action is None:
         if yes:
+            if create_managed_nodes or install_lnd:
+                typer.echo(
+                    "Node initialization requires explicit --wallet-action selection; "
+                    "no nodes created.",
+                    err=True,
+                )
+                raise typer.Exit(1)
             typer.echo(
                 "Configuration stage complete; no wallet action selected. "
                 "Wallet and nodes unchanged."
@@ -286,7 +353,7 @@ def setup(
                 type=Choice([item.value for item in WalletAction]),
             )
         )
-    _wallet_stage(
+    selected_wallet = _wallet_stage(
         path,
         planned,
         wallet_action,
@@ -299,7 +366,31 @@ def setup(
         interactive=not yes,
         data_dir=data_dir,
     )
-    typer.echo("Wallet stage complete; Lightning provisioning was not performed.")
+    create = create_managed_nodes
+    if create is None and planned.lightning.mode == "managed" and not yes:
+        create = typer.confirm(
+            "Create fresh managed node identities (not restore lost nodes)?", default=False
+        )
+    if not create:
+        if install_lnd:
+            typer.echo(
+                "--install-lnd requires --create-managed-nodes here; "
+                "use jm-lightning install-lnd separately for installation only.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        typer.echo("Wallet stage complete; Lightning provisioning was not performed.")
+        return
+    _managed_node_stage(
+        path,
+        selected_wallet,
+        data_dir=data_dir,
+        install_lnd=install_lnd,
+        consumers_excluded=applications_quiesced,
+        passphrase_file=bip39_passphrase_file,
+        no_passphrase=no_bip39_passphrase,
+        interactive=not yes,
+    )
 
 
 def _wallet_password(path: Path | None, *, interactive: bool, confirm: bool) -> SecretStr:
@@ -329,7 +420,7 @@ def _wallet_stage(
     show_seed: bool,
     interactive: bool,
     data_dir: Path | None,
-) -> None:
+) -> _SelectedWallet:
     from jmwallet.cli.mnemonic import decrypt_mnemonic, validate_mnemonic
     from jmwallet.setup_wallet import SetupWalletError, publish_setup_wallet
 
@@ -348,6 +439,7 @@ def _wallet_stage(
     published = False
     config_commit_started = False
     generated = False
+    newly_created = False
     phrase: SecretStr | None = None
     try:
         target = config_path.resolve(strict=False)
@@ -435,6 +527,7 @@ def _wallet_stage(
                 raise typer.Exit(1)
             phrase = result.mnemonic
             generated = result.origin == "generated"
+            newly_created = result.newly_created
 
         if config_path.resolve(strict=False) != target or _contents(config_path) != original:
             raise ConfigFileError("configuration changed during wallet setup")
@@ -444,6 +537,16 @@ def _wallet_stage(
             {"wallet": {"mnemonic_file": str(selected)}},
             validate=validate_config_document,
         )
+        committed = _contents(config_path)
+        if (
+            config_path.resolve(strict=False) != target
+            or committed is None
+            or (
+                validate_config_document(tomllib.loads(committed.decode("utf-8"))).model_dump()
+                != validate_config_document(candidate).model_dump()
+            )
+        ):
+            raise ConfigFileError("configuration changed after wallet selection")
     except (OSError, RuntimeError, ValueError, ConfigFileError, SetupWalletError):
         if config_commit_started:
             message = (
@@ -487,6 +590,193 @@ def _wallet_stage(
                 "Seed not displayed. Encrypted wallet preserved; "
                 "private seed backup remains pending."
             )
+    assert phrase is not None
+    return _SelectedWallet(
+        selected, phrase, newly_created, target, hashlib.sha256(committed).hexdigest()
+    )
+
+
+def _managed_node_stage(
+    config_path: Path,
+    wallet: _SelectedWallet,
+    *,
+    data_dir: Path | None,
+    install_lnd: bool,
+    consumers_excluded: bool,
+    passphrase_file: Path | None,
+    no_passphrase: bool,
+    interactive: bool,
+) -> None:
+    try:
+        from jmwallet.setup_lightning import SetupLightningError, initialize_managed_nodes
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not (
+            exc.name in {"jmwallet.setup_lightning", "jmswap"} or exc.name.startswith("jmswap.")
+        ):
+            raise
+        typer.echo(
+            "Managed setup requires the jm-lightning component in this Python installation. "
+            "Wallet preserved; no node initialization performed.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+
+    try:
+        document = _contents(config_path)
+        if (
+            document is None
+            or config_path.resolve(strict=False) != wallet.config_target
+            or (hashlib.sha256(document).hexdigest() != wallet.config_digest)
+        ):
+            raise SetupLightningError(
+                "Configuration changed after wallet selection; inspect before initialization"
+            )
+        settings = validate_config_document(tomllib.loads(document.decode("utf-8")))
+        if settings.lightning.mode != "managed" or settings.wallet.address_type != "p2tr":
+            raise SetupLightningError(
+                "Node creation requires explicit managed Lightning and Taproot"
+            )
+        if not consumers_excluded and interactive:
+            consumers_excluded = typer.confirm(
+                "Have you excluded node consumers and automatic restarts "
+                "until initialization finishes? "
+                "Keep existing settlement monitors running",
+                default=False,
+            )
+        if not consumers_excluded:
+            raise SetupLightningError(
+                "Affirm --applications-quiesced; "
+                "initialization does not stop or drain other applications"
+            )
+        if passphrase_file is not None and no_passphrase:
+            raise SetupLightningError(
+                "Choose a BIP39 passphrase file or explicit no-passphrase, not both"
+            )
+        if passphrase_file is not None:
+            passphrase = SecretStr(
+                read_private_file(passphrase_file.expanduser()).decode("utf-8").rstrip("\r\n")
+            )
+        elif no_passphrase:
+            if (
+                settings.wallet.bip39_passphrase is not None
+                and settings.wallet.bip39_passphrase.get_secret_value()
+            ):
+                raise SetupLightningError(
+                    "Resolve the configured BIP39 passphrase before selecting no passphrase"
+                )
+            passphrase = SecretStr("")
+        elif settings.wallet.bip39_passphrase is not None:
+            passphrase = settings.wallet.bip39_passphrase
+        elif interactive:
+            passphrase = SecretStr(
+                typer.prompt(
+                    "BIP39 passphrase for node identities (hidden; empty means none)",
+                    default="",
+                    show_default=False,
+                    hide_input=True,
+                )
+            )
+        else:
+            raise SetupLightningError(
+                "Select --bip39-passphrase-file or --no-bip39-passphrase explicitly"
+            )
+        if (
+            settings.wallet.bip39_passphrase is not None
+            and passphrase != settings.wallet.bip39_passphrase
+        ):
+            raise SetupLightningError(
+                "Resolve the configured BIP39 passphrase before choosing a different value"
+            )
+        if (
+            "BIP39_PASSPHRASE" in os.environ
+            and os.environ["BIP39_PASSPHRASE"] != passphrase.get_secret_value()
+        ):
+            raise SetupLightningError(
+                "Resolve the conflicting BIP39_PASSPHRASE environment override "
+                "before initialization"
+            )
+        if "EXPECTED_FINGERPRINT" in os.environ:
+            from jmcore.wallet_metadata import WalletIdentity
+
+            from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
+
+            expected = WalletIdentity.validate_fingerprint(os.environ["EXPECTED_FINGERPRINT"])
+            if (
+                get_mnemonic_fingerprint(
+                    wallet.mnemonic.get_secret_value(), passphrase.get_secret_value()
+                )
+                != expected
+            ):
+                raise SetupLightningError(
+                    "Selected wallet does not match EXPECTED_FINGERPRINT; "
+                    "resolve staged credentials"
+                )
+        if (
+            _contents(config_path) != document
+            or config_path.resolve(strict=False) != wallet.config_target
+        ):
+            raise SetupLightningError(
+                "Configuration changed while choosing node options; inspect it"
+            )
+        actual_data_dir = (
+            (data_dir if data_dir is not None else settings.get_data_dir())
+            .expanduser()
+            .resolve(strict=False)
+        )
+        typer.echo("Checking prerequisites for explicit fresh-node initialization.")
+        registry = initialize_managed_nodes(
+            settings,
+            wallet.mnemonic,
+            passphrase,
+            wallet_file=wallet.path,
+            data_dir=actual_data_dir,
+            consumers_excluded=consumers_excluded,
+            install_lnd=install_lnd,
+        )
+        if (
+            _contents(config_path) != document
+            or config_path.resolve(strict=False) != wallet.config_target
+        ):
+            raise SetupLightningError(
+                "Nodes were initialized but configuration changed; "
+                "inspect before starting consumers"
+            )
+    except (SetupLightningError, OSError, RuntimeError, ValueError) as exc:
+        message = (
+            str(exc)
+            if isinstance(exc, SetupLightningError)
+            else ("Node initialization could not be verified; inspect prerequisites.")
+        )
+        typer.echo(message, err=True)
+        typer.echo(
+            "Wallet remains selected; preserve any partial node state for inspection or recovery.",
+            err=True,
+        )
+        typer.echo(
+            "Keep new-node consumers and automatic restarts excluded until recovery completes; "
+            "retain existing settlement monitors.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+    typer.echo(f"Initialized {len(registry.nodes)} managed nodes; they are not running.")
+    command = [
+        str(Path(sys.executable).with_name("jm-lightning")),
+        "run",
+        "--data-dir",
+        str(actual_data_dir.expanduser().absolute()),
+        "--config-file",
+        str(config_path),
+        "--mnemonic-file",
+        str(wallet.path),
+    ]
+    if passphrase.get_secret_value():
+        command.append("--prompt-bip39-passphrase")
+    typer.echo("Start the persistent supervisor separately (keep it running):")
+    typer.echo(shlex.join(command))
+    typer.echo(
+        "LND supervision does not replace application settlement monitors. "
+        "No markets were activated."
+    )
 
 
 def main(args: list[str] | None = None) -> None:

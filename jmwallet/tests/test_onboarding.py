@@ -133,6 +133,34 @@ def test_unsupported_existing_backend_cannot_authorize_managed_setup(tmp_path: P
     assert path.read_text() == original
 
 
+def test_interactive_managed_setup_asks_for_missing_core_cookie_without_reading_it(
+    tmp_path: Path,
+) -> None:
+    cookie = tmp_path / "not-created.cookie"
+    directory = tmp_path / "data"
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(directory),
+            "--configure-only",
+            "--network",
+            "regtest",
+            "--taproot",
+            "--lightning",
+            "managed",
+            "--rpc-url",
+            "http://127.0.0.1:18443",
+        ],
+        input=f"{cookie}\ny\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "path only; not read now" in result.output
+    assert not cookie.exists()
+    document = tomllib.loads((directory / "config.toml").read_text())
+    assert document["bitcoin"]["rpc_cookie_file"] == str(cookie)
+
+
 def test_explicit_data_directory_wins_over_inherited_config_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -14,6 +14,18 @@ Modern HD wallet for JoinMarket with support for Bitcoin Core nodes and lightwei
 - **History Recovery**: Reconstruct and persist best-effort CoinJoin, send, and deposit
   history from on-chain data when importing a wallet from seed
 
+## Guided Setup
+
+In a complete installation, `jm-ng setup` guides configuration and explicit
+wallet selection, generation, or import. `--configure-only` leaves wallets and
+nodes unchanged. Taproot remains opt-in, and generated seeds are not disclosed
+into redirected output without separate authorization.
+
+Fresh managed-node initialization is optional and does not start an ongoing
+supervisor or activate markets. Existing or interrupted node state requires
+explicit inspection rather than automatic replacement. See the
+[standard setup guide](../docs/technical/standard-taproot-setup.md) and CLI help.
+
 ## Imported Wallet History
 
 After a seed import, `jm-wallet` reconstructs confirmed transaction history on the
