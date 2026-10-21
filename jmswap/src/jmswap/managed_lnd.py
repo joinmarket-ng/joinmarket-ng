@@ -13,6 +13,7 @@ from loguru import logger
 
 from jmswap.lnd_config import LndEnvironment, render_lnd_conf
 from jmswap.managed_nodes import ManagedNode, ManagedNodeError, ManagedNodePaths
+from jmswap.managed_quarantine import managed_launch_policy
 
 # lnrpc.WalletState values (stateservice.proto).
 NON_EXISTING, LOCKED, UNLOCKED, RPC_ACTIVE, SERVER_ACTIVE = 0, 1, 2, 3, 4
@@ -63,24 +64,53 @@ class ManagedLnd:
             raise LndProcessError(
                 f"lnd not found at {self.env.lnd_binary}; run `jm-lightning install-lnd`"
             )
-        await self._stop_stale_instance()
-        node_dir = self.paths.node_dir(self.node)
-        ensure_private_directory(node_dir)
-        conf = render_lnd_conf(self.node, self.env)
-        atomic_write_private(self.paths.lnd_conf(self.node), conf.encode())
-        # Console logging is disabled; this only captures early startup failures.
-        console = open(node_dir / "lnd-console.log", "wb")  # noqa: SIM115
+        async with managed_launch_policy(self.paths, self.node, network=self.env.network) as (
+            current,
+            quarantined,
+        ):
+            self.node = current
+            await self._stop_stale_instance()
+            node_dir = self.paths.node_dir(self.node)
+            ensure_private_directory(node_dir)
+            conf = render_lnd_conf(self.node, self.env, quarantined=quarantined)
+            atomic_write_private(self.paths.lnd_conf(self.node), conf.encode())
+            # Console logging is disabled; this only captures early startup failures.
+            console = open(node_dir / "lnd-console.log", "wb")  # noqa: SIM115
+            try:
+                spawn = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        str(self.env.lnd_binary),
+                        f"--lnddir={node_dir}",
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=console,
+                        stderr=console,
+                        start_new_session=True,
+                    )
+                )
+                try:
+                    self._process = await asyncio.shield(spawn)
+                except asyncio.CancelledError:
+                    # Spawning can finish after caller cancellation. Recover its
+                    # handle and stop it before releasing launch ownership, even
+                    # if the caller repeats cancellation while cleanup runs.
+                    cleanup = asyncio.create_task(self._recover_canceled_spawn(spawn))
+                    while not cleanup.done():
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await asyncio.shield(cleanup)
+                    cleanup.result()
+                    raise
+            finally:
+                console.close()
+
+    async def _recover_canceled_spawn(
+        self, spawn: asyncio.Task[asyncio.subprocess.Process]
+    ) -> None:
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                str(self.env.lnd_binary),
-                f"--lnddir={node_dir}",
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=console,
-                stderr=console,
-                start_new_session=True,
-            )
-        finally:
-            console.close()
+            self._process = await spawn
+        except Exception as exc:
+            logger.warning("Canceled managed LND spawn failed ({})", type(exc).__name__)
+        else:
+            await self.stop()
 
     async def _responds(self) -> bool:
         if not self.paths.tls_cert(self.node).exists():

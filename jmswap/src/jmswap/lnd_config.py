@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from jmswap.managed_nodes import ManagedNode, ManagedNodeError
+from jmswap.managed_nodes import ManagedNode, ManagedNodeError, NodeState
 
 _DEFAULT_RPC_PORTS = {"mainnet": 8332, "testnet": 18332, "signet": 38332, "regtest": 18443}
 
@@ -72,8 +72,9 @@ def _value(value: str) -> str:
     return value
 
 
-def render_lnd_conf(node: ManagedNode, env: LndEnvironment) -> str:
+def render_lnd_conf(node: ManagedNode, env: LndEnvironment, *, quarantined: bool = False) -> str:
     """The complete ``lnd.conf`` of one managed node."""
+    refuse_inbound = quarantined or node.state in {NodeState.RETIRING, NodeState.RECOVERING}
     sections: dict[str, list[str]] = {
         "Application Options": [
             f"listen=127.0.0.1:{node.p2p_port}",
@@ -81,7 +82,7 @@ def render_lnd_conf(node: ManagedNode, env: LndEnvironment) -> str:
             "norest=true",
             "tlsdisableautofill=true",
             "nobootstrap=true",
-            "maxpendingchannels=4",
+            f"maxpendingchannels={0 if refuse_inbound else 4}",
             "acceptortimeout=120s",
             "debuglevel=info",
             "maxlogfiles=3",

@@ -230,10 +230,13 @@ class ManagedNodePaths:
 
     root: Path
     network: str
+    wallet_identity: str
 
     @classmethod
     def for_wallet(cls, data_dir: Path, network: str, wallet_identity: str) -> ManagedNodePaths:
-        return cls(data_dir / "lightning" / network / wallet_identity[:16], network)
+        return cls(
+            data_dir / "lightning" / network / wallet_identity[:16], network, wallet_identity
+        )
 
     @property
     def registry(self) -> Path:
@@ -266,6 +269,12 @@ class ManagedNodePaths:
 
     def lnd_conf(self, node: ManagedNode) -> Path:
         return self.node_dir(node) / "lnd.conf"
+
+    def quarantine(self, node: ManagedNode) -> Path:
+        return self.node_dir(node) / "quarantine.json"
+
+    def policy_lock(self, node: ManagedNode) -> Path:
+        return self.node_dir(node) / "policy.lock"
 
     def tls_cert(self, node: ManagedNode) -> Path:
         return self.node_dir(node) / "tls.cert"
@@ -324,9 +333,14 @@ class RegistryStore:
                 f"managed node registry {self.paths.registry} is malformed or unsupported; "
                 "it was left untouched"
             ) from exc
+        self._check_scope(registry)
+        return registry
+
+    def _check_scope(self, registry: NodeRegistry) -> None:
         if registry.network != self.paths.network:
             raise RegistryError("managed node registry belongs to another network")
-        return registry
+        if registry.wallet_identity != self.paths.wallet_identity:
+            raise RegistryError("managed node registry belongs to a different wallet")
 
     def update(
         self, change: Callable[[NodeRegistry | None], NodeRegistry | None]
@@ -340,6 +354,7 @@ class RegistryStore:
             if result is None:
                 return current
             result = NodeRegistry.model_validate(result.model_dump())
+            self._check_scope(result)
             if result.model_dump_json() != before:
                 self._write(result)
             return result

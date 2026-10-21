@@ -27,6 +27,40 @@ def store_at(tmp_path: Path) -> RegistryStore:
     return RegistryStore(ManagedNodePaths.for_wallet(tmp_path, "signet", WALLET))
 
 
+def test_full_wallet_owner_is_checked_even_when_path_prefixes_collide(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    store.update(lambda current: two_node_registry())
+    other_identity = WALLET[:16] + "cd" * 24
+    other_paths = ManagedNodePaths.for_wallet(tmp_path, "signet", other_identity)
+    assert other_paths.root == store.paths.root
+    with pytest.raises(RegistryError, match="different wallet"):
+        RegistryStore(other_paths).load()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("scope", ["network", "wallet"])
+def test_update_never_writes_foreign_authority(
+    tmp_path: Path,
+    existing: bool,
+    scope: str,
+) -> None:
+    store = store_at(tmp_path)
+    if existing:
+        store.update(lambda current: two_node_registry())
+    before = store.paths.registry.read_bytes() if existing else None
+    foreign = two_node_registry()
+    if scope == "network":
+        foreign.network = "regtest"
+    else:
+        foreign.wallet_identity = "cd" * 32
+    with pytest.raises(RegistryError, match="another network|different wallet"):
+        store.update(lambda current: foreign)
+    if before is None:
+        assert not store.paths.registry.exists()
+    else:
+        assert store.paths.registry.read_bytes() == before
+
+
 def two_node_registry() -> NodeRegistry:
     registry = new_registry("signet", WALLET)
     allocate_node(registry, 0, birthday=1, ports=(20001, 20002))
@@ -130,7 +164,9 @@ def test_unreadable_registry_is_refused_and_left_untouched(tmp_path: Path, raw: 
 def test_registry_of_another_network_is_refused(tmp_path: Path) -> None:
     store = store_at(tmp_path)
     store.update(lambda current: two_node_registry())
-    mainnet = RegistryStore(ManagedNodePaths(store.paths.root, "mainnet"))
+    mainnet = RegistryStore(
+        ManagedNodePaths(store.paths.root, "mainnet", store.paths.wallet_identity)
+    )
 
     with pytest.raises(RegistryError, match="another network"):
         mainnet.load()

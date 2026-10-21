@@ -119,6 +119,19 @@ or taker settlement monitors, which must also remain running until their
 outcomes are known. An established node missing its wallet still requires
 explicit recovery and a supervisor restart; polling never reinitializes it.
 
+Managed launches enforce sticky inbound-channel quarantine for retiring and
+recovering identities. The private per-node `quarantine.json` binds the request
+to the full wallet identity, network, and node generation. Later launches use
+LND's `maxpendingchannels=0`, even if registry state rolls back to `active`.
+Unknown marker data is preserved and also restricts inbound opens; it is not
+treated as a valid owned request. Existing active installations without a
+marker retain their affirmative active policy.
+
+The request and process launch share a lock, but recording a request does not
+retroactively quarantine an already running LND. Effective quarantine requires
+a separately verified restart before any channel closure. This launch policy
+does not close channels, sweep coins, or establish retirement completion.
+
 ### Wallet Reserve
 
 Anchor channels need confirmed wallet coins to fee-bump a force close. LND
@@ -401,16 +414,21 @@ also as JSON.
 
 ## Persisted State
 
+Managed-node paths below are relative to
+`<data_dir>/lightning/<network>/<wallet_identity[:16]>/`. The registry retains
+the full wallet identity; the path prefix is not sufficient ownership proof.
+
 | State | Location | Absent means |
 | --- | --- | --- |
-| Node registry: epoch, nodes with state, identity, ports, close and sweep intents | `lightning/<fingerprint>/registry.json` | No managed nodes; nothing is created or started |
-| LND data per node | `lightning/<fingerprint>/nodes/<epoch>-<mixdepth>-<generation>/` | That node is not started and needs recovery |
-| Backups: registry copy and static channel backups | `lightning/<fingerprint>/backup/` | Nothing to restore from |
+| Node registry: epoch, nodes with state, identity, ports, close and sweep intents | `registry.json` | No launch authority; nothing is created or started |
+| LND data per node | `nodes/<epoch>-<mixdepth>-<generation>/` | Established nodes need recovery; only affirmative provisioning may resume creation |
+| Sticky quarantine intent | `nodes/<epoch>-<mixdepth>-<generation>/quarantine.json` | No quarantine request; the validated registry lifecycle still controls launch authority |
+| Backups: registry copy and static channel backups | `backup/` | No local backup evidence; not proof that recovery is unnecessary |
 | Ring node bindings | existing `node-bindings.json` | Managed init writes them for its own new nodes |
-| Market ledger, store, leases | existing wallet market ledger | No sales or leases |
+| Market ledger, store, leases | existing wallet market ledger | No local sales evidence; absence alone cannot clear retirement obligations |
 | Advertised bonds per period | `market/advertised-bonds.json` | Created when first needed; every bond counts as advertised through the next period |
-| Bond lease purchases, with their keys until their period ends or as evidence of an unusable paid lease | `market/bond-purchases/` | No lease paid here; nothing blocks the next purchase, and no registry entry counts as leased here |
-| Rented bond with derived certificate key | existing bond registry, new entry kind | No rental; older entries keep raw keys |
+| Bond lease purchases, with their keys until their period ends or as evidence of an unusable paid lease | `<data_dir>/market/bond-purchases/` | No local purchase evidence; not proof of no prior payment or lease provenance |
+| Imported leased bond and random renter certificate key | wallet-specific fidelity bond registry | No locally recorded credential; the owner's signature and renter key cannot be recovered from the seed alone |
 
 A data directory without a market store is treated as one that never sold a
 lease, so existing makers keep advertising their bond. This is a
