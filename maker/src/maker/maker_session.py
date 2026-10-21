@@ -24,6 +24,7 @@ import json
 import math
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -849,7 +850,21 @@ class MakerSession:
                     initialized_backend=node,
                     chain_backend=bot.backend,
                 )
-            responses = await self.ring_participant.handle(payload)
+            try:
+                responses = await self.ring_participant.handle(payload)
+            except Exception:
+                # A report is informational and request-local. Sending it must
+                # not change locks, retirement, or the original failure path.
+                with suppress(Exception):
+                    failure = self.ring_participant.opening_failure_response(payload)
+                    if failure is not None:
+                        await asyncio.wait_for(
+                            self._send_ring_response(
+                                bot, self.crypto.encrypt(encode_ring_message(failure)), source
+                            ),
+                            timeout=1.0,
+                        )
+                raise
             if isinstance(payload, RingCancelPayload):
                 self.release_input_locks()
                 if not self.ring_participant.holds_active_record():

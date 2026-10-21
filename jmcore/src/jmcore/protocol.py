@@ -85,6 +85,8 @@ _FEATURE_IDENTIFIER_DELIMITERS = _PEERLIST_FIELD_DELIMITERS | {"+"}
 FEATURE_NEUTRINO_COMPAT = "neutrino_compat"
 FEATURE_PUSH_ENCRYPTED = "push_encrypted"
 FEATURE_PRIVATE_CHANNEL_RING = "private_channel_ring"
+# Authenticated !pubkey response-format negotiation, not a directory feature.
+RING_OPEN_DIAGNOSTICS_TOKEN = "ring_open_diagnostics=1"
 FEATURE_PEERLIST_FEATURES = "peerlist_features"  # Supports extended peerlist with F: suffix
 FEATURE_PING = "ping"  # Supports application-level PING/PONG heartbeat
 FEATURE_DIRECT_PING_V1 = "direct_ping_v1"  # Verified direct sockets echo a 16-byte hex nonce

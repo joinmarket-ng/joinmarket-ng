@@ -282,6 +282,18 @@ checks channel activation, an exact-channel payment on each edge, and confirmed
 cooperative closure at both endpoints. This does not cover buyout settlement
 or automatic timeout-split fee bumping (which remains unsupported).
 
+Ring response timeouts report the phase, expected response, and round-local
+participant counts, retaining partial progress even when collection is canceled.
+Makers including `ring_open_diagnostics=1` in an authenticated pubkey response can
+receive an explicit diagnostic opening request. This is session-local metadata,
+not a second global ring feature or configuration option. Their signed,
+encrypted failure reports identify the
+reported incoming or outgoing edge by a round-local ordinal. These reports are
+informational, do not count as readiness, and do not prove the root cause or
+authorize cancellation or signing. Legacy peers use unchanged opening messages.
+When no report arrives before the deadline, the error lists candidate edges and
+states that the root cause is unknown rather than blaming a missing participant.
+
 A failed or interrupted fixture keeps its chain, journals, and channels for
 review. `E2E_RESET=1` deletes one reviewed fixture; it is never a retry of an
 uncertain signed round.

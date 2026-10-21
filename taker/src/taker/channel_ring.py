@@ -52,6 +52,7 @@ from jmcore.cofunded_ring import (
     RingInvitePayload,
     RingKeyPair,
     RingManifest,
+    RingOpenDiagnosticsPayload,
     RingOpenPayload,
     RingPayloadType,
     RingPlanAckPayload,
@@ -100,6 +101,7 @@ from jmswap.lnd import (
 from loguru import logger
 
 from taker.orderbook import offer_supports_private_channel_ring
+from taker.ring_diagnostics import RingResponseProgress
 from taker.ring_planner import (
     ParticipantChannelLimits,
     RingParty,
@@ -121,6 +123,10 @@ if TYPE_CHECKING:
 
 class TakerRingError(Exception):
     """A strict all-party ring round cannot safely advance."""
+
+
+class RingResponseTimeoutError(TakerRingError):
+    """A safe ordinal-only response diagnostic, suitable for default logs."""
 
 
 def _chain_hash(network: str) -> bytes:
@@ -375,24 +381,50 @@ class TakerRingCoordinator:
     ) -> dict[str, list[RingPayloadType]]:
         nicks = list(self._ring_sessions())
         counts = {nick: expected_counts for nick in nicks} if expected_counts > 1 else None
-        responses = await self._await_setup_action(
-            lambda: self.session.directory_client.wait_for_responses(
-                expected_nicks=nicks,
-                expected_command="!ring",
-                timeout=self._bounded_setup_timeout(
-                    self.config.phase_timeout_seconds if timeout is None else timeout
-                ),
-                expected_counts=counts,
-            ),
-            self.config.phase_timeout_seconds if timeout is None else timeout,
+        record = self._record()
+        plans = record.coordinator_plans
+        key_by_nick = {nick: key for key, nick in self._peer_by_key.items()}
+        progress = RingResponseProgress(
+            expected_response=expected_type.message_type,
+            round_nonce=record.round_nonce,
+            revision=record.revision,
+            participants={
+                nick: (
+                    key_by_nick.get(nick),
+                    plans.get(key_by_nick.get(nick, "")),
+                    self._ring_sessions()[nick].crypto,
+                )
+                for nick in nicks
+            },
+            expected_count=expected_counts,
         )
+        try:
+            responses = await self._await_setup_action(
+                lambda: self.session.directory_client.wait_for_responses(
+                    expected_nicks=nicks,
+                    expected_command="!ring",
+                    timeout=self._bounded_setup_timeout(
+                        self.config.phase_timeout_seconds if timeout is None else timeout
+                    ),
+                    expected_counts=counts,
+                    response_progress=progress.responses,
+                    response_filter=progress.include_response,
+                ),
+                self.config.phase_timeout_seconds if timeout is None else timeout,
+            )
+        except TimeoutError as exc:
+            raise RingResponseTimeoutError(progress.summary()) from exc
+        # Mocks and legacy collectors can return their own response dictionary.
+        progress.responses.update(responses)
         result: dict[str, list[RingPayloadType]] = {}
         for nick in nicks:
             response = responses.get(nick)
             if response is None or response.get("error"):
-                raise TakerRingError(f"ring peer failed during {expected_type.message_type}")
+                raise RingResponseTimeoutError(progress.summary())
             values = response["data"]
             encoded_values = values if isinstance(values, list) else [values]
+            if len(encoded_values) < expected_counts:
+                raise RingResponseTimeoutError(progress.summary())
             if len(encoded_values) != expected_counts:
                 raise TakerRingError(
                     f"ring peer returned {len(encoded_values)} responses, "
@@ -783,12 +815,18 @@ class TakerRingCoordinator:
             RingLifecycleState.ACCEPTOR_ARMED,
             updates={"outgoing_open_started": True},
         )
+        outgoing_ordinal = plan.cycle_keys.index(plan.outgoing_edge.opener_key) + 1
+        incoming_ordinal = plan.cycle_keys.index(plan.incoming_edge.opener_key) + 1
         outgoing, incoming = await self._await_setup_action(
             lambda: asyncio.gather(
                 _log_preparation_leg(
-                    "outgoing channel negotiation", self.lnd.start_external_channel(request)
+                    f"opening outgoing edge {outgoing_ordinal}",
+                    self.lnd.start_external_channel(request),
                 ),
-                _log_preparation_leg("incoming channel acceptance", acceptor_task),
+                _log_preparation_leg(
+                    f"opening incoming edge {incoming_ordinal}",
+                    acceptor_task,
+                ),
             ),
             self.config.open_timeout_seconds,
         )
@@ -801,9 +839,13 @@ class TakerRingCoordinator:
         plans = record.coordinator_plans
         payloads = {
             nick: cast(
-                RingOpenPayload,
+                RingPayloadType,
                 self._sign(
-                    RingOpenPayload(
+                    (
+                        RingOpenDiagnosticsPayload
+                        if self._ring_sessions()[nick].supports_ring_diagnostics
+                        else RingOpenPayload
+                    )(
                         round_nonce=record.round_nonce,
                         revision=record.revision,
                         signer_key=self.coordinator_key,
@@ -1474,6 +1516,8 @@ class TakerRingCoordinator:
             return True
         except Exception as exc:
             logger.error(f"Co-funded channel ring aborted before completion ({type(exc).__name__})")
+            if isinstance(exc, RingResponseTimeoutError):
+                logger.error("{}", exc)
             if self.record_key is not None and not self.sign_authorized:
                 await self.cancel("coordinator_failure")
             return False

@@ -36,6 +36,7 @@ from jmcore.protocol import (
     COMMAND_PREFIX,
     FEATURE_PRIVATE_CHANNEL_RING,
     JM_VERSION,
+    RING_OPEN_DIAGNOSTICS_TOKEN,
     MessageType,
 )
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
@@ -793,6 +794,7 @@ class ProtocolHandlersMixin:
 
                 if self.channel_ring_capability_validated:
                     response.setdefault("features", []).append(FEATURE_PRIVATE_CHANNEL_RING)
+                    response["ring_open_diagnostics"] = True
                 self.active_sessions[session_key] = session
                 logger.info(
                     f"Created CoinJoin session with {taker_nick} "
@@ -1566,6 +1568,8 @@ class ProtocolHandlersMixin:
                 features = data.get("features", [])
                 if features:
                     msg_content += f" features={','.join(features)}"
+                if data.get("ring_open_diagnostics") is True:
+                    msg_content += f" {RING_OPEN_DIAGNOSTICS_TOKEN}"
             else:
                 # Fallback to JSON for unknown commands
                 msg_content = json.dumps(data)

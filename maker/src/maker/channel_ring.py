@@ -8,7 +8,8 @@ import hashlib
 import secrets
 import time
 from collections.abc import Awaitable, Sequence
-from typing import TYPE_CHECKING, TypeVar, cast
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from jmcore.bitcoin import (
     address_to_scriptpubkey,
@@ -40,9 +41,11 @@ from jmcore.cofunded_ring import (
     ReadinessState,
     RingCancelPayload,
     RingEdge,
+    RingFailurePayload,
     RingHelloPayload,
     RingInvitePayload,
     RingManifest,
+    RingOpenDiagnosticsPayload,
     RingOpenPayload,
     RingPayload,
     RingPayloadType,
@@ -78,6 +81,7 @@ from jmswap.lnd import (
     FundingNegotiation,
     FundingTransactionChainStatus,
     InboundChannelExpectation,
+    LndTimeoutError,
     PendingChannelExpectation,
     PendingChannelObservation,
     VerifiedChannelRetirementAuthorization,
@@ -220,6 +224,7 @@ class MakerRingParticipant:
         self.chain_backend = chain_backend
         self.record_key: RingRecordKey | None = None
         self.acceptor_task: asyncio.Task[object] | None = None
+        self._opening_failure: tuple[str, RingFailurePayload] | None = None
 
     def cancel_acceptor_task(self) -> None:
         """Stop the incoming-channel acceptor when its session ends without a ring."""
@@ -294,6 +299,7 @@ class MakerRingParticipant:
         return {"handled_requests": requests, "handled_responses": encoded_responses}
 
     async def handle(self, payload: RingPayloadType) -> list[RingPayloadType]:
+        self._opening_failure = None
         if isinstance(payload, RingInvitePayload):
             return await self._invite(payload)
         record = self._record()
@@ -303,7 +309,7 @@ class MakerRingParticipant:
             return cached
         if isinstance(payload, RingPlanPayload):
             return await self._plan(payload, record)
-        if isinstance(payload, RingOpenPayload):
+        if isinstance(payload, (RingOpenPayload, RingOpenDiagnosticsPayload)):
             return await self._open(payload, record)
         if isinstance(payload, RingUnsignedPayload):
             return await self._unsigned(payload, record)
@@ -562,7 +568,7 @@ class MakerRingParticipant:
         return [ack]
 
     async def _open(
-        self, payload: RingOpenPayload, record: RingParticipantRecord
+        self, payload: RingOpenPayload | RingOpenDiagnosticsPayload, record: RingParticipantRecord
     ) -> list[RingPayloadType]:
         if record.state is not RingLifecycleState.ACCEPTOR_ARMED or record.plan is None:
             raise MakerRingError("ring_open is out of order")
@@ -570,6 +576,10 @@ class MakerRingParticipant:
             raise MakerRingError("ring_open plan hash differs from the acknowledged plan")
         if self.acceptor_task is None:
             raise MakerRingError("incoming channel acceptor is not armed")
+        if record.outgoing_open_started:
+            # Both wire types authorize the same single attempt. Switching
+            # types after failure must not create an independent replay path.
+            raise MakerRingError("channel opening has already started for this revision")
         plan = record.plan
         edge = plan.outgoing_edge
         policy = edge.policy
@@ -592,11 +602,42 @@ class MakerRingParticipant:
             RingLifecycleState.ACCEPTOR_ARMED,
             updates={"outgoing_open_started": True},
         )
+        reported = False
+
+        async def observe(leg: Literal["incoming", "outgoing"], action: Awaitable[Any]) -> Any:
+            nonlocal reported
+            local_edge = plan.incoming_edge if leg == "incoming" else plan.outgoing_edge
+            ordinal = plan.cycle_keys.index(local_edge.opener_key) + 1
+            try:
+                return await _log_preparation_leg(f"{leg} edge {ordinal}", action)
+            except Exception as exc:
+                if isinstance(payload, RingOpenDiagnosticsPayload) and not reported:
+                    reported = True
+                    # Diagnostic failures must not replace the original backend exception.
+                    with suppress(Exception):
+                        failure = cast(
+                            RingFailurePayload,
+                            _signed(
+                                RingFailurePayload(
+                                    round_nonce=record.round_nonce,
+                                    revision=record.revision,
+                                    signer_key=record.ring_public_key,
+                                    plan_hash=payload.plan_hash,
+                                    pending_channel_id=local_edge.pending_channel_id,
+                                    leg=leg,
+                                    reason="timeout"
+                                    if isinstance(exc, (TimeoutError, LndTimeoutError))
+                                    else "backend_failure",
+                                ),
+                                record.ring_secret,
+                            ),
+                        )
+                        self._opening_failure = (_request_text(payload), failure)
+                raise
+
         outgoing, incoming = await asyncio.gather(
-            _log_preparation_leg(
-                "outgoing channel negotiation", self.lnd.start_external_channel(request)
-            ),
-            _log_preparation_leg("incoming channel acceptance", self.acceptor_task),
+            observe("outgoing", self.lnd.start_external_channel(request)),
+            observe("incoming", self.acceptor_task),
         )
         if not isinstance(incoming, AcceptorObservation):
             raise MakerRingError("incoming acceptor returned an invalid observation")
@@ -640,6 +681,17 @@ class MakerRingParticipant:
         }
         self.store.transition(record.key, RingLifecycleState.PREPARED_NOT_VERIFIED, updates=updates)
         return [response]
+
+    def opening_failure_response(self, payload: RingPayloadType) -> RingFailurePayload | None:
+        """Take a request-local failure report, only for the explicit diagnostic opt-in."""
+        saved, self._opening_failure = self._opening_failure, None
+        if (
+            isinstance(payload, RingOpenDiagnosticsPayload)
+            and saved is not None
+            and saved[0] == _request_text(payload)
+        ):
+            return saved[1]
+        return None
 
     def _validate_manifest(
         self, payload: RingUnsignedPayload, record: RingParticipantRecord

@@ -787,6 +787,8 @@ class MultiDirectoryClient(DirectoryClientPool):
         timeout: float = 60.0,
         expected_counts: dict[str, int] | None = None,
         on_stalled: tuple[float, Callable[[set[str]], Awaitable[None]]] | None = None,
+        response_progress: dict[str, dict[str, Any]] | None = None,
+        response_filter: Callable[[str, str], bool] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Wait for responses from multiple makers at once.
 
@@ -794,6 +796,10 @@ class MultiDirectoryClient(DirectoryClientPool):
         seconds, with the nicks that have not answered at all yet. It runs alongside
         response collection and is canceled and joined when this phase ends. The
         wait keeps its original deadline and everything already received.
+
+        ``response_progress`` retains partial responses even if collection is
+        canceled. ``response_filter`` consumes informational frames before any
+        counting or deduplication, without extending the original deadline.
 
         Listens for responses from BOTH:
         - Directory server message streams (via client.listen_for_messages())
@@ -830,7 +836,9 @@ class MultiDirectoryClient(DirectoryClientPool):
         # authenticated messages from each peer.
         accumulate_responses = expected_command == "!sig" or expected_counts is not None
 
-        responses: dict[str, dict[str, Any]] = {}
+        responses: dict[str, dict[str, Any]] = (
+            response_progress if response_progress is not None else {}
+        )
         remaining_nicks = set(expected_nicks)
         deduplicator = ResponseDeduplicator()
         # For multi-response phases: track seen data per nick to drop cross-directory
@@ -903,6 +911,9 @@ class MultiDirectoryClient(DirectoryClientPool):
             if command != expected_command.lstrip("!"):
                 return
 
+            if response_filter is not None and not response_filter(from_nick, payload):
+                return
+
             if responses.get(from_nick, {}).get("error"):
                 logger.warning(f"Ignoring late {expected_command} from {from_nick} after !error")
                 return
@@ -937,7 +948,19 @@ class MultiDirectoryClient(DirectoryClientPool):
                 if retry_task is not None and retry_task.done():
                     retry_task.result()
                 if elapsed >= timeout:
-                    if not accumulate_responses:
+                    if expected_command == "!ring":
+                        for ordinal, nick in enumerate(expected_nicks, 1):
+                            data = responses.get(nick, {}).get("data", [])
+                            received = len(data) if isinstance(data, list) else int(bool(data))
+                            expected = (expected_counts or {}).get(nick, 1)
+                            if received < expected:
+                                logger.warning(
+                                    "Ring response timeout: participant {} sent {}/{} responses",
+                                    ordinal,
+                                    received,
+                                    expected,
+                                )
+                    elif not accumulate_responses:
                         logger.warning(
                             f"Timeout waiting for {expected_command} from: {remaining_nicks}"
                         )

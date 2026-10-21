@@ -8,6 +8,7 @@ without its signing key.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 from _taker_test_helpers import make_directory_client
@@ -216,3 +217,66 @@ async def test_directory_channel_skips_connected_direct_peer():
     assert channel == "directory:dir:1"
     directory.send_private_message.assert_awaited_once_with("maker", "tx", "blob")
     peer.send_privmsg.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_informational_ring_frames_never_count_as_readiness():
+    client = make_directory_client()
+    client.clients = {}
+    maker = NickIdentity(5)
+    progress: dict[str, dict[str, Any]] = {}
+
+    async def queue(data):
+        await client._direct_message_queue.put(
+            {
+                "type": MessageType.PRIVMSG.value,
+                "line": signed_line(maker, client.nick_identity.nick, "ring", data),
+            }
+        )
+
+    await queue("diagnostic")
+    task = asyncio.create_task(
+        client.wait_for_responses(
+            [maker.nick],
+            "!ring",
+            timeout=5,
+            response_progress=progress,
+            response_filter=lambda nick, data: data.split()[0] != "diagnostic",
+        )
+    )
+    try:
+        await asyncio.sleep(0.02)
+        assert not task.done() and progress == {}
+        await queue("normal-response")
+        result = await asyncio.wait_for(task, timeout=2)
+        assert result is progress
+        assert result[maker.nick]["data"].split()[0] == "normal-response"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_keeps_partial_ring_response_counts():
+    client = make_directory_client()
+    client.clients = {}
+    maker = NickIdentity(5)
+    await client._direct_message_queue.put(
+        {
+            "type": MessageType.PRIVMSG.value,
+            "line": signed_line(maker, client.nick_identity.nick, "ring", "first"),
+        }
+    )
+    progress: dict[str, dict[str, Any]] = {}
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            client.wait_for_responses(
+                [maker.nick],
+                "!ring",
+                timeout=5,
+                expected_counts={maker.nick: 2},
+                response_progress=progress,
+            ),
+            timeout=0.02,
+        )
+    assert [item.split()[0] for item in progress[maker.nick]["data"]] == ["first"]

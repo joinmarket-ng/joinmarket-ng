@@ -71,6 +71,10 @@ async def test_three_maker_ring_without_taker_lnd() -> None:
         assert len(record.participants) == len(record.manifest.edges) == 3
         assert len(record.manifest.equal_output_indices) == 4
         assert len(taker._session.ring_maker_sessions) == 3
+        assert all(
+            maker.supports_ring_diagnostics
+            for maker in taker._session.ring_maker_sessions.values()
+        )
         assert not taker._session.ordinary_maker_sessions
 
         raw_tx = str(await bitcoin_rpc("getrawtransaction", [txid]))

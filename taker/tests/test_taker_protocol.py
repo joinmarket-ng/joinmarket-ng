@@ -3282,6 +3282,30 @@ class TestNeutrinoIncompatibleMakerReplacement:
         assert mk.supports_neutrino_compat is False
         assert mk.crypto is not None
 
+    @pytest.mark.parametrize(
+        "token, expected",
+        [
+            ("", False),
+            ("ring_open_diagnostics=1", True),
+            ("ring_open_diagnostics=2", False),
+            ("ring_open_diagnostics=1 ring_open_diagnostics=0", False),
+        ],
+    )
+    def test_ring_diagnostics_require_authenticated_peer_advertisement(self, token, expected):
+        from taker.coinjoin_session import CoinJoinSession
+
+        session = CoinJoinSession()
+        session.crypto_session = CryptoSession()
+        peer_crypto = CryptoSession()
+        maker = MakerSession(nick="J5x", offer=_simple_offer("J5x"))
+        # A stale directory hint alone must never enable the new request type.
+        maker.supports_ring_diagnostics = True
+        session.maker_sessions = {"J5x": maker}
+        assert session.process_pubkey_response(
+            "J5x", f"{peer_crypto.get_pubkey_hex()} features=private_channel_ring {token}"
+        )
+        assert maker.supports_ring_diagnostics is expected
+
     def test_process_pubkey_response_rejects_empty_payload(self):
         from taker.coinjoin_session import CoinJoinSession
 

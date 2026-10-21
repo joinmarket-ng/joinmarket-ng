@@ -519,6 +519,12 @@ class CoinJoinSession:
             return False
 
         session = self.maker_sessions[nick]
+        from jmcore.protocol import RING_OPEN_DIAGNOSTICS_TOKEN
+
+        # Directory feature hints are not enough to opt into a new private
+        # message type. Only this authenticated peer response can enable it.
+        diagnostics = [part for part in parts[1:] if part.startswith("ring_open_diagnostics=")]
+        session.supports_ring_diagnostics = diagnostics == [RING_OPEN_DIAGNOSTICS_TOKEN]
         nacl_pubkey = parts[0]
         session.pubkey = nacl_pubkey
         session.responded_fill = True

@@ -2144,6 +2144,85 @@ async def test_preparation_leg_log_preserves_result_and_error() -> None:
         await _log_preparation_leg("incoming channel acceptance", stalled())
 
 
+@pytest.mark.parametrize("diagnostic", [False, True])
+async def test_opening_failure_is_opt_in_request_local_and_not_a_second_attempt(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from jmcore.cofunded_ring import RingOpenDiagnosticsPayload, verify_payload
+
+    await harness.machine.handle(harness.invite())
+    acknowledgments = await harness.machine.handle(harness.plan())
+    error = TimeoutError("private backend details must not be sent")
+    backend = AsyncMock(side_effect=error)
+    monkeypatch.setattr(harness.lnd, "start_external_channel", backend)
+    payload_type = RingOpenDiagnosticsPayload if diagnostic else RingOpenPayload
+    request = harness.signed(
+        payload_type(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            plan_hash=acknowledgments[0].plan_hash,
+        )
+    )
+    with pytest.raises(TimeoutError) as caught:
+        await harness.machine.handle(request)
+    assert caught.value is error
+    report = harness.machine.opening_failure_response(request)
+    if diagnostic:
+        assert report is not None and verify_payload(report)
+        assert report.leg == "outgoing" and report.reason == "timeout"
+        assert report.pending_channel_id == harness.record().plan.outgoing_edge.pending_channel_id
+        assert "private backend" not in encode_ring_message(report)
+    else:
+        assert report is None
+    assert harness.machine.opening_failure_response(request) is None
+    record = harness.record()
+    assert record.outgoing_open_started and not record.local_input_signature_created
+    # The legacy and diagnostic wire types share ONE authorized attempt.
+    switched_type = RingOpenPayload if diagnostic else RingOpenDiagnosticsPayload
+    switched = harness.signed(
+        switched_type(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            plan_hash=acknowledgments[0].plan_hash,
+        )
+    )
+    with pytest.raises(MakerRingError, match="already started"):
+        await harness.machine.handle(switched)
+    assert backend.await_count == 1
+
+
+async def test_opening_cancellation_does_not_create_a_failure_report(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from jmcore.cofunded_ring import RingOpenDiagnosticsPayload
+
+    await harness.machine.handle(harness.invite())
+    acknowledgments = await harness.machine.handle(harness.plan())
+    monkeypatch.setattr(
+        harness.lnd, "start_external_channel", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+    request = harness.signed(
+        RingOpenDiagnosticsPayload(
+            round_nonce="aa" * 32,
+            revision=0,
+            signer_key=harness.taker_key,
+            plan_hash=acknowledgments[0].plan_hash,
+        )
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await harness.machine.handle(request)
+    assert harness.machine.opening_failure_response(request) is None
+
+
 def _invite_record(
     outpoint: Outpoint, owner: str, nonce_byte: str, age: float
 ) -> RingParticipantRecord:

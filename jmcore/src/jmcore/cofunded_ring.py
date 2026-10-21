@@ -780,6 +780,41 @@ class RingUnsignedPayload(RingPayload):
         return self
 
 
+class RingOpenDiagnosticsPayload(RingPayload):
+    """Explicit opt-in to informational opening failures, advertised by the maker.
+
+    A distinct type preserves the canonical hashes of legacy ring_open requests.
+    Both types authorize exactly the same single opening attempt.
+    """
+
+    message_type: ClassVar[str] = "ring_open_diagnostics"
+    type: Literal["ring_open_diagnostics"] = "ring_open_diagnostics"
+    plan_hash: Hex32
+
+    @model_validator(mode="after")
+    def validate_plan_hash(self) -> RingOpenDiagnosticsPayload:
+        _validate_hex(self.plan_hash, 32, "plan_hash")
+        return self
+
+
+class RingFailurePayload(RingPayload):
+    """A participant report, never cancellation evidence or signing authorization."""
+
+    message_type: ClassVar[str] = "ring_failure"
+    type: Literal["ring_failure"] = "ring_failure"
+    phase: Literal["opening"] = "opening"
+    leg: Literal["incoming", "outgoing"]
+    reason: Literal["timeout", "backend_failure"]
+    plan_hash: Hex32
+    pending_channel_id: Hex32
+
+    @model_validator(mode="after")
+    def validate_failure_binding(self) -> RingFailurePayload:
+        _validate_hex(self.plan_hash, 32, "plan_hash")
+        _validate_hex(self.pending_channel_id, 32, "pending_channel_id")
+        return self
+
+
 class RingReadyPayload(RingPayload):
     message_type: ClassVar[str] = "ring_ready"
     type: Literal["ring_ready"] = "ring_ready"
@@ -913,6 +948,8 @@ RingPayloadType: TypeAlias = (
     | RingPlanPayload
     | RingPlanAckPayload
     | RingOpenPayload
+    | RingOpenDiagnosticsPayload
+    | RingFailurePayload
     | RingPreparedPayload
     | RingUnsignedPayload
     | RingReadyPayload
@@ -931,6 +968,8 @@ _PAYLOAD_TYPES: dict[str, type[RingPayload]] = {
         RingPlanPayload,
         RingPlanAckPayload,
         RingOpenPayload,
+        RingOpenDiagnosticsPayload,
+        RingFailurePayload,
         RingPreparedPayload,
         RingUnsignedPayload,
         RingReadyPayload,

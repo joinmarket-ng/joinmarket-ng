@@ -55,6 +55,7 @@ class MakerSession:
     responded_auth: bool = False
     responded_sig: bool = False
     supports_neutrino_compat: bool = False  # Supports extended UTXO metadata for Neutrino
+    supports_ring_diagnostics: bool = False  # Authenticated, session-local !pubkey opt-in
     hold_seconds: int | None = None
     hold_deadline: float | None = None
     # Communication channel used for this session (must be consistent throughout)
