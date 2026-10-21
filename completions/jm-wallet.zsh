@@ -224,7 +224,7 @@ _jm_wallet() {
             '--rpc-url=[]: :' \
             '--neutrino-url=[]: :' \
             '--extended[Show detailed addresses, derivations, and UTXO outpoints]' \
-            '--view=[Extended-view layout\: '\''legacy'\'' (the existing layout, default) or '\''full'\'' (pipe-aligned table, one line per UTXO, exact confirmation counts, explicit spendable state). Requires --extended.]: :' \
+            '--view=[Extended-view layout\: '\''legacy'\'' (the existing layout, default), '\''full'\'' (pipe-aligned table, one line per UTXO, exact confirmation counts, explicit spendable state), or '\''compact'\'' (80-column variant of '\''full'\''\: two lines per UTXO, three for funded bonds, full copyable outpoints). Requires --extended.]: :' \
             '--gap=[Max address gap to show in extended view]: :' \
             '--show-empty[In --extended view, show addresses with zero balance. When disabled (default), empty addresses are hidden except for the first unused one per branch so you still have a fresh receive address.]' \
             '--show-utxos[In the basic view, add a per-mixdepth UTXO breakdown grouped by type (cj-out, cj-change, deposit, reg-change) plus fidelity bonds.]' \

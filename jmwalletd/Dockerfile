@@ -4,13 +4,13 @@
 # Update with: ./scripts/update-base-images.sh
 # =============================================================================
 ARG PYTHON_VERSION=3.14
-ARG PYTHON_SLIM_DIGEST=sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+ARG PYTHON_SLIM_DIGEST=sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a
 
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
 # Different versions produce different WHEEL/RECORD files, breaking layer reproducibility
 # Update versions with: ./scripts/update-base-images.sh
-ARG SETUPTOOLS_VERSION=84.0.0
+ARG SETUPTOOLS_VERSION=84.2.1
 ARG WHEEL_VERSION=0.48.0
 
 # Debian archive snapshot (snapshot.debian.org) that apt resolves against.
