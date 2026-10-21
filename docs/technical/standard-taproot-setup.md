@@ -412,6 +412,15 @@ guidance, and role/market options. The fresh-install offer will invoke the
 complete flow once those stages are available; configuration alone is not
 reported as wallet or Lightning provisioning.
 
+The wallet-publication foundation requires an explicit generate/import choice
+and a nonempty encryption password. It does not overwrite a wallet or its
+metadata. Its versioned setup journal distinguishes intent, prepared encrypted
+bytes, and completed publication. An interrupted setup never regenerates a
+missing wallet or infers that an existing wallet is unused. Resume preserves
+changed recovery metadata; missing import metadata needs explicit recovery
+confirmation. Durable setup publication currently supports POSIX filesystems.
+This foundation is not yet connected to the setup prompts.
+
 `jm-wallet info` shows a Lightning section per mixdepth: node identity and
 generation, sync state, reserve against its range, channel count, and
 outbound and inbound liquidity. `jm-lightning status` shows the same data,

@@ -139,8 +139,36 @@ def read_sensitive_file(path: Path) -> bytes:
         return sensitive_file.read()
 
 
-def atomic_write_private(path: Path, data: bytes) -> None:
-    """Atomically write bytes without exposing a permissively-mode temporary file."""
+def sync_parent_directories(path: Path) -> None:
+    """Flush directory entries through the parent chain on POSIX filesystems.
+
+    This includes newly created ancestors whose entries a leaf-only flush would
+    miss. Errors propagate: callers must not acknowledge durable publication
+    after an unsupported or failed flush. Windows keeps its existing file-flush
+    contract; directory descriptors are not portable there.
+    """
+    if os.name != "posix":
+        return
+    directory = path.parent.resolve(strict=True)
+    while True:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if directory.parent == directory:
+            break
+        directory = directory.parent
+
+
+def atomic_write_private(path: Path, data: bytes, *, replace: bool = True) -> None:
+    """Atomically publish private bytes, optionally refusing ANY existing destination.
+
+    The default replacement contract is unchanged. ``replace=False`` publishes
+    a complete inode with an atomic hard link, never falls back to overwriting,
+    and flushes parent entries before returning. If a post-link flush fails the
+    file may already exist: callers must inspect/resume, not blindly recreate.
+    """
     _reject_parent_traversal(path)
     parent = path.parent
     if parent.is_symlink():
@@ -161,7 +189,12 @@ def atomic_write_private(path: Path, data: bytes) -> None:
             temp_file.write(data)
             temp_file.flush()
             os.fsync(temp_file.fileno())
-        os.replace(temp_path, path)
+        if replace:
+            os.replace(temp_path, path)
+        else:
+            os.link(temp_path, path, follow_symlinks=False)
+            temp_path.unlink()
+            sync_parent_directories(path)
     finally:
         if fd >= 0:
             os.close(fd)
