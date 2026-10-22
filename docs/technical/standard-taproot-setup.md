@@ -572,6 +572,17 @@ one with no durable ring record yet. An empty handler counter or record list
 therefore grants no financial quiescence or node-retirement authority. This
 gate is also transient and remains closed if its waiter is canceled.
 
+The separate `close_offer_admission()` operation closes both fill and offer
+publication gates before waiting, stages withdrawals for every retained identity,
+then drains accepted fill handlers and attempts connected-directory delivery.
+Offline withdrawals remain queued and reconnects send cancellations, not new
+offers. In-flight public or private messages may still land; a returned call is
+not proof that every peer removed its cached offer. Accepted sessions keep their
+original routing and resources. Market sellers require their own admission
+closure, and neither boundary supplies node-retirement clearance.
+Retained noncurrent identities may lack a reconnect worker; queued cancellation
+alone therefore does not guarantee eventual delivery.
+
 Role guidance prints separate actor commands and mixdepth-specific reserve
 funding instructions; it never submits a reserve transaction or starts actors.
 After a fresh software installation, the installer offers guided setup with a

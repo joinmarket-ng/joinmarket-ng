@@ -287,7 +287,8 @@ class ProtocolHandlersMixin:
             # Respond to orderbook requests with PRIVMSG (including bond if available)
             if to_nick == "PUBLIC" and command == "orderbook":
                 if (
-                    generation_id != self.current_generation_id
+                    self._offer_admission_closed
+                    or generation_id != self.current_generation_id
                     or generation.state is not GenerationState.ACCEPTING
                 ):
                     return
@@ -357,7 +358,11 @@ class ProtocolHandlersMixin:
         try:
             generation_id = self.current_generation_id if generation_id is None else generation_id
             generation = self._generation(generation_id)
-            if generation is None or generation.state is not GenerationState.ACCEPTING:
+            if (
+                self._offer_admission_closed
+                or generation is None
+                or generation.state is not GenerationState.ACCEPTING
+            ):
                 return
             if not self._directory_orderbook_response_limiter.try_consume():
                 self._orderbook_response_counts["directory_suppressed"] += 1
@@ -408,6 +413,8 @@ class ProtocolHandlersMixin:
                     # clients below because listeners can remove failed connections.
                     async with asyncio.timeout(_ORDERBOOK_SEND_TIMEOUT_SEC):
                         for order_type_str, data in responses:
+                            if self._offer_admission_closed:
+                                return
                             try:
                                 await client.send_private_message(taker_nick, order_type_str, data)
                                 logger.trace(f"Sent {order_type_str} offer to {taker_nick}")
@@ -457,7 +464,11 @@ class ProtocolHandlersMixin:
         try:
             generation_id = self.current_generation_id if generation_id is None else generation_id
             generation = self._generation(generation_id)
-            if generation is None or generation.state is not GenerationState.ACCEPTING:
+            if (
+                self._offer_admission_closed
+                or generation is None
+                or generation.state is not GenerationState.ACCEPTING
+            ):
                 return
             if not self._direct_orderbook_response_limiter.try_consume():
                 self._orderbook_response_counts["direct_suppressed"] += 1
@@ -477,6 +488,8 @@ class ProtocolHandlersMixin:
             # One lease-guard decision per response.
             bond = self._advertised_bond()
             for offer in offers:
+                if self._offer_admission_closed:
+                    return
                 # Format offer data (parameters without the command)
                 order_type_str = offer.ordertype.value
                 data = f"{offer.oid} {offer.minsize} {offer.maxsize} {offer.txfee} {offer.cjfee}"

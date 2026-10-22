@@ -113,10 +113,12 @@ async def test_closed_fills_allocate_nothing_and_cannot_replace_accepted_session
 
 
 @pytest.mark.parametrize("phase", ["fee", "fill"])
+@pytest.mark.parametrize("closure", ["fill", "offer"])
 async def test_preaccepted_fill_finishes_after_closure_without_being_canceled(
     bot: MakerBot,
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
+    closure: str,
 ) -> None:
     entered, release = asyncio.Event(), asyncio.Event()
     if phase == "fee":
@@ -144,7 +146,8 @@ async def test_preaccepted_fill_finishes_after_closure_without_being_canceled(
         monkeypatch.setattr(protocol_handlers, "CoinJoinSession", pending)
     filling = asyncio.create_task(bot._handle_fill("peer", request(1)))
     await entered.wait()
-    closing = asyncio.create_task(bot.close_fill_admission())
+    close = bot.close_fill_admission if closure == "fill" else bot.close_offer_admission
+    closing = asyncio.create_task(close())
     await asyncio.sleep(0)
     try:
         assert bot._fill_admission_closed and not closing.done()
@@ -233,9 +236,11 @@ async def test_multiple_fills_and_closure_waiters_have_independent_lifetimes(
         await asyncio.gather(*fills, *waiters, return_exceptions=True)
 
 
+@pytest.mark.parametrize("closure", ["fill", "offer"])
 async def test_accepted_auth_and_first_ring_dispatch_keep_original_node_resources(
     bot: MakerBot,
     monkeypatch: pytest.MonkeyPatch,
+    closure: str,
 ) -> None:
     await bot._handle_fill("peer", request(1))
     session = bot.active_sessions[(0, "peer")]
@@ -249,7 +254,10 @@ async def test_accepted_auth_and_first_ring_dispatch_keep_original_node_resource
     bot._channel_ring_store = store
     bot.config.channel_ring = bot.config.channel_ring.model_copy(update={"enabled": True})
     bot.channel_ring_capability_validated = True
-    await bot.close_fill_admission()
+    if closure == "fill":
+        await bot.close_fill_admission()
+    else:
+        await bot.close_offer_admission()
     await bot._handle_auth("peer", "auth ciphertext")
     authenticated.assert_awaited_once()
     session.state = CoinJoinState.IOAUTH_SENT

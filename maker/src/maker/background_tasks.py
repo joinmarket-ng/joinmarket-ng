@@ -548,15 +548,18 @@ class BackgroundTasksMixin:
             # ordered behind any cancellation this directory still
             # owes, and keeps a failed message for a later retry.
             delivery = generation.offer_delivery
-            delivery.queue(
-                [new_node_id],
-                {
-                    offer.oid: self._format_offer_announcement(offer, include_bond=False)
-                    # Read at queue time: an offer refresh may have
-                    # adopted new terms since this cycle started.
-                    for offer in generation.current_offers
-                },
-            )
+            if self._offer_admission_closed:
+                self._queue_offer_withdrawals(generation)
+            else:
+                delivery.queue(
+                    [new_node_id],
+                    {
+                        offer.oid: self._format_offer_announcement(offer, include_bond=False)
+                        # Read at queue time: an offer refresh may have
+                        # adopted new terms since this cycle started.
+                        for offer in generation.current_offers
+                    },
+                )
             await delivery.flush({new_node_id: client})
 
             # Start listener task.

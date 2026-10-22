@@ -97,6 +97,7 @@ class MakerBotProtocol(Protocol):
     _channel_ring_nodes: ChannelRingNodePool | None
     _stopping: bool
     _fill_admission_closed: bool
+    _offer_admission_closed: bool
     _active_fill_admissions: int
     _fill_admissions_idle: asyncio.Event
     _session_handler_tasks: set[asyncio.Task[None]]
@@ -181,6 +182,8 @@ class MakerBotProtocol(Protocol):
     async def _resync_wallet_and_update_offers(self) -> None: ...
 
     def _format_offer_announcement(self, offer: Offer, include_bond: bool = False) -> str: ...
+
+    def _queue_offer_withdrawals(self, generation: MakerGeneration) -> None: ...
 
     # Defined in BackgroundTasksMixin, called by ProtocolHandlersMixin and MakerSession
     async def _deferred_wallet_resync(self) -> None: ...

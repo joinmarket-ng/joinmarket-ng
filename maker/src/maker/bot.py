@@ -227,6 +227,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.running = False
         self._stopping = False
         self._fill_admission_closed = False
+        self._offer_admission_closed = False
         self._active_fill_admissions = 0
         self._fill_admissions_idle = asyncio.Event()
         self._fill_admissions_idle.set()
@@ -1616,6 +1617,28 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             logger.bind(sensitive=True).error(f"Failed to start maker bot: {e}")
             raise
 
+    async def close_offer_admission(self) -> None:
+        """Close new fills/publication and attempt withdrawal, never retire resources.
+
+        Both gates and all retained identities' queued withdrawals are set
+        before the first wait. A completed call drains accepted fill handlers
+        and attempts delivery to connected directories. Offline withdrawals
+        remain pending, not guaranteed delivered: a noncurrent identity may
+        lack a reconnect worker. An already-started public or private send may
+        still land. Canceling this wait leaves the gates and queued debt.
+
+        Accepted sessions, generation routing, recovery tasks, and node leases
+        remain intact. Market sellers have their own admission boundary. This
+        transient operation proves neither financial quiescence nor clearance
+        to retire an identity or node; a new process starts open as before.
+        """
+        self._fill_admission_closed = True
+        self._offer_admission_closed = True
+        for generation in list(self.generations.values()):
+            self._queue_offer_withdrawals(generation)
+        await self.close_fill_admission()
+        await self._flush_offer_delivery()
+
     async def close_fill_admission(self) -> None:
         """Reject new fills and await already-accepted fill handlers, not sessions.
 
@@ -2031,6 +2054,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         overlapping rescan uses it to detect that the offers it wants already
         exist and must not be rebuilt (which would re-randomize unchanged terms).
         """
+        if self._offer_admission_closed:
+            await self._flush_offer_delivery()
+            return
         generation = self._generation()
         if generation is None:
             return
@@ -2073,6 +2099,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         adopted = False
         try:
             new_offers = await offer_manager.create_offers()
+            if not self._can_publish_generation(generation):
+                return
 
             if self.current_offers == new_offers:
                 logger.debug("Offers unchanged, skipping re-announcement")
@@ -2165,7 +2193,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
     def _can_publish_generation(self, generation: MakerGeneration) -> bool:
         """Whether this identity may still publish offers of its own."""
         return (
-            generation.generation_id == self.current_generation_id
+            not self._offer_admission_closed
+            and generation.generation_id == self.current_generation_id
             and self._generation(generation.generation_id) is generation
             and cast(MakerGeneration, generation).state is GenerationState.ACCEPTING
         )
@@ -2179,10 +2208,34 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
     async def _deliver_pending(self, generation: MakerGeneration) -> None:
         """Send whatever this generation's directories still owe."""
+        if self._offer_admission_closed:
+            self._queue_offer_withdrawals(generation)
         await generation.offer_delivery.flush(self._generation_clients(generation.generation_id))
+
+    def _queue_offer_withdrawals(self, generation: MakerGeneration) -> None:
+        """Supersede even offline announcements without changing session-owned offers."""
+        delivery = generation.offer_delivery
+        offers = (
+            self.current_offers
+            if generation.generation_id == self.current_generation_id
+            else generation.current_offers
+        )
+        offer_ids = {offer.oid for offer in offers} | {
+            oid for updates in delivery.pending.values() for oid in updates
+        }
+        node_ids = (
+            set(self._generation_clients(generation.generation_id))
+            | set(delivery.pending)
+            | {node_id for _, node_id in generation.directory_pool.list_disconnected()}
+        )
+        delivery.queue(node_ids, dict.fromkeys(offer_ids, None))
 
     async def _flush_offer_delivery(self) -> None:
         """Retry public offer messages the current identity still owes."""
+        if self._offer_admission_closed:
+            for retained in list(self.generations.values()):
+                await self._deliver_pending(retained)
+            return
         generation = self._generation()
         if generation is None or generation.state is not GenerationState.ACCEPTING:
             return
@@ -2214,6 +2267,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
     async def _announce_generation_offers(self, generation: MakerGeneration) -> None:
         """Announce offers using only the identity that owns them."""
+        if self._offer_admission_closed:
+            await self._deliver_pending(generation)
+            return
         clients = self._generation_clients(generation.generation_id)
         delivery = generation.offer_delivery
         delivery.queue(clients, self._public_offer_payloads(generation.current_offers))
