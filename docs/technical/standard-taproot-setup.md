@@ -150,6 +150,35 @@ retroactively quarantine an already running LND. Effective quarantine requires
 a separately verified restart before any channel closure. This launch policy
 does not close channels, sweep coins, or establish retirement completion.
 
+Automatic maker-owned supervision is not implemented. Do not attach the
+current LND supervisor to the maker CLI's exit stack: unwinding that stack stops
+application monitors, while exiting the supervisor stops its children. Neither
+action proves that accepted work has completed. An independent LND process alone
+also does not preserve the application's settlement supervision.
+
+Any future integrated owner must retain the complete accepted population:
+
+| Accepted work | Required application ownership |
+| --- | --- |
+| Validated fills, including unbound sessions, detached handlers, and signed rounds awaiting push | Original maker session, generation, keys, and input-lock owner |
+| Ring preparation, signing, open channels, and unresolved restart records | Original participant journal, node binding, and ring reconciliation |
+| Prepared buyout sessions, including unbound entries and completed sessions still watched for reorgs | Original buyout runtime, journal, endpoint, and settlement monitor |
+| Reserve claims handed to a CoinJoin | The accepting session's transaction ownership; reserve refresh and claim timers are not completion receipts |
+| Market reservations, published quotes, held payments, and prepared deliveries | Original seller ledger, signing authority, invoice owner, and settlement monitor |
+| Outgoing bond-lease requests, payment attempts, and unresolved delivery | Original purchaser records, payer identity, and payment review; stopping the buyer does not leave an independent review task |
+
+Before such an owner may stop LND, new admission must remain excluded across
+restart, all accepted work must remain covered by its original live monitors,
+and affirmative evidence must clear that entire population. Missing, partial,
+unreadable, or ambiguous evidence means retaining ownership, not stopping.
+Transient admission gates, empty journals, elapsed timers, and task completion
+do not establish these conditions. External shared-wallet and taker actors also
+need coverage; the maker CLI's resource stack is not a complete actor inventory.
+No complete cross-actor clearance receipt currently exists, so neither stricter
+startup readiness nor the admission APIs authorize automatic financial
+maintenance. Existing installations retain their explicit supervisor commands,
+registry formats, and startup behavior.
+
 ### Wallet Reserve
 
 Anchor channels need confirmed wallet coins to fee-bump a force close. LND
