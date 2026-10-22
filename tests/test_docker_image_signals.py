@@ -28,7 +28,16 @@ def test_docker_stop_terminates_command_with_sigterm(image_env: str) -> None:
     # and be SIGKILLed (exit 137) after the stop timeout; under an init it dies
     # from the forwarded SIGTERM (exit 128 + 15).
     started = subprocess.run(
-        ["docker", "run", "-d", "--pull=never", "--network=none", image, "sleep", "300"],
+        [
+            "docker",
+            "run",
+            "-d",
+            "--pull=never",
+            "--network=none",
+            image,
+            "sleep",
+            "300",
+        ],
         capture_output=True,
         text=True,
         timeout=60,
@@ -52,5 +61,8 @@ def test_docker_stop_terminates_command_with_sigterm(image_env: str) -> None:
         assert exit_code == "143"
     finally:
         subprocess.run(
-            ["docker", "rm", "-f", container], capture_output=True, timeout=60, check=False
+            ["docker", "rm", "-f", container],
+            capture_output=True,
+            timeout=60,
+            check=False,
         )
