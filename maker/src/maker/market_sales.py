@@ -64,6 +64,7 @@ from maker.fidelity import FidelityBondInfo, find_fidelity_bonds
 if TYPE_CHECKING:
     from jmcore.market_store import HoldInvoice
     from jmswap.lnd_invoices import LndInvoiceClient
+    from jmswap.lnd_peer import PaymentRouteHop
     from jmwallet.wallet.service import WalletService
     from taker.market_settlement import MultiNodeHoldInvoices
     from taker.wallet_market import WalletMarketSeller
@@ -299,7 +300,63 @@ class MarketSales:
             raise MarketSalesUnavailableError(
                 "no original Lightning invoice endpoint is configured"
             )
-        return MultiNodeHoldInvoices(clients, self._invoice_node)
+        return MultiNodeHoldInvoices(
+            clients,
+            self._invoice_node,
+            invoice_hints=(
+                self._invoice_hints if self._settings.lightning.mode == "managed" else None
+            ),
+        )
+
+    async def _invoice_hints(
+        self, owner: str, amount_sats: int
+    ) -> tuple[tuple[PaymentRouteHop, ...], ...]:
+        """Authorize only this wallet's recorded incoming ring edges on this node."""
+        from jmcore.channel_ring_store import RingLifecycleState
+        from jmswap.buyout_messages import Outpoint
+        from jmswap.lnd_peer import LndPeerClient
+        from jmswap.ring_invoice_hints import incoming_ring_route_hints
+
+        pool = getattr(self._bot, "_channel_ring_nodes", None)
+        store = getattr(self._bot, "_channel_ring_store", None)
+        node = self._bot.config.channel_ring.nodes.get(owner)
+        if pool is None or store is None or node is None:
+            return ()
+        report = store.load_all()
+        if report.corruptions:
+            return ()
+        binding = None
+        incoming: dict[Outpoint, str] = {}
+        for record in report.records:
+            edge = record.incoming_edge
+            if (
+                record.node_binding.node_name != owner
+                or record.state
+                not in {RingLifecycleState.BROADCAST, RingLifecycleState.CONFIRMED_OPEN}
+                or record.manifest is None
+                or edge is None
+                or edge.funding_outpoint is None
+                or edge.funding_outpoint.txid != record.manifest.unsigned_txid
+            ):
+                continue
+            # This verifies the recorded wallet, network, mixdepth and original
+            # node identity. Never resolve through the current mixdepth mapping.
+            bound = pool.for_binding(record.node_binding)
+            if binding is not None and binding != bound.binding:
+                return ()
+            binding = bound.binding
+            point = Outpoint(txid=edge.funding_outpoint.txid, vout=edge.funding_outpoint.vout)
+            if point in incoming and incoming[point] != edge.peer.node_id:
+                return ()
+            incoming[point] = edge.peer.node_id
+        if binding is None:
+            return ()
+        async with LndPeerClient(
+            node.lnd_grpc_url.removeprefix("https://"),
+            Path(node.lnd_tls_cert_path).expanduser().read_bytes(),
+            Path(node.lnd_macaroon_path).expanduser().read_bytes(),
+        ) as client:
+            return await incoming_ring_route_hints(client, binding, incoming, amount_sats)
 
     async def _start_reconciliation_owned(self) -> None:
         """Restart monitoring, not selling, from the retained required-mode ledger."""

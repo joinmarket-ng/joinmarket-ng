@@ -216,13 +216,14 @@ def _parse_channel_point(value: str) -> Outpoint:
 
 
 class PaymentRouteHop(BaseModel):
-    """One hop of an operator-configured route hint, as ``lnrpc.HopHint``.
+    """One bounded route-hint hop, as ``lnrpc.HopHint``.
 
     The fields are LND's own, with LND's ranges: a channel and a CLTV delta must
     be present (both are positive), and the two fee terms are uint32 and may be
     zero. A hint says how to reach the destination through a channel the payer's
-    graph does not advertise; it is the payer's own routing input and never
-    leaves this node, so nothing here is negotiated or sent to a counterparty.
+    graph does not advertise. Constructor-configured payment hints stay with
+    the payer. Passing hints explicitly to invoice creation instead discloses
+    those paths to anyone holding that invoice; its caller owns that authority.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True, hide_input_in_errors=True)
@@ -234,12 +235,14 @@ class PaymentRouteHop(BaseModel):
     cltv_expiry_delta: Annotated[int, Field(ge=1, le=_MAX_UINT16)]
 
 
-def _require_route_hints(value: Any) -> tuple[tuple[PaymentRouteHop, ...], ...]:
+def _require_route_hints(
+    value: Any, *, name: str = "payment_route_hints"
+) -> tuple[tuple[PaymentRouteHop, ...], ...]:
     """Validate and copy configured route hints; errors never quote a hint."""
     if type(value) is not tuple:
-        raise ValueError("payment_route_hints must be a tuple of route hint paths")
+        raise ValueError(f"{name} must be a tuple of route hint paths")
     if len(value) > MAX_ROUTE_HINT_PATHS:
-        raise ValueError(f"payment_route_hints must hold at most {MAX_ROUTE_HINT_PATHS} paths")
+        raise ValueError(f"{name} must hold at most {MAX_ROUTE_HINT_PATHS} paths")
     paths: list[tuple[PaymentRouteHop, ...]] = []
     for path in value:
         if type(path) is not tuple or not path:
@@ -250,6 +253,16 @@ def _require_route_hints(value: Any) -> tuple[tuple[PaymentRouteHop, ...], ...]:
             raise ValueError("each payment route hint hop must be a PaymentRouteHop")
         paths.append(tuple(path))
     return tuple(paths)
+
+
+def serialize_route_hints(
+    paths: tuple[tuple[PaymentRouteHop, ...], ...], *, name: str = "route_hints"
+) -> list[pb.RouteHint]:
+    """Copy validated paths into LND messages without authorizing their disclosure."""
+    return [
+        pb.RouteHint(hop_hints=[pb.HopHint(**hop.model_dump()) for hop in path])
+        for path in _require_route_hints(paths, name=name)
+    ]
 
 
 @dataclass(frozen=True)
@@ -289,6 +302,11 @@ class ChannelInfo:
     remote_balance_sat: int
     pending_htlcs: int
     commitment_type: str
+    channel_id: int = 0
+    peer_scid_alias: int = 0
+    alias_scids: tuple[int, ...] = ()
+    zero_conf: bool = False
+    remote_reserve_sat: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.point, Outpoint):
@@ -305,6 +323,11 @@ class ChannelInfo:
             raise _response_error("channel pending HTLC count is negative")
         if not self.commitment_type:
             raise _response_error("channel omits its commitment type")
+        for identifier in (self.channel_id, self.peer_scid_alias, *self.alias_scids):
+            if type(identifier) is not int or not 0 <= identifier <= _MAX_UINT64:
+                raise _response_error("channel reports an invalid routing identifier")
+        if self.remote_reserve_sat is not None:
+            _require_response_amount(self.remote_reserve_sat, "remote channel reserve")
 
 
 @dataclass(frozen=True)
@@ -509,6 +532,22 @@ class LndPeerClient:
         response = await self._call("ListChannels", pb.ListChannelsRequest())
         return [_channel_info(channel) for channel in response.channels]
 
+    async def channel_routing_edge(self, point: Outpoint) -> pb.ChannelEdge:
+        """Read directional routing policies for this exact local funding outpoint."""
+        if not isinstance(point, Outpoint):
+            raise ValueError("channel point must be an Outpoint")
+        response = await self._call(
+            "GetChanInfo", pb.ChanInfoRequest(chan_point=f"{point.txid}:{point.vout}")
+        )
+        if (
+            not isinstance(response, pb.ChannelEdge)
+            or _parse_channel_point(response.chan_point) != point
+        ):
+            raise _response_error("routing edge does not match the requested funding outpoint")
+        _require_response_pubkey_hex(response.node1_pub, "first routing node")
+        _require_response_pubkey_hex(response.node2_pub, "second routing node")
+        return response
+
     async def new_address(self) -> str:
         """Return a fresh P2TR address from the node's default account."""
         response = await self._call(
@@ -526,12 +565,17 @@ class LndPeerClient:
         expiry_seconds: int,
         *,
         include_private_routes: bool = False,
+        invoice_route_hints: tuple[tuple[PaymentRouteHop, ...], ...] = (),
     ) -> str:
         """Add a hold-free invoice for ``preimage`` and return its BOLT 11 string.
 
         The preimage is chosen by the caller, so the buyout can bind the payment
         to a secret it already committed to. The node's answer is only accepted
         if the invoice it created really is the one for that preimage.
+
+        Explicit invoice hints are separate from payer-only configuration.
+        LND's native private-hint selection can omit unadvertised peers, so a
+        caller may supply paths whose disclosure it has independently authorized.
         """
         raw = _require_argument_bytes(preimage, PREIMAGE_LENGTH, "preimage")
         amount = _require_argument_count(amount_sat, "amount_sat", 1)
@@ -540,7 +584,13 @@ class LndPeerClient:
             raise ValueError("include_private_routes must be a bool")
         response = await self._call(
             "AddInvoice",
-            pb.Invoice(r_preimage=raw, value=amount, expiry=expiry, private=include_private_routes),
+            pb.Invoice(
+                r_preimage=raw,
+                value=amount,
+                expiry=expiry,
+                private=include_private_routes,
+                route_hints=serialize_route_hints(invoice_route_hints, name="invoice_route_hints"),
+            ),
         )
         if bytes(response.r_hash) != hashlib.sha256(raw).digest():
             raise _response_error("invoice is not for the requested preimage")
@@ -644,10 +694,9 @@ class LndPeerClient:
         """
         request = router_pb.SendPaymentRequest(
             payment_request=_require_bolt11(bolt11),
-            route_hints=[
-                pb.RouteHint(hop_hints=[pb.HopHint(**hop.model_dump()) for hop in path])
-                for path in self._payment_route_hints
-            ],
+            route_hints=serialize_route_hints(
+                self._payment_route_hints, name="payment_route_hints"
+            ),
             fee_limit_sat=_require_argument_count(fee_limit_sat, "fee_limit_sat", 0),
             cltv_limit=_require_argument_count(cltv_limit, "cltv_limit", 1),
             timeout_seconds=_require_argument_count(timeout_seconds, "timeout_seconds", 1),
@@ -806,6 +855,11 @@ def _channel_info(channel: Any) -> ChannelInfo:
         commitment_type = pb.CommitmentType.Name(int(channel.commitment_type))
     except ValueError:
         raise _response_error("channel reports an unknown commitment type") from None
+    remote_reserve = None
+    if channel.HasField("remote_constraints"):
+        remote_reserve = int(channel.remote_constraints.chan_reserve_sat)
+    elif channel.remote_chan_reserve_sat:
+        remote_reserve = int(channel.remote_chan_reserve_sat)
     return ChannelInfo(
         point=_parse_channel_point(channel.channel_point),
         peer_pubkey=str(channel.remote_pubkey),
@@ -816,6 +870,11 @@ def _channel_info(channel: Any) -> ChannelInfo:
         remote_balance_sat=int(channel.remote_balance),
         pending_htlcs=len(channel.pending_htlcs),
         commitment_type=commitment_type,
+        channel_id=int(channel.chan_id),
+        peer_scid_alias=int(channel.peer_scid_alias),
+        alias_scids=tuple(int(alias) for alias in channel.alias_scids),
+        zero_conf=bool(channel.zero_conf),
+        remote_reserve_sat=remote_reserve,
     )
 
 

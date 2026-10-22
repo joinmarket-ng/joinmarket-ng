@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from types import TracebackType
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from _taker_market_helpers import FakeHoldInvoices
 from jmcore.credential_market import MarketError
 from jmswap.lnd_invoices import payment_hash_for
-from jmswap.lnd_peer import InvoiceState
+from jmswap.lnd_peer import InvoiceState, PaymentRouteHop
 
 from taker.market_settlement import MultiNodeHoldInvoices
 
@@ -121,3 +122,98 @@ async def test_an_invoice_no_node_knows_cannot_be_settled() -> None:
     async with _invoices(_Route("a"), a=_Node()) as invoices:
         with pytest.raises(MarketError, match="No Lightning node"):
             await invoices.settle(PREIMAGE)
+
+
+class _HintedNode(_Node):
+    def __init__(self) -> None:
+        super().__init__()
+        self.invoice_hints: list[tuple[tuple[PaymentRouteHop, ...], ...]] = []
+
+    async def add_hold_invoice(
+        self,
+        payment_hash: bytes,
+        amount_sats: int,
+        expiry_seconds: int,
+        *,
+        private: bool = False,
+        invoice_route_hints: tuple[tuple[PaymentRouteHop, ...], ...] = (),
+    ) -> str:
+        self.invoice_hints.append(invoice_route_hints)
+        return await super().add_hold_invoice(
+            payment_hash, amount_sats, expiry_seconds, private=private
+        )
+
+
+def _hints() -> tuple[tuple[PaymentRouteHop, ...], ...]:
+    return (
+        (
+            PaymentRouteHop(
+                node_id="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                chan_id=42,
+                fee_base_msat=1_000,
+                fee_proportional_millionths=1,
+                cltv_expiry_delta=80,
+            ),
+        ),
+    )
+
+
+async def test_new_hints_are_resolved_only_on_the_selected_original_owner() -> None:
+    a, b = _Node(), _HintedNode()
+    route = _Route("b")
+    resolver = AsyncMock(return_value=_hints())
+    async with MultiNodeHoldInvoices(
+        cast(dict[str, Any], {"a": a, "b": b}), route, invoice_hints=resolver
+    ) as invoices:
+        first = await invoices.add_hold_invoice(HASH, 100, 600)
+        resolver.assert_awaited_once_with("b", 100)
+        assert b.invoice_hints == [_hints()] and a.invoices == {}
+        route.node = "a"
+        assert await invoices.add_hold_invoice(HASH, 100, 600) == first
+        assert b.invoice_hints == [_hints()] and resolver.await_count == 1
+
+
+async def test_old_invoice_recovery_does_not_require_new_hint_authority() -> None:
+    a, b = _Node(), _HintedNode()
+    original = await a.add_hold_invoice(HASH, 100, 600)
+    resolver = AsyncMock(side_effect=AssertionError("old binding is unavailable"))
+    async with MultiNodeHoldInvoices(
+        cast(dict[str, Any], {"a": a, "b": b}), _Route("b"), invoice_hints=resolver
+    ) as invoices:
+        assert await invoices.add_hold_invoice(HASH, 100, 600) == original
+        resolver.assert_not_awaited()
+        assert b.invoices == {}
+
+
+@pytest.mark.parametrize("amount,expiry", [(0, 600), (False, 600), (100, 0), (100, 3601)])
+async def test_existing_invoice_recovery_preserves_request_validation(
+    amount: int, expiry: int
+) -> None:
+    node = _Node()
+    await node.add_hold_invoice(HASH, 100, 600)
+    resolver = AsyncMock(side_effect=AssertionError("no new hint authority"))
+    async with MultiNodeHoldInvoices(
+        cast(dict[str, Any], {"a": node}), _Route("a"), invoice_hints=resolver
+    ) as invoices:
+        with pytest.raises(ValueError, match="amount_sats|expiry_seconds"):
+            await invoices.add_hold_invoice(HASH, amount, expiry)
+    resolver.assert_not_awaited()
+    assert node.private == [False]
+
+
+async def test_hint_failure_retains_owner_before_awaiting_metadata() -> None:
+    a, b = _Node(), _HintedNode()
+    route = _Route("b")
+    resolver = AsyncMock(side_effect=OSError("policy lookup unavailable"))
+    async with MultiNodeHoldInvoices(
+        cast(dict[str, Any], {"a": a, "b": b}), route, invoice_hints=resolver
+    ) as invoices:
+        with pytest.raises(OSError):
+            await invoices.add_hold_invoice(HASH, 100, 600)
+        assert a.invoices == b.invoices == {}
+        route.node = "a"
+        resolver.side_effect = None
+        resolver.return_value = _hints()
+        await invoices.add_hold_invoice(HASH, 100, 600)
+        assert HASH in b.invoices and HASH not in a.invoices
+        assert [call.args[0] for call in resolver.await_args_list] == ["b", "b"]

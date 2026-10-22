@@ -490,6 +490,49 @@ class TestNodeInfo:
 
 
 class TestChannels:
+    async def test_maps_peer_alias_and_known_reserve_without_substituting_a_local_alias(
+        self,
+    ) -> None:
+        stub = RecordingStub(
+            ListChannels=pb.ListChannelsResponse(
+                channels=[
+                    channel(
+                        chan_id=42,
+                        peer_scid_alias=123,
+                        alias_scids=[999],
+                        zero_conf=True,
+                        remote_constraints=pb.ChannelConstraints(chan_reserve_sat=10_000),
+                    )
+                ]
+            )
+        )
+        async with peer_client(stub) as client:
+            result = (await client.channels())[0]
+        assert result.channel_id == 42 and result.peer_scid_alias == 123
+        assert result.alias_scids == (999,) and result.zero_conf
+        assert result.remote_reserve_sat == 10_000
+
+    async def test_routing_policy_lookup_is_bound_to_the_funding_outpoint(self) -> None:
+        edge = pb.ChannelEdge(
+            chan_point=f"{TXID}:3", node1_pub=NODE_PUBKEY.hex(), node2_pub=PEER_PUBKEY.hex()
+        )
+        stub = RecordingStub(GetChanInfo=edge)
+        async with peer_client(stub) as client:
+            assert await client.channel_routing_edge(POINT) == edge
+        assert stub.last.request == pb.ChanInfoRequest(chan_point=f"{TXID}:3")
+
+    async def test_wrong_routing_outpoint_is_rejected(self) -> None:
+        stub = RecordingStub(
+            GetChanInfo=pb.ChannelEdge(
+                chan_point=f"{TXID}:4",
+                node1_pub=NODE_PUBKEY.hex(),
+                node2_pub=PEER_PUBKEY.hex(),
+            )
+        )
+        async with peer_client(stub) as client:
+            with pytest.raises(LndPeerResponseError):
+                await client.channel_routing_edge(POINT)
+
     async def test_maps_the_metadata_eligibility_is_judged_on(self) -> None:
         stub = RecordingStub(
             ListChannels=pb.ListChannelsResponse(
@@ -562,6 +605,32 @@ class TestNewAddress:
 
 
 class TestCreateInvoice:
+    async def test_explicit_invoice_hints_do_not_include_payer_configuration(self) -> None:
+        stub = RecordingStub(
+            AddInvoice=pb.AddInvoiceResponse(r_hash=PAYMENT_HASH, payment_request=BOLT11)
+        )
+        invoice_hints = ((hop(chan_id=42),),)
+        async with peer_client(stub, payment_route_hints=((hop(chan_id=99),),)) as client:
+            assert (
+                await client.create_invoice(
+                    PREIMAGE,
+                    1_000,
+                    600,
+                    include_private_routes=True,
+                    invoice_route_hints=invoice_hints,
+                )
+                == BOLT11
+            )
+        assert stub.last.request.private is True
+        assert [hint.hop_hints[0].chan_id for hint in stub.last.request.route_hints] == [42]
+
+    async def test_invalid_explicit_invoice_hints_are_rejected_before_rpc(self) -> None:
+        stub = RecordingStub()
+        async with peer_client(stub) as client:
+            with pytest.raises(ValueError):
+                await client.create_invoice(PREIMAGE, 1_000, 600, invoice_route_hints=((),))
+        assert stub.calls == []
+
     async def test_private_routes_are_explicitly_requested(self) -> None:
         stub = RecordingStub(
             AddInvoice=pb.AddInvoiceResponse(r_hash=PAYMENT_HASH, payment_request=BOLT11)

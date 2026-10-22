@@ -31,8 +31,13 @@ from jmcore.market_store import (
     MarketStoreUnavailableError,
 )
 from jmcore.settings import JoinMarketSettings
-from jmswap.lnd_invoices import HoldInvoiceStatus, LndInvoiceClient, payment_hash_for
-from jmswap.lnd_peer import InvoiceState
+from jmswap.lnd_invoices import (
+    HoldInvoiceStatus,
+    LndInvoiceClient,
+    payment_hash_for,
+    validate_hold_invoice_request,
+)
+from jmswap.lnd_peer import InvoiceState, PaymentRouteHop
 from loguru import logger
 
 # A reservation whose invoice was never published is canceled after this delay.
@@ -79,6 +84,9 @@ def seller_invoice_client(settings: JoinMarketSettings) -> LndInvoiceClient:
 InvoiceRoute = Callable[[bytes], str | None]
 """Name the node that must invoice a payment hash, or ``None`` when none may."""
 
+InvoiceHints = Callable[[str, int], Awaitable[tuple[tuple[PaymentRouteHop, ...], ...]]]
+"""Resolve explicitly authorized paths on this invoice's original named owner."""
+
 
 class InvoiceRefusedError(MarketError):
     """No configured Lightning node may create this hold invoice."""
@@ -94,14 +102,22 @@ class MultiNodeHoldInvoices:
     the node that holds them. ``lookup`` returns ``None`` only when every node
     reports the hash unknown: an unreachable node makes the answer unknown, so
     it raises, and an invoice is never created twice on different nodes.
-    Invoices are private, so they carry route hints for private channels.
+    Invoices request LND's native private hints. The owning maker can separately
+    authorize explicit incoming ring paths for unadvertised peers.
     """
 
-    def __init__(self, clients: Mapping[str, LndInvoiceClient], route: InvoiceRoute) -> None:
+    def __init__(
+        self,
+        clients: Mapping[str, LndInvoiceClient],
+        route: InvoiceRoute,
+        *,
+        invoice_hints: InvoiceHints | None = None,
+    ) -> None:
         if not clients:
             raise ValueError("At least one Lightning node is required")
         self._clients = dict(clients)
         self._route = route
+        self._invoice_hints = invoice_hints
         self._owners: dict[bytes, str] = {}
         self._stack = AsyncExitStack()
 
@@ -128,6 +144,22 @@ class MultiNodeHoldInvoices:
         # Recorded before the call: a retry, or the cancel of an invoice whose
         # creation may still land, must reach the same node.
         self._owners[payment_hash] = owner
+        if self._invoice_hints is not None:
+            # Old or ambiguously created invoices retain their original bytes.
+            # Missing new hint provenance must never obstruct their recovery.
+            existing = await self._clients[owner].lookup(payment_hash)
+            if existing is not None:
+                validate_hold_invoice_request(payment_hash, amount_sats, expiry_seconds)
+                return existing.payment_request
+            hints = await self._invoice_hints(owner, amount_sats)
+            if hints:
+                return await self._clients[owner].add_hold_invoice(
+                    payment_hash,
+                    amount_sats,
+                    expiry_seconds,
+                    private=True,
+                    invoice_route_hints=hints,
+                )
         return await self._clients[owner].add_hold_invoice(
             payment_hash, amount_sats, expiry_seconds, private=True
         )

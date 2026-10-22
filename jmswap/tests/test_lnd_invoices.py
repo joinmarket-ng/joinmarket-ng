@@ -20,7 +20,7 @@ from jmswap.lnd_invoices import (
     _InvoicesMacaroon,
     payment_hash_for,
 )
-from jmswap.lnd_peer import InvoiceState
+from jmswap.lnd_peer import InvoiceState, PaymentRouteHop
 from jmswap.lndrpc import invoices_pb2 as invoices_pb
 from jmswap.lndrpc import lightning_pb2 as pb
 
@@ -124,6 +124,36 @@ async def test_add_hold_invoice_maps_request() -> None:
         False,
     )
     assert request.memo == ""
+
+
+async def test_add_hold_invoice_includes_only_explicit_validated_hints() -> None:
+    hop = PaymentRouteHop(
+        node_id="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        chan_id=42,
+        fee_base_msat=1_000,
+        fee_proportional_millionths=1,
+        cltv_expiry_delta=40,
+    )
+    stub = RecordingStub(AddHoldInvoice=invoices_pb.AddHoldInvoiceResp(payment_request=BOLT11))
+    async with invoice_client(stub) as client:
+        assert (
+            await client.add_hold_invoice(
+                PAYMENT_HASH, 1_000, 960, private=True, invoice_route_hints=((hop,),)
+            )
+            == BOLT11
+        )
+    request = stub.calls[0].request
+    assert request.private is True
+    assert list(request.route_hints) == [pb.RouteHint(hop_hints=[pb.HopHint(**hop.model_dump())])]
+    assert [call.method for call in stub.calls] == ["AddHoldInvoice"]
+
+
+async def test_invalid_hold_invoice_hints_do_not_create_or_look_up_an_invoice() -> None:
+    stub = RecordingStub()
+    async with invoice_client(stub) as client:
+        with pytest.raises(ValueError):
+            await client.add_hold_invoice(PAYMENT_HASH, 1_000, 960, invoice_route_hints=((),))
+    assert stub.calls == []
 
 
 async def test_add_hold_invoice_resolves_an_existing_hash_by_lookup() -> None:

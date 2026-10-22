@@ -22,7 +22,7 @@ from typing import Any, Final
 
 import grpc
 
-from jmswap.lnd_peer import InvoiceState
+from jmswap.lnd_peer import InvoiceState, PaymentRouteHop, serialize_route_hints
 from jmswap.lndrpc import invoices_pb2 as invoices_pb
 from jmswap.lndrpc import invoices_pb2_grpc as invoices_grpc
 
@@ -96,6 +96,17 @@ def _require_hash(value: bytes, name: str) -> bytes:
     return value
 
 
+def validate_hold_invoice_request(
+    payment_hash: bytes, amount_sats: int, expiry_seconds: int
+) -> None:
+    """Apply the same request bounds when creating or recovering an invoice."""
+    _require_hash(payment_hash, "payment_hash")
+    if type(amount_sats) is not int or not 1 <= amount_sats <= _MAX_AMOUNT_SATS:
+        raise ValueError("amount_sats is out of range")
+    if type(expiry_seconds) is not int or not 1 <= expiry_seconds <= _MAX_EXPIRY_SECONDS:
+        raise ValueError("expiry_seconds is out of range")
+
+
 class LndInvoiceClient:
     """Async hold-invoice client for one LND node; use as an async context manager."""
 
@@ -161,6 +172,7 @@ class LndInvoiceClient:
         expiry_seconds: int,
         *,
         private: bool = False,
+        invoice_route_hints: tuple[tuple[PaymentRouteHop, ...], ...] = (),
     ) -> str:
         """Create a memo-less hold invoice and return its BOLT11 request.
 
@@ -168,11 +180,8 @@ class LndInvoiceClient:
         request is returned, so a retry after an ambiguous failure always ends
         with one invoice that this seller controls.
         """
-        _require_hash(payment_hash, "payment_hash")
-        if type(amount_sats) is not int or not 1 <= amount_sats <= _MAX_AMOUNT_SATS:
-            raise ValueError("amount_sats is out of range")
-        if type(expiry_seconds) is not int or not 1 <= expiry_seconds <= _MAX_EXPIRY_SECONDS:
-            raise ValueError("expiry_seconds is out of range")
+        validate_hold_invoice_request(payment_hash, amount_sats, expiry_seconds)
+        hints = serialize_route_hints(invoice_route_hints, name="invoice_route_hints")
         try:
             response = await self._call(
                 "AddHoldInvoice",
@@ -181,6 +190,7 @@ class LndInvoiceClient:
                     value=amount_sats,
                     expiry=expiry_seconds,
                     private=private,
+                    route_hints=hints,
                 ),
             )
         except LndInvoiceRpcError:

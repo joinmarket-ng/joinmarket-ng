@@ -259,12 +259,15 @@ privacy cluster:
 - A maker invoices PoDLE sales from its current offer mixdepth's node.
 - Bond leases are paid and invoiced from mixdepth 0's node, where bonds live.
 
-There is no automatic fallback to another mixdepth's node. Ring channels are
-private and their peers usually have no public channels, so invoices carry
-explicit route hints for the node's incoming ring channels. When the node
-cannot pay (no route or liquidity), an interactive run shows the invoice as
-text and a terminal QR code for an external wallet; a non-interactive run
-skips the purchase.
+There is no automatic fallback to another mixdepth's node. Ring peers usually
+have no public channels, so managed maker-market invoices add explicit hints for validated,
+locally recorded incoming ring channels. LND's automatic private hints omit
+unadvertised peers. Invoice holders can see the selected incoming peer and
+channel, but the channel is not publicly announced. Missing, older, or invalid
+ring provenance grants no additional hint, and existing invoices keep their
+original contents and owner. When the node cannot pay (no route or liquidity),
+an interactive run shows the invoice as text and a terminal QR code for an
+external wallet; a non-interactive run skips the purchase.
 
 Managed payments resolve the current `active` node of the same mixdepth for
 each fresh attempt and verify its public key and network before paying. A
