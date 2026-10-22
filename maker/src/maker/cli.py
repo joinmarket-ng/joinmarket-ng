@@ -28,6 +28,7 @@ from jmcore.settings import (
     JoinMarketSettings,
     ensure_config_file,
 )
+from jmcore.tasks import run_async
 from jmcore.wallet_metadata import WalletIdentity, selected_identity
 from jmwallet.wallet.service import WalletService
 from loguru import logger
@@ -39,10 +40,6 @@ from maker.fidelity import ExpiredFidelityBondCertificateError
 from maker.mixdepth_selection import MixdepthSelectionPolicy
 
 app = SortedTyper(no_args_is_help=True, callback=version_options)
-
-
-def run_async(coro: Any) -> Any:
-    return asyncio.run(coro)
 
 
 def _staged_wallet_binding(

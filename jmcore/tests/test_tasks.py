@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import signal
+import subprocess
+import sys
 
 import pytest
 
-from jmcore.tasks import _BACKGROUND_TASKS, parse_directory_address, run_periodic_task, spawn_task
+from jmcore.tasks import (
+    _BACKGROUND_TASKS,
+    parse_directory_address,
+    run_async,
+    run_periodic_task,
+    spawn_task,
+)
 
 
 class TestRunPeriodicTask:
@@ -261,3 +270,80 @@ class TestParseDirectoryAddress:
         host, port = parse_directory_address("192.168.1.1:3000")
         assert host == "192.168.1.1"
         assert port == 3000
+
+
+# A child interpreter receives the real SIGTERM, so pytest's own handlers stay untouched.
+# The coroutine either absorbs the cancellation (maker pattern) or lets it escape
+# (taker pattern); both must run their cleanup before the process exits.
+_SIGTERM_CHILD = """
+import asyncio, sys
+from jmcore.tasks import run_async
+
+absorb = sys.argv[1] == "absorb"
+
+async def main() -> str:
+    try:
+        print("ready", flush=True)
+        await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        if not absorb:
+            raise
+    finally:
+        await asyncio.sleep(0)
+        print("cleanup", flush=True)
+    return "returned"
+
+try:
+    print(run_async(main()), flush=True)
+except KeyboardInterrupt:
+    print("interrupted", flush=True)
+    sys.exit(130)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals only")
+class TestRunAsyncSigterm:
+    """SIGTERM must stop a run_async program gracefully, like Ctrl+C."""
+
+    @staticmethod
+    def _terminate_child(mode: str) -> tuple[int, list[str]]:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SIGTERM_CHILD, mode],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "ready"
+            proc.send_signal(signal.SIGTERM)
+            out, _ = proc.communicate(timeout=10)
+        finally:
+            proc.kill()
+        return proc.returncode, out.split()
+
+    def test_absorbed_cancellation_returns_after_cleanup(self) -> None:
+        returncode, lines = self._terminate_child("absorb")
+        assert returncode == 0
+        assert lines == ["cleanup", "returned"]
+
+    def test_escaped_cancellation_raises_keyboard_interrupt_after_cleanup(self) -> None:
+        returncode, lines = self._terminate_child("raise")
+        assert returncode == 130
+        assert lines == ["cleanup", "interrupted"]
+
+
+def test_run_async_restores_previous_sigterm_handler() -> None:
+    def custom_handler(signum: int, frame: object) -> None:
+        pass
+
+    original = signal.signal(signal.SIGTERM, custom_handler)
+    try:
+
+        async def answer() -> int:
+            return 42
+
+        assert run_async(answer()) == 42
+        assert signal.getsignal(signal.SIGTERM) is custom_handler
+    finally:
+        signal.signal(signal.SIGTERM, original)

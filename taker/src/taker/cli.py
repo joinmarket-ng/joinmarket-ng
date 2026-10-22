@@ -10,7 +10,6 @@ Configuration is loaded with the following priority (highest to lowest):
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -21,6 +20,7 @@ from jmcore.models import NetworkType
 from jmcore.notifications import get_notifier
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import JoinMarketSettings, ensure_config_file
+from jmcore.tasks import run_async
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 
@@ -358,7 +358,7 @@ def coinjoin(
     logger.bind(sensitive=True).info(f"Tor SOCKS: {config.socks_host}:{config.socks_port}")
 
     try:
-        asyncio.run(
+        run_async(
             _run_coinjoin(
                 settings=settings,
                 config=config,

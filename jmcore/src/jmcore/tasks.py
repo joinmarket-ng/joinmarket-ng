@@ -2,16 +2,20 @@
 Shared async task utilities for JoinMarket components.
 
 Provides common patterns for periodic background tasks used by
-both maker and taker components.
+both maker and taker components, and a signal-aware runner for their
+command-line entry points.
 """
 
 from __future__ import annotations
 
 import asyncio
+import signal
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import Any, TypeVar
 
 from loguru import logger
+
+T = TypeVar("T")
 
 
 async def run_periodic_task(
@@ -111,3 +115,51 @@ def spawn_task(coro: Coroutine[Any, Any, Any], *, name: str | None = None) -> as
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_on_spawned_task_done)
     return task
+
+
+def run_async(coro: Coroutine[Any, Any, T]) -> T:
+    """Run ``coro`` like :func:`asyncio.run`, but let SIGTERM stop it like Ctrl+C.
+
+    ``asyncio.run`` turns SIGINT into cancellation of the main task, so the
+    program's ``finally`` and ``except asyncio.CancelledError`` cleanup runs.
+    SIGTERM (``docker stop``, systemd, ``kill``) gets no such treatment: as PID 1
+    in a container the process ignores it until it is killed, and otherwise it
+    dies without cleanup. Here SIGTERM cancels the main task the same way.
+
+    If the coroutine absorbs the cancellation, its result is returned. If the
+    cancellation escapes, ``KeyboardInterrupt`` is raised, so callers keep a
+    single interrupt path for both signals.
+    """
+    terminated = False
+
+    async def main() -> T:
+        nonlocal terminated
+        loop = asyncio.get_running_loop()
+        main_task = asyncio.current_task()
+        assert main_task is not None
+
+        def on_sigterm() -> None:
+            nonlocal terminated
+            terminated = True
+            logger.info("Received SIGTERM, shutting down")
+            main_task.cancel()
+
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+        except (NotImplementedError, RuntimeError, ValueError):
+            # No signal support in this loop (Windows) or not the main thread.
+            return await coro
+        try:
+            return await coro
+        finally:
+            loop.remove_signal_handler(signal.SIGTERM)
+            if previous is not None:
+                signal.signal(signal.SIGTERM, previous)
+
+    try:
+        return asyncio.run(main())
+    except asyncio.CancelledError:
+        if terminated:
+            raise KeyboardInterrupt from None
+        raise
