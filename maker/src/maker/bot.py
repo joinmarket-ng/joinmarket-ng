@@ -1294,6 +1294,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 self.bond_lease_guard = BondLeaseGuard(
                     get_market_store_path(resolved_data_dir),
                     (self.config.bitcoin_network or self.config.network).value,
+                    wallet_id=self.wallet.market_wallet_id,
                 )
                 # Unknown history selects as before; the guard then suppresses proofs.
                 leased = (
@@ -2267,7 +2268,39 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
     def _advertised_bond(self) -> FidelityBondInfo | None:
         """The selected bond, unless the lease guard forbids advertising it now."""
         bond = self.fidelity_bond
-        if bond is None or self.bond_lease_guard is None or self.bond_lease_guard.allows(bond):
+        if bond is None:
+            return bond
+        if self.bond_lease_guard is None:
+            # Preserve the legacy embedding fallback, but never let a missing
+            # guard bypass a fresh wallet's persisted history requirement.
+            from jmcore.bond_advertisements import (
+                BoundAdvertisementRecord,
+                advertisement_record_path,
+                read_advertisements,
+            )
+            from jmcore.market_store import MarketStore
+            from jmcore.paths import get_default_data_dir, get_market_store_path
+
+            data_dir = (
+                Path(self.config.data_dir) if self.config.data_dir else get_default_data_dir()
+            )
+            try:
+                if (
+                    MarketStore.inspect_advertisement_binding(get_market_store_path(data_dir))
+                    is not None
+                ):
+                    return None
+                record = read_advertisements(
+                    advertisement_record_path(data_dir),
+                    wallet_id=self.wallet.market_wallet_id,
+                    network=(self.config.bitcoin_network or self.config.network).value,
+                )
+                if isinstance(record, BoundAdvertisementRecord):
+                    return None
+            except Exception:
+                return None
+            return bond
+        if self.bond_lease_guard.allows(bond):
             return bond
         return None
 

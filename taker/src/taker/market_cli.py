@@ -37,7 +37,6 @@ from jmcore.credential_market import (
     Network,
     Product,
     SignedDocument,
-    bond_resource,
     canonical,
     decode_document,
     document_hash,
@@ -555,7 +554,7 @@ def _command_seller_add_inventory(args: argparse.Namespace) -> None:
     try:
         if args.authorization is not None:
             _, authority = _authorization(args.authorization)
-            store.add_inventory("bond", bond_resource(authority.bond, authority.period), None)
+            store.add_bond_inventory(authority.bond, authority.period)
         else:
             credential = _document(args.credential)
             try:
@@ -564,10 +563,8 @@ def _command_seller_add_inventory(args: argparse.Namespace) -> None:
             except ValueError:
                 bond = BondCredential.model_validate(credential)
                 bond.verify()
-                store.add_inventory(
-                    "bond",
-                    bond_resource(bond.bond, bond.cert_expiry - 1),
-                    bond.model_dump(mode="json"),
+                store.add_bond_inventory(
+                    bond.bond, bond.cert_expiry - 1, bond.model_dump(mode="json")
                 )
     except (MarketError, ValueError, TypeError) as exc:
         raise MarketCLIError("inventory credential is invalid") from exc

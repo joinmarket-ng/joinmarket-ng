@@ -8,10 +8,11 @@ import json
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from bitcointx.core.key import CKey
+from jmcore.constants import GENESIS_BLOCK_HASHES
 from jmcore.credential_market import (
     MarketAuthorization,
     MarketError,
@@ -21,7 +22,7 @@ from jmcore.credential_market import (
 )
 from jmcore.crypto import NickIdentity
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
-from jmcore.market_keys import BoundMarketKeys, MarketKeyScope
+from jmcore.market_keys import BoundMarketKeys, MarketKeyScope, WalletMarketKeys
 from jmcore.market_store import MarketStore, MarketStoreError
 from jmswap.lnd_invoices import HoldInvoiceStatus
 from jmwallet.wallet.service import WalletService
@@ -51,6 +52,10 @@ class _Invoices(_NullInvoices):
         self.settled = asyncio.Event()
         self.closed = False
 
+    async def __aenter__(self) -> _Invoices:
+        self.closed = False
+        return self
+
     async def lookup(self, payment_hash: bytes) -> HoldInvoiceStatus | None:
         self.looked_up.set()
         return await super().lookup(payment_hash)
@@ -65,17 +70,43 @@ class _Invoices(_NullInvoices):
 
 @pytest.fixture
 async def runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> AsyncIterator[tuple[WalletMarketSeller, WalletService, _Invoices]]:
     wallet, backend = _wallet(tmp_path)
-    _activate_store(tmp_path, wallet)
+    mode = getattr(request, "param", None)
+    bound_history = mode in {"bound", "bound-bond"}
+    if bound_history:
+        from jmcore.bond_advertisements import (
+            advertisement_record_path,
+            initialize_fresh_advertisements,
+        )
+        from jmcore.paths import get_market_store_path, get_used_commitments_path
+
+        initialize_fresh_advertisements(
+            advertisement_record_path(tmp_path),
+            wallet.market_wallet_id,
+            "regtest",
+            history_confirmed=True,
+        )
+        with MarketStore(
+            get_market_store_path(tmp_path), wallet_id=wallet.market_wallet_id
+        ) as store:
+            store.activate_wallet(
+                get_used_commitments_path(tmp_path, create=False),
+                history_confirmed=True,
+                bound_advertisements_network="regtest",
+            )
+    else:
+        _activate_store(tmp_path, wallet)
 
     async def authorize(outpoint: ExternalPoDLEOutpoint) -> tuple[BoundMarketKeys, SignedDocument]:
         bond = _bond().model_copy(update={"outpoint": outpoint})
         bound = wallet.market_keys.bind(
             MarketKeyScope(
                 network="regtest",
-                chain_hash="22" * 32,
+                chain_hash=GENESIS_BLOCK_HASHES["regtest"] if bound_history else "22" * 32,
                 role="seller",
                 period=0,
                 bond=outpoint,
@@ -92,6 +123,12 @@ async def runtime(
 
     monkeypatch.setattr(wallet, "create_market_authorization", authorize)
     monkeypatch.setattr(backend, "get_block_height", AsyncMock(return_value=1), raising=False)
+    monkeypatch.setattr(
+        backend,
+        "get_block_hash",
+        AsyncMock(return_value=GENESIS_BLOCK_HASHES["regtest"]),
+        raising=False,
+    )
     monkeypatch.setattr(wallet_market, "MarketTransport", _Transport)
     monkeypatch.setattr(_Transport, "instances", [])
     monkeypatch.setattr(_Transport, "start_error", None)
@@ -103,7 +140,11 @@ async def runtime(
 
     monkeypatch.setattr(MarketSettlement, "run", fast_run)
     invoices = _Invoices()
-    options = WalletMarketSellerOptions(bond=_bond().outpoint, products=["podle"], price_sats=1000)
+    options = WalletMarketSellerOptions(
+        bond=_bond().outpoint,
+        products=["bond" if mode == "bound-bond" else "podle"],
+        price_sats=1000,
+    )
     extra = options.model_copy(update={"bond": ExternalPoDLEOutpoint(txid="33" * 32, vout=1)})
     seller = WalletMarketSeller(
         wallet, _settings(tmp_path), options, invoices=invoices, additional=[extra]
@@ -212,6 +253,172 @@ async def test_closed_admission_keeps_settlement_unknowns_delivery_and_ownership
     assert await seller._respond_callback("buyer", _request(2)) == {"error": "unavailable"}
     await seller.stop()
     assert invoices.closed and not seller.running
+
+
+@pytest.mark.parametrize("runtime", ["bound"], indirect=True)
+async def test_required_history_loss_does_not_block_original_hold_settlement_and_delivery(
+    runtime: tuple[WalletMarketSeller, WalletService, _Invoices],
+) -> None:
+    from jmcore.bond_advertisements import advertisement_record_path
+
+    seller, wallet, invoices = runtime
+    seller.add_podle_inventory(ExternalPoDLE.model_validate(_podle_credential(0x41)))
+    assert "quote" in await seller._respond_callback("buyer", _request())
+    store, settlement, keys = seller._store, seller._settlement, seller._keys
+    assert store is not None and settlement is not None and wallet.data_dir is not None
+    (hold,) = store.hold_invoices(int(time.time()))
+    advertisement_record_path(wallet.data_dir).unlink()
+    with MarketStore(store.path, wallet_id=wallet.market_wallet_id, create=False) as restarted:
+        assert restarted.hold_invoices(int(time.time()))[0].quote_id == hold.quote_id
+    await seller.close_admission()
+    invoices.pay(hold.payment_hash, 1000)
+    await asyncio.wait_for(invoices.settled.wait(), timeout=2)
+    assert store.get_delivery(hold.quote_id) is not None
+    assert seller._store is store and seller._settlement is settlement and seller._keys is keys
+    assert not invoices.closed and seller.running and not seller.accepting
+    assert "delivery" in await seller._respond_callback(
+        "buyer",
+        {
+            "action": "delivery",
+            "quote_id": hold.quote_id,
+        },
+    )
+
+
+@pytest.mark.parametrize("runtime", ["bound"], indirect=True)
+@pytest.mark.parametrize("outcome", ["settled", "earlier-period", "wrong-key"])
+async def test_closed_monitor_restart_recovers_original_quote_scope_and_invoice_node(
+    runtime: tuple[WalletMarketSeller, WalletService, _Invoices],
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from jmcore.bond_advertisements import advertisement_record_path
+    from jmswap.lnd_invoices import InvoiceState
+
+    from taker.market_settlement import CREDENTIAL_GRACE_SECONDS, MultiNodeHoldInvoices
+
+    original, wallet, invoices = runtime
+    original.add_podle_inventory(ExternalPoDLE.model_validate(_podle_credential(0x41)))
+    assert "quote" in await original._respond_callback("buyer", _request())
+    assert original._store is not None and wallet.data_dir is not None
+    (hold,) = original._store.hold_invoices(int(time.time()))
+    transport_count = len(_Transport.instances)
+    await original.stop()
+    advertisement_record_path(wallet.data_dir).unlink()
+    authorize = AsyncMock(
+        side_effect=AssertionError("original bond is unavailable; never reauthorize")
+    )
+    monkeypatch.setattr(wallet, "create_market_authorization", authorize)
+    if outcome == "earlier-period":
+        monkeypatch.setattr(wallet.backend, "get_block_height", AsyncMock(return_value=2017))
+    elif outcome == "wrong-key":
+        bind = WalletMarketKeys.bind
+
+        def wrong_identity(keys: WalletMarketKeys, scope: MarketKeyScope) -> BoundMarketKeys:
+            return bind(keys, scope.model_copy(update={"period": scope.period + 1}))
+
+        monkeypatch.setattr(WalletMarketKeys, "bind", wrong_identity)
+    other_node = _Invoices()
+    owners = MultiNodeHoldInvoices({"n0": other_node, "n1": invoices}, lambda _hash: None)
+    restarted = WalletMarketSeller(
+        wallet,
+        _settings(wallet.data_dir),
+        None,
+        invoices=owners,
+        sale_check=AsyncMock(return_value=True),
+    )
+    invoices.looked_up.clear()
+    try:
+        await restarted.start()
+        assert restarted.running and not restarted.accepting
+        assert restarted._transport is None and restarted._service is None
+        assert len(_Transport.instances) == transport_count
+        authorize.assert_not_awaited()
+        await asyncio.wait_for(invoices.looked_up.wait(), timeout=2)
+        assert owners._owners[hold.payment_hash] == "n1"
+        assert restarted._settlement_task is not None and not restarted._settlement_task.done()
+        assert restarted._settlement is not None and restarted._store is not None
+        if outcome == "earlier-period":
+            recovered = restarted._seller_key_for(hold)
+            assert recovered.scope.period == 0
+            assert len(restarted._store.hold_invoices(int(time.time()))) == 1
+        else:
+            invoices.pay(hold.payment_hash, 1000)
+            if outcome == "wrong-key":
+                monkeypatch.setattr(
+                    restarted._settlement,
+                    "clock",
+                    lambda: hold.invoice_expires_at + CREDENTIAL_GRACE_SECONDS + 1,
+                )
+                await restarted._settlement.reconcile_once()
+                assert len(restarted._store.hold_invoices(int(time.time()))) == 1
+                assert invoices.invoices[hold.payment_hash].state is InvoiceState.ACCEPTED
+                assert ("cancel", hold.payment_hash) not in invoices.calls
+                assert restarted._store.get_delivery(hold.quote_id) is None
+            else:
+                await asyncio.wait_for(invoices.settled.wait(), timeout=2)
+                assert restarted._store.get_delivery(hold.quote_id) is not None
+                assert not other_node.invoices
+                assert ("settle", hold.payment_hash) in invoices.calls
+        assert not advertisement_record_path(wallet.data_dir).exists()
+    finally:
+        await restarted.stop()
+
+
+@pytest.mark.parametrize("runtime", ["bound-bond"], indirect=True)
+async def test_reconciliation_signing_requires_the_same_nonterminal_bond_hold_after_await(
+    runtime: tuple[WalletMarketSeller, WalletService, _Invoices],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jmcore.bond_advertisements import advertisement_record_path
+
+    original, wallet, invoices = runtime
+    original.add_bond_inventory()
+    request = {
+        **_request(),
+        "product": "bond",
+        "certificate_pubkey": bytes(CKey(b"\x66" * 32).pub).hex(),
+    }
+    assert "quote" in await original._respond_callback("buyer", request)
+    assert original._store is not None and wallet.data_dir is not None
+    (hold,) = original._store.hold_invoices(int(time.time()))
+    await original.stop()
+    advertisement_record_path(wallet.data_dir).unlink()
+    entered, release = asyncio.Event(), asyncio.Event()
+    returned = AsyncMock()
+
+    async def sign(*_args: object) -> object:
+        entered.set()
+        await release.wait()
+        return returned
+
+    signer = AsyncMock(side_effect=sign)
+    monkeypatch.setattr(wallet, "create_market_bond_credential", signer)
+    restarted = WalletMarketSeller(wallet, _settings(wallet.data_dir), None, invoices=invoices)
+    task: asyncio.Task[None] | None = None
+    try:
+        await restarted.start()
+        assert restarted._store is not None
+        attach = Mock(wraps=restarted._store.attach_credential)
+        monkeypatch.setattr(restarted._store, "attach_credential", attach)
+        task = asyncio.create_task(restarted._provide_reconciliation_credential(hold.quote_id))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        restarted._store.begin_hold_cancel(hold.quote_id)
+        release.set()
+        with pytest.raises(MarketError, match="nonterminal|changed"):
+            await task
+        returned.model_dump.assert_not_called()
+        attach.assert_not_called()
+        assert restarted._store.get_delivery(hold.quote_id) is None
+        signer.reset_mock()
+        with pytest.raises(MarketError, match="nonterminal"):
+            await restarted._provide_reconciliation_credential("ee" * 32)
+        signer.assert_not_awaited()
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await restarted.stop()
 
 
 async def test_transport_can_replay_existing_quote_but_cannot_allocate_after_closure(

@@ -12,19 +12,21 @@ from pathlib import Path
 from typing import Literal
 
 from jmcore import experimental
+from jmcore.constants import GENESIS_BLOCK_HASHES
 from jmcore.credential_market import (
     MarketAuthorization,
     MarketError,
     MarketQuote,
     SignedDocument,
     bond_resource,
+    document_hash,
     verify_authorization,
 )
 from jmcore.crypto import NickIdentity
 from jmcore.experimental import warn_experimental
 from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_faults import MarketFaultCache
-from jmcore.market_keys import BoundMarketKeys
+from jmcore.market_keys import BoundMarketKeys, MarketKeyScope
 from jmcore.market_store import (
     BackingLookup,
     HoldInvoice,
@@ -71,7 +73,7 @@ class WalletMarketSeller:
         self,
         wallet: WalletService,
         settings: JoinMarketSettings,
-        options: WalletMarketSellerOptions,
+        options: WalletMarketSellerOptions | None,
         *,
         invoices: AbstractAsyncContextManager[HoldInvoiceBackend] | None = None,
         backing_sats: BackingLookup | None = None,
@@ -84,6 +86,9 @@ class WalletMarketSeller:
         PoDLE sales to inventory it values, for example one mixdepth's coins.
         ``sale_check`` is asked before each held payment is settled.
         ``additional`` lists further bonds to serve, one authority and nick each.
+        Explicit ``options=None`` opens required-mode reconciliation only, with
+        admission closed and no transport or new authorization. It does not
+        restore buyer delivery or authorize historical node recovery.
         """
         wallet_data_dir = wallet.data_dir
         if not isinstance(wallet_data_dir, Path):
@@ -97,21 +102,33 @@ class WalletMarketSeller:
         if wallet.network != (bitcoin_network.value if bitcoin_network else settings_network):
             raise ValueError("Wallet and market seller must use the same network")
 
-        snapshot = WalletMarketSellerOptions.model_validate(options.model_dump(mode="json"))
+        snapshot = (
+            None
+            if options is None
+            else WalletMarketSellerOptions.model_validate(options.model_dump(mode="json"))
+        )
         extra = tuple(
             WalletMarketSellerOptions.model_validate(option.model_dump(mode="json"))
             for option in additional
         )
-        bonds = [snapshot.bond, *(option.bond for option in extra)]
+        if snapshot is None and extra:
+            raise ValueError("Reconciliation-only startup cannot serve additional authorities")
+        bonds = [
+            *([snapshot.bond] if snapshot is not None else []),
+            *(option.bond for option in extra),
+        ]
         if len({(bond.txid, bond.vout) for bond in bonds}) != len(bonds):
             raise ValueError("Each seller authority needs its own bond")
         self.wallet = wallet
         self.settings = settings
         self._data_dir = wallet_data_dir.resolve()
-        self._bond = snapshot.bond
-        self._products = tuple(snapshot.products)
-        self._price_sats = snapshot.price_sats
-        self._quote_ttl = snapshot.quote_ttl
+        self._bond = None if snapshot is None else snapshot.bond
+        self._products = () if snapshot is None else tuple(snapshot.products)
+        self._price_sats = 0 if snapshot is None else snapshot.price_sats
+        self._quote_ttl = 0 if snapshot is None else snapshot.quote_ttl
+        self._reconciliation_only = snapshot is None
+        self._reconciliation_genesis: str | None = None
+        self._reconciliation_keys: dict[str, BoundMarketKeys] = {}
         self._additional_options = extra
         self._invoice_client = invoices
         self._custom_backing = backing_sats
@@ -120,7 +137,7 @@ class WalletMarketSeller:
         self._closed = False
         self._start_attempted = False
         self._running = False
-        self._admission_closed = False
+        self._admission_closed = self._reconciliation_only
         self._active_admissions = 0
         self._admissions_idle = asyncio.Event()
         self._admissions_idle.set()
@@ -142,7 +159,7 @@ class WalletMarketSeller:
 
     @property
     def running(self) -> bool:
-        """Whether this runtime is currently able to publish seller responses."""
+        """Whether this runtime owns active service or closed reconciliation."""
         return self._running and not self._closed
 
     @property
@@ -194,7 +211,7 @@ class WalletMarketSeller:
         }
 
     async def start(self) -> None:
-        """Open the already-activated ledger and begin relay-only service."""
+        """Open the existing ledger for relay service or closed reconciliation."""
         if self._closed:
             raise RuntimeError("Wallet market seller is stopped and cannot restart")
         if self._start_attempted or self._starting_task is not None or self._running:
@@ -249,6 +266,28 @@ class WalletMarketSeller:
         self._resources.enter_context(store.seller_runtime())
         invoices = await self._resources.enter_async_context(invoice_client)
 
+        if self._reconciliation_only:
+            if store.advertisement_binding != (self.wallet.market_wallet_id, self.wallet.network):
+                raise MarketError("Reconciliation-only startup requires a matching bound ledger")
+            genesis = await self.wallet.backend.get_block_hash(0)
+            if genesis != GENESIS_BLOCK_HASHES.get(self.wallet.network):
+                raise MarketError("Reconciliation backend does not match the wallet network")
+            if self._closed:
+                raise RuntimeError("Wallet market seller stopped during reconciliation startup")
+            self._reconciliation_genesis = genesis
+            self._running = True
+            self._settlement = MarketSettlement(
+                store,
+                invoices,
+                self._seller_key_for,
+                lambda: self.wallet.backend.get_block_height(),
+                credential_provider=self._provide_reconciliation_credential,
+                sale_check=self._sale_check,
+            )
+            self._settlement_task = asyncio.create_task(self._settlement.run())
+            return
+
+        assert self._bond is not None
         bound_keys, authorization = await self.wallet.create_market_authorization(self._bond)
         if self._closed:
             raise RuntimeError("Wallet market seller stopped during startup")
@@ -368,6 +407,8 @@ class WalletMarketSeller:
 
     def set_price_sats(self, price_sats: int, *, bond: ExternalPoDLEOutpoint | None = None) -> None:
         """Price later listings and quotes of ``bond``'s authority (the first by default)."""
+        if self._bond is None:
+            raise MarketError("Reconciliation-only runtime cannot reprice inventory")
         if bond is None or (bond.txid, bond.vout) == (self._bond.txid, self._bond.vout):
             snapshot = WalletMarketSellerOptions(
                 bond=self._bond, products=list(self._products), price_sats=price_sats
@@ -440,6 +481,8 @@ class WalletMarketSeller:
     def add_bond_inventory(self, bond: ExternalPoDLEOutpoint | None = None) -> None:
         """Stock one lease of ``bond``'s authority (the first by default) for its period."""
         service = self._local_service()
+        if self._bond is None:
+            raise MarketError("Reconciliation-only runtime cannot stock inventory")
         if bond is not None and (bond.txid, bond.vout) != (self._bond.txid, self._bond.vout):
             record = self._additional_authority(bond)
             record.service._validate_bound_keys()
@@ -449,9 +492,7 @@ class WalletMarketSeller:
             products = self._products
         if "bond" not in products:
             raise MarketError("Bond product is unavailable")
-        service.store.add_inventory(
-            "bond", bond_resource(service.authority.bond, service.authority.period), None
-        )
+        service.store.add_bond_inventory(service.authority.bond, service.authority.period)
 
     def pending_quotes(self) -> list[SignedDocument]:
         services = self._services()
@@ -466,9 +507,12 @@ class WalletMarketSeller:
     def _seller_key_for(self, hold: HoldInvoice) -> BoundMarketKeys:
         """The key of the authority that quoted ``hold``.
 
-        A quote of an authority not served now (an earlier period or run) gets
-        the first authority's key, so the store still refunds an expired one.
+        Ordinary service retains its first-key fallback for an authority not
+        served now. Closed reconciliation verifies and derives the original
+        signed quote's exact historical scope instead.
         """
+        if self._reconciliation_only:
+            return self._reconciliation_quote(hold.quote_id)[1]
         keys, store = self._keys, self._store
         if keys is None or store is None:
             raise MarketStoreUnavailableError("Wallet market seller is unavailable")
@@ -484,6 +528,91 @@ class WalletMarketSeller:
                 if record.service.authority == authority:
                     return record.keys
         return keys
+
+    def _reconciliation_store(self) -> MarketStore:
+        """Unknown identity is not a missing credential eligible for timed refund."""
+        store = self._store
+        if not self.running or store is None:
+            raise MarketError("Original reconciliation runtime is unavailable")
+        try:
+            if store.advertisement_binding != (self.wallet.market_wallet_id, self.wallet.network):
+                raise MarketError("Original reconciliation ledger binding changed")
+            store.check_commitments_path(get_used_commitments_path(self._data_dir, create=False))
+        except MarketStoreError as exc:
+            raise MarketError("Original reconciliation ledger identity is unknown") from exc
+        return store
+
+    def _reconciliation_quote(self, quote_id: str) -> tuple[MarketQuote, BoundMarketKeys]:
+        store = self._reconciliation_store()
+        try:
+            document = store.get_quote(quote_id)
+            authority = verify_authorization(
+                MarketQuote.model_validate(document.body).authorization
+            )
+            quote = document.verified(MarketQuote, authority.seller_pubkey)
+            if quote.quote_id != quote_id or authority.bond.network != self.wallet.network:
+                raise MarketError("Original quote identity or network does not match")
+            if self._reconciliation_genesis is None:
+                raise MarketError("Original quote chain binding is unavailable")
+            identity = document_hash(quote.authorization.body)
+            keys = self._reconciliation_keys.get(identity)
+            if keys is None:
+                keys = self.wallet.market_keys.bind(
+                    MarketKeyScope(
+                        network=self.wallet.network,
+                        chain_hash=self._reconciliation_genesis,
+                        role="seller",
+                        period=authority.period,
+                        bond=authority.bond.outpoint,
+                    )
+                )
+            if (
+                keys.wallet_id != self.wallet.market_wallet_id
+                or keys.signing_public_key().hex() != authority.seller_pubkey
+            ):
+                raise MarketError("Original quote signing identity cannot be verified")
+            self._reconciliation_keys[identity] = keys
+            return quote, keys
+        except MarketStoreError as exc:
+            raise MarketError("Original quote identity is unknown") from exc
+
+    def _reconciliation_bond_hold(self, quote_id: str) -> HoldInvoice:
+        holds = [
+            hold
+            for hold in self._reconciliation_store().hold_invoices(int(time.time()))
+            if hold.quote_id == quote_id
+            and hold.product == "bond"
+            and hold.state == "open"
+            and hold.quote_state == "live"
+        ]
+        if len(holds) != 1:
+            raise MarketError("No original nonterminal bond obligation is available")
+        return holds[0]
+
+    async def _provide_reconciliation_credential(self, quote_id: str) -> None:
+        hold = self._reconciliation_bond_hold(quote_id)
+        quote, keys = self._reconciliation_quote(quote_id)
+        authority = verify_authorization(quote.authorization)
+        if (
+            quote.product != "bond"
+            or quote.certificate_pubkey is None
+            or quote.resource != bond_resource(authority.bond, authority.period)
+        ):
+            raise MarketError("Original bond obligation assignment is inconsistent")
+        if hold.credential_attached:
+            return
+        credential = await self.wallet.create_market_bond_credential(
+            quote.authorization,
+            quote.certificate_pubkey,
+        )
+        current, current_keys = self._reconciliation_quote(quote_id)
+        if (
+            current != quote
+            or current_keys is not keys
+            or self._reconciliation_bond_hold(quote_id) != hold
+        ):
+            raise MarketError("Original bond obligation changed during signing")
+        self._reconciliation_store().attach_credential(quote_id, credential.model_dump(mode="json"))
 
     async def _provide_credential(self, quote_id: str) -> None:
         """Sign the bond lease for an accepted bond quote with this wallet.
@@ -592,5 +721,7 @@ class WalletMarketSeller:
                 self._service = None
                 self._keys = None
                 self._fault_cache = None
+                self._reconciliation_keys.clear()
+                self._reconciliation_genesis = None
             if close_error is not None:
                 raise close_error

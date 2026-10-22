@@ -514,8 +514,12 @@ maker's other owned bonds through the same seller, one period at a time and
 each under its own nick, with the same preconditions plus a Lightning node for
 mixdepth 0, which invoices the leases. The advertised bond is never rented,
 and a bond is rented only after every period the data directory may have
-advertised it in (`market/advertised-bonds.json`), so the first rental starts
-two periods after the maker first runs with this version. The price is
+advertised it in (`market/advertised-bonds.json`). Existing wallets without
+complete advertisement history wait until period P+2 after initializing that
+history in period P. Uninterrupted fresh guided setup can establish complete,
+wallet-and-network-bound history before any advertisements, avoiding that
+initial delay for idle bonds. Losing required bound history blocks new proof
+and rental admission; it never authorizes recreating empty history. The price is
 `bond_rent_rate` per year on the locked amount for the rest of the period. See
 the [standard Taproot setup](technical/standard-taproot-setup.md#idle-bond-rental).
 

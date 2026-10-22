@@ -8,6 +8,11 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from jmcore.bond_advertisements import (
+    BoundAdvertisementRecord,
+    advertisement_record_path,
+    read_advertisements,
+)
 from jmcore.crypto import mnemonic_to_seed
 from jmcore.market_keys import MarketKeysClosedError, WalletMarketKeys
 from jmcore.market_store import MarketStore
@@ -88,6 +93,15 @@ def test_explicit_fresh_activation_uses_full_market_identity_and_exact_binding(
     assert state["wallet_id"] != wallet_identity_of(mnemonic_to_seed(PHRASE, ""))
     with MarketStore(state["store"], wallet_id=state["wallet_id"], create=False) as store:
         store.check_commitments_path(state["commitments"])
+        assert store.advertisement_binding == (state["wallet_id"], "regtest")
+    history = read_advertisements(
+        advertisement_record_path(state["directory"]),
+        wallet_id=state["wallet_id"],
+        network="regtest",
+        require_bound=True,
+    )
+    assert isinstance(history, BoundAdvertisementRecord)
+    assert history.rentable(("11" * 32, 0), 0)
 
 
 @pytest.mark.parametrize("authority", ["activation", "history", "publication", "import", "resume"])
@@ -220,3 +234,59 @@ def test_market_key_capabilities_are_closed_on_success_and_refusal(
     for instance in instances:
         with pytest.raises(MarketKeysClosedError):
             instance.ledger_identity()
+
+
+def test_fresh_history_uses_effective_bitcoin_network(fixture: Any) -> None:
+    state = fixture
+    state["settings"] = validate_config_document(
+        {
+            "network_config": {"network": "mainnet", "bitcoin_network": "signet"},
+            "wallet": {"address_type": "p2tr"},
+            "lightning": {"mode": "manual"},
+        }
+    )
+    assert prepare(state)
+    assert MarketStore.inspect_advertisement_binding(state["store"], require_ready=True) == (
+        state["wallet_id"],
+        "signet",
+    )
+
+
+def test_history_publication_failure_preserves_artifact_and_prevents_fresh_retry(
+    fixture: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = fixture
+    original = setup_market.initialize_fresh_advertisements
+
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        original(*args, **kwargs)
+        raise OSError("interrupted after publication")
+
+    monkeypatch.setattr(setup_market, "initialize_fresh_advertisements", interrupted)
+    with pytest.raises(SetupMarketError, match="preserved"):
+        prepare(state)
+    path = advertisement_record_path(state["directory"])
+    before = path.read_bytes()
+    assert not state["store"].exists()
+    monkeypatch.setattr(setup_market, "initialize_fresh_advertisements", original)
+    with pytest.raises(SetupMarketError, match="artifacts"):
+        prepare(state)
+    assert path.read_bytes() == before and not state["store"].exists()
+
+
+def test_ready_legacy_binding_never_initializes_or_promotes_advertisement_history(
+    fixture: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = fixture
+    with MarketStore(state["store"], wallet_id=state["wallet_id"]) as store:
+        store.activate_wallet(state["commitments"], history_confirmed=True)
+    initializer = Mock(side_effect=AssertionError("ready ledgers have no fresh authority"))
+    monkeypatch.setattr(setup_market, "initialize_fresh_advertisements", initializer)
+    assert not prepare(
+        state, publication=None, activate=False, history_excluded_since_generation=False
+    )
+    initializer.assert_not_called()
+    assert MarketStore.inspect_advertisement_binding(state["store"]) is None
+    assert not advertisement_record_path(state["directory"]).exists()

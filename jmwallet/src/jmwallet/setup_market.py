@@ -10,6 +10,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from jmcore.bond_advertisements import (
+    advertisement_record_path,
+    initialize_fresh_advertisements,
+)
 from jmcore.crypto import mnemonic_to_seed
 from jmcore.market_keys import WalletMarketKeys
 from jmcore.market_store import MarketStore
@@ -128,9 +132,19 @@ def prepare_seller_ledger(
         if _data_target(data_dir) != target:
             raise SetupMarketError("Data-directory alias changed; no ledger activation attempted")
         ensure_sensitive_directory(target)
-        _absent_market_artifacts(target)  # Repeat immediately before the first store mutation.
+        _absent_market_artifacts(target)  # Repeat before the first history/store mutation.
+        initialize_fresh_advertisements(
+            advertisement_record_path(target),
+            wallet_id,
+            network.value,
+            history_confirmed=True,
+        )
         with MarketStore(store_path, wallet_id=wallet_id, create=True) as store:
-            store.activate_wallet(commitments, history_confirmed=True)
+            store.activate_wallet(
+                commitments,
+                history_confirmed=True,
+                bound_advertisements_network=network.value,
+            )
             store.check_commitments_path(commitments)
         return True
     except SetupMarketError:

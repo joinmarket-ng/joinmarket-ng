@@ -16,10 +16,10 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import AbstractContextManager, contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 from bitcointx.core.key import CKey, CPubKey  # type: ignore[import-not-found]
 from nacl.exceptions import CryptoError
@@ -27,6 +27,12 @@ from nacl.public import PublicKey, SealedBox
 from pydantic import ValidationError
 from typing_extensions import TypedDict
 
+from jmcore.bond_advertisements import (
+    ADVERTISEMENT_FILE,
+    AdvertisementRecordError,
+    BitcoinNetwork,
+    locked_advertisements,
+)
 from jmcore.credential_market import (
     MARKET_PODLE_RETRIES,
     Allocation,
@@ -51,6 +57,7 @@ from jmcore.credential_market import (
 )
 from jmcore.external_podle import ExternalPoDLE
 from jmcore.market_keys import BoundMarketKeys
+from jmcore.paths import get_market_store_path
 from jmcore.secure_files import atomic_write_private, exclusive_file_lock, read_private_file
 
 Product = Literal["podle", "bond"]
@@ -74,6 +81,9 @@ HoldState = Literal["reserved", "open", "canceling", "canceled", "settling", "se
 
 _STANDALONE_MODE = "standalone"
 _WALLET_MODE = "wallet"
+_BOUND_ADVERTISEMENT_MODE = "wallet-bound-advertisements-v2"
+_ADVERTISEMENT_NETWORK_KEY = "bond_advertisement_network"
+_ADVERTISEMENT_WALLET_KEY = "bond_advertisement_wallet_id"
 _UNSUPPORTED_SCHEMA_MESSAGE = "unsupported market store format; keep the file for inspection"
 # A hold invoice outlives its quote, so a payment sent just before the quote
 # expires can still be accepted and completed.
@@ -204,6 +214,7 @@ class MarketStore:
         self.wallet_id = wallet_id
         self._closed = False
         self._lock = threading.RLock()
+        self._observed_advertisement_binding: tuple[str, str] | None = None
         if not create and not self.path.is_file():
             raise MarketStoreUnavailableError("market store does not exist")
         self._prepare_parent()
@@ -263,6 +274,62 @@ class MarketStore:
             if state not in ("disabled", "activating", "ready", "recovery_required"):
                 raise MarketStoreCorruptError("wallet ledger state is invalid")
             return cast(Literal["disabled", "activating", "ready", "recovery_required"], state)
+
+    @property
+    def advertisement_binding(self) -> tuple[str, str] | None:
+        """The independent required-history binding, not proof that history is available."""
+        with self._lock:
+            return self._check_advertisement_binding(self._connection)
+
+    @classmethod
+    def inspect_advertisement_binding(
+        cls,
+        path: Path,
+        *,
+        require_ready: bool = False,
+    ) -> tuple[str, str] | None:
+        """Inspect the persisted requirement without creating a store or history file."""
+        if path.is_symlink():
+            raise MarketStoreCorruptError("market store path must not be a symlink")
+        if not path.exists():
+            if os.path.lexists(path.with_name(f"{path.name}.wallet-ledger")):
+                raise MarketStoreCorruptError(
+                    "wallet ledger intent exists without its market store"
+                )
+            return None
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                path.absolute().as_uri() + "?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+            connection.row_factory = sqlite3.Row
+            inspection = cls.__new__(cls)
+            inspection.path = path
+            inspection.wallet_id = None
+            inspection._connection = connection
+            inspection._closed = False
+            inspection._lock = threading.RLock()
+            connection.execute("BEGIN")
+            binding = cls._advertisement_binding(connection)
+            if binding is not None and require_ready:
+                inspection._verify_schema(readonly=True)
+                if cls._wallet_state_for_connection(connection, binding[0]) != "ready":
+                    raise MarketStoreUnavailableError("bound advertisement ledger is not ready")
+            return binding
+        except sqlite3.Error as exc:
+            raise MarketStoreCorruptError(
+                "could not inspect advertisement history requirement"
+            ) from exc
+        finally:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.rollback()
+                with suppress(sqlite3.Error):
+                    connection.close()
 
     @classmethod
     def diagnose_wallet(
@@ -357,7 +424,12 @@ class MarketStore:
 
     @classmethod
     def _scan_bond_leases(
-        cls, path: Path, bonds: list[BondReference], height: int
+        cls,
+        path: Path,
+        bonds: list[BondReference],
+        height: int,
+        *,
+        advertisement_binding: tuple[str, str] | None = None,
     ) -> frozenset[tuple[str, int]]:
         """:func:`blocked_bond_outpoints` over a read-only connection."""
         period = period_at_height(height)
@@ -376,13 +448,24 @@ class MarketStore:
             connection.row_factory = sqlite3.Row
             inspection = cls.__new__(cls)
             inspection.path = path
-            inspection.wallet_id = None
+            inspection.wallet_id = (
+                None if advertisement_binding is None else advertisement_binding[0]
+            )
             inspection._connection = connection
             inspection._closed = False
             inspection._lock = threading.RLock()
             # One snapshot: a reservation moves inventory and hold together.
             connection.execute("BEGIN")
             inspection._verify_schema(readonly=True)
+            if advertisement_binding is not None and (
+                inspection._advertisement_binding(connection) != advertisement_binding
+                or inspection._wallet_state_for_connection(connection, inspection.wallet_id)
+                != "ready"
+                or any(bond.network != advertisement_binding[1] for bond in bonds)
+            ):
+                raise MarketStoreUnavailableError(
+                    "bound advertisement ledger is not ready or matching"
+                )
             states = {str(row[0]) for row in connection.execute("SELECT state FROM wallet_ledger")}
             if states - {"ready", "disabled"}:
                 raise MarketStoreError("the wallet ledger's lease history is not confirmed")
@@ -468,7 +551,13 @@ class MarketStore:
         with self._lock:
             self._require_wallet_ledger(self._connection, canonical_path)
 
-    def activate_wallet(self, commitments_path: Path, *, history_confirmed: bool = False) -> None:
+    def activate_wallet(
+        self,
+        commitments_path: Path,
+        *,
+        history_confirmed: bool = False,
+        bound_advertisements_network: str | None = None,
+    ) -> None:
         """Explicitly bind and import the complete legacy PoDLE history once.
 
         The caller's confirmation is required because a missing or incomplete JSON
@@ -478,11 +567,31 @@ class MarketStore:
             raise MarketStoreError("wallet activation requires a bound wallet_id")
         if history_confirmed is not True:
             raise MarketStoreError("wallet activation requires history_confirmed=True")
+        if (
+            bound_advertisements_network is not None
+            and bound_advertisements_network not in get_args(BitcoinNetwork)
+        ):
+            raise MarketStoreError("bound advertisement network is invalid")
         canonical_path = self._canonical_commitments_path(commitments_path)
         commitments_lock = canonical_path.with_name(f"{canonical_path.name}.lock")
         init_lock = self.path.with_name(f"{self.path.name}.init.lock")
-        with exclusive_file_lock(commitments_lock), exclusive_file_lock(init_lock), self._lock:
-            self._activate_wallet_locked(canonical_path)
+        history_scope = (
+            locked_advertisements(
+                self.path.with_name(ADVERTISEMENT_FILE),
+                wallet_id=self.wallet_id,
+                network=bound_advertisements_network,
+                require_bound=True,
+            )
+            if bound_advertisements_network is not None
+            else nullcontext()
+        )
+        with (
+            history_scope,
+            exclusive_file_lock(commitments_lock),
+            exclusive_file_lock(init_lock),
+            self._lock,
+        ):
+            self._activate_wallet_locked(canonical_path, bound_advertisements_network)
 
     def recover_wallet(self, commitments_path: Path, *, history_confirmed: bool = False) -> None:
         """Explicitly merge a complete confirmed history into a failed activation."""
@@ -567,6 +676,10 @@ class MarketStore:
         paths = (source, target)
         marker = canonical({"from": str(source), "to": str(target)}).decode("ascii")
         with self._transaction() as connection:
+            if self._check_advertisement_binding(connection) is not None:
+                raise MarketStoreUnavailableError(
+                    "bound advertisement history requires coupled recovery before rebinding"
+                )
             self._verify_schema(rebind_paths=paths)
             bound = self._verify_wallet_ledger(connection, rebind_paths=paths)
             if self._wallet_state_for_connection(connection, self.wallet_id) == "disabled":
@@ -718,8 +831,90 @@ class MarketStore:
         encoded_credential, certificate_pubkey = self._validate_inventory_credential(
             product, resource, credential
         )
+        # Legacy insertion retains its contract. Live wallet callers use typed
+        # admission; the required mode must never fall through this old API.
+        if product == "bond" and self.advertisement_binding is not None:
+            raise MarketStoreUnavailableError("bound bond inventory requires typed bond admission")
+        if product == "bond":
+            try:
+                # Preserve valid v1 insertion semantics, but a v2/orphaned or
+                # unreadable record cannot silently select the legacy path.
+                with locked_advertisements(self.path.with_name(ADVERTISEMENT_FILE), blocking=False):
+                    self._insert_inventory(
+                        product, resource, encoded_credential, certificate_pubkey
+                    )
+            except (AdvertisementRecordError, OSError) as exc:
+                raise MarketStoreUnavailableError(
+                    "bond advertisement admission is unavailable"
+                ) from exc
+            return
+        self._insert_inventory(product, resource, encoded_credential, certificate_pubkey)
+
+    def add_bond_inventory(
+        self,
+        bond: BondReference,
+        period: int,
+        credential: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically check advertisement eligibility and durably designate one lease.
+
+        Admission precedes SQLite locking. A busy history lock fails closed
+        rather than blocking an event-loop caller or cancellation monitor.
+        """
+        self._require_int(period, "bond period", minimum=0)
+        bond = BondReference.model_validate(bond.model_dump(mode="json"))
+        resource = bond_resource(bond, period)
+        encoded, certificate = self._validate_inventory_credential("bond", resource, credential)
+        if credential is not None:
+            supplied = BondCredential.model_validate(credential)
+            if supplied.bond != bond or supplied.cert_expiry != period + 1:
+                raise MarketStoreConflictError("bond credential does not match the admitted period")
+        try:
+            with locked_advertisements(
+                self.path.with_name(ADVERTISEMENT_FILE),
+                wallet_id=self.wallet_id,
+                network=bond.network,
+                blocking=False,
+            ) as history:
+                binding = self.advertisement_binding
+                snapshot = history.snapshot
+                if binding is not None:
+                    if binding != (self.wallet_id, bond.network):
+                        raise MarketStoreConflictError("bond advertisement wallet/network mismatch")
+                    history.require_bound()
+                elif snapshot is not None and snapshot.version == 2:
+                    raise MarketStoreUnavailableError("bound advertisement ledger is not activated")
+                if snapshot is not None and not snapshot.rentable(
+                    (bond.outpoint.txid, bond.outpoint.vout), period
+                ):
+                    raise MarketStoreConflictError(
+                        "the bond may be advertised in this lease period"
+                    )
+                self._insert_inventory("bond", resource, encoded, certificate, bond_admitted=True)
+        except (AdvertisementRecordError, OSError) as exc:
+            raise MarketStoreUnavailableError(
+                "bond advertisement admission is unavailable"
+            ) from exc
+
+    def _insert_inventory(
+        self,
+        product: Product,
+        resource: str,
+        encoded_credential: bytes | None,
+        certificate_pubkey: str | None,
+        *,
+        bond_admitted: bool = False,
+    ) -> None:
         with self._transaction() as connection:
             wallet_ledger = self._require_seller_wallet_ready(connection)
+            if (
+                product == "bond"
+                and self._check_advertisement_binding(connection) is not None
+                and not bond_admitted
+            ):
+                raise MarketStoreUnavailableError(
+                    "bound bond inventory requires typed bond admission"
+                )
             existing = connection.execute(
                 "SELECT id FROM inventory WHERE product = ? AND resource = ?",
                 (product, resource),
@@ -1688,13 +1883,65 @@ class MarketStore:
             return
         self._verify_wallet_ledger(self._connection, readonly=readonly, rebind_paths=rebind_paths)
 
-    @staticmethod
-    def _ledger_mode(connection: sqlite3.Connection) -> LedgerMode:
-        """Return the explicit activation mode; an absent marker is never trusted."""
-        row = connection.execute("SELECT value FROM metadata WHERE key = 'ledger_mode'").fetchone()
-        if row is None or row["value"] not in (_STANDALONE_MODE, _WALLET_MODE):
+    @classmethod
+    def _ledger_header(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> tuple[LedgerMode, tuple[str, str] | None]:
+        """Read mode and its indivisible requirement in one metadata snapshot."""
+        rows = connection.execute(
+            "SELECT key, value FROM metadata WHERE key IN (?, ?, ?)",
+            ("ledger_mode", _ADVERTISEMENT_NETWORK_KEY, _ADVERTISEMENT_WALLET_KEY),
+        ).fetchall()
+        values = {row["key"]: row["value"] for row in rows}
+        if len(values) != len(rows):
+            raise MarketStoreCorruptError("market ledger metadata has duplicate keys")
+        mode = values.get("ledger_mode")
+        if mode == _BOUND_ADVERTISEMENT_MODE:
+            network, wallet = (
+                values.get(_ADVERTISEMENT_NETWORK_KEY),
+                values.get(_ADVERTISEMENT_WALLET_KEY),
+            )
+            if (
+                not isinstance(network, str)
+                or network not in get_args(BitcoinNetwork)
+                or not isinstance(wallet, str)
+            ):
+                raise MarketStoreCorruptError("bound advertisement metadata is incomplete")
+            try:
+                cls._require_hex32(wallet, "advertisement wallet_id")
+            except ValueError as exc:
+                raise MarketStoreCorruptError(
+                    "bound advertisement wallet identity is invalid"
+                ) from exc
+            return cast(LedgerMode, _WALLET_MODE), (wallet, network)
+        if (
+            mode not in (_STANDALONE_MODE, _WALLET_MODE)
+            or _ADVERTISEMENT_NETWORK_KEY in values
+            or _ADVERTISEMENT_WALLET_KEY in values
+        ):
             raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
-        return cast(LedgerMode, row["value"])
+        return cast(LedgerMode, mode), None
+
+    @classmethod
+    def _ledger_mode(cls, connection: sqlite3.Connection) -> LedgerMode:
+        """Project the compatible public mode without discarding required metadata."""
+        return cls._ledger_header(connection)[0]
+
+    @classmethod
+    def _advertisement_binding(cls, connection: sqlite3.Connection) -> tuple[str, str] | None:
+        return cls._ledger_header(connection)[1]
+
+    def _check_advertisement_binding(
+        self, connection: sqlite3.Connection
+    ) -> tuple[str, str] | None:
+        binding = self._advertisement_binding(connection)
+        observed = getattr(self, "_observed_advertisement_binding", None)
+        if observed is not None and observed != binding:
+            raise MarketStoreCorruptError("required advertisement binding changed or disappeared")
+        if binding is not None:
+            self._observed_advertisement_binding = binding
+        return binding
 
     def _verify_standalone_ledger(self, connection: sqlite3.Connection) -> None:
         """Require that no partially written wallet activation exists."""
@@ -1909,6 +2156,13 @@ class MarketStore:
             raise MarketStoreCorruptError("wallet ledger commitments path is invalid") from exc
         if str(metadata_path) != row["value"]:
             raise MarketStoreCorruptError("wallet ledger commitments path is not canonical")
+        if (
+            self._check_advertisement_binding(connection) is not None
+            and self.path.resolve() != get_market_store_path(metadata_path.parent.parent).resolve()
+        ):
+            raise MarketStoreCorruptError(
+                "bound advertisement ledger data-directory binding changed"
+            )
         intent_path = self._read_wallet_intent(readonly=readonly)
         pending = connection.execute(
             "SELECT value FROM metadata WHERE key = 'commitments_rebind'"
@@ -2033,8 +2287,27 @@ class MarketStore:
         except (MarketStoreError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise MarketStoreCorruptError("wallet ledger intent is invalid") from exc
 
-    def _activate_wallet_locked(self, commitments_path: Path) -> None:
+    def _activate_wallet_locked(
+        self,
+        commitments_path: Path,
+        bound_advertisements_network: str | None = None,
+    ) -> None:
         mode = self._ledger_mode(self._connection)
+        binding = self._check_advertisement_binding(self._connection)
+        if binding is not None and (
+            binding[0] != self.wallet_id
+            or (
+                bound_advertisements_network is not None
+                and binding[1] != bound_advertisements_network
+            )
+        ):
+            raise MarketStoreConflictError(
+                "bound advertisement activation identity/network mismatch"
+            )
+        if mode == _WALLET_MODE and binding is None and bound_advertisements_network is not None:
+            raise MarketStoreError(
+                "existing wallet ledgers cannot acquire fresh history implicitly"
+            )
         if mode == _WALLET_MODE:
             self._verify_wallet_ledger(self._connection, commitments_path)
             state = self._wallet_state_for_connection(self._connection, self.wallet_id)
@@ -2049,7 +2322,7 @@ class MarketStore:
 
         with self._transaction() as connection:
             if self._ledger_mode(connection) == _STANDALONE_MODE:
-                self._enter_wallet_mode(connection, commitments_path)
+                self._enter_wallet_mode(connection, commitments_path, bound_advertisements_network)
             else:
                 self._require_wallet_ledger(connection, commitments_path)
             state = self._wallet_state_for_connection(connection, self.wallet_id)
@@ -2082,6 +2355,10 @@ class MarketStore:
 
     def _recover_wallet_locked(self, commitments_path: Path) -> None:
         self._verify_schema()
+        if self._check_advertisement_binding(self._connection) is not None:
+            raise MarketStoreUnavailableError(
+                "bound advertisement history requires coupled recovery"
+            )
         if self._ledger_mode(self._connection) != _WALLET_MODE:
             raise MarketStoreError("wallet ledger has not been activated")
         self._verify_wallet_ledger(self._connection, commitments_path)
@@ -2121,7 +2398,12 @@ class MarketStore:
                 (self.wallet_id,),
             )
 
-    def _enter_wallet_mode(self, connection: sqlite3.Connection, commitments_path: Path) -> None:
+    def _enter_wallet_mode(
+        self,
+        connection: sqlite3.Connection,
+        commitments_path: Path,
+        bound_advertisements_network: str | None = None,
+    ) -> None:
         """Bind this store to one wallet by recording the mode and its binding.
 
         The schema already carries every ledger table, so activation only makes
@@ -2132,8 +2414,17 @@ class MarketStore:
                 "standalone store has interrupted wallet ledger activation"
             )
         connection.execute(
-            "UPDATE metadata SET value = ? WHERE key = 'ledger_mode'", (_WALLET_MODE,)
+            "UPDATE metadata SET value = ? WHERE key = 'ledger_mode'",
+            (_WALLET_MODE if bound_advertisements_network is None else _BOUND_ADVERTISEMENT_MODE,),
         )
+        if bound_advertisements_network is not None:
+            connection.executemany(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                (
+                    (_ADVERTISEMENT_NETWORK_KEY, bound_advertisements_network),
+                    (_ADVERTISEMENT_WALLET_KEY, self.wallet_id),
+                ),
+            )
         connection.execute(
             "INSERT INTO metadata (key, value) VALUES ('commitments_path', ?)",
             (str(commitments_path),),
@@ -2311,6 +2602,9 @@ class MarketStore:
             or self._wallet_state_for_connection(connection, self.wallet_id) != "ready"
         ):
             raise MarketStoreUnavailableError("wallet ledger is not ready for market issuance")
+        binding = self._check_advertisement_binding(connection)
+        if binding is not None and binding[0] != self.wallet_id:
+            raise MarketStoreConflictError("bound advertisement ledger belongs to another wallet")
         return True
 
     def _require_local_ledger_access(
@@ -2445,12 +2739,17 @@ class MarketStore:
         seller_key: CKey | BoundMarketKeys,
         wallet_ledger: bool,
     ) -> None:
+        binding = self._check_advertisement_binding(connection)
         if not isinstance(seller_key, BoundMarketKeys):
+            if binding is not None:
+                raise MarketStoreUnavailableError("bound advertisement ledger requires wallet keys")
             return
         if not wallet_ledger or self.wallet_id is None:
             raise MarketStoreUnavailableError("wallet-bound seller requires a ready wallet ledger")
         if seller_key.wallet_id != self.wallet_id:
             raise MarketStoreConflictError("wallet-bound seller does not match the store wallet")
+        if binding is not None and seller_key.scope.network != binding[1]:
+            raise MarketStoreConflictError("wallet-bound seller network does not match the ledger")
 
     @staticmethod
     def _validate_sealed_box_pubkey(value: str) -> None:
@@ -2717,7 +3016,11 @@ class MarketStore:
 
 
 def blocked_bond_outpoints(
-    path: Path, bonds: Iterable[BondReference], height: int
+    path: Path,
+    bonds: Iterable[BondReference],
+    height: int,
+    *,
+    advertisement_binding: tuple[str, str] | None = None,
 ) -> frozenset[tuple[str, int]]:
     """Outpoints of bonds their owner must not advertise at ``height``.
 
@@ -2742,5 +3045,9 @@ def blocked_bond_outpoints(
     if not path.exists():
         if os.path.lexists(path.with_name(f"{path.name}.wallet-ledger")):
             raise MarketStoreCorruptError("wallet ledger intent exists without its market store")
+        if advertisement_binding is not None:
+            raise MarketStoreUnavailableError("bound advertisement ledger is missing")
         return frozenset()
-    return MarketStore._scan_bond_leases(path, list(bonds), height)
+    return MarketStore._scan_bond_leases(
+        path, list(bonds), height, advertisement_binding=advertisement_binding
+    )

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from jmcore.bitcoin import scriptpubkey_to_address
+from jmcore.bond_advertisements import AdvertisementHistoryRecord, read_advertisements
 from jmcore.channel_ring import ChannelRingNodeConfig
 from jmcore.credential_market import (
     BLOCKS_PER_PERIOD,
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from jmcore.market_store import HoldInvoice
     from jmswap.lnd_invoices import LndInvoiceClient
     from jmwallet.wallet.service import WalletService
+    from taker.market_settlement import MultiNodeHoldInvoices
     from taker.wallet_market import WalletMarketSeller
 
     from maker.bot import MakerBot
@@ -84,6 +86,10 @@ BOND_MIXDEPTH = 0
 
 class MarketSalesUnavailableError(Exception):
     """A precondition for selling is missing; making continues without sales."""
+
+
+class _RequiredAdvertisementHistoryError(AdvertisementRecordError):
+    """Unknown bound history must close admission without replacing the runtime."""
 
 
 def sellable(utxo: UTXOInfo) -> bool:
@@ -170,6 +176,8 @@ class MarketSales:
         self._task: asyncio.Task[None] | None = None
         self._admission_closed = False
         self._producer_lock = asyncio.Lock()
+        self._required_advertisement_binding: tuple[str, str] | None = None
+        self._reconciliation_required = False
         self._last_warning: str | None = None
         self._last_note: str | None = None
 
@@ -219,7 +227,7 @@ class MarketSales:
             if self._admission_closed:
                 return
             await asyncio.sleep(1.0)
-        while not self._admission_closed:
+        while not self._admission_closed or self._needs_reconciliation_start():
             try:
                 await self._ensure_seller()
                 await self.refresh()
@@ -228,14 +236,18 @@ class MarketSales:
                 raise
             except Exception as exc:
                 async with self._producer_lock:
-                    if self._admission_closed:
+                    if self._admission_closed and not self._needs_reconciliation_start():
                         return
                     self._warn(exc)
-                    await self._stop_seller()
+                    if not self._reconciliation_required:
+                        await self._stop_seller()
                 delay = RETRY_SECONDS
-            if self._admission_closed:
+            if self._admission_closed and not self._needs_reconciliation_start():
                 return
             await asyncio.sleep(delay)
+
+    def _needs_reconciliation_start(self) -> bool:
+        return self._reconciliation_required and (self._seller is None or not self._seller.running)
 
     def _warn(self, exc: Exception) -> None:
         known = isinstance(
@@ -252,12 +264,109 @@ class MarketSales:
 
     async def _ensure_seller(self) -> None:
         """Start a seller, or replace one whose period or served bonds changed."""
+        history_failure: Exception | None = None
         async with self._producer_lock:
-            if not self._admission_closed:
-                await self._ensure_seller_owned()
+            if self._reconciliation_required:
+                if self._needs_reconciliation_start():
+                    await self._start_reconciliation_owned()
+            elif not self._admission_closed:
+                try:
+                    await self._ensure_seller_owned()
+                except _RequiredAdvertisementHistoryError as exc:
+                    history_failure = exc
+                    self._admission_closed = True
+                    self._reconciliation_required = True
+                    if self._needs_reconciliation_start():
+                        await self._start_reconciliation_owned()
+        if history_failure is not None:
+            self._note(
+                f"{history_failure}; closing new admission without stopping retained runtimes"
+            )
+            await self.close_admission()
+
+    def _invoices(self) -> MultiNodeHoldInvoices:
+        from taker.market_settlement import MultiNodeHoldInvoices, seller_invoice_client
+
+        clients = {
+            name: _invoice_client(node)
+            for name, node in self._bot.config.channel_ring.nodes.items()
+        }
+        if self._settings.market.lnd_grpc_url and MARKET_NODE not in clients:
+            # Probe configured historical owners, never substitute a newly
+            # selected node for an invoice missing from its original history.
+            clients[MARKET_NODE] = seller_invoice_client(self._settings)
+        if not clients:
+            raise MarketSalesUnavailableError(
+                "no original Lightning invoice endpoint is configured"
+            )
+        return MultiNodeHoldInvoices(clients, self._invoice_node)
+
+    async def _start_reconciliation_owned(self) -> None:
+        """Restart monitoring, not selling, from the retained required-mode ledger."""
+        from taker.wallet_market import WalletMarketSeller
+
+        previous = self._seller
+        if previous is not None:
+            if previous.running:
+                return
+            # A failed start may retain failed-close resources. Keep its owner
+            # reachable, and do not replace it until explicit cleanup succeeds.
+            await previous.stop()
+            self._seller = None
+        seller = WalletMarketSeller(
+            self._bot.wallet,
+            self._settings,
+            None,
+            invoices=self._invoices(),
+            backing_sats=self._backing_sats,
+            sale_check=self._sale_check,
+        )
+        self._seller = seller
+        await seller.start()
+
+    def _verify_required_advertisements(self) -> None:
+        wallet = self._bot.wallet
+        if wallet.data_dir is None:
+            return
+        path = get_market_store_path(wallet.data_dir)
+        try:
+            binding = MarketStore.inspect_advertisement_binding(path)
+        except MarketStoreError as exc:
+            if self._required_advertisement_binding is not None:
+                raise _RequiredAdvertisementHistoryError(
+                    "required bond history is unavailable"
+                ) from exc
+            return  # Legacy readiness retains its existing validation below.
+        if (
+            self._required_advertisement_binding is not None
+            and binding != self._required_advertisement_binding
+        ):
+            raise _RequiredAdvertisementHistoryError("required bond history binding changed")
+        if binding is None:
+            return
+        self._required_advertisement_binding = binding
+        if binding != (wallet.market_wallet_id, str(wallet.network)):
+            raise _RequiredAdvertisementHistoryError(
+                "required bond history wallet/network mismatch"
+            )
+        try:
+            MarketStore.inspect_advertisement_binding(path, require_ready=True)
+            read_advertisements(
+                advertisement_record_path(wallet.data_dir),
+                wallet_id=binding[0],
+                network=binding[1],
+                require_bound=True,
+            )
+        except (MarketStoreError, AdvertisementRecordError) as exc:
+            raise _RequiredAdvertisementHistoryError(
+                "required bond history is unavailable"
+            ) from exc
 
     async def _ensure_seller_owned(self) -> None:
         """Replace only while the producer lock is held and admission stays open."""
+        await asyncio.to_thread(self._verify_required_advertisements)
+        if self._admission_closed:
+            return
         wallet = self._bot.wallet
         config = self._bot.config
         height = await wallet.backend.get_block_height()
@@ -286,11 +395,16 @@ class MarketSales:
             and self._served == served
         ):
             return
+        # Network and bond discovery may have suspended since the first check.
+        # Never replace the retained runtime after observing required-history
+        # failure in that interval.
+        await asyncio.to_thread(self._verify_required_advertisements)
+        if self._admission_closed:
+            return
         await self._stop_seller()
         if self._admission_closed:
             return
         try:
-            from taker.market_settlement import MultiNodeHoldInvoices, seller_invoice_client
             from taker.podle_purchase import market_fee_rate, seller_price_sats
             from taker.wallet_market import WalletMarketSeller
         except ImportError as exc:
@@ -324,12 +438,7 @@ class MarketSales:
             )
             for bond in rentals
         )
-        clients = {name: _invoice_client(node) for name, node in nodes.items()}
-        if self._settings.market.lnd_grpc_url and MARKET_NODE not in clients:
-            # Never invoices, but may hold invoices of a seller that used this
-            # store before; an unknown invoice must be unknown to every node.
-            clients[MARKET_NODE] = seller_invoice_client(self._settings)
-        invoices = MultiNodeHoldInvoices(clients, self._invoice_node)
+        invoices = self._invoices()
         seller = WalletMarketSeller(
             wallet,
             self._settings,
@@ -395,13 +504,29 @@ class MarketSales:
         if self._admission_closed:
             return []
         admitted: set[tuple[str, int]] = set()
+        wallet_id, network = wallet.market_wallet_id, str(wallet.network)
+
+        def record_history() -> AdvertisementHistoryRecord:
+            binding = MarketStore.inspect_advertisement_binding(get_market_store_path(data_dir))
+            if binding is not None and binding != (wallet_id, network):
+                raise AdvertisementRecordError("bond history wallet/network mismatch")
+            return record_advertisement(
+                advertisement_record_path(data_dir),
+                period,
+                wallet_id=wallet_id,
+                network=network,
+                require_bound=binding is not None,
+            )
+
         try:
             # Created when absent, counting every bond as advertised through the
             # next period.
-            record = await asyncio.to_thread(
-                record_advertisement, advertisement_record_path(data_dir), period
-            )
-        except AdvertisementRecordError as exc:
+            record = await asyncio.to_thread(record_history)
+        except (AdvertisementRecordError, MarketStoreError) as exc:
+            if self._required_advertisement_binding is not None:
+                raise _RequiredAdvertisementHistoryError(
+                    "required bond history is unavailable"
+                ) from exc
             self._note(f"Bond rental paused: {exc}")
         else:
             if lease_admission_open(height):
@@ -443,9 +568,22 @@ class MarketSales:
 
     async def refresh(self) -> None:
         """Follow the offer mixdepth, reprice, and stock new coins and leases."""
+        history_failure: Exception | None = None
         async with self._producer_lock:
             if not self._admission_closed:
-                await self._refresh_owned()
+                try:
+                    await asyncio.to_thread(self._verify_required_advertisements)
+                    if not self._admission_closed:
+                        await self._refresh_owned()
+                except _RequiredAdvertisementHistoryError as exc:
+                    history_failure = exc
+                    self._admission_closed = True
+                    self._reconciliation_required = True
+        if history_failure is not None:
+            self._note(
+                f"{history_failure}; closing new admission without stopping retained runtimes"
+            )
+            await self.close_admission()
 
     async def _refresh_owned(self) -> None:
         seller = self._seller
@@ -494,8 +632,19 @@ class MarketSales:
             if (bond.txid, bond.vout) in self._stocked_bonds:
                 continue
             # A lease stocked (or sold) by an earlier run of this period conflicts.
-            with suppress(MarketStoreConflictError):
+            try:
                 seller.add_bond_inventory(outpoint)
+            except MarketStoreConflictError:
+                pass
+            except MarketStoreError as exc:
+                if self._required_advertisement_binding is not None:
+                    raise _RequiredAdvertisementHistoryError(
+                        "required bond admission is unavailable"
+                    ) from exc
+                self._note(
+                    f"Bond rental admission paused: {exc}; existing settlement stays running"
+                )
+                continue
             self._stocked_bonds.add((bond.txid, bond.vout))
 
     async def _stock(self, seller: WalletMarketSeller, mixdepth: int) -> None:
@@ -603,13 +752,15 @@ class MarketSales:
         return None
 
     async def _stop_seller(self) -> None:
-        seller, self._seller = self._seller, None
-        self._mixdepth = None
-        self._period = None
-        self._served = None
-        self._rented = []
+        seller = self._seller
         if seller is not None:
             try:
                 await seller.stop()
             except Exception as exc:
                 logger.warning("The market seller did not stop cleanly: {}", type(exc).__name__)
+                raise
+        self._seller = None
+        self._mixdepth = None
+        self._period = None
+        self._served = None
+        self._rented = []

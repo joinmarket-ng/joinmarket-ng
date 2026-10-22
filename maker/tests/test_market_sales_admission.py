@@ -38,6 +38,307 @@ class _RetainedSeller(_Seller):
         self.idle.set()
 
 
+@pytest.mark.parametrize("retry", [False, True])
+async def test_restart_with_lost_required_history_starts_original_hold_monitor_without_a_bond(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry: bool,
+) -> None:
+    import time
+    from unittest.mock import AsyncMock
+
+    from jmcore.bond_advertisements import (
+        advertisement_record_path,
+        initialize_fresh_advertisements,
+    )
+    from jmcore.constants import GENESIS_BLOCK_HASHES
+    from jmcore.credential_market import MarketAuthorization, PaymentTerms, sign_document
+    from jmcore.external_podle import ExternalPoDLEOutpoint
+    from jmcore.market_keys import MarketKeyScope
+    from jmcore.market_store import HoldReservation, MarketStore
+    from jmcore.models import NetworkType
+    from jmcore.paths import get_market_store_path, get_used_commitments_path
+    from jmcore.settings import NetworkSettings
+    from jmswap.lnd_invoices import HoldInvoiceStatus, InvoiceState
+    from taker.market_settlement import MultiNodeHoldInvoices
+
+    sales, bot, _, backend = _sales(tmp_path, price=700)
+    sales._settings = sales._settings.model_copy(
+        update={
+            "network_config": NetworkSettings(network=NetworkType.REGTEST, directory_servers=[]),
+        }
+    )
+    sales._seller = None
+    wallet = bot.wallet
+    bond = _owned_bond(0xAA)
+    assert bond.private_key is not None and bond.pubkey is not None
+    outpoint = ExternalPoDLEOutpoint(txid=bond.txid, vout=bond.vout)
+    keys = wallet.market_keys.bind(
+        MarketKeyScope(
+            network="regtest",
+            chain_hash=GENESIS_BLOCK_HASHES["regtest"],
+            role="seller",
+            period=0,
+            bond=outpoint,
+        )
+    )
+    from jmcore.credential_market import BondReference
+
+    authority = MarketAuthorization(
+        bond=BondReference(
+            network="regtest", outpoint=outpoint, pubkey=bond.pubkey.hex(), locktime=bond.locktime
+        ),
+        period=0,
+        seller_pubkey=keys.signing_public_key().hex(),
+    )
+    authorization = sign_document(authority, bond.private_key)
+    history = advertisement_record_path(tmp_path)
+    initialize_fresh_advertisements(
+        history, wallet.market_wallet_id, "regtest", history_confirmed=True
+    )
+    now = int(time.time())
+    with MarketStore(get_market_store_path(tmp_path), wallet_id=wallet.market_wallet_id) as store:
+        store.activate_wallet(
+            get_used_commitments_path(tmp_path, create=False),
+            history_confirmed=True,
+            bound_advertisements_network="regtest",
+        )
+        store.add_bond_inventory(authority.bond, 0)
+        reserved = store.reserve_hold_quote(
+            authorization,
+            keys,
+            "44" * 32,
+            "bond",
+            keys.signing_public_key().hex(),
+            "lightning",
+            1000,
+            1000,
+            now,
+            1000,
+            request_id="01" * 16,
+        )
+        assert isinstance(reserved, HoldReservation)
+        terms = PaymentTerms(rail="lightning", request="original-hold-request", amount_sats=1000)
+        store.issue_hold_quote(
+            reserved.quote_id, keys, terms, f"ln:{reserved.payment_hash.hex()}", now
+        )
+        (hold,) = store.hold_invoices(now)
+    history.unlink()
+    looked_up = asyncio.Event()
+    original_node = AsyncMock()
+    original_node.__aenter__.return_value = original_node
+
+    async def lookup(payment_hash: bytes) -> HoldInvoiceStatus | None:
+        assert payment_hash == hold.payment_hash
+        looked_up.set()
+        return HoldInvoiceStatus(InvoiceState.OPEN, terms.request, 0, None)
+
+    original_node.lookup.side_effect = lookup
+    invoices = MultiNodeHoldInvoices({"original": original_node}, sales._invoice_node)
+    monkeypatch.setattr(sales, "_invoices", lambda: invoices)
+    genesis = AsyncMock(
+        side_effect=[OSError("temporarily unavailable"), GENESIS_BLOCK_HASHES["regtest"]]
+        if retry
+        else None,
+        return_value=GENESIS_BLOCK_HASHES["regtest"],
+    )
+    monkeypatch.setattr(backend, "get_block_hash", genesis, raising=False)
+    authorize = AsyncMock(side_effect=AssertionError("do not require or create current authority"))
+    monkeypatch.setattr(wallet, "create_market_authorization", authorize)
+    try:
+        if retry:
+            monkeypatch.setattr(market_sales, "RETRY_SECONDS", 0.001)
+            sales.start()
+        else:
+            await sales._ensure_seller()
+        await asyncio.wait_for(looked_up.wait(), timeout=3)
+        if sales._task is not None:
+            await asyncio.wait_for(sales._task, timeout=3)
+        monitor = sales._seller
+        assert monitor is not None and monitor.running and not monitor.accepting
+        assert monitor._settlement_task is not None and not monitor._settlement_task.done()
+        assert monitor._transport is None and monitor._service is None and sales._admission_closed
+        assert monitor._seller_key_for(hold).signing_public_key() == keys.signing_public_key()
+        assert invoices._owners[hold.payment_hash] == "original"
+        authorize.assert_not_awaited()
+        original_node.add_hold_invoice.assert_not_awaited()
+        original_node.cancel.assert_not_awaited()
+        assert not history.exists()
+    finally:
+        await sales.stop()
+        await wallet.close()
+
+
+async def test_failed_reconciliation_start_keeps_owner_until_failed_cleanup_can_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from jmcore.bond_advertisements import (
+        advertisement_record_path,
+        initialize_fresh_advertisements,
+    )
+    from jmcore.constants import GENESIS_BLOCK_HASHES
+    from jmcore.market_store import MarketStore
+    from jmcore.models import NetworkType
+    from jmcore.paths import get_market_store_path, get_used_commitments_path
+    from jmcore.settings import NetworkSettings
+    from taker import wallet_market
+
+    sales, bot, _, backend = _sales(tmp_path, price=700)
+    sales._seller = None
+    sales._settings = sales._settings.model_copy(
+        update={
+            "network_config": NetworkSettings(network=NetworkType.REGTEST, directory_servers=[]),
+        }
+    )
+    history = advertisement_record_path(tmp_path)
+    initialize_fresh_advertisements(
+        history, bot.wallet.market_wallet_id, "regtest", history_confirmed=True
+    )
+    path = get_market_store_path(tmp_path)
+    with MarketStore(path, wallet_id=bot.wallet.market_wallet_id) as store:
+        store.activate_wallet(
+            get_used_commitments_path(tmp_path, create=False),
+            history_confirmed=True,
+            bound_advertisements_network="regtest",
+        )
+    history.unlink()
+    invoices = AsyncMock()
+    invoices.__aenter__.return_value = invoices
+    monkeypatch.setattr(sales, "_invoices", lambda: invoices)
+    monkeypatch.setattr(
+        backend,
+        "get_block_hash",
+        AsyncMock(
+            side_effect=[
+                OSError("startup unavailable"),
+                GENESIS_BLOCK_HASHES["regtest"],
+            ]
+        ),
+        raising=False,
+    )
+    close = MarketStore.close
+    close_failures = 0
+
+    def failing_close(store: MarketStore) -> None:
+        nonlocal close_failures
+        if store.path == path and close_failures < 2:
+            close_failures += 1
+            raise OSError("cleanup not yet confirmed")
+        close(store)
+
+    monkeypatch.setattr(MarketStore, "close", failing_close)
+    created: list[WalletMarketSeller] = []
+    initialize = wallet_market.WalletMarketSeller.__init__
+
+    def track(seller: WalletMarketSeller, *args: Any, **kwargs: Any) -> None:
+        initialize(seller, *args, **kwargs)
+        created.append(seller)
+
+    monkeypatch.setattr(wallet_market.WalletMarketSeller, "__init__", track)
+    try:
+        with pytest.raises(OSError, match="cleanup"):
+            await sales._ensure_seller()
+        owner = sales._seller
+        assert owner is not None and owner._store is not None and not owner.running
+        assert sales._needs_reconciliation_start() and created == [owner]
+        with pytest.raises(OSError, match="cleanup"):
+            await sales._ensure_seller()
+        assert sales._seller is owner and owner._store is not None and created == [owner]
+        await sales._ensure_seller()
+        assert owner._store is None and len(created) == 2
+        assert sales._seller is created[1] and sales._seller.running and not sales._seller.accepting
+    finally:
+        await sales.stop()
+        await bot.wallet.close()
+
+
+async def test_terminal_stop_retains_failed_close_for_explicit_retry(
+    state: tuple[MarketSales, SimpleNamespace, _RetainedSeller, _Backend],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    sales, _, seller, _ = state
+    stop = AsyncMock(side_effect=[OSError("close failed"), None])
+    monkeypatch.setattr(seller, "stop", stop)
+    with pytest.raises(OSError, match="close failed"):
+        await sales.stop()
+    assert sales._seller is seller
+    await sales.stop()
+    assert sales._seller is None and stop.await_count == 2
+
+
+@pytest.mark.parametrize("failure", ["missing", "legacy", "corrupt", "during-height"])
+async def test_required_history_failure_closes_admission_but_keeps_original_settlement(
+    state: tuple[MarketSales, SimpleNamespace, _RetainedSeller, _Backend],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from jmcore.bond_advertisements import (
+        advertisement_record_path,
+        initialize_fresh_advertisements,
+        record_advertisement,
+    )
+    from jmcore.market_store import MarketStore
+    from jmcore.paths import get_market_store_path, get_used_commitments_path
+
+    sales, bot, seller, backend = state
+    _coin(bot.wallet, backend, 1, 0)
+    await sales.refresh()
+    payment_hash = b"\x44" * 32
+    seller.sold[payment_hash] = seller.inventory[0]
+    directory = bot.wallet.data_dir
+    history = advertisement_record_path(directory)
+    initialize_fresh_advertisements(
+        history, bot.wallet.market_wallet_id, "regtest", history_confirmed=True
+    )
+    with MarketStore(
+        get_market_store_path(directory), wallet_id=bot.wallet.market_wallet_id
+    ) as store:
+        store.activate_wallet(
+            get_used_commitments_path(directory, create=False),
+            history_confirmed=True,
+            bound_advertisements_network="regtest",
+        )
+    sales._verify_required_advertisements()
+    entered, release = asyncio.Event(), asyncio.Event()
+    task: asyncio.Task[None] | None = None
+    if failure == "during-height":
+
+        async def height() -> int:
+            entered.set()
+            await release.wait()
+            return 100_000
+
+        monkeypatch.setattr(backend, "get_block_height", height)
+        task = asyncio.create_task(sales._ensure_seller())
+        await entered.wait()
+    try:
+        history.unlink()
+        if failure == "legacy":
+            record_advertisement(history, 0)
+        elif failure == "corrupt":
+            history.write_bytes(b'{"version":2,')
+        release.set()
+        if task is not None:
+            await task
+        else:
+            await sales.refresh()
+        assert sales._admission_closed and not seller.accepting
+        assert sales._seller is seller and seller.running and seller.stop_calls == 0
+        assert sales._invoice_node(payment_hash) == "n1"
+        assert await sales._sale_check(
+            cast(HoldInvoice, SimpleNamespace(payment_hash=payment_hash))
+        )
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.fixture
 async def state(
     tmp_path: Path,

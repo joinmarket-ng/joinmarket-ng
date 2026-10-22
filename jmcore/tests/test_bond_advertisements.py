@@ -13,6 +13,8 @@ import pytest
 
 from jmcore.bond_advertisements import (
     AdvertisementRecordError,
+    BoundAdvertisementRecord,
+    initialize_fresh_advertisements,
     locked_advertisements,
     read_advertisements,
     record_advertisement,
@@ -20,6 +22,7 @@ from jmcore.bond_advertisements import (
 
 FIRST = ("11" * 32, 0)
 SECOND = ("22" * 32, 1)
+WALLET_ID = "a1" * 32
 
 
 def test_snapshot_absence_is_nonmutating_and_initialization_stays_conservative(
@@ -65,6 +68,94 @@ def test_corrupt_record_is_never_replaced_by_a_writer(tmp_path: Path) -> None:
     with pytest.raises(AdvertisementRecordError, match="corrupt"):
         record_advertisement(path, 10, FIRST)
     assert path.read_bytes() == original
+
+
+def test_fresh_history_has_explicit_identity_and_network_even_in_period_zero(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "market" / "history.json"
+    with pytest.raises(AdvertisementRecordError, match="confirmed"):
+        initialize_fresh_advertisements(path, WALLET_ID, "regtest")
+    assert not path.parent.exists()
+    initialize_fresh_advertisements(path, WALLET_ID, "regtest", history_confirmed=True)
+    record = read_advertisements(path, wallet_id=WALLET_ID, network="regtest", require_bound=True)
+    assert isinstance(record, BoundAdvertisementRecord)
+    assert record.rentable(FIRST, 0) and record.since == -1
+    record_advertisement(path, 0, FIRST, wallet_id=WALLET_ID, network="regtest", require_bound=True)
+    restarted = read_advertisements(
+        path, wallet_id=WALLET_ID, network="regtest", require_bound=True
+    )
+    assert restarted is not None and not restarted.rentable(FIRST, 1)
+    assert restarted.rentable(FIRST, 2) and restarted.rentable(SECOND, 0)
+
+
+@pytest.mark.parametrize(
+    "identity,network", [(None, None), ("b2" * 32, "regtest"), (WALLET_ID, "signet")]
+)
+def test_bound_history_never_adopts_another_identity_or_network(
+    tmp_path: Path,
+    identity: str | None,
+    network: str | None,
+) -> None:
+    path = tmp_path / "history.json"
+    initialize_fresh_advertisements(path, WALLET_ID, "regtest", history_confirmed=True)
+    original = path.read_bytes()
+    with pytest.raises(AdvertisementRecordError, match="binding"):
+        record_advertisement(path, 10, FIRST, wallet_id=identity, network=network)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("replacement", ["absent", "legacy", "corrupt", "dangling"])
+def test_required_history_loss_or_downgrade_never_reinitializes_it(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    path = tmp_path / "history.json"
+    if replacement == "legacy":
+        record_advertisement(path, 10)
+    elif replacement == "corrupt":
+        path.write_bytes(b'{"version":2,')
+    elif replacement == "dangling":
+        path.symlink_to(tmp_path / "missing-target")
+    before = path.lstat() if os.path.lexists(path) else None
+    with pytest.raises(AdvertisementRecordError):
+        record_advertisement(
+            path, 10, FIRST, wallet_id=WALLET_ID, network="regtest", require_bound=True
+        )
+    if before is None:
+        assert not path.exists()
+    else:
+        after = path.lstat()
+        assert (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) == (
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+
+
+def test_post_publication_failure_preserves_history_and_blocks_fresh_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jmcore import bond_advertisements
+
+    path = tmp_path / "market" / "history.json"
+    original = bond_advertisements.atomic_write_private
+
+    def interrupted(destination: Path, data: bytes, *, replace: bool = True) -> None:
+        original(destination, data, replace=replace)
+        raise OSError("simulated post-publication failure")
+
+    monkeypatch.setattr(bond_advertisements, "atomic_write_private", interrupted)
+    with pytest.raises(AdvertisementRecordError, match="incomplete"):
+        initialize_fresh_advertisements(path, WALLET_ID, "regtest", history_confirmed=True)
+    assert path.exists()
+    before = path.read_bytes()
+    monkeypatch.setattr(bond_advertisements, "atomic_write_private", original)
+    with pytest.raises(AdvertisementRecordError, match="exists"):
+        initialize_fresh_advertisements(path, WALLET_ID, "regtest", history_confirmed=True)
+    assert path.read_bytes() == before
 
 
 @pytest.mark.skipif(os.name != "posix", reason="readiness handshake uses POSIX pipe selection")

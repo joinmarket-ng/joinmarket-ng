@@ -340,6 +340,16 @@ than twice that interval. A bond served or stocked in a period stays served by
 its own authority until the period ends, even if it would no longer be
 admitted, so a held payment for its lease is always settled or refunded.
 
+Existing wallets retain conservative advertisement initialization: unknown
+history initialized in period P blocks new rental admission through P+1.
+Uninterrupted fresh guided activation instead publishes complete empty history,
+bound to the full wallet identity and Bitcoin network, before activating its
+ledger. Only that witnessed generation can avoid the initial delay for idle
+bonds; imports, restarts, and old publication records grant no such authority.
+Proof admission and typed rental stocking share one cross-process lock through
+their respective durable writes. Legacy raw inventory insertion retains its
+compatibility contract, not this stronger admission guarantee.
+
 Before choosing a bond, and every 30 seconds while making, the maker reads
 the market store of its data directory (read-only). A bond is blocked from
 the reservation of a hold for its lease until the invoice is confirmed
@@ -476,6 +486,24 @@ or disclosure ends that invocation's automatic activation eligibility; private
 seed backup remains available. Preserve any partial ledger and use explicit
 history inspection/recovery, never generate a replacement as rollback.
 
+Fresh activation publishes bound advertisement history without replacement
+before activating a ledger that independently requires that history. Missing,
+corrupt, mismatched, or v1 replacement history blocks new proof and rental
+admission, without recreating or downgrading it. Preserve partial artifacts.
+Coupled recovery and directory rebinding for this new mode are not yet supported
+and are explicitly refused. Existing valid legacy ledgers and v1 history keep
+their previous behavior on upgrade, without automatic promotion or migration.
+The previous ledger decoder rejects the new internal mode; this is not a claim
+that arbitrary older software can safely operate on it.
+
+Required-history failure closes admission without stopping an existing seller's
+settlement monitor. After a restart, the maker can instead start a closed,
+reconciliation-only runtime from the verified ledger and original configured
+invoice endpoints, without a current owned bond or replacement authorization.
+Unverified original signing identities remain unknown. This mode starts no
+relay: a durably prepared package is not proof that its buyer received it.
+Retain original node histories and do not treat monitoring as retirement clearance.
+
 Imported, existing, and resumed wallets receive already-ready binding checks
 only. Missing, disabled, standalone, activating, recovery-required, or unavailable
 state supplies no fresh authority and receives no implicit activation. A ready
@@ -580,11 +608,11 @@ the full wallet identity; the path prefix is not sufficient ownership proof.
 | Backups: registry copy and static channel backups | `backup/` | No local backup evidence; not proof that recovery is unnecessary |
 | Ring node bindings | existing `node-bindings.json` | Managed init writes them for its own new nodes |
 | Market ledger, store, leases | existing wallet market ledger | No local sales evidence; absence alone cannot clear retirement obligations |
-| Advertised bonds per period | `market/advertised-bonds.json` | Created when first needed; every bond counts as advertised through the next period |
+| Advertised bonds per period | `market/advertised-bonds.json` | Legacy history initializes conservatively; required bound history blocks new issuance when absent, never recreates fresh history |
 | Bond lease purchases, with their keys until their period ends or as evidence of an unusable paid lease | `<data_dir>/market/bond-purchases/` | No local purchase evidence; not proof of no prior payment or lease provenance |
 | Imported leased bond and random renter certificate key | wallet-specific fidelity bond registry | No locally recorded credential; the owner's signature and renter key cannot be recovered from the seed alone |
 
-A data directory without a market store is treated as one that never sold a
+A legacy data directory without a market store is treated as one that never sold a
 lease, so existing makers keep advertising their bond. This is a
 compatibility policy, not a proof: a store deleted together with its wallet
 ledger intent (or a standalone store, which has none) is not detected, and

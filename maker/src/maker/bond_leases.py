@@ -25,6 +25,8 @@ from pathlib import Path
 
 from jmcore.bond_advertisements import (
     ADVERTISEMENT_FILE,
+    BoundAdvertisementRecord,
+    locked_advertisements,
 )
 from jmcore.bond_advertisements import (
     AdvertisementRecord as AdvertisementRecord,
@@ -43,7 +45,7 @@ from jmcore.bond_advertisements import (
 )
 from jmcore.credential_market import BondReference, period_at_height
 from jmcore.external_podle import ExternalPoDLEOutpoint
-from jmcore.market_store import blocked_bond_outpoints
+from jmcore.market_store import MarketStore, blocked_bond_outpoints
 from loguru import logger
 from pydantic import ValidationError
 
@@ -92,16 +94,20 @@ class BondLeaseGuard:
         store_path: Path,
         network: str,
         *,
+        wallet_id: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.store_path = store_path
         self.record_path = store_path.with_name(ADVERTISEMENT_FILE)
         self.network = network
+        self.wallet_id = wallet_id
+        self._required_binding: tuple[str, str] | None = None
         self._clock = clock
         self._blocked: frozenset[Outpoint] | None = None
         self._read_at: float | None = None
         # The bond recorded as advertised through the period after the last reading.
         self._recorded: Outpoint | None = None
+        self._recorded_through: int | None = None
         self._status = ""
 
     async def refresh(
@@ -118,40 +124,114 @@ class BondLeaseGuard:
         """
         references = bond_references(bonds, self.network)
         self._recorded = None
+        self._recorded_through = None
         try:
-            blocked = await asyncio.to_thread(
-                blocked_bond_outpoints, self.store_path, references, height
+            blocked, recorded = await asyncio.to_thread(
+                self._read_and_record,
+                references,
+                height,
+                advertising,
             )
-        except Exception as exc:
-            self._blocked = None
-            self._read_at = None
+        except AdvertisementRecordError as exc:
+            # Preserve the lease snapshot contract, but never authorize a proof
+            # when its advertisement could not be durably recorded.
+            try:
+                blocked = await asyncio.to_thread(
+                    blocked_bond_outpoints,
+                    self.store_path,
+                    references,
+                    height,
+                )
+            except Exception as read_error:
+                self._unknown(read_error)
+                return None
+            self._blocked = blocked
+            self._read_at = self._clock()
             self._transition(
-                "unknown",
-                f"Fidelity bond lease history is unknown ({exc}); "
-                "offers carry no bond proof until it can be read",
+                "unrecorded",
+                f"Could not record fidelity bond advertisement ({exc}); "
+                "offers carry no bond proof until history is available",
             )
+            return blocked
+        except Exception as exc:
+            self._unknown(exc)
             return None
         self._blocked = blocked
         self._read_at = self._clock()
-        if advertising is not None and (outpoint := (advertising.txid, advertising.vout)) not in (
-            blocked
-        ):
-            try:
-                await asyncio.to_thread(
-                    record_advertisement, self.record_path, period_at_height(height), outpoint
-                )
-            except Exception as exc:
-                self._transition(
-                    "unrecorded",
-                    f"Could not record the advertised fidelity bond ({exc}); "
-                    "offers carry no bond proof until it is recorded",
-                )
-            else:
-                self._recorded = outpoint
+        self._recorded = recorded
+        self._recorded_through = None if recorded is None else period_at_height(height) + 1
         return blocked
+
+    def _read_and_record(
+        self,
+        references: list[BondReference],
+        height: int,
+        advertising: FidelityBondInfo | None,
+    ) -> tuple[frozenset[Outpoint], Outpoint | None]:
+        binding = MarketStore.inspect_advertisement_binding(self.store_path)
+        if self._required_binding is not None and binding != self._required_binding:
+            raise AdvertisementRecordError("required advertisement binding changed or disappeared")
+        if binding is not None:
+            self._required_binding = binding
+            if binding != (self.wallet_id, self.network):
+                raise AdvertisementRecordError("advertisement wallet/network binding mismatch")
+        with locked_advertisements(
+            self.record_path,
+            wallet_id=self.wallet_id,
+            network=self.network,
+            require_bound=binding is not None,
+        ) as history:
+            if binding is None and isinstance(history.snapshot, BoundAdvertisementRecord):
+                raise AdvertisementRecordError("bound advertisement ledger is incomplete")
+            blocked = blocked_bond_outpoints(
+                self.store_path, references, height, advertisement_binding=binding
+            )
+            recorded = None
+            if (
+                advertising is not None
+                and (outpoint := (advertising.txid, advertising.vout)) not in blocked
+            ):
+                history.record(period_at_height(height), outpoint)
+                recorded = outpoint
+            return blocked, recorded
+
+    def _unknown(self, exc: Exception) -> None:
+        self._blocked = None
+        self._read_at = None
+        self._transition(
+            "unknown",
+            f"Fidelity bond lease history is unknown ({exc}); "
+            "offers carry no bond proof until it can be read",
+        )
+        return None
 
     def allows(self, bond: FidelityBondInfo) -> bool:
         """Whether the last reading lets the owner advertise ``bond`` now."""
+        if self._required_binding is not None:
+            try:
+                if (
+                    MarketStore.inspect_advertisement_binding(
+                        self.store_path,
+                        require_ready=True,
+                    )
+                    != self._required_binding
+                ):
+                    raise AdvertisementRecordError("required advertisement binding changed")
+                history = read_advertisements(
+                    self.record_path,
+                    wallet_id=self.wallet_id,
+                    network=self.network,
+                    require_bound=True,
+                )
+                if (
+                    history is None
+                    or self._recorded_through is None
+                    or history.through((bond.txid, bond.vout)) < self._recorded_through
+                ):
+                    raise AdvertisementRecordError("required advertisement entry disappeared")
+            except Exception as exc:
+                self._unknown(exc)
+                return False
         if (
             self._blocked is None
             or self._read_at is None
