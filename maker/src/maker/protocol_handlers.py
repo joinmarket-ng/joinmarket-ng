@@ -594,7 +594,11 @@ class ProtocolHandlersMixin:
         simultaneously, each with a unique ID.
         """
         reservation_owned = False
-        if getattr(self, "_stopping", False) is True:
+        fill_admitted = False
+        if (
+            getattr(self, "_stopping", False) is True
+            or getattr(self, "_fill_admission_closed", False) is True
+        ):
             return
         session: MakerSession | None = None
         log_context: AbstractContextManager[None] | None = None
@@ -723,6 +727,11 @@ class ProtocolHandlersMixin:
                 return
 
             refresh_fee_policy = getattr(self, "_initialize_minimum_fee_policy", None)
+            # Validation and registration are synchronous. Closing admission
+            # later must not invalidate this session's accepted protocol work.
+            self._active_fill_admissions += 1
+            self._fill_admissions_idle.clear()
+            fill_admitted = True
             if inspect.iscoroutinefunction(refresh_fee_policy):
                 await refresh_fee_policy(announce=False)
             minimum_fee_rate = getattr(self, "minimum_fee_rate_sat_vb", None)
@@ -829,6 +838,10 @@ class ProtocolHandlersMixin:
             logger.error("Failed to handle !fill")
             logger.bind(sensitive=True).error(f"Failed to handle !fill: {e}")
         finally:
+            if fill_admitted:
+                self._active_fill_admissions -= 1
+                if self._active_fill_admissions == 0:
+                    self._fill_admissions_idle.set()
             if log_context is not None:
                 log_context.__exit__(None, None, None)
 

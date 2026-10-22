@@ -535,6 +535,15 @@ automatic node maintenance, and adds no durable exclusion across restarts.
 Independently canceled worker threads may still finish existing writes; this
 boundary is not a filesystem-write barrier.
 
+Maker fill-admission closure rejects fresh fills before commitment allocation
+and waits for fill handlers accepted before its first suspension. It does not
+withdraw offers or stop sessions. Accepted sessions can still authenticate,
+consume reserves, and create their first ring record afterward, using their
+original resources. The entire accepted session remains outstanding, including
+one with no durable ring record yet. An empty handler counter or record list
+therefore grants no financial quiescence or node-retirement authority. This
+gate is also transient and remains closed if its waiter is canceled.
+
 Role guidance prints separate actor commands and mixdepth-specific reserve
 funding instructions; it never submits a reserve transaction or starts actors.
 After a fresh software installation, the installer offers guided setup with a

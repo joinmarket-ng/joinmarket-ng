@@ -96,6 +96,9 @@ class MakerBotProtocol(Protocol):
     channel_ring_capability_validated: bool
     _channel_ring_nodes: ChannelRingNodePool | None
     _stopping: bool
+    _fill_admission_closed: bool
+    _active_fill_admissions: int
+    _fill_admissions_idle: asyncio.Event
     _session_handler_tasks: set[asyncio.Task[None]]
     _channel_ring_store: RingParticipantStore | None
 

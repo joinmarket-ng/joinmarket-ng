@@ -226,6 +226,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         self.running = False
         self._stopping = False
+        self._fill_admission_closed = False
+        self._active_fill_admissions = 0
+        self._fill_admissions_idle = asyncio.Event()
+        self._fill_admissions_idle.set()
         self._session_handler_tasks: set[asyncio.Task[None]] = set()
         self.listen_tasks: list[asyncio.Task[None]] = []
         self._session_cleanup_task: asyncio.Task[None] | None = None
@@ -1610,6 +1614,22 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             logger.error("Failed to start maker bot")
             logger.bind(sensitive=True).error(f"Failed to start maker bot: {e}")
             raise
+
+    async def close_fill_admission(self) -> None:
+        """Reject new fills and await already-accepted fill handlers, not sessions.
+
+        Acceptance occurs after synchronous offer validation, before the fill's
+        first await. An accepted session may still authenticate, acquire its
+        first ring binding, or consume a reserve after this method returns.
+        Treat the whole session as outstanding, not only existing ring records.
+
+        The sticky gate closes when this coroutine executes. Canceling its wait
+        cancels neither handlers nor settlement/recovery tasks. This does not
+        withdraw offers, stop resources, establish financial quiescence, or
+        authorize node retirement. A new process starts open as before.
+        """
+        self._fill_admission_closed = True
+        await self._fill_admissions_idle.wait()
 
     async def stop(self) -> None:
         """Stop the maker bot"""
