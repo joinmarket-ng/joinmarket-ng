@@ -112,6 +112,7 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
     sh /tmp/docker-apt-install.sh \
     libsecp256k1-2 \
     libsodium23 \
+    tini \
     whiptail \
     && rm -rf \
         /usr/local/bin/pip* \
@@ -164,4 +165,7 @@ VOLUME /home/jm/.joinmarket-ng
 # Users can override this with -e JOINMARKET_DATA_DIR=/custom/path
 ENV JOINMARKET_DATA_DIR=/home/jm/.joinmarket-ng
 
+# tini is PID 1: it forwards `docker stop`'s SIGTERM to the command and reaps
+# orphaned processes. A bare PID 1 ignores signals it has no handler for.
+ENTRYPOINT ["tini", "--"]
 CMD ["jm-taker", "--help"]

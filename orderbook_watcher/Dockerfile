@@ -109,6 +109,7 @@ RUN --mount=type=bind,source=scripts/docker-apt-install.sh,target=/tmp/docker-ap
     sh /tmp/docker-apt-install.sh \
     libsecp256k1-2 \
     libsodium23 \
+    tini \
     && rm -rf \
         /usr/local/bin/pip* \
         /usr/local/lib/python${PYTHON_VERSION%.*}/ensurepip \
@@ -150,4 +151,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" || exit 1
 
+# tini is PID 1: it forwards `docker stop`'s SIGTERM to the command and reaps
+# orphaned processes. A bare PID 1 ignores signals it has no handler for.
+ENTRYPOINT ["tini", "--"]
 CMD ["python", "-m", "orderbook_watcher.main"]
