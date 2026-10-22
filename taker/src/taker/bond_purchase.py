@@ -51,6 +51,7 @@ from jmcore.credential_market import (
     verify_authorization,
 )
 from jmcore.market_faults import MarketFaultCache
+from jmcore.paths import get_bond_purchases_path
 from jmcore.secure_files import ensure_private_directory
 from jmcore.settings import JoinMarketSettings
 from jmwallet.backends.base import BlockchainBackend
@@ -116,7 +117,7 @@ class _Review:
 
 
 def bond_purchases_dir(data_dir: Path) -> Path:
-    path = data_dir / "market" / "bond-purchases"
+    path = get_bond_purchases_path(data_dir)
     ensure_private_directory(path)
     return path
 
@@ -303,6 +304,37 @@ class BondPurchaser:
         self._transport_factory = transport_factory or (
             lambda: buyer_transport(settings, self._fault_cache)
         )
+
+    async def reconcile_payments(self, height: int) -> None:
+        """Resolve original payment history without requesting or buying a lease.
+
+        Delivery and import do not make a tracked payment terminal. This path
+        remains usable after a valid lease was adopted, and does not create a
+        purchase directory or infer payment failure from missing history.
+        Independently valid records remain monitored when another needs review.
+        """
+        records, unreadable = read_records(get_bond_purchases_path(self._data_dir))
+        period = period_at_height(height)
+        for record in records:
+            if problem := _record_problem(record):
+                logger.error("Bond purchase record {} needs review: {}", record.path.name, problem)
+                unreadable.append(record.path)
+                continue
+            if record.state in {"requested", "failed"}:
+                continue
+            try:
+                await self._resolve(record, period)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Cannot reconcile bond purchase {} ({})", record.path.name, type(exc).__name__
+                )
+        if unreadable:
+            logger.error(
+                "Bond purchase history needs review ({}); preserved without repair",
+                ", ".join(path.name for path in unreadable),
+            )
 
     async def lease(
         self, backend: BlockchainBackend, *, cap_sats: int, max_rate: float

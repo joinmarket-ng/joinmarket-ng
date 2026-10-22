@@ -12,10 +12,12 @@ caps and crash safety are the purchaser's (``taker.bond_purchase``).
 from __future__ import annotations
 
 import asyncio
+import stat
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
+from jmcore.paths import get_bond_purchases_path
 from jmcore.settings import JoinMarketSettings
 from loguru import logger
 
@@ -118,6 +120,12 @@ class BondLeaseBuyer:
         """Lease a bond if the maker needs one; False when one was needed but not leased."""
         bot = self._bot
         height = await bot.backend.get_block_height()
+        has_history = self._has_purchase_history()
+        if self._purchaser is not None or has_history:
+            # A usable owned or imported bond closes purchase admission, not
+            # the original payment monitor. Reconcile without opening a market
+            # transport, including after restart with a valid imported lease.
+            await self._get_purchaser().reconcile_payments(height)
         if not needs_lease(bot.fidelity_bond, height):
             return True
         if bot.fidelity_bond is not None:
@@ -133,6 +141,19 @@ class BondLeaseBuyer:
         await bot.adopt_leased_bond(await leased_bond_info(leased, bot.backend, height), height)
         self._last_warning = None
         return True
+
+    def _has_purchase_history(self) -> bool:
+        """Probe affirmative record files without importing the optional taker."""
+        directory = get_bond_purchases_path(self._settings.data_dir)
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(mode):
+            raise BondLeaseUnavailableError("bond purchase history needs directory review")
+        # Unlike glob(), iterdir() reports scan errors rather than silently
+        # turning inaccessible history into apparent absence.
+        return any(path.name.endswith(".json") for path in directory.iterdir())
 
     def _get_purchaser(self) -> Any:
         if self._purchaser is not None:

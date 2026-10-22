@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,7 +83,9 @@ class _Bot:
 
 
 def _buyer(bot: _Bot, result: Any) -> tuple[BondLeaseBuyer, AsyncMock]:
-    purchaser = SimpleNamespace(lease=AsyncMock(return_value=result))
+    purchaser = SimpleNamespace(
+        lease=AsyncMock(return_value=result), reconcile_payments=AsyncMock()
+    )
     buyer = BondLeaseBuyer(JoinMarketSettings(), bot, purchaser)  # type: ignore[arg-type]
     return buyer, purchaser.lease
 
@@ -142,6 +145,104 @@ async def test_an_owned_bond_is_never_replaced() -> None:
     assert bot.adopted == []
 
 
+@pytest.mark.parametrize("owned", [False, True])
+async def test_a_usable_bond_keeps_its_existing_payment_monitor(owned: bool) -> None:
+    bot = _Bot(_bond(owned=owned), 1)
+    buyer, lease = _buyer(bot, None)
+    reconcile = buyer._purchaser.reconcile_payments
+    assert await buyer.check()
+    reconcile.assert_awaited_once_with(1)
+    lease.assert_not_awaited()
+    assert bot.released == 0 and bot.adopted == []
+
+
+@pytest.mark.parametrize("history", ["missing", "empty", "unrelated"])
+async def test_a_bonded_maker_without_history_does_not_initialize_the_optional_buyer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, history: str
+) -> None:
+    directory = tmp_path / "market" / "bond-purchases"
+    if history != "missing":
+        directory.mkdir(parents=True)
+    if history == "unrelated":
+        (directory / "notes.txt").write_text("not purchase evidence")
+    before = set(tmp_path.rglob("*"))
+    buyer = BondLeaseBuyer(JoinMarketSettings(data_dir=tmp_path), _Bot(_bond(), 1))  # type: ignore[arg-type]
+    initialize = MagicMock(side_effect=AssertionError("optional purchaser must remain unloaded"))
+    monkeypatch.setattr(buyer, "_get_purchaser", initialize)
+    assert await buyer.check()
+    initialize.assert_not_called()
+    assert buyer._purchaser is None and set(tmp_path.rglob("*")) == before
+
+
+async def test_purchase_history_is_discovered_after_an_earlier_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buyer = BondLeaseBuyer(JoinMarketSettings(data_dir=tmp_path), _Bot(_bond(), 1))  # type: ignore[arg-type]
+    purchaser = SimpleNamespace(reconcile_payments=AsyncMock(), lease=AsyncMock())
+    initialize = MagicMock(return_value=purchaser)
+    monkeypatch.setattr(buyer, "_get_purchaser", initialize)
+    assert await buyer.check()
+    initialize.assert_not_called()
+    directory = tmp_path / "market" / "bond-purchases"
+    directory.mkdir(parents=True)
+    (directory / "existing.json").write_text("unreadable history still needs review")
+    assert await buyer.check()
+    initialize.assert_called_once_with()
+    purchaser.reconcile_payments.assert_awaited_once_with(1)
+    purchaser.lease.assert_not_awaited()
+
+
+@pytest.mark.parametrize("environment_override", [False, True])
+async def test_default_history_probe_does_not_create_the_data_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_override: bool
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("JOINMARKET_DATA_DIR", raising=False)
+    if environment_override:
+        monkeypatch.setenv("JOINMARKET_DATA_DIR", str(tmp_path / "custom"))
+    settings = JoinMarketSettings()
+    settings.data_dir = None
+    buyer = BondLeaseBuyer(settings, _Bot(_bond(), 1))  # type: ignore[arg-type]
+    initialize = MagicMock(side_effect=AssertionError("no purchaser without history"))
+    monkeypatch.setattr(buyer, "_get_purchaser", initialize)
+    assert await buyer.check()
+    assert list(tmp_path.iterdir()) == []
+    initialize.assert_not_called()
+
+
+@pytest.mark.parametrize("history", ["file", "symlink", "unreadable"])
+@pytest.mark.parametrize("initialized", [False, True])
+async def test_unknown_history_is_not_treated_as_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, history: str, initialized: bool
+) -> None:
+    directory = tmp_path / "market" / "bond-purchases"
+    directory.parent.mkdir()
+    if history == "file":
+        directory.write_text("not a directory")
+    elif history == "symlink":
+        directory.symlink_to(tmp_path, target_is_directory=True)
+    else:
+        directory.mkdir()
+        original_iterdir = Path.iterdir
+
+        def unreadable(path: Path) -> Any:
+            if path == directory:
+                raise PermissionError("history scan unavailable")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", unreadable)
+    buyer = BondLeaseBuyer(JoinMarketSettings(data_dir=tmp_path), _Bot(_bond(), 1))  # type: ignore[arg-type]
+    if initialized:
+        buyer._purchaser = SimpleNamespace(reconcile_payments=AsyncMock())
+    initialize = MagicMock(side_effect=AssertionError("no purchase initialization"))
+    monkeypatch.setattr(buyer, "_get_purchaser", initialize)
+    with pytest.raises((bond_lease_buyer.BondLeaseUnavailableError, PermissionError)):
+        await buyer.check()
+    initialize.assert_not_called()
+    if initialized:
+        buyer._purchaser.reconcile_payments.assert_not_awaited()
+
+
 async def test_leasing_needs_a_node_for_mixdepth_0() -> None:
     bot = _Bot(None, 1)
     bot.config.channel_ring = SimpleNamespace(mixdepth_nodes={1: "n1"}, nodes={})
@@ -173,6 +274,7 @@ async def test_managed_buyer_can_track_original_payment_without_an_active_mappin
         master_key=SimpleNamespace(get_public_key_bytes=lambda: bytes(OWNER.pub)),
     )
     settings: Any = SimpleNamespace(
+        data_dir=tmp_path,
         lightning=SimpleNamespace(mode="managed"),
         get_data_dir=lambda: tmp_path,
         network_config=SimpleNamespace(
@@ -195,6 +297,32 @@ async def test_managed_buyer_can_track_original_payment_without_an_active_mappin
         == "succeeded"
     )
     client.track_payment.assert_awaited_once_with(b"\x42" * 32)
+
+    # A fresh buyer discovers durable history even with a valid adopted bond
+    # and no ACTIVE node. It must use the retained original payer and hash.
+    directory = tmp_path / "market" / "bond-purchases"
+    directory.mkdir(parents=True)
+    record = directory / "existing.json"
+    record.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "state": "done",
+                "period": 0,
+                "payment_state": "pending",
+                "payer": original.identity_pubkey,
+                "payment_hash": "42" * 32,
+                "seller_pubkey": bytes(OWNER.pub).hex(),
+                "cert_pubkey": bytes(CERTIFICATE.pub).hex(),
+            }
+        )
+    )
+    bot.fidelity_bond = _bond()
+    assert await BondLeaseBuyer(settings, bot).check()  # type: ignore[arg-type]
+    assert client.track_payment.await_count == 2
+    client.track_payment.assert_awaited_with(b"\x42" * 32)
+    assert json.loads(record.read_text())["payment_state"] == "succeeded"
+    assert bot.adopted == [] and bot.released == 0
 
 
 async def test_run_waits_for_the_maker_and_keeps_retrying(

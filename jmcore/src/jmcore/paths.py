@@ -64,19 +64,20 @@ def get_nick_state_component(role: NickRole, address_type: str) -> str:
     return f"{role}{suffix}"
 
 
-def get_default_data_dir() -> Path:
+def get_default_data_dir(*, create: bool = True) -> Path:
     """
     Get the default JoinMarket data directory.
 
     Returns ~/.joinmarket-ng or $JOINMARKET_DATA_DIR if set.
-    Creates the directory if it doesn't exist.
+    Creates the directory unless ``create=False`` requests read-only inspection.
 
     For compatibility with reference JoinMarket in Docker, users can
     set JOINMARKET_DATA_DIR=/home/jm/.joinmarket-ng to share the same volume.
     """
     env_path = os.getenv("JOINMARKET_DATA_DIR")
     data_dir = Path(env_path) if env_path else Path.home() / ".joinmarket-ng"
-    ensure_sensitive_directory(data_dir)
+    if create:
+        ensure_sensitive_directory(data_dir)
 
     return data_dir
 
@@ -131,6 +132,13 @@ def get_market_store_path(data_dir: Path | None = None) -> Path:
     if data_dir is None:
         data_dir = get_default_data_dir()
     return data_dir / "market" / "seller.sqlite"
+
+
+def get_bond_purchases_path(data_dir: Path | None = None) -> Path:
+    """Locate bond-lease payment history without creating or changing it."""
+    if data_dir is None:
+        data_dir = get_default_data_dir(create=False)
+    return data_dir / "market" / "bond-purchases"
 
 
 def get_ignored_makers_path(data_dir: Path | None = None) -> Path:

@@ -591,6 +591,143 @@ async def test_delivery_never_proves_settlement_across_periods(
     assert len(payer.paid) == 2
 
 
+@pytest.mark.parametrize("delivery_state", ["done", "paying", "invalid", "unimported"])
+@pytest.mark.parametrize("outcome", ["succeeded", "failed", "pending", "lookup_error"])
+async def test_status_only_reconciliation_after_restart_never_buys_or_imports(
+    tmp_path: Path,
+    market: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_state: str,
+    outcome: str,
+) -> None:
+    transport = _market((0xB2, 6_000))
+    payer = _Payer()
+    if delivery_state == "paying":
+        transport.deliver = False
+    elif delivery_state == "invalid":
+        monkeypatch.setattr(bond_purchase, "open_delivery", Mock(side_effect=ValueError("junk")))
+    elif delivery_state == "unimported":
+        market.import_error = "conflict"
+    await _lease(_purchaser(tmp_path, transport, payer), market)
+    (before,) = _records(tmp_path)
+    assert before["state"] == delivery_state and before["payment_state"] == "pending"
+    status = AsyncMock(return_value=outcome)
+    if outcome == "lookup_error":
+        status.side_effect = OSError("original node unavailable")
+    monkeypatch.setattr(payer, "status", status)
+    factory = Mock(side_effect=AssertionError("no market connection during status polling"))
+    purchaser = BondPurchaser(
+        _settings(tmp_path), payer, wallet_fingerprint=FINGERPRINT, transport_factory=factory
+    )
+    imported = list(market.imported)
+    market.backend.reset_mock()
+    await purchaser.reconcile_payments(market.height)
+    status.assert_awaited_once_with(PaymentIdentity(before["payer"], before["payment_hash"]))
+    factory.assert_not_called()
+    market.backend.get_utxo.assert_not_awaited()
+    assert market.imported == imported and len(payer.paid) == 1
+    (after,) = _records(tmp_path)
+    if outcome in {"pending", "lookup_error"}:
+        assert after == before
+    else:
+        assert after["payment_state"] == outcome
+        assert after["state"] == ("failed" if outcome == "failed" else delivery_state)
+        await purchaser.reconcile_payments(market.height)
+        assert status.await_count == 1
+
+
+@pytest.mark.parametrize("history", ["missing", "empty"])
+async def test_reconciliation_without_history_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, history: str
+) -> None:
+    if history == "empty":
+        (tmp_path / "market" / "bond-purchases").mkdir(parents=True)
+    payer = _Payer()
+    status = AsyncMock()
+    monkeypatch.setattr(payer, "status", status)
+    purchaser = _purchaser(tmp_path, _market(), payer)
+    factory = Mock(side_effect=AssertionError("no transport"))
+    purchaser._transport_factory = factory
+    before = set(tmp_path.rglob("*"))
+    await purchaser.reconcile_payments(1)
+    assert set(tmp_path.rglob("*")) == before
+    status.assert_not_awaited()
+    factory.assert_not_called()
+    assert payer.paid == []
+
+
+@pytest.mark.parametrize(
+    "content", ["{not json", '{"version":2,"state":"paying"}', '{"version":1,"state":"paying"}']
+)
+async def test_corrupt_history_does_not_stop_independent_payment_monitoring_or_allow_buying(
+    tmp_path: Path, market: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    payer = _Payer()
+    transport = _market((0xB2, 6_000))
+    purchaser = _purchaser(tmp_path, transport, payer)
+    await _lease(purchaser, market)
+    unknown = tmp_path / "market" / "bond-purchases" / "unknown.json"
+    unknown.write_text(content)
+    status = AsyncMock(return_value="succeeded")
+    monkeypatch.setattr(payer, "status", status)
+    transport.requests.clear()
+    await purchaser.reconcile_payments(market.height)
+    assert unknown.read_text() == content
+    valid = next(path for path in unknown.parent.glob("*.json") if path != unknown)
+    assert json.loads(valid.read_text())["payment_state"] == "succeeded"
+    assert status.await_count == 1
+    assert await _lease(purchaser, market) is None
+    assert unknown.read_text() == content and len(payer.paid) == 1 and transport.requests == []
+
+
+async def test_status_only_reconciliation_preserves_existing_expired_undelivered_transition(
+    tmp_path: Path, market: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = _market((0xB2, 6_000))
+    transport.deliver = False
+    payer = _Payer()
+    purchaser = _purchaser(tmp_path, transport, payer)
+    await _lease(purchaser, market)
+    before = _records(tmp_path)[0]
+    status = AsyncMock(return_value="succeeded")
+    monkeypatch.setattr(payer, "status", status)
+    purchaser._transport_factory = Mock(side_effect=AssertionError("no transport"))
+    await purchaser.reconcile_payments(2017)
+    after = _records(tmp_path)[0]
+    assert after == {**before, "state": "unused", "payment_state": "succeeded"}
+    await purchaser.reconcile_payments(2017)
+    assert status.await_count == 1 and len(payer.paid) == 1
+
+
+async def test_status_only_reconciliation_leaves_requested_and_failed_records_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "market" / "bond-purchases"
+    directory.mkdir(parents=True)
+    for state in ("requested", "failed"):
+        (directory / f"{state}.json").write_text(json.dumps({"version": 1, "state": state}))
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+    payer = _Payer()
+    status = AsyncMock(side_effect=AssertionError("no payment intent"))
+    monkeypatch.setattr(payer, "status", status)
+    await _purchaser(tmp_path, _market(), payer).reconcile_payments(2017)
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+    status.assert_not_awaited()
+
+
+async def test_status_poll_cancellation_keeps_pending_history(
+    tmp_path: Path, market: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payer = _Payer()
+    purchaser = _purchaser(tmp_path, _market((0xB2, 6_000)), payer)
+    await _lease(purchaser, market)
+    before = _records(tmp_path)
+    monkeypatch.setattr(payer, "status", AsyncMock(side_effect=asyncio.CancelledError))
+    with pytest.raises(asyncio.CancelledError):
+        await purchaser.reconcile_payments(market.height)
+    assert _records(tmp_path) == before and len(payer.paid) == 1
+
+
 @pytest.mark.asyncio
 async def test_cancellation_during_payment_keeps_a_blocking_record(
     tmp_path: Path,

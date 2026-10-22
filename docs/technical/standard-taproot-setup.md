@@ -450,6 +450,13 @@ is collected after a crash. At most one lease is paid for per period:
 - An unreadable or unknown record blocks every purchase until it is reviewed,
   since it proves neither that nothing was paid nor that a payment resolved.
 
+With leasing enabled, payment monitoring continues even when the maker already
+has a usable owned or imported bond. After an upgrade or restart, existing
+purchase records resume status checks on their original payer; this does not
+request, pay for, or reimport a lease. Missing or empty history creates no
+directory or marker and does not initialize the optional purchaser. Unreadable
+records remain unchanged while independently valid payments are monitored.
+
 Deriving the renter key from the seed would not help recovery, since the
 owner's certificate signature cannot be recovered from the seed either. A
 delivered lease is imported into the bond registry as an external entry. A
