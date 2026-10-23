@@ -739,7 +739,7 @@
 # Timeouts and intervals
 # maker_timeout_sec = 60         # Range: 10-3600 seconds
 # initial_confirmation_timeout_sec = 300  # Initial preview expiry; 0 disables
-# order_wait_time = 120.0        # Max seconds to wait (range: 1-3600)
+# order_wait_time = 120.0        # Preselection budget, including peerlist and reconnect (range: 1-3600)
 # orderbook_min_wait = 30.0      # Min seconds before early exit is allowed
 # orderbook_quiet_period = 15.0  # Seconds of silence to trigger early exit
 # rescan_interval_sec = 600

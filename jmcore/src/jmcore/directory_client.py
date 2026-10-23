@@ -1343,6 +1343,7 @@ class DirectoryClient:
         duration: float = 5.0,
         *,
         keep: Callable[[dict[str, Any]], bool] | None = None,
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
         """
         Listen for messages for a specified duration.
@@ -1356,6 +1357,8 @@ class DirectoryClient:
                 messages are discarded, and messages beyond the collection limits are
                 dropped instead of closing the connection, so relayed traffic from
                 other peers cannot end the caller's collection.
+            deadline: Optional absolute event-loop deadline for reads and PONG
+                sends. Expiry returns messages already collected.
 
         Returns:
             List of received messages
@@ -1373,6 +1376,9 @@ class DirectoryClient:
         messages: list[dict[str, Any]] = []
         total_message_bytes = 0
         start_time = asyncio.get_event_loop().time()
+        end_time = start_time + duration
+        if deadline is not None:
+            end_time = min(end_time, deadline)
 
         def collect(message: dict[str, Any]) -> None:
             nonlocal total_message_bytes
@@ -1410,9 +1416,9 @@ class DirectoryClient:
         consecutive_errors = 0
         max_consecutive_errors = 5
 
-        while asyncio.get_event_loop().time() - start_time < duration:
+        while asyncio.get_event_loop().time() < end_time:
             try:
-                remaining_time = duration - (asyncio.get_event_loop().time() - start_time)
+                remaining_time = end_time - asyncio.get_event_loop().time()
                 if remaining_time <= 0:
                     break
 
@@ -1428,7 +1434,8 @@ class DirectoryClient:
 
                 # Handle PING immediately by sending PONG back -- don't buffer
                 if response.get("type") == MessageType.PING.value:
-                    await self._send_pong()
+                    async with asyncio.timeout_at(deadline):
+                        await self._send_pong()
                     consecutive_errors = 0
                     continue
 
@@ -1470,6 +1477,7 @@ class DirectoryClient:
         max_wait: float = 120.0,
         min_wait: float = 30.0,
         quiet_period: float = 15.0,
+        deadline: float | None = None,
     ) -> tuple[list[Offer], list[FidelityBond]]:
         """
         Fetch orderbooks from all connected peers.
@@ -1490,13 +1498,29 @@ class DirectoryClient:
             quiet_period: Seconds without new offers to trigger early exit (default 15).
                 After min_wait, if no new offers arrive for this long, all responsive
                 makers are assumed to have replied.
+            deadline: Optional absolute event-loop deadline, including PEERLIST and
+                the orderbook request. Normal collection expiry still returns the
+                offers received; parsing and connection cleanup may finish afterward.
 
         Returns:
             Tuple of (offers, fidelity_bonds)
         """
         # Use get_peerlist_with_features to populate peer_features cache for neutrino_compat
         # detection. The peerlist itself is not used for offer filtering.
-        peers_with_features = await self.get_peerlist_with_features()
+        async with asyncio.timeout_at(deadline):
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                return [], []
+            peers_with_features = await self.get_peerlist_with_features()
+            if not self.connection:
+                raise DirectoryClientError("Not connected")
+            pubmsg = {
+                "type": MessageType.PUBMSG.value,
+                "line": f"{self.nick}!PUBLIC!orderbook",
+            }
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("Orderbook request deadline expired")
+            await self.connection.send(json.dumps(pubmsg).encode("utf-8"))
+        logger.debug("Sent !orderbook broadcast to PUBLIC")
         offers: list[Offer] = []
         bonds: list[FidelityBond] = []
         bond_claim_set: set[str] = set()
@@ -1506,16 +1530,6 @@ class DirectoryClient:
             logger.bind(sensitive=True).debug(
                 f"Found {len(peers_with_features)} peers on {self.host}:{self.port}"
             )
-
-        if not self.connection:
-            raise DirectoryClientError("Not connected")
-
-        pubmsg = {
-            "type": MessageType.PUBMSG.value,
-            "line": f"{self.nick}!PUBLIC!orderbook",
-        }
-        await self.connection.send(json.dumps(pubmsg).encode("utf-8"))
-        logger.debug("Sent !orderbook broadcast to PUBLIC")
 
         # Adaptive orderbook listening: instead of waiting a fixed duration, we listen
         # in small chunks and exit early once offers stop arriving. This dramatically
@@ -1533,6 +1547,8 @@ class DirectoryClient:
         #     responsive makers have replied.
 
         # Sanity: clamp min_wait and quiet_period so they fit within max_wait
+        if deadline is not None:
+            max_wait = min(max_wait, max(0.0, deadline - asyncio.get_running_loop().time()))
         min_wait = min(min_wait, max_wait)
         quiet_period = min(quiet_period, max_wait - min_wait) if max_wait > min_wait else 0.0
 
@@ -1554,12 +1570,15 @@ class DirectoryClient:
         total_message_bytes = 0
         offer_count = 0
         start_time = asyncio.get_event_loop().time()
+        end_time = start_time + max_wait
+        if deadline is not None:
+            end_time = min(end_time, deadline)
         last_offer_time = start_time
         chunk_duration = 1.0  # Listen in 1s chunks for responsiveness
 
         while True:
             elapsed = asyncio.get_event_loop().time() - start_time
-            if elapsed >= max_wait:
+            if asyncio.get_event_loop().time() >= end_time:
                 break
 
             # Check early exit: past min_wait and no new offers for quiet_period
@@ -1572,14 +1591,21 @@ class DirectoryClient:
                     )
                     break
 
-            remaining = max_wait - elapsed
+            remaining = end_time - asyncio.get_event_loop().time()
             listen_time = min(chunk_duration, remaining)
             if listen_time <= 0:
                 break
 
             # Relayed public traffic is filtered while listening, so a flood can
             # neither fill the collection nor close the directory connection.
-            chunk = await self.listen_for_messages(duration=listen_time, keep=is_orderbook_message)
+            if deadline is None:
+                chunk = await self.listen_for_messages(
+                    duration=listen_time, keep=is_orderbook_message
+                )
+            else:
+                chunk = await self.listen_for_messages(
+                    duration=listen_time, keep=is_orderbook_message, deadline=deadline
+                )
             new_offers = 0
             for msg in chunk:
                 try:
