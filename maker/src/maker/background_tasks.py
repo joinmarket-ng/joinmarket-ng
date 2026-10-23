@@ -137,12 +137,13 @@ class BackgroundTasksMixin:
     async def _periodic_rate_limit_status(self) -> None:
         """Background task to periodically log rate limiting statistics.
 
-        This runs every hour to provide visibility into spam/abuse without
-        flooding logs. Shows:
-        - Total violations across all peers
-        - Currently banned peers
-        - Top violators (by violation count)
-        - Aggregate response admissions, transport-budget drops, and directory fanout
+        This runs every hour. Shows:
+        - Aggregate response admissions, transport-budget drops, and directory fanout (INFO)
+        - Total violations, currently banned peers, and top violators (DEBUG)
+
+        Spam is handled automatically by the rate limiters and is not
+        operator-actionable, so per-peer violation and ban statistics stay at
+        DEBUG and do not surface at the default log level.
         """
         # First log after 10 minutes (give time for initial activity)
         await asyncio.sleep(600)
@@ -174,7 +175,7 @@ class BackgroundTasksMixin:
                         f"{nick}({count})" for nick, count in stats["top_violators"][:5]
                     )
 
-                    logger.info(
+                    logger.debug(
                         f"Rate limit status: {stats['total_violations']} total violations, "
                         f"{banned_count} banned peer(s)"
                         + (f" [{banned_list}]" if banned_count > 0 else "")
@@ -197,7 +198,7 @@ class BackgroundTasksMixin:
                         f"{conn}({count})" for conn, count in direct_stats["top_violators"][:5]
                     )
 
-                    logger.info(
+                    logger.debug(
                         f"Direct connection rate limit: {direct_stats['total_violations']} "
                         f"violations, {banned_count} banned connection(s)"
                         + (f" [{banned_list}]" if banned_count > 0 else "")
@@ -228,9 +229,15 @@ class BackgroundTasksMixin:
         - Total directory servers configured
         - Currently connected servers
         - Disconnected servers (if any)
+
+        An outage is reported at WARNING once when it appears or changes and
+        recovery at INFO once; an unchanged state is repeated only at DEBUG so
+        a long-lived outage does not re-warn every 10 minutes.
         """
         # First log after 5 minutes (give time for initial connection)
         await asyncio.sleep(300)
+
+        reported_disconnected: frozenset[str] = frozenset()
 
         while self.running:
             try:
@@ -253,17 +260,27 @@ class BackgroundTasksMixin:
                     disconnected_str = ", ".join(disconnected_servers[:5])
                     if len(disconnected_servers) > 5:
                         disconnected_str += f", ... and {len(disconnected_servers) - 5} more"
-                    logger.warning(
+                    message = (
                         f"Directory connection status: {connected_count}/{total_servers} "
                         f"connected. Disconnected: [{disconnected_str}]"
                     )
+                    if frozenset(disconnected_servers) != reported_disconnected:
+                        logger.warning(message)
+                    else:
+                        logger.debug(message)
+                    reported_disconnected = frozenset(disconnected_servers)
                 else:
-                    # Healthy state: keep at DEBUG so long-running makers do not
-                    # spam INFO every 10 minutes. Use --log-level DEBUG to see it.
-                    logger.debug(
+                    message = (
                         f"Directory connection status: {connected_count}/{total_servers} connected "
                         f"[{', '.join(connected_servers)}]"
                     )
+                    if reported_disconnected:
+                        logger.info(message)
+                    else:
+                        # Healthy state: keep at DEBUG so long-running makers do not
+                        # spam INFO every 10 minutes. Use --log-level DEBUG to see it.
+                        logger.debug(message)
+                    reported_disconnected = frozenset()
 
                 # Log again in 10 minutes
                 await asyncio.sleep(600)

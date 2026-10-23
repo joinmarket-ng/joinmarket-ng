@@ -1175,6 +1175,53 @@ async def test_directory_status_reports_rotation_gap_as_info(
     assert fragment in status[0][1]
 
 
+@pytest.mark.asyncio
+async def test_directory_status_warns_only_when_disconnected_set_changes(
+    config: MakerConfig,
+) -> None:
+    """An unchanged outage repeats at DEBUG; changes WARN and recovery is INFO once."""
+    from loguru import logger
+
+    config = config.model_copy(update={"directory_servers": ["a.onion:5222", "b.onion:5222"]})
+    backend = MagicMock()
+    backend.can_provide_neutrino_metadata.return_value = False
+    bot = MakerBot(wallet=MagicMock(), backend=backend, config=config)
+    bot.running = True
+    records: list[tuple[str, str]] = []
+    handler = logger.add(
+        lambda message: records.append(
+            (message.record["level"].name, str(message.record["message"]))
+        ),
+        level="DEBUG",
+    )
+    # Connected set after each 10-minute tick (the first tick observes nothing connected).
+    schedule: list[set[str] | None] = [set(), {"a.onion:5222"}, {"a.onion:5222", "b.onion:5222"}]
+    schedule += [{"a.onion:5222", "b.onion:5222"}, None]
+
+    async def fake_sleep(delay: float) -> None:
+        if delay != 600:
+            return
+        connected = schedule.pop(0)
+        if connected is None:
+            bot.running = False
+            return
+        bot.directory_clients.clear()
+        for server in connected:
+            bot.directory_clients[server] = MagicMock()
+
+    try:
+        with patch("maker.background_tasks.asyncio.sleep", side_effect=fake_sleep):
+            await bot._periodic_directory_connection_status()
+    finally:
+        logger.remove(handler)
+
+    status = [record for record in records if record[1].startswith("Directory connection status:")]
+    assert [level for level, _ in status] == ["WARNING", "DEBUG", "WARNING", "INFO", "DEBUG"]
+    assert "0/2 connected. Disconnected: [a.onion:5222, b.onion:5222]" in status[0][1]
+    assert "1/2 connected. Disconnected: [b.onion:5222]" in status[2][1]
+    assert "2/2 connected" in status[3][1]
+
+
 def _with_onion(bot: MakerBot, tor_control: MagicMock) -> MakerGeneration:
     from jmcore.tor_control import EphemeralHiddenService
 
