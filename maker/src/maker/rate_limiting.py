@@ -138,6 +138,9 @@ class OrderbookRateLimiter:
         self._banned_peers: dict[str, float] = {}  # peer_nick -> ban_timestamp
         self._fanout_sources: dict[str, set[str]] = {}
         self._fanout_duplicates = 0
+        # Monotonic since startup; per-peer counts above reset on ban expiry and cleanup.
+        self._cumulative_violations = 0
+        self._cumulative_bans = 0
         self.max_tracked_identities = max_tracked_identities
         self._tracked_identities: OrderedDict[str, None] = OrderedDict()
 
@@ -180,6 +183,7 @@ class OrderbookRateLimiter:
                 # Still banned, increment violation count
                 new_violations = self._violation_counts.get(peer_nick, 0) + 1
                 self._violation_counts[peer_nick] = new_violations
+                self._cumulative_violations += 1
                 logger.debug(
                     f"Rejecting request from banned peer {peer_nick} "
                     f"(remaining={remaining:.0f}s, violations={new_violations})"
@@ -203,9 +207,12 @@ class OrderbookRateLimiter:
         # Check if peer should be banned based on violations
         if violations >= self.violation_ban_threshold:
             self._banned_peers[peer_nick] = now
+            self._cumulative_bans += 1
             # Get backoff history for detailed logging
             backoff_level = self._get_backoff_level_name(violations)
-            logger.warning(
+            # Bans are automatic self-protection, not operator-actionable: keep
+            # them at DEBUG so spammers do not surface at the default log level.
+            logger.debug(
                 f"BANNED peer {peer_nick} for {self.ban_duration}s "
                 f"after {violations} rate limit violations (final backoff: {backoff_level})"
             )
@@ -239,6 +246,7 @@ class OrderbookRateLimiter:
         # Rate limited - record violation
         new_violations = violations + 1
         self._violation_counts[peer_nick] = new_violations
+        self._cumulative_violations += 1
         time_until_allowed = effective_interval - elapsed
         backoff_level = self._get_backoff_level_name(new_violations)
         logger.debug(
@@ -340,6 +348,8 @@ class OrderbookRateLimiter:
                 - banned_peers: List of currently banned peer nicks
                 - top_violators: List of (nick, violations) tuples, top 10
                 - fanout_duplicates: Cumulative cross-directory duplicates suppressed
+                - cumulative_violations: Violations since startup (never reset)
+                - cumulative_bans: Bans issued since startup (never reset)
         """
         now = time.monotonic()
 
@@ -363,6 +373,8 @@ class OrderbookRateLimiter:
             "banned_peers": banned,
             "top_violators": top_violators,
             "fanout_duplicates": self._fanout_duplicates,
+            "cumulative_violations": self._cumulative_violations,
+            "cumulative_bans": self._cumulative_bans,
         }
 
 
@@ -423,6 +435,9 @@ class DirectConnectionRateLimiter:
 
         # Banned connections
         self._banned: dict[str, float] = {}
+        # Monotonic since startup; per-connection counts above reset on ban expiry and cleanup.
+        self._cumulative_violations = 0
+        self._cumulative_bans = 0
         self.max_tracked_identities = max_tracked_identities
         self._tracked_identities: OrderedDict[str, None] = OrderedDict()
 
@@ -502,6 +517,7 @@ class DirectConnectionRateLimiter:
             if now - self._banned[conn_id] < self.ban_duration:
                 violations = self._orderbook_violations.get(conn_id, 0) + 1
                 self._orderbook_violations[conn_id] = violations
+                self._cumulative_violations += 1
                 return False
             # Ban expired
             del self._banned[conn_id]
@@ -516,11 +532,13 @@ class DirectConnectionRateLimiter:
         # Rate limited - record violation
         violations = self._orderbook_violations.get(conn_id, 0) + 1
         self._orderbook_violations[conn_id] = violations
+        self._cumulative_violations += 1
 
         # Check if should be banned
         if violations >= self.orderbook_ban_threshold:
             self._banned[conn_id] = now
-            logger.warning(
+            self._cumulative_bans += 1
+            logger.debug(
                 f"BANNED direct connection {conn_id} for {self.ban_duration}s "
                 f"after {violations} orderbook violations"
             )
@@ -598,4 +616,6 @@ class DirectConnectionRateLimiter:
             "tracked_connections": len(self._message_last_update),
             "banned_connections": banned,
             "top_violators": top_violators,
+            "cumulative_violations": self._cumulative_violations,
+            "cumulative_bans": self._cumulative_bans,
         }

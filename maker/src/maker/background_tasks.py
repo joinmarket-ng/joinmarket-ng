@@ -139,18 +139,29 @@ class BackgroundTasksMixin:
 
         This runs every hour. Shows:
         - Aggregate response admissions, transport-budget drops, and directory fanout (INFO)
+        - Spam episodes: start, one reminder per hour with that hour's delta, end (INFO)
         - Total violations, currently banned peers, and top violators (DEBUG)
 
-        Spam is handled automatically by the rate limiters and is not
-        operator-actionable, so per-peer violation and ban statistics stay at
-        DEBUG and do not surface at the default log level.
+        Spam is reported as episodes rather than per event so log volume stays
+        bounded no matter how hard a spammer pushes: a quiet maker logs nothing,
+        an attacked maker logs one line per hour, and an episode ends after a
+        full hour with no violation and no active ban. Per-event bans and the
+        detailed per-peer statistics stay at DEBUG.
         """
         # First log after 10 minutes (give time for initial activity)
         await asyncio.sleep(600)
 
+        episode_started_at: float | None = None
+        episode_last_active_at = 0.0
+        episode_start_violations = 0
+        episode_start_bans = 0
+        seen_violations = 0
+        seen_bans = 0
+
         while self.running:
             try:
                 stats = self._orderbook_rate_limiter.get_statistics()
+                direct_stats = self._direct_connection_rate_limiter.get_statistics()
 
                 counts = self._orderbook_response_counts
                 if any(counts.values()) or stats["fanout_duplicates"]:
@@ -163,6 +174,46 @@ class BackgroundTasksMixin:
                         f"suppressed={counts['direct_suppressed']}; "
                         f"fanout duplicates={stats['fanout_duplicates']}"
                     )
+
+                violations = stats["cumulative_violations"] + direct_stats["cumulative_violations"]
+                bans = stats["cumulative_bans"] + direct_stats["cumulative_bans"]
+                new_violations = violations - seen_violations
+                new_bans = bans - seen_bans
+                seen_violations, seen_bans = violations, bans
+                banned_now = len(stats["banned_peers"]) + len(direct_stats["banned_connections"])
+                now = time.monotonic()
+                if new_violations > 0 or banned_now > 0:
+                    top = sorted(
+                        stats["top_violators"] + direct_stats["top_violators"],
+                        key=lambda item: item[1],
+                        reverse=True,
+                    )[:3]
+                    detail = (
+                        f"+{new_violations} violations, +{new_bans} bans since last report; "
+                        f"{banned_now} currently banned"
+                        + (
+                            f"; top: {', '.join(f'{peer}({count})' for peer, count in top)}"
+                            if top
+                            else ""
+                        )
+                    )
+                    if episode_started_at is None:
+                        episode_started_at = now
+                        episode_start_violations = violations - new_violations
+                        episode_start_bans = bans - new_bans
+                        logger.info(f"Spam episode started: {detail}")
+                    else:
+                        hours = (now - episode_started_at) / 3600
+                        logger.info(f"Spam episode ongoing ({hours:.0f}h): {detail}")
+                    episode_last_active_at = now
+                elif episode_started_at is not None:
+                    hours = (episode_last_active_at - episode_started_at) / 3600
+                    logger.info(
+                        f"Spam episode ended (quiet for an hour) after {hours:.0f}h: "
+                        f"{violations - episode_start_violations} violations, "
+                        f"{bans - episode_start_bans} bans in total"
+                    )
+                    episode_started_at = None
 
                 # Only log if there's activity worth reporting
                 if stats["total_violations"] > 0 or stats["banned_peers"]:
@@ -187,7 +238,6 @@ class BackgroundTasksMixin:
                     )
 
                 # Also log direct connection rate limiter stats if any activity
-                direct_stats = self._direct_connection_rate_limiter.get_statistics()
                 if direct_stats["total_violations"] > 0 or direct_stats["banned_connections"]:
                     banned_count = len(direct_stats["banned_connections"])
                     banned_list = ", ".join(direct_stats["banned_connections"][:5])

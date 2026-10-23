@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jmcore.crypto import NickIdentity
@@ -138,6 +138,65 @@ async def test_direct_command_summary_uses_trace(
 
     assert_trace(captured_logs, f"Direct message from {taker.nick}: cmd=unknown")
     assert_trace(captured_logs, f"Unknown direct command from {taker.nick}: unknown")
+
+
+@pytest.mark.asyncio
+async def test_spam_is_reported_as_bounded_episodes(
+    maker_bot: MakerBot, captured_logs: list[LogRecord]
+) -> None:
+    """One INFO line on start, one per hour while it lasts, one on end; bans stay at DEBUG."""
+    clock = [10_000.0]
+    orderbook = maker_bot._orderbook_rate_limiter
+    direct = maker_bot._direct_connection_rate_limiter
+
+    def spam(nick: str, requests: int) -> None:
+        for _ in range(requests):
+            orderbook.check(nick, source="dir:localhost:5222")
+
+    # Actions taken after each hourly tick (ticks happen at 10min, then every hour).
+    after_tick: list[object] = [lambda: spam("J5other", 3), None, None, "stop"]
+    maker_bot.running = True
+
+    async def sleep(delay: float) -> None:
+        clock[0] += delay
+        if delay != 3600:
+            return
+        action = after_tick.pop(0)
+        if action == "stop":
+            maker_bot.running = False
+        elif callable(action):
+            action()
+
+    with (
+        patch("maker.background_tasks.asyncio.sleep", side_effect=sleep),
+        patch("maker.background_tasks.time.monotonic", side_effect=lambda: clock[0]),
+        patch("maker.rate_limiting.time.monotonic", side_effect=lambda: clock[0]),
+    ):
+        # First request is admitted; the ban lands on the check after the threshold is reached.
+        spam("J5spammer", orderbook.violation_ban_threshold + 2)
+        for _ in range(direct.orderbook_ban_threshold + 1):
+            direct.check_orderbook("peer:1")
+        assert orderbook.is_banned("J5spammer")
+        assert direct.is_banned("peer:1")
+
+        await maker_bot._periodic_rate_limit_status()
+
+    episodes = [message for _, message in captured_logs if message.startswith("Spam episode")]
+    assert [message.split("; top")[0] for message in episodes] == [
+        "Spam episode started: +110 violations, +2 bans since last report; 2 currently banned",
+        "Spam episode ongoing (1h): +2 violations, +0 bans since last report; 0 currently banned",
+        "Spam episode ended (quiet for an hour) after 1h: 112 violations, 2 bans in total",
+    ]
+    assert [level for level, message in captured_logs if message.startswith("Spam episode")] == [
+        "INFO"
+    ] * 3
+    detail = [
+        level
+        for level, message in captured_logs
+        if message.startswith(("BANNED", "Rate limit status:", "Direct connection rate limit:"))
+    ]
+    assert detail and set(detail) == {"DEBUG"}
+    assert [m for level, m in captured_logs if level in {"INFO", "WARNING", "ERROR"}] == episodes
 
 
 @pytest.mark.asyncio
