@@ -911,6 +911,7 @@ class DirectoryClient:
         all_peers: list[tuple[str, str, FeatureSet]] = []
         chunks_received = 0
         got_first_response = False
+        last_chunk_at = 0.0
         response_incomplete = False
 
         # Bound non-connection errors (e.g. malformed payloads) so a
@@ -933,8 +934,10 @@ class DirectoryClient:
                         return _PeerlistFetchResult(peers=(), snapshot=None)
                     receive_timeout = remaining
                 else:
-                    # Already received at least one chunk - use shorter inter-chunk timeout
-                    receive_timeout = inter_chunk_timeout
+                    # Already received at least one chunk - use shorter inter-chunk
+                    # timeout, measured from the last chunk so that other relayed
+                    # traffic cannot keep the fetch open.
+                    receive_timeout = max(0.0, inter_chunk_timeout - (elapsed - last_chunk_at))
 
                 try:
                     if use_inflight_sink:
@@ -950,6 +953,7 @@ class DirectoryClient:
                         self._discard_peerlist_chunk(peerlist_str)
                         consecutive_errors = 0
                         got_first_response = True
+                        last_chunk_at = asyncio.get_event_loop().time() - start_time
                         chunks_received += 1
                         chunk_peers, chunk_malformed = self._process_peerlist_response(peerlist_str)
                         response_incomplete = response_incomplete or chunk_malformed
@@ -970,6 +974,7 @@ class DirectoryClient:
 
                     if msg_type == MessageType.PEERLIST.value:
                         got_first_response = True
+                        last_chunk_at = asyncio.get_event_loop().time() - start_time
                         chunks_received += 1
                         peerlist_str = response.get("line", "")
                         chunk_peers, chunk_malformed = self._process_peerlist_response(peerlist_str)
@@ -991,7 +996,12 @@ class DirectoryClient:
                     logger.trace(
                         f"Buffering unexpected message type {msg_type} while waiting for PEERLIST"
                     )
-                    self._buffer_message(response)
+                    try:
+                        self._buffer_message(response)
+                    except _DirectoryClientLimitError:
+                        # Relayed traffic from any peer lands here; dropping it
+                        # keeps the bound without disconnecting from the directory.
+                        logger.trace("Dropping message while waiting for PEERLIST: buffer full")
 
                 except TimeoutError:
                     if not got_first_response:
@@ -1412,15 +1422,19 @@ class DirectoryClient:
             chunk = await self.listen_for_messages(duration=listen_time)
             new_offers = 0
             for msg in chunk:
+                # Lightweight offer detection: check if the line contains an offer type
+                line = msg.get("line", "")
+                is_offer = any(prefix in line for prefix in offer_prefixes)
+                if not is_offer and msg.get("type") != MessageType.PEERLIST.value:
+                    continue
                 try:
                     total_message_bytes = self._append_collected_message(
                         messages, msg, total_message_bytes, "orderbook fetch"
                     )
-                except _DirectoryClientLimitError as e:
-                    await self._abort_for_resource_limit(e)
-                # Lightweight offer detection: check if the line contains an offer type
-                line = msg.get("line", "")
-                if any(prefix in line for prefix in offer_prefixes):
+                except _DirectoryClientLimitError:
+                    logger.trace("Dropping orderbook message: collection limit reached")
+                    continue
+                if is_offer:
                     new_offers += 1
 
             if new_offers > 0:
