@@ -39,6 +39,7 @@ The module is designed to be:
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -129,6 +130,10 @@ class EventTemplate:
     priority_builder: Callable[[dict[str, Any]], NotificationPriority]
 
 
+_TXID_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
+_AMOUNT_RE = re.compile(r"\d[\d,_]*(?:\.\d+)?\s*(?:sats?|satoshis?|BTC)\b", re.IGNORECASE)
+
+
 def _summary_body(notifier: Notifier, f: dict[str, Any]) -> str:
     period_label: str = f["period_label"]
     total_requests: int = f["total_requests"]
@@ -171,10 +176,11 @@ def _summary_body(notifier: Notifier, f: dict[str, Any]) -> str:
 
 
 def _rejection_body(notifier: Notifier, f: dict[str, Any]) -> str:
-    body = f"Taker: {notifier._format_nick(f['taker_nick'])}\nReason: {f['reason']}"
+    reason = notifier._scrub_text(f["reason"])
+    body = f"Taker: {notifier._format_nick(f['taker_nick'])}\nReason: {reason}"
     details = f.get("details", "")
     if details:
-        body += f"\nDetails: {details}"
+        body += f"\nDetails: {notifier._scrub_text(details)}"
     return body + _coinjoin_id_line(notifier, f)
 
 
@@ -186,7 +192,7 @@ def _coinjoin_id_line(notifier: Notifier, f: dict[str, Any]) -> str:
 
 
 def _coinjoin_failed_body(notifier: Notifier, f: dict[str, Any]) -> str:
-    body = f"Reason: {f['reason']}"
+    body = f"Reason: {notifier._scrub_text(f['reason'])}"
     phase = f.get("phase", "")
     if phase:
         body = f"Phase: {phase}\n" + body
@@ -325,9 +331,7 @@ EVENT_TEMPLATES: dict[NotificationEvent, EventTemplate] = {
         body_builder=lambda n, f: (
             f"Amount: {n._format_amount(f['cj_amount'])}\n"
             f"Makers: {f['num_makers']}\n"
-            f"Destination: "
-            f"{'internal' if f['destination'] == 'INTERNAL' else f['destination'][:12] + '...'}"
-            + _coinjoin_id_line(n, f)
+            f"Destination: {n._format_destination(f['destination'])}" + _coinjoin_id_line(n, f)
         ),
         priority_builder=lambda _f: NotificationPriority.INFO,
     ),
@@ -442,7 +446,7 @@ class NotificationConfig(BaseModel):
     )
     include_txids: bool = Field(
         default=False,
-        description="Include transaction IDs in notifications (privacy risk)",
+        description="Include transaction IDs and destination addresses in notifications (privacy risk)",
     )
     include_coinjoin_id: bool = Field(
         default=True,
@@ -982,6 +986,22 @@ class Notifier:
         if base:
             return f"{base}/tx/{txid}"
         return txid
+
+    def _format_destination(self, destination: str) -> str:
+        """Format a destination address, shown only when txids are enabled."""
+        if destination == "INTERNAL":
+            return "internal"
+        if not self.config.include_txids:
+            return "[hidden]"
+        return destination[:12] + "..."
+
+    def _scrub_text(self, text: str) -> str:
+        """Hide txids and amounts in free-form text that privacy settings forbid."""
+        if not self.config.include_txids:
+            text = _TXID_RE.sub("[hidden]", text)
+        if not self.config.include_amounts:
+            text = _AMOUNT_RE.sub("[hidden]", text)
+        return text
 
     # =========================================================================
     # Typed-event seam

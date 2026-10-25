@@ -610,7 +610,7 @@ class NotificationSettings(BaseModel):
     )
     include_txids: bool = Field(
         default=False,
-        description="Include transaction IDs in notifications (privacy risk)",
+        description="Include transaction IDs and destination addresses in notifications (privacy risk)",
     )
     include_coinjoin_id: bool = Field(
         default=True,
