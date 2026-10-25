@@ -8,6 +8,7 @@ N times. This module provides deduplication to avoid processing duplicates.
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 
@@ -72,7 +73,8 @@ class MessageDeduplicator:
                            Should be longer than expected network latency variance.
         """
         self.window_seconds = window_seconds
-        self._seen: dict[str, SeenMessage] = {}
+        # Insertion order is timestamp order, so expiry only pops from the front.
+        self._seen: OrderedDict[str, SeenMessage] = OrderedDict()
         self._stats = DeduplicationStats()
 
     def is_duplicate(self, fingerprint: str, source: str) -> tuple[bool, str, int]:
@@ -107,9 +109,11 @@ class MessageDeduplicator:
     def _cleanup(self, now: float) -> None:
         """Remove entries older than the window."""
         cutoff = now - self.window_seconds
-        expired = [fp for fp, entry in self._seen.items() if entry.timestamp < cutoff]
-        for fp in expired:
-            del self._seen[fp]
+        while self._seen:
+            oldest = next(iter(self._seen.values()))
+            if oldest.timestamp >= cutoff:
+                break
+            self._seen.popitem(last=False)
 
     @staticmethod
     def make_fingerprint(from_nick: str, command: str, first_arg: str = "") -> str:
