@@ -185,6 +185,47 @@ class TestCoinJoinNotificationIDs:
         assert "CoinJoin ID: cj-abcdef123456" in notifier._send.call_args.kwargs["body"]
 
     @pytest.mark.asyncio
+    async def test_coinjoin_start_destination_follows_txid_privacy(self) -> None:
+        address = "bc1qdestinationaddress0000000000000000000"
+        hidden = Notifier(NotificationConfig(enabled=True, urls=["test://"]))
+        hidden._send = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        await hidden.notify_coinjoin_start(100_000, 2, address)
+        assert address[:12] not in hidden._send.call_args.kwargs["body"]
+
+        shown = Notifier(NotificationConfig(enabled=True, urls=["test://"], include_txids=True))
+        shown._send = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        await shown.notify_coinjoin_start(100_000, 2, address)
+        assert f"Destination: {address[:12]}..." in shown._send.call_args.kwargs["body"]
+
+    @pytest.mark.asyncio
+    async def test_failure_text_is_filtered_by_amount_and_txid_privacy(self) -> None:
+        txid = "ab" * 32
+        text = f"Input UTXO {txid}:0 of 1,234,567 sats and 0.5 BTC is invalid"
+        notifier = Notifier(
+            NotificationConfig(
+                enabled=True, urls=["test://"], include_amounts=False, include_txids=False
+            )
+        )
+        notifier._send = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        await notifier.notify_coinjoin_failed(text)
+        await notifier.notify_rejection("taker", "reason", text)
+
+        for call in notifier._send.call_args_list:
+            body = call.kwargs["body"]
+            assert txid not in body
+            assert "1,234,567" not in body
+            assert "0.5 BTC" not in body
+            assert "is invalid" in body
+
+        permissive = Notifier(
+            NotificationConfig(enabled=True, urls=["test://"], include_txids=True)
+        )
+        permissive._send = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        await permissive.notify_coinjoin_failed(text)
+        assert text in permissive._send.call_args.kwargs["body"]
+
+    @pytest.mark.asyncio
     async def test_coinjoin_complete_reports_broadcast_outcome(self) -> None:
         notifier = Notifier(NotificationConfig(enabled=True, urls=["test://"]))
         notifier._send = AsyncMock(return_value=True)  # type: ignore[method-assign]
