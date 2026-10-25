@@ -10,12 +10,18 @@ it as disconnected.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.deduplication import ResponseDeduplicator
-from jmcore.directory_client import DirectoryClient, DirectoryClientError
+from jmcore.directory_client import (
+    MAX_BUFFERED_MESSAGE_BYTES,
+    MAX_BUFFERED_MESSAGES,
+    DirectoryClient,
+    DirectoryClientError,
+)
 from jmcore.directory_pool import DirectoryClientPool
 from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID, OnionPeer
@@ -138,7 +144,10 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         # Unified message queue for direct peer messages
         # Messages from direct peers are queued here and consumed by wait_for_responses
-        self._direct_message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._direct_message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=MAX_BUFFERED_MESSAGES
+        )
+        self._direct_message_queue_bytes = 0
 
         # Multi-directory nick tracking
         # Format: active_nicks[nick] = {server1: True, server2: True, ...}
@@ -415,8 +424,6 @@ class MultiDirectoryClient(DirectoryClientPool):
         to match the format expected by the response processing logic.
         """
         try:
-            import json
-
             msg = json.loads(data.decode("utf-8"))
             logger.debug(f"Received direct message from {nick}: type={msg.get('type')}")
 
@@ -425,10 +432,22 @@ class MultiDirectoryClient(DirectoryClientPool):
             msg["from_direct"] = True
 
             # Queue for processing by wait_for_responses
-            await self._direct_message_queue.put(msg)
+            size = self._direct_message_size(msg)
+            if (
+                self._direct_message_queue.full()
+                or self._direct_message_queue_bytes + size > MAX_BUFFERED_MESSAGE_BYTES
+            ):
+                logger.debug(f"Direct message queue full, dropping message from {nick}")
+                return
+            self._direct_message_queue.put_nowait(msg)
+            self._direct_message_queue_bytes += size
         except Exception as e:
             logger.warning("Error processing direct peer message")
             logger.bind(sensitive=True).warning(f"Error processing peer message from {nick}: {e}")
+
+    @staticmethod
+    def _direct_message_size(msg: dict[str, Any]) -> int:
+        return len(json.dumps(msg).encode("utf-8"))
 
     async def _on_peer_disconnect(self, nick: str) -> None:
         """Handle peer disconnection."""
@@ -902,6 +921,9 @@ class MultiDirectoryClient(DirectoryClientPool):
             while True:
                 try:
                     msg = self._direct_message_queue.get_nowait()
+                    self._direct_message_queue_bytes = max(
+                        0, self._direct_message_queue_bytes - self._direct_message_size(msg)
+                    )
                     process_message(msg, "direct")
                 except asyncio.QueueEmpty:
                     break
