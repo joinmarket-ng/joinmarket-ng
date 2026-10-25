@@ -63,6 +63,8 @@ _ORDERBOOK_SEND_TIMEOUT_SEC = 5.0
 # Admission is capped before task creation, which also bounds the
 # cancellation-suppressing subset retained after reaper detachment.
 MAX_SESSION_HANDLER_TASKS = 128
+# One running handler plus one waiting for the session lock (an !auth then !tx).
+MAX_HANDLERS_PER_SESSION = 2
 MAX_ACTIVE_MAKER_SESSIONS = 128
 MAX_PENDING_SIGNED_ROUNDS = 1024
 
@@ -821,7 +823,20 @@ class ProtocolHandlersMixin:
         *,
         name: str,
     ) -> None:
-        """Run a handler independently so the reaper cannot cancel a directory listener."""
+        """Start a session handler without blocking the listener that received it.
+
+        Handlers can wait minutes on backend lookups, such as a neutrino UTXO scan
+        from a peer-chosen height, so awaiting them here would stall every other
+        message on the connection. The session lock still runs a session's
+        handlers in order.
+        """
+        if session.pending_handlers >= MAX_HANDLERS_PER_SESSION:
+            self._log_rate_limited(
+                "maker-session-handler-busy",
+                "Dropping maker session handler: session already busy",
+                interval=10.0,
+            )
+            return
         if self._session_handler_task_count >= MAX_SESSION_HANDLER_TASKS:
             self._log_rate_limited(
                 "maker-session-handler-cap",
@@ -830,27 +845,17 @@ class ProtocolHandlersMixin:
             )
             return
         self._session_handler_task_count += 1
+        session.pending_handlers += 1
+
+        def handler_finished(task: asyncio.Task[None]) -> None:
+            session.pending_handlers -= 1
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(f"Failed to handle message: {task.exception()}")
+
         task = asyncio.create_task(session.run_handler(self, handler), name=name)
+        task.add_done_callback(handler_finished)
         task.add_done_callback(self._session_handler_done)
-        detached_wait = asyncio.create_task(session.detached_event.wait())
-        try:
-            done, _ = await asyncio.wait({task, detached_wait}, return_when=asyncio.FIRST_COMPLETED)
-            if task in done:
-                try:
-                    task.result()
-                except asyncio.CancelledError:
-                    if not session.expired:
-                        raise
-            else:
-                self._register_detached_handler_task(task)
-        except asyncio.CancelledError:
-            task.cancel()
-            if not task.done():
-                self._register_detached_handler_task(task)
-            raise
-        finally:
-            detached_wait.cancel()
-            await asyncio.gather(detached_wait, return_exceptions=True)
+        self._register_detached_handler_task(task)
 
     def _session_handler_done(self: MakerBotProtocol, task: asyncio.Task[None]) -> None:
         """Release handler admission and remove completed detached tasks."""

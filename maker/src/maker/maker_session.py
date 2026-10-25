@@ -101,6 +101,7 @@ class MakerSession:
         self.deadline = time.monotonic() + inner.session_timeout_sec
         self.inner.deadline = self.deadline
         self.handler_task: asyncio.Task[None] | None = None
+        self.pending_handlers = 0
         self.expired = False
         self.detached = False
         self.cleanup_started = False
