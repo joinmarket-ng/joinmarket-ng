@@ -1123,6 +1123,10 @@ async def _run_plan(
 
 def main() -> None:
     """Entry point."""
+    from jmcore.process_hardening import harden_current_process
+
+    # Disable core dumps and ptrace before any wallet command loads secrets.
+    harden_current_process()
     app()
 
 
