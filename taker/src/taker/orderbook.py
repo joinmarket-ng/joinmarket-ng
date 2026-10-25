@@ -397,6 +397,28 @@ def dedupe_offers_by_maker(
     return result
 
 
+def _bond_key(offer: Offer) -> str | None:
+    if offer.fidelity_bond_data and offer.fidelity_bond_value > 0:
+        return f"{offer.fidelity_bond_data['utxo_txid']}:{offer.fidelity_bond_data['utxo_vout']}"
+    return None
+
+
+def bond_sibling_nicks(offers: Iterable[Offer], nicks: set[str]) -> set[str]:
+    """Return other nicks whose offers claim a verified bond also claimed by ``nicks``.
+
+    ``dedupe_offers_by_bond`` only sees one selection call. Replacement waves and
+    top-ups select again while makers from earlier calls are already in the
+    CoinJoin, so their bond siblings must be excluded explicitly.
+    """
+    offers = list(offers)
+    claimed = {key for offer in offers if offer.counterparty in nicks and (key := _bond_key(offer))}
+    return {
+        offer.counterparty
+        for offer in offers
+        if offer.counterparty not in nicks and _bond_key(offer) in claimed
+    }
+
+
 def dedupe_offers_by_bond(
     offers: list[Offer], cj_amount: int, round_up_cj_fees: bool = False
 ) -> list[Offer]:
@@ -425,13 +447,7 @@ def dedupe_offers_by_bond(
     unbonded: list[Offer] = []
 
     for offer in offers:
-        bond_key = None
-        if offer.fidelity_bond_data and offer.fidelity_bond_value > 0:
-            # Use txid:vout as unique key
-            bond_key = (
-                f"{offer.fidelity_bond_data['utxo_txid']}:{offer.fidelity_bond_data['utxo_vout']}"
-            )
-
+        bond_key = _bond_key(offer)
         if bond_key:
             if bond_key not in by_bond:
                 by_bond[bond_key] = []
@@ -1216,6 +1232,7 @@ class OrderbookManager:
         hard = self.own_wallet_nicks.copy()
         if hard_exclude_nicks:
             hard.update(hard_exclude_nicks)
+            hard.update(bond_sibling_nicks(self.offers, hard_exclude_nicks))
 
         soft = self.ignored_makers.copy()
         if exclude_nicks:
@@ -1253,6 +1270,7 @@ class OrderbookManager:
         # picked twice.
         missing = n - len(result)
         already_picked = set(result.keys())
+        already_picked.update(bond_sibling_nicks(self.offers, already_picked))
         topup_result, topup_fee = choose_orders(
             offers=available_offers,
             cj_amount=cj_amount,
@@ -1319,6 +1337,7 @@ class OrderbookManager:
         hard = self.own_wallet_nicks.copy()
         if hard_exclude_nicks:
             hard.update(hard_exclude_nicks)
+            hard.update(bond_sibling_nicks(self.offers, hard_exclude_nicks))
 
         soft = self.ignored_makers.copy()
         if exclude_nicks:
