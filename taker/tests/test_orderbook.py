@@ -1509,6 +1509,63 @@ class TestOrderbookManager:
 
         assert len(orders) == 2, "Sweep soft fallback should refill from ignored makers"
 
+    @staticmethod
+    def _bonded_offer(nick: str, bond_txid: str) -> Offer:
+        return Offer(
+            counterparty=nick,
+            oid=0,
+            ordertype=OfferType.SW0_RELATIVE,
+            minsize=10_000,
+            maxsize=1_000_000,
+            txfee=0,
+            cjfee="0.0002",
+            fidelity_bond_data={
+                "utxo_txid": bond_txid,
+                "utxo_vout": 0,
+                "locktime": 500000,
+                "utxo_pub": "pubkey",
+                "cert_expiry": 1700000000,
+            },
+            fidelity_bond_value=1_000,
+        )
+
+    def test_replacement_excludes_bond_siblings_of_session_makers(
+        self, max_cj_fee: MaxCjFee, tmp_path: Path
+    ) -> None:
+        """A replacement wave cannot add a second nick backed by a bond already in the round."""
+        manager = OrderbookManager(max_cj_fee, data_dir=tmp_path)
+        manager.update_offers(
+            [
+                self._bonded_offer("sibling_a", "a" * 64),
+                self._bonded_offer("sibling_b", "a" * 64),
+                self._bonded_offer("honest1", "b" * 64),
+                self._bonded_offer("honest2", "c" * 64),
+            ]
+        )
+
+        orders, _ = manager.select_makers(cj_amount=100_000, n=3, hard_exclude_nicks={"sibling_a"})
+
+        assert set(orders) == {"honest1", "honest2"}
+
+    def test_soft_fallback_top_up_excludes_bond_siblings(
+        self, max_cj_fee: MaxCjFee, tmp_path: Path
+    ) -> None:
+        """The top-up pass cannot pick a bond sibling of a maker from the strict pass."""
+        manager = OrderbookManager(max_cj_fee, data_dir=tmp_path)
+        manager.update_offers(
+            [
+                self._bonded_offer("sibling_a", "a" * 64),
+                self._bonded_offer("sibling_b", "a" * 64),
+                self._bonded_offer("honest1", "b" * 64),
+                self._bonded_offer("honest2", "c" * 64),
+            ]
+        )
+        manager.add_ignored_maker("honest1")
+
+        for _ in range(50):
+            orders, _ = manager.select_makers(cj_amount=100_000, n=3)
+            assert not {"sibling_a", "sibling_b"} <= set(orders)
+
 
 class TestMixedBondedBondlessSelection:
     """Tests for the per-slot probabilistic bonded/bondless selection."""
