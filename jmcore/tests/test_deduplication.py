@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from jmcore.deduplication import (
     DeduplicationStats,
     MessageDeduplicator,
@@ -122,6 +124,39 @@ class TestMessageDeduplicator:
         assert is_dup is False
         assert source == "dir2.onion"  # New first source
         assert count == 1
+
+    def test_expiry_drops_only_expired_entries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = [0.0]
+        monkeypatch.setattr("jmcore.deduplication.time.monotonic", lambda: clock[0])
+        dedup = MessageDeduplicator(window_seconds=30.0)
+        for i in range(10):
+            clock[0] = float(i)
+            dedup.is_duplicate(f"fp{i}", "dir1")
+
+        clock[0] = 34.5
+        dedup.is_duplicate("new", "dir1")
+
+        assert len(dedup) == 6
+        assert dedup.is_duplicate("fp4", "dir1")[0] is False
+        assert dedup.is_duplicate("fp5", "dir1")[0] is True
+
+    def test_check_cost_does_not_grow_with_window_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = [0.0]
+        monkeypatch.setattr("jmcore.deduplication.time.monotonic", lambda: clock[0])
+        dedup = MessageDeduplicator(window_seconds=30.0)
+        for i in range(50_000):
+            clock[0] = i / 2000
+            dedup.is_duplicate(f"flood{i}", "dir1")
+
+        start = time.perf_counter()
+        for i in range(2_000):
+            dedup.is_duplicate(f"probe{i}", "dir1")
+        elapsed = time.perf_counter() - start
+
+        assert len(dedup) == 52_000
+        assert elapsed < 0.5
 
     def test_make_fingerprint_format(self) -> None:
         """Test fingerprint format."""
