@@ -32,29 +32,48 @@ def _message() -> dict[str, Any]:
     return {"type": MessageType.PUBMSG.value, "line": "maker!PUBLIC!not-an-offer"}
 
 
+def _peerlist_then(noise: int) -> AsyncMock:
+    """A connection that sends noise, one PEERLIST chunk, more noise, then goes quiet."""
+    frames = [json.dumps(_message()).encode("utf-8")] * noise
+    frames.append(
+        json.dumps(
+            {"type": MessageType.PEERLIST.value, "line": f"{VALID_MAKER_NICKS[0]};loc1.onion:5222"}
+        ).encode("utf-8")
+    )
+    frames.extend([json.dumps(_message()).encode("utf-8")] * noise)
+
+    async def receive() -> bytes:
+        if frames:
+            return frames.pop(0)
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    connection = AsyncMock()
+    connection.receive.side_effect = receive
+    return connection
+
+
 @pytest.mark.asyncio
-async def test_peerlist_message_buffer_limit_closes_connection(
+async def test_peerlist_message_buffer_limit_drops_relayed_messages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unexpected messages cannot make a peerlist fetch retain an unbounded queue."""
+    """Relayed noise beyond the buffer cap is dropped without leaving the directory."""
     monkeypatch.setattr("jmcore.directory_client.MAX_BUFFERED_MESSAGES", 1)
-    connection = AsyncMock()
-    connection.receive.side_effect = [
-        json.dumps(_message()).encode("utf-8"),
-        json.dumps(_message()).encode("utf-8"),
-    ]
+    connection = _peerlist_then(noise=5)
     client = DirectoryClient("host", 1234, "mainnet")
     client.connection = connection
+    client._peerlist_chunk_timeout = 0.1
 
-    with pytest.raises(DirectoryClientError, match="message buffer limit"):
-        await client.get_peerlist_with_features()
+    peers = await client.get_peerlist_with_features()
 
-    connection.close.assert_awaited_once()
-    assert client.connection is None
+    assert [nick for nick, _, _ in peers] == [VALID_MAKER_NICKS[0]]
+    assert client._message_buffer.qsize() == 1
+    connection.close.assert_not_awaited()
+    assert client.connection is connection
 
 
 @pytest.mark.asyncio
-async def test_peerlist_message_buffer_byte_limit_closes_connection(
+async def test_peerlist_message_buffer_byte_limit_drops_relayed_messages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Buffered JSON accounting includes the serialized UTF-8 message size."""
@@ -63,16 +82,44 @@ async def test_peerlist_message_buffer_byte_limit_closes_connection(
         "jmcore.directory_client.MAX_BUFFERED_MESSAGE_BYTES",
         len(json.dumps(message).encode("utf-8")) - 1,
     )
-    connection = AsyncMock()
-    connection.receive.return_value = json.dumps(message).encode("utf-8")
+    connection = _peerlist_then(noise=3)
     client = DirectoryClient("host", 1234, "mainnet")
     client.connection = connection
+    client._peerlist_chunk_timeout = 0.1
 
-    with pytest.raises(DirectoryClientError, match="message buffer byte limit"):
-        await client.get_peerlist_with_features()
+    peers = await client.get_peerlist_with_features()
 
-    connection.close.assert_awaited_once()
-    assert client.connection is None
+    assert [nick for nick, _, _ in peers] == [VALID_MAKER_NICKS[0]]
+    assert client._message_buffer.qsize() == 0
+    connection.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_peerlist_fetch_ends_despite_continuous_relayed_traffic() -> None:
+    """Traffic other than PEERLIST cannot keep the inter-chunk wait open forever."""
+    chunk = json.dumps(
+        {"type": MessageType.PEERLIST.value, "line": f"{VALID_MAKER_NICKS[0]};loc1.onion:5222"}
+    ).encode("utf-8")
+    sent_chunk = False
+
+    async def receive() -> bytes:
+        nonlocal sent_chunk
+        if not sent_chunk:
+            sent_chunk = True
+            return chunk
+        await asyncio.sleep(0.01)
+        return json.dumps(_message()).encode("utf-8")
+
+    connection = AsyncMock()
+    connection.receive.side_effect = receive
+    client = DirectoryClient("host", 1234, "mainnet")
+    client.connection = connection
+    client._peerlist_chunk_timeout = 0.2
+
+    peers = await asyncio.wait_for(client.get_peerlist_with_features(), timeout=5.0)
+
+    assert [nick for nick, _, _ in peers] == [VALID_MAKER_NICKS[0]]
+    connection.close.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -99,30 +146,38 @@ async def test_listen_message_byte_limit_closes_without_returning_partial_messag
 
 
 @pytest.mark.asyncio
-async def test_orderbook_fetch_limit_applies_across_listen_chunks(
+async def test_orderbook_fetch_ignores_noise_and_drops_beyond_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An orderbook fetch counts messages returned by every listen chunk together."""
+    """Noise does not count toward the orderbook limit, and overflow is dropped."""
     monkeypatch.setattr("jmcore.directory_client.MAX_COLLECTED_MESSAGES", 2)
     connection = AsyncMock()
     client = DirectoryClient("host", 1234, "mainnet")
     client.connection = connection
     client.get_peerlist_with_features = AsyncMock(return_value=[])  # type: ignore[method-assign]
-    listen_calls = 0
+    offer_lines = [
+        f"{nick}!PUBLIC!sw0reloffer {oid} 750000 790107726787 500 0.001"
+        for oid, nick in enumerate((*VALID_MAKER_NICKS, VALID_MAKER_NICKS[0]))
+    ]
+    chunks = [
+        [_message()] * 50 + [{"type": MessageType.PUBMSG.value, "line": offer_lines[0]}],
+        [_message()] * 50 + [{"type": MessageType.PUBMSG.value, "line": offer_lines[1]}],
+        [{"type": MessageType.PUBMSG.value, "line": offer_lines[2]}],
+    ]
 
     async def listen_once(duration: float = 5.0) -> list[dict[str, Any]]:
-        nonlocal listen_calls
-        listen_calls += 1
-        return [_message()]
+        return chunks.pop(0) if chunks else []
 
     client.listen_for_messages = listen_once  # type: ignore[method-assign]
 
-    with pytest.raises(DirectoryClientError, match="orderbook fetch message limit"):
-        await client.fetch_orderbooks(max_wait=30.0, min_wait=0.0, quiet_period=0.0)
+    offers, _bonds = await client.fetch_orderbooks(max_wait=3.0, min_wait=0.0, quiet_period=0.0)
 
-    assert listen_calls == 3
-    connection.close.assert_awaited_once()
-    assert client.connection is None
+    assert sorted((offer.counterparty, offer.oid) for offer in offers) == [
+        (VALID_MAKER_NICKS[0], 0),
+        (VALID_MAKER_NICKS[1], 1),
+    ]
+    connection.close.assert_not_awaited()
+    assert client.connection is connection
 
 
 @pytest.mark.asyncio
