@@ -612,6 +612,10 @@ class TestHiddenServiceListener:
         connection.close = AsyncMock()
 
         await bot._on_direct_connection(connection, "127.0.0.1:12345")
+        for _ in range(200):
+            if (session.generation_id, taker_identity.nick) not in bot.active_sessions:
+                break
+            await asyncio.sleep(0.01)
         bot.running = False
         cleanup_task = bot._session_cleanup_task
         assert cleanup_task is not None

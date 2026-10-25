@@ -869,16 +869,15 @@ class TestMakerBotMultiOfferFill:
         commitments = set(maker_bot._reserved_commitments)
 
         await old_session.lock.acquire()
-        task = asyncio.create_task(
-            getattr(maker_bot, handler_name)(taker_nick, f"{callback_name[3:]} payload")
-        )
+        await getattr(maker_bot, handler_name)(taker_nick, f"{callback_name[3:]} payload")
+        waiters = set(maker_bot._detached_handler_tasks)
         await asyncio.sleep(0)
-        assert not task.done()
+        assert waiters and not any(waiter.done() for waiter in waiters)
 
         assert maker_bot.active_sessions.pop(_session_key(taker_nick)) is old_session
         maker_bot.active_sessions[_session_key(taker_nick)] = replacement
         old_session.lock.release()
-        await task
+        await asyncio.gather(*waiters)
 
         assert maker_bot.active_sessions[_session_key(taker_nick)] is replacement
         getattr(old_session, callback_name).assert_not_awaited()
@@ -886,6 +885,71 @@ class TestMakerBotMultiOfferFill:
         old_session.inner.wallet.release_coinjoin_inputs.assert_not_called()
         replacement.release_input_locks.assert_not_called()
         assert maker_bot._reserved_commitments == commitments
+
+    @pytest.mark.asyncio
+    async def test_slow_auth_handler_does_not_block_its_listener(self, maker_bot):
+        """A handler waiting on a slow backend lookup must not stall the caller."""
+        taker_nick = "J5SlowAuthTaker"
+        session = self._session(taker_nick, "a3" * 32)
+        lookup_done = asyncio.Event()
+
+        async def slow_auth(*_args: object) -> None:
+            await lookup_done.wait()
+
+        session.on_auth = AsyncMock(side_effect=slow_auth)
+        maker_bot.active_sessions[_session_key(taker_nick)] = session
+
+        await asyncio.wait_for(maker_bot._handle_auth(taker_nick, "auth payload"), timeout=1.0)
+
+        handlers = set(maker_bot._detached_handler_tasks)
+        await asyncio.sleep(0)
+        assert len(handlers) == 1 and not any(handler.done() for handler in handlers)
+        lookup_done.set()
+        await asyncio.gather(*handlers)
+        session.on_auth.assert_awaited_once()
+        assert session.pending_handlers == 0
+
+    @pytest.mark.asyncio
+    async def test_busy_session_drops_extra_handlers(self, maker_bot):
+        """Duplicate messages for a busy session cannot pile up handler tasks."""
+        taker_nick = "J5DuplicateAuthTaker"
+        session = self._session(taker_nick, "a4" * 32)
+        lookup_done = asyncio.Event()
+
+        async def slow_auth(*_args: object) -> None:
+            await lookup_done.wait()
+
+        session.on_auth = AsyncMock(side_effect=slow_auth)
+        maker_bot.active_sessions[_session_key(taker_nick)] = session
+
+        for _ in range(5):
+            await maker_bot._handle_auth(taker_nick, "auth payload")
+
+        handlers = set(maker_bot._detached_handler_tasks)
+        assert len(handlers) == 2
+        assert maker_bot._session_handler_task_count == 2
+        lookup_done.set()
+        await asyncio.gather(*handlers)
+        assert maker_bot._session_handler_task_count == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_session_handler_is_logged(self, maker_bot):
+        """An exception escaping a spawned handler is still reported."""
+        taker_nick = "J5FailingAuthTaker"
+        session = self._session(taker_nick, "a5" * 32)
+        session.on_auth = AsyncMock(side_effect=RuntimeError("handler exploded"))
+        maker_bot.active_sessions[_session_key(taker_nick)] = session
+        records: list[str] = []
+        sink = logger.add(lambda message: records.append(str(message)), level="ERROR")
+        try:
+            await maker_bot._handle_auth(taker_nick, "auth payload")
+            await asyncio.gather(*maker_bot._detached_handler_tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+        finally:
+            logger.remove(sink)
+
+        assert any("handler exploded" in record for record in records)
+        assert session.pending_handlers == 0
 
     @pytest.mark.asyncio
     async def test_timeout_cleanup_releases_commitment_reservation(self, maker_bot):
