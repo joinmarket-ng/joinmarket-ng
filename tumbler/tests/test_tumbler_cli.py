@@ -605,3 +605,17 @@ class TestCollectBalances:
         assert all(
             min_conf == 5 and excluded == {("aa" * 32, 1)} for _, min_conf, excluded in calls
         )
+
+
+def test_main_hardens_process_before_running_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tumbler.cli as tumbler_cli
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "jmcore.process_hardening.harden_current_process", lambda: calls.append("harden")
+    )
+    monkeypatch.setattr(tumbler_cli, "app", lambda: calls.append("app"))
+
+    tumbler_cli.main()
+
+    assert calls == ["harden", "app"]
