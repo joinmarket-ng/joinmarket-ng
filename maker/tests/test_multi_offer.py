@@ -690,6 +690,51 @@ class TestMakerBotMultiOfferFill:
         assert commitment not in maker_bot._reserved_commitments
 
     @pytest.mark.asyncio
+    async def test_fill_at_cap_sheds_oldest_unauthenticated_session(self, maker_bot) -> None:
+        """Free !fill floods cannot lock new takers out until session deadlines pass."""
+        from jmcore.encryption import CryptoSession
+
+        from maker.protocol_handlers import MAX_ACTIVE_MAKER_SESSIONS
+
+        maker_bot._send_response = AsyncMock()
+        with patch("maker.protocol_handlers.check_commitment", return_value=True):
+            for i in range(MAX_ACTIVE_MAKER_SESSIONS + 1):
+                await maker_bot._handle_fill(
+                    f"J5Flood{i}",
+                    f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{i:064x}",
+                )
+
+        assert len(maker_bot.active_sessions) == MAX_ACTIVE_MAKER_SESSIONS
+        assert _session_key("J5Flood0") not in maker_bot.active_sessions
+        assert f"{0:064x}" not in maker_bot._reserved_commitments
+        assert _session_key(f"J5Flood{MAX_ACTIVE_MAKER_SESSIONS}") in maker_bot.active_sessions
+
+    @pytest.mark.asyncio
+    async def test_fill_at_cap_keeps_sessions_with_running_handlers(self, maker_bot) -> None:
+        """Shedding never touches a session whose !auth handler holds its lock."""
+        from jmcore.encryption import CryptoSession
+
+        from maker.protocol_handlers import MAX_ACTIVE_MAKER_SESSIONS
+
+        maker_bot._send_response = AsyncMock()
+        with patch("maker.protocol_handlers.check_commitment", return_value=True):
+            for i in range(MAX_ACTIVE_MAKER_SESSIONS):
+                await maker_bot._handle_fill(
+                    f"J5Flood{i}",
+                    f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{i:064x}",
+                )
+            busy = maker_bot.active_sessions[_session_key("J5Flood0")]
+            async with busy.lock:
+                await maker_bot._handle_fill(
+                    "J5NewTaker",
+                    f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{'cd' * 32}",
+                )
+
+        assert maker_bot.active_sessions[_session_key("J5Flood0")] is busy
+        assert _session_key("J5Flood1") not in maker_bot.active_sessions
+        assert _session_key("J5NewTaker") in maker_bot.active_sessions
+
+    @pytest.mark.asyncio
     async def test_fill_failure_releases_commitment_reservation(self, maker_bot):
         """A failed fill releases its commitment reservation."""
 
