@@ -134,6 +134,7 @@ class MakerBotProtocol(Protocol):
     async def _expire_timed_out_session(
         self, session_key: tuple[int, str], session: MakerSession
     ) -> bool: ...
+    async def _shed_oldest_preauth_session(self) -> bool: ...
 
     async def _dispatch_session_handler(
         self,

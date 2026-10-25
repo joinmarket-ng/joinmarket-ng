@@ -635,9 +635,11 @@ class ProtocolHandlersMixin:
                 )
                 return
 
-            if (generation_id, taker_nick) not in self.active_sessions and len(
-                self.active_sessions
-            ) >= MAX_ACTIVE_MAKER_SESSIONS:
+            if (
+                (generation_id, taker_nick) not in self.active_sessions
+                and len(self.active_sessions) >= MAX_ACTIVE_MAKER_SESSIONS
+                and not await self._shed_oldest_preauth_session()
+            ):
                 self._log_rate_limited(
                     "maker-active-session-cap",
                     f"Rejecting new maker session at cap ({MAX_ACTIVE_MAKER_SESSIONS})",
@@ -778,6 +780,24 @@ class ProtocolHandlersMixin:
         finally:
             if log_context is not None:
                 log_context.__exit__(None, None, None)
+
+    async def _shed_oldest_preauth_session(self: MakerBotProtocol) -> bool:
+        """Expire the oldest session still waiting for !auth to make room.
+
+        A !fill costs the sender nothing, so a full table of sessions that never
+        authenticate must not lock out new takers until their deadlines pass.
+        """
+        candidates = [
+            (session.created_at, key, session)
+            for key, session in self.active_sessions.items()
+            if session.state == CoinJoinState.PUBKEY_SENT
+            and session.handler_task is None
+            and not session.lock.locked()
+        ]
+        if not candidates:
+            return False
+        _, key, session = min(candidates, key=lambda candidate: candidate[0])
+        return await self._expire_timed_out_session(key, session)
 
     async def _handle_auth(
         self: MakerBotProtocol,
