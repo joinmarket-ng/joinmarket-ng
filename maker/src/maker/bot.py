@@ -1541,6 +1541,7 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         # Ensure rate limiters are cleaned up periodically
         self._direct_connection_rate_limiter.cleanup_old_entries()
+        self._message_rate_limiter.cleanup_old_peers()
 
     def _release_commitment_reservation(self, commitment: str) -> None:
         """Release a commitment reserved by an in-flight local session."""

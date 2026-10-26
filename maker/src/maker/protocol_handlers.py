@@ -209,17 +209,19 @@ class ProtocolHandlersMixin:
                         )
                     return
 
-            # Apply generic per-peer rate limiting (only for non-duplicates)
-            action, _delay = self._message_rate_limiter.check(from_nick)
+            # Apply generic per-peer rate limiting (only for non-duplicates). Other
+            # message types come from the directory and carry no peer nick.
+            if msg_type in (MessageType.PRIVMSG.value, MessageType.PUBMSG.value):
+                action, _delay = self._message_rate_limiter.check(from_nick)
 
-            if action != RateLimitAction.ALLOW:
-                violations = self._message_rate_limiter.get_violation_count(from_nick)
-                # Only log every 50th violation to prevent log flooding
-                if violations % 50 == 0:
-                    logger.warning(
-                        f"Rate limit exceeded for {from_nick} ({violations} violations total)"
-                    )
-                return  # Drop the message
+                if action != RateLimitAction.ALLOW:
+                    violations = self._message_rate_limiter.get_violation_count(from_nick)
+                    # Only log every 50th violation to prevent log flooding
+                    if violations % 50 == 0:
+                        logger.warning(
+                            f"Rate limit exceeded for {from_nick} ({violations} violations total)"
+                        )
+                    return  # Drop the message
 
             # Process the message
             if msg_type == MessageType.PRIVMSG.value:
