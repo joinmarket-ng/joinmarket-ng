@@ -395,6 +395,11 @@ records. An `activating` state is committed before history import. Success recor
 `ready`; failure leaves `activating` or `recovery_required`, never a fresh empty
 ledger. Repeating activation cannot clear a recovery requirement.
 
+Unreadable `cmtdata/commitments.json` files remain at their original path and are
+not automatically replaced. Strict external-credential operations and native
+ledger claims fail closed, including after reloads or restarts. Preserve the file
+and recover complete, consistent history; deleting it is not a safe repair.
+
 | Existing State | Behavior |
 | --- | --- |
 | No market database or intent | Existing CoinJoin behavior; no automatic market activation |
