@@ -13,11 +13,8 @@ def test_spa_catch_all_blocks_path_traversal(app_with_jam_assets: TestClient) ->
     assert "<html>jam</html>" in resp.text
 
 
-def test_docs_and_openapi_remain_available_without_auth(app_with_jam_assets: TestClient) -> None:
-    """Operational docs should be readable without wallet auth."""
-    docs = app_with_jam_assets.get("/docs")
-    assert docs.status_code == 200
-
+def test_openapi_remains_available_without_auth(app_with_jam_assets: TestClient) -> None:
+    """The OpenAPI schema should be readable without wallet auth."""
     openapi = app_with_jam_assets.get("/openapi.json")
     assert openapi.status_code == 200
 
@@ -54,3 +51,17 @@ def test_large_legitimate_request_body_accepted(app: TestClient) -> None:
     entries = [{"utxo-string": f"{'ab' * 32}:{i}", "freeze": True} for i in range(500)]
     resp = app.post("/api/v1/wallet/w.jmdat/freeze-batch", json={"entries": entries})
     assert resp.status_code != 413
+
+
+def test_cdn_docs_pages_not_served_on_jam_origin(app_with_jam_assets: TestClient) -> None:
+    """Swagger UI and ReDoc load third-party scripts, so they must not share Jam's origin."""
+    for path in ("/docs", "/redoc", "/docs/oauth2-redirect"):
+        resp = app_with_jam_assets.get(path)
+        assert "cdn.jsdelivr.net" not in resp.text
+        assert "<html>jam</html>" in resp.text
+
+
+def test_docs_served_without_jam(app: TestClient) -> None:
+    resp = app.get("/docs")
+    assert resp.status_code == 200
+    assert "swagger-ui" in resp.text
