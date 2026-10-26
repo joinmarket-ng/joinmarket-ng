@@ -431,6 +431,7 @@ class TestNeutrinoCoinJoin:
         taker_config = TakerConfig(
             mnemonic=TAKER_MNEMONIC,
             network=NetworkType.TESTNET,  # Protocol network for directory server
+            bitcoin_network=NetworkType.REGTEST,  # Chain of the wallets and maker addresses
             directory_servers=[_directory_server_addr()],
             allow_clearnet_connections=True,
             coinjoin_amount=50_000_000,  # 0.5 BTC
@@ -795,6 +796,7 @@ class TestNeutrinoCoinJoin:
         taker_config = TakerConfig(
             mnemonic=TAKER_MNEMONIC,
             network=NetworkType.TESTNET,  # Protocol network for directory server
+            bitcoin_network=NetworkType.REGTEST,  # Chain of the wallets and maker addresses
             directory_servers=[_directory_server_addr()],
             allow_clearnet_connections=True,
             coinjoin_amount=50_000_000,  # 0.5 BTC
