@@ -5,6 +5,7 @@ Manager for PoDLE commitments (used for retry tracking).
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING
 from jmcore.commitment_blacklist import get_blacklist
 from jmcore.paths import get_used_commitments_path
 from jmcore.podle import PoDLECommitment, generate_podle
+from jmcore.secure_files import atomic_write_sensitive_file
 from loguru import logger
 
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
@@ -45,7 +47,11 @@ class PoDLEManager:
                     self.external_commitments = {}
             logger.debug(f"Loaded {len(self.used_commitments)} used PoDLE commitments")
         except Exception as e:
-            logger.error(f"Failed to load used commitments: {e}")
+            # Keep the unreadable file for recovery instead of overwriting it
+            # on the next save.
+            backup = self.filepath.with_name(f"{self.filepath.name}.corrupt.{int(time.time())}")
+            self.filepath.replace(backup)
+            logger.error(f"Failed to load used commitments: {e}; moved file to {backup}")
 
     def _save(self) -> None:
         """Save used commitments to file."""
@@ -54,8 +60,7 @@ class PoDLEManager:
                 "used": list(self.used_commitments),
                 "external": self.external_commitments,
             }
-            with open(self.filepath, "w") as f:
-                json.dump(data, f, indent=2)
+            atomic_write_sensitive_file(self.filepath, json.dumps(data, indent=2).encode())
         except Exception as e:
             logger.error(f"Failed to save used commitments: {e}")
 
