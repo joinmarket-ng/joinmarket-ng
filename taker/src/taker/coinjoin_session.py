@@ -171,6 +171,9 @@ class CoinJoinSession:
         # minimum miner fee policy rejection. Declining is honest behaviour, so
         # these nicks are kept out of the persistent ignored-maker set.
         self.declined_signer_nicks: set[str] = set()
+        # Makers that declared an input the taker also spends in the final
+        # transaction; the owner adds them to the persistent ignored-maker set.
+        self.conflicting_input_nicks: set[str] = set()
 
         # Addresses recorded for broadcast verification and history reconciliation.
         self.cj_destination: str = ""
@@ -238,6 +241,7 @@ class CoinJoinSession:
         self.last_failure_reason = None
         self.failed_signer_nicks = set()
         self.declined_signer_nicks = set()
+        self.conflicting_input_nicks = set()
         self.cj_destination = ""
         self.cj_destination_is_internal = False
         self.taker_change_address = ""
@@ -1022,7 +1026,8 @@ class CoinJoinSession:
         """
         declared_outpoints: set[tuple[str, int]] = set()
         for utxo_meta in utxo_metadata_list:
-            txid = utxo_meta.txid
+            # Hex case must not hide a duplicate of an outpoint declared elsewhere.
+            txid = utxo_meta.txid.lower()
             vout = utxo_meta.vout
             scriptpubkey = ""
 
@@ -1369,6 +1374,26 @@ class CoinJoinSession:
 
             if not selected_utxos:
                 logger.error("Failed to select enough UTXOs")
+                return False
+
+            # The !auth duplicate check only saw the preselected UTXOs; inputs
+            # added above could collide with a maker's declared input.
+            taker_outpoints = {(u.txid.lower(), u.vout) for u in selected_utxos}
+            conflicting_nicks = {
+                nick
+                for nick, session in self.maker_sessions.items()
+                if any((u["txid"].lower(), u["vout"]) in taker_outpoints for u in session.utxos)
+            }
+            if conflicting_nicks:
+                self.conflicting_input_nicks = conflicting_nicks
+                self.last_failure_reason = (
+                    "A maker declared an input that the taker also spends; "
+                    "retry with different makers."
+                )
+                logger.warning("Maker declared one of our inputs, aborting transaction build")
+                logger.bind(sensitive=True).warning(
+                    "Makers declaring our inputs: {}", ", ".join(sorted(conflicting_nicks))
+                )
                 return False
 
             # Lock any inputs added beyond the already-reserved preselection so a

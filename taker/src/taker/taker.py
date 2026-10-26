@@ -1568,6 +1568,8 @@ class Taker(TakerMonitoringMixin):
                 destination_is_internal=destination_is_internal,
             )
             if not tx_success:
+                for nick in self._session.conflicting_input_nicks:
+                    self.orderbook_manager.add_ignored_maker(nick)
                 logger.error("Transaction build failed")
                 self.state = TakerState.FAILED
                 return None
