@@ -226,6 +226,44 @@ class TestCoinJoinNotificationIDs:
         assert text in permissive._send.call_args.kwargs["body"]
 
     @pytest.mark.asyncio
+    async def test_rejection_hides_unitless_amounts(self) -> None:
+        """Maker validation errors carry bare satoshi values without a unit."""
+        notifier = Notifier(
+            NotificationConfig(enabled=True, urls=["test://"], include_amounts=False)
+        )
+        notifier._send = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        await notifier.notify_rejection(
+            "taker", "Amount too small: 99999 < 100000", "Taker's UTXO too small: 1_000 < 2,000"
+        )
+
+        body = notifier._send.call_args.kwargs["body"]
+        assert "Reason: Amount too small: [hidden] < [hidden]" in body
+        assert "Details: Taker's UTXO too small: [hidden] < [hidden]" in body
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Amount too large: 5000000 > 4000000.", "Amount too large: [hidden] > [hidden]."),
+            ("fee 0.0002 exceeds limit", "fee [hidden] exceeds limit"),
+            ("Session timed out after 120s", "Session timed out after 120s"),
+            ("need 10 makers, got 3", "need 10 makers, got 3"),
+            ("peer 127.0.0.1:8080 runs 2026.10.1", "peer 127.0.0.1:8080 runs 2026.10.1"),
+            ("utxo " + "ab" * 32 + ":123", "utxo " + "ab" * 32 + ":123"),
+            ("nick J5abc123def", "nick J5abc123def"),
+        ],
+    )
+    def test_amount_scrubbing_keeps_non_amount_numbers(self, text: str, expected: str) -> None:
+        notifier = Notifier(
+            NotificationConfig(
+                enabled=True, urls=["test://"], include_amounts=False, include_txids=True
+            )
+        )
+        assert notifier._scrub_text(text) == expected
+        shown = Notifier(NotificationConfig(enabled=True, urls=["test://"], include_txids=True))
+        assert shown._scrub_text(text) == text
+
+    @pytest.mark.asyncio
     async def test_coinjoin_complete_reports_broadcast_outcome(self) -> None:
         notifier = Notifier(NotificationConfig(enabled=True, urls=["test://"]))
         notifier._send = AsyncMock(return_value=True)  # type: ignore[method-assign]

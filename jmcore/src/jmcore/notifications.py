@@ -132,6 +132,19 @@ class EventTemplate:
 
 _TXID_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
 _AMOUNT_RE = re.compile(r"\d[\d,_]*(?:\.\d+)?\s*(?:sats?|satoshis?|BTC)\b", re.IGNORECASE)
+# Protocol errors often carry unitless amounts ("Amount too small: 99999 < 100000").
+# Match standalone numbers, but not digits glued to identifiers or units ("120s",
+# "v1"), dotted versions/IPs, or "host:port" and "txid:vout" suffixes.
+_BARE_NUMBER_RE = re.compile(r"(?<![\w:])(?<!\d\.)\d+(?:[,_]\d+)*(?:\.\d+)?(?!\w|\.\d)")
+# Shorter numbers are kept: they are counts or indices, not amounts worth hiding.
+_MIN_HIDDEN_BARE_DIGITS = 3
+
+
+def _hide_bare_amount(match: re.Match[str]) -> str:
+    token = match.group()
+    if sum(char.isdigit() for char in token) < _MIN_HIDDEN_BARE_DIGITS:
+        return token
+    return "[hidden]"
 
 
 def _summary_body(notifier: Notifier, f: dict[str, Any]) -> str:
@@ -1001,6 +1014,7 @@ class Notifier:
             text = _TXID_RE.sub("[hidden]", text)
         if not self.config.include_amounts:
             text = _AMOUNT_RE.sub("[hidden]", text)
+            text = _BARE_NUMBER_RE.sub(_hide_bare_amount, text)
         return text
 
     # =========================================================================
