@@ -351,3 +351,33 @@ def test_default_port_sources_match_listener_ids(tmp_path: Path) -> None:
         "dir:localhost:5222",
         "dir:localhost:5223",
     }
+
+
+@pytest.mark.asyncio
+async def test_directory_peerlist_lines_do_not_create_rate_limiter_entries(bot: MakerBot) -> None:
+    features = "x" * 1_000
+    for i in range(50):
+        await bot._handle_message(
+            {
+                "type": MessageType.PEERLIST.value,
+                "line": f"J5Churn{i:09d};{'a' * 56}.onion:5222;F:{features}",
+            },
+            source="dir:node1",
+        )
+
+    assert bot._message_rate_limiter.get_stats()["tracked_peers"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_prunes_idle_message_rate_limiter_entries(
+    bot: MakerBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [1_000.0]
+    monkeypatch.setattr("jmcore.rate_limiter.time.monotonic", lambda: clock[0])
+    bot._message_rate_limiter.check("J5IdlePeer")
+    assert bot._message_rate_limiter.get_stats()["tracked_peers"] == 1
+
+    clock[0] += 3_601
+    await bot._cleanup_timed_out_sessions()
+
+    assert bot._message_rate_limiter.get_stats()["tracked_peers"] == 0
