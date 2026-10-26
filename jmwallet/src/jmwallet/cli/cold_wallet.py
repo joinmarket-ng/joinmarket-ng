@@ -1320,7 +1320,7 @@ def spend_bond(
 
     NOTE: Sparrow Wallet also cannot sign CLTV timelock scripts.
     """
-    setup_cli(log_level, data_dir=data_dir)
+    settings = setup_cli(log_level, data_dir=data_dir)
 
     from jmcore.bitcoin import (
         BIP32Derivation,
@@ -1412,8 +1412,14 @@ def spend_bond(
         )
 
     # Validate fee rate
-    if fee_rate <= 0:
+    if not math.isfinite(fee_rate) or fee_rate <= 0:
         logger.error("Fee rate must be positive")
+        raise typer.Exit(1)
+    max_fee_rate = settings.wallet.max_fee_rate_sat_vb
+    if fee_rate > max_fee_rate:
+        logger.error(
+            f"--fee-rate {fee_rate:.2f} sat/vB exceeds safety maximum ({max_fee_rate:.0f} sat/vB)"
+        )
         raise typer.Exit(1)
 
     # Validate destination address
