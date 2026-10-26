@@ -27,6 +27,7 @@ from jmcore.commitment_blacklist import (
 from jmcore.crypto import NickIdentity, verify_signed_privmsg
 from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
+from jmcore.encryption import NaclError, init_pubkey
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
 from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID
@@ -67,6 +68,15 @@ MAX_SESSION_HANDLER_TASKS = 128
 MAX_HANDLERS_PER_SESSION = 2
 MAX_ACTIVE_MAKER_SESSIONS = 128
 MAX_PENDING_SIGNED_ROUNDS = 1024
+
+
+def _is_usable_taker_pubkey(taker_pk: str) -> bool:
+    """Match the key check in CoinJoinSession.handle_fill without creating a session."""
+    try:
+        init_pubkey(taker_pk)
+    except NaclError:
+        return False
+    return True
 
 
 class ProtocolHandlersMixin:
@@ -635,18 +645,6 @@ class ProtocolHandlersMixin:
                 )
                 return
 
-            if (
-                (generation_id, taker_nick) not in self.active_sessions
-                and len(self.active_sessions) >= MAX_ACTIVE_MAKER_SESSIONS
-                and not await self._shed_oldest_preauth_session()
-            ):
-                self._log_rate_limited(
-                    "maker-active-session-cap",
-                    f"Rejecting new maker session at cap ({MAX_ACTIVE_MAKER_SESSIONS})",
-                    interval=10.0,
-                )
-                return
-
             # Reserve synchronously before the first await. Network !hp2
             # broadcasts may blacklist this commitment while the same
             # multi-maker round is in progress, but a second local session must
@@ -687,6 +685,24 @@ class ProtocolHandlersMixin:
                 logger.warning(f"Invalid fill request for offer {offer_id}")
                 logger.bind(sensitive=True).warning(
                     f"Invalid fill request for offer {offer_id}: {error}"
+                )
+                return
+
+            # At the cap, only a fill that passed every check above and carries a
+            # usable encryption key may shed another taker's pending session.
+            if (
+                (generation_id, taker_nick) not in self.active_sessions
+                and len(self.active_sessions) >= MAX_ACTIVE_MAKER_SESSIONS
+                and not (
+                    _is_usable_taker_pubkey(taker_pk) and await self._shed_oldest_preauth_session()
+                )
+            ):
+                self._release_commitment_reservation(commitment)
+                reservation_owned = False
+                self._log_rate_limited(
+                    "maker-active-session-cap",
+                    f"Rejecting new maker session at cap ({MAX_ACTIVE_MAKER_SESSIONS})",
+                    interval=10.0,
                 )
                 return
 

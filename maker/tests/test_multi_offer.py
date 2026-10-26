@@ -735,6 +735,35 @@ class TestMakerBotMultiOfferFill:
         assert _session_key("J5NewTaker") in maker_bot.active_sessions
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fill_args",
+        [
+            "fill 99 500000 {pk}",  # unknown offer
+            "fill 0 1 {pk}",  # amount below minsize
+            "fill 0 500000 {bad_pk}",  # unusable encryption key
+        ],
+    )
+    async def test_invalid_fill_at_cap_does_not_shed(self, maker_bot, fill_args: str) -> None:
+        """Only a fill that could start a session may evict a pending one."""
+        from jmcore.encryption import CryptoSession
+
+        from maker.protocol_handlers import MAX_ACTIVE_MAKER_SESSIONS
+
+        maker_bot._send_response = AsyncMock()
+        with patch("maker.protocol_handlers.check_commitment", return_value=True):
+            for i in range(MAX_ACTIVE_MAKER_SESSIONS):
+                await maker_bot._handle_fill(
+                    f"J5Flood{i}",
+                    f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{i:064x}",
+                )
+            before = dict(maker_bot.active_sessions)
+            args = fill_args.format(pk=CryptoSession().get_pubkey_hex(), bad_pk="ab" * 31)
+            await maker_bot._handle_fill("J5Invalid", f"{args} P{'cd' * 32}")
+
+        assert maker_bot.active_sessions == before
+        assert "cd" * 32 not in maker_bot._reserved_commitments
+
+    @pytest.mark.asyncio
     async def test_fill_failure_releases_commitment_reservation(self, maker_bot):
         """A failed fill releases its commitment reservation."""
 

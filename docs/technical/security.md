@@ -117,6 +117,7 @@ changing private transaction message sizes or signed-input lock policy:
 | Public broadcast forwarding | 16 MiB/s across recipients, 64 MiB burst |
 | Tracked directory offers | 256 per connection generation; order IDs at most 64 characters |
 | Maker direct sockets | 256 across all identity generations; 60-second receive-idle and initial authentication deadlines |
+| Maker active sessions | 128; at the cap, a valid new `!fill` expires the oldest session still waiting for `!auth` |
 | Client buffered messages | 1,024 messages and 8 MiB serialized data |
 | Client message collection | 10,000 messages and 32 MiB per collection/fetch |
 | Client retained state | 10,000 offers and 20,000 peers per directory; 64 features per peer |
