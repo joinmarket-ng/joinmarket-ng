@@ -18,7 +18,7 @@ import typer
 from bitcointx.core.key import CKey, CPubKey
 from jmcore.cli_common import resolve_backend_settings, setup_cli
 from jmcore.constants import SECP256K1_N
-from jmcore.secure_files import atomic_write_private
+from jmcore.secure_files import atomic_write_private, ensure_sensitive_directory
 from loguru import logger
 
 from jmwallet.cli import app
@@ -465,7 +465,7 @@ def generate_hot_keypair(
             logger.info("Private key will be written to a local key file")
 
     if not saved_to_registry:
-        resolved_data_dir.mkdir(parents=True, exist_ok=True)
+        ensure_sensitive_directory(resolved_data_dir)
         key_file_name = f"hot_certificate_key_{pubkey.hex()[:16]}.json"
         saved_key_file = resolved_data_dir / key_file_name
         key_content = (

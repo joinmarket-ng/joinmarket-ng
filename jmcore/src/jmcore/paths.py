@@ -49,7 +49,7 @@ def get_commitment_blacklist_path(data_dir: Path | None = None) -> Path:
 
     # Use cmtdata/ subdirectory for commitment data (matches reference implementation)
     cmtdata_dir = data_dir / "cmtdata"
-    cmtdata_dir.mkdir(parents=True, exist_ok=True)
+    ensure_sensitive_directory(cmtdata_dir)
 
     return cmtdata_dir / "commitmentlist"
 
@@ -69,7 +69,7 @@ def get_used_commitments_path(data_dir: Path | None = None) -> Path:
 
     # Use cmtdata/ subdirectory
     cmtdata_dir = data_dir / "cmtdata"
-    cmtdata_dir.mkdir(parents=True, exist_ok=True)
+    ensure_sensitive_directory(cmtdata_dir)
 
     return cmtdata_dir / "commitments.json"
 
