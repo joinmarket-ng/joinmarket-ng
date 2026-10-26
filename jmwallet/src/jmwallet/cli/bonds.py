@@ -156,7 +156,7 @@ def _list_bonds_offline(
     if json_output:
         import json
 
-        output = [bond.model_dump() for bond in bonds]
+        output = [bond.model_dump(exclude={"cert_privkey"}) for bond in bonds]
         print(json.dumps(output, indent=2))
         return
 

@@ -109,7 +109,7 @@ def registry_show(
     if json_output:
         import json
 
-        print(json.dumps(bond.model_dump(), indent=2))
+        print(json.dumps(bond.model_dump(exclude={"cert_privkey"}), indent=2))
         return
 
     print("\n" + "=" * 80)
