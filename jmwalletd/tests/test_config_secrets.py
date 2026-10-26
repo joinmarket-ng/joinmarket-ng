@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from loguru import logger
 
-from jmcore.settings import BitcoinSettings, JoinMarketSettings
+from jmcore.settings import BitcoinSettings, JoinMarketSettings, WalletSettings
 from jmwalletd.deps import get_daemon_state
 
 
@@ -111,3 +111,21 @@ def test_configget_rejects_undeclared_attributes(
         )
     assert response.status_code == 409
     assert "backend-secret" not in response.text
+
+
+@pytest.mark.parametrize("field", ["wallet_with_passphrase", "bip39_passphrase_enabled"])
+def test_configget_resolves_declared_alias_spellings(
+    authed_client: tuple[TestClient, str], field: str
+) -> None:
+    client, token = authed_client
+    settings = JoinMarketSettings.model_construct(
+        wallet=WalletSettings(bip39_passphrase_enabled=True)
+    )
+    with patch("jmcore.settings.get_settings", return_value=settings):
+        response = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/configget",
+            json={"section": "WALLET", "field": field},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 200
+    assert response.json()["configvalue"] == "True"

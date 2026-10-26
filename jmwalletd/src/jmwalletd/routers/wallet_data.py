@@ -11,6 +11,7 @@ from typing import Any
 from bitcointx.core.key import CKey  # type: ignore[import-not-found]
 from fastapi import APIRouter, Depends
 from loguru import logger
+from pydantic import AliasChoices, BaseModel
 
 from jmcore.protocol import UTXOMetadata
 from jmwallet.history import get_address_history_types, get_used_addresses
@@ -578,17 +579,31 @@ async def config_get(
                 value = getattr(subsettings, real_field)
                 return ConfigGetResponse(configvalue=str(value))
 
-        value = _get_setting_value(settings, section, field_name)
-        return ConfigGetResponse(configvalue=_config_response_value(field_name, value))
+        declared_field, value = _get_setting_value(settings, section, field_name)
+        return ConfigGetResponse(configvalue=_config_response_value(declared_field, value))
     except (AttributeError, KeyError) as exc:
         raise ConfigNotPresent(f"Config not found: [{section}] {field_name}") from exc
 
 
-def _get_setting_value(settings: Any, section: str, field: str) -> Any:
+def _declared_field_name(model: type[BaseModel], name: str) -> str | None:
+    """Resolve a declared settings field, including its accepted alias spellings."""
+    if name in model.model_fields:
+        return name
+    for field_name, info in model.model_fields.items():
+        alias = info.validation_alias
+        if isinstance(alias, AliasChoices) and name in alias.choices:
+            return field_name
+    return None
+
+
+def _get_setting_value(settings: Any, section: str, field: str) -> tuple[str, Any]:
     """Look up a config value from the settings hierarchy.
 
     Maps the reference implementation's config section names to our
-    Pydantic settings structure.
+    Pydantic settings structure. Only declared fields (or their alias
+    spellings, such as ``wallet_with_passphrase``) are readable; the
+    declared field name is returned so secret masking cannot be bypassed
+    through an alias.
     """
     # Map reference section names to our settings attributes.
     section_map: dict[str, str] = {
@@ -605,12 +620,13 @@ def _get_setting_value(settings: Any, section: str, field: str) -> Any:
         msg = f"Unknown section: {section}"
         raise KeyError(msg)
 
-    value = getattr(subsettings, field, None)
-    if field not in type(subsettings).model_fields or value is None:
+    declared_field = _declared_field_name(type(subsettings), field)
+    value = None if declared_field is None else getattr(subsettings, declared_field, None)
+    if declared_field is None or value is None:
         msg = f"Unknown field: {field}"
         raise KeyError(msg)
 
-    return value
+    return declared_field, value
 
 
 # ---------------------------------------------------------------------------
