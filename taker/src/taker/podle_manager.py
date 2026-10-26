@@ -4,7 +4,9 @@ Manager for PoDLE commitments (used for retry tracking).
 
 from __future__ import annotations
 
+import itertools
 import json
+import os
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -49,9 +51,26 @@ class PoDLEManager:
         except Exception as e:
             # Keep the unreadable file for recovery instead of overwriting it
             # on the next save.
-            backup = self.filepath.with_name(f"{self.filepath.name}.corrupt.{int(time.time())}")
-            self.filepath.replace(backup)
+            backup = self._quarantine_unreadable_file()
             logger.error(f"Failed to load used commitments: {e}; moved file to {backup}")
+
+    def _quarantine_unreadable_file(self) -> Path:
+        """Move the unreadable file aside without replacing an earlier backup."""
+        stem = f"{self.filepath.name}.corrupt.{int(time.time())}"
+        for attempt in itertools.count():
+            backup = self.filepath.with_name(stem if attempt == 0 else f"{stem}.{attempt}")
+            try:
+                # Reserve the name so a backup from the same second is never replaced.
+                os.close(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            except FileExistsError:
+                continue
+            try:
+                os.replace(self.filepath, backup)
+            except BaseException:
+                backup.unlink(missing_ok=True)
+                raise
+            return backup
+        raise AssertionError("unreachable")
 
     def _save(self) -> None:
         """Save used commitments to file."""
