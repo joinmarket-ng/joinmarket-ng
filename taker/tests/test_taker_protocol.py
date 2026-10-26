@@ -2799,9 +2799,9 @@ class TestPhaseAuthMakerAuthentication:
                 "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
                 "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa",
             ),
-            # Uppercase bech32 decodes for the network but not in the tx builder.
+            # Mixed-case bech32 is invalid under BIP173.
             (
-                "BCRT1QQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPVXAT9T",
+                "BCRT1QQYQSZQGPqyqszqgpqyqszqgpqyqszqgpvxat9t",
                 "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa",
             ),
         ],
@@ -2821,6 +2821,18 @@ class TestPhaseAuthMakerAuthentication:
         assert result.success is False
         assert nick not in session_state.maker_sessions
         assert result.failed_makers == [nick]
+
+    @pytest.mark.asyncio
+    async def test_accepts_maker_with_uppercase_bech32_addresses(self):
+        """BIP173 allows all-uppercase addresses, and the tx builder decodes them."""
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True,
+            valid_btc_sig=True,
+            cj_addr="BCRT1QQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPVXAT9T",
+            change_addr="BCRT1QQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZAZMWWA",
+        )
+        assert result.success is True
+        assert nick in session_state.maker_sessions
 
     @pytest.mark.asyncio
     async def test_rejects_maker_declaring_more_inputs_than_cap(self):

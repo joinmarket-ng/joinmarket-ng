@@ -1026,6 +1026,22 @@ class TestPubkeyToP2wpkhAddress:
 class TestAddressToScriptpubkey:
     """Tests for address_to_scriptpubkey."""
 
+    def test_uppercase_bech32_matches_network_decoder(self) -> None:
+        """BIP173 all-uppercase addresses decode like their lowercase form."""
+        addr = "bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t"
+        spk = address_to_scriptpubkey(addr)
+        assert address_to_scriptpubkey(addr.upper()) == spk
+        assert address_to_scriptpubkey_for_network(addr.upper(), "regtest") == spk
+        assert get_address_type(addr.upper()) == "p2wpkh"
+
+    def test_mixed_case_bech32_is_rejected(self) -> None:
+        addr = "bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t"
+        mixed = addr[:10].upper() + addr[10:]
+        with pytest.raises(ValueError):
+            address_to_scriptpubkey(mixed)
+        with pytest.raises(ValueError):
+            get_address_type(mixed)
+
     def test_p2wpkh_address(self) -> None:
         """Roundtrip: pubkey -> address -> scriptpubkey."""
         pubkey = b"\x02" + b"\xcc" * 32

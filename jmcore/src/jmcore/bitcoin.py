@@ -459,6 +459,19 @@ def script_to_p2wsh_scriptpubkey(script: bytes) -> bytes:
     return bytes([0x00, 0x20]) + script_hash
 
 
+def _segwit_hrp(address: str) -> str | None:
+    """Return the human-readable part of a SegWit address, or None for Base58.
+
+    BIP173 requires accepting all-uppercase addresses; the decoder still rejects
+    mixed case.
+    """
+    lowered = address.lower()
+    for hrp in ("bc", "tb", "bcrt"):
+        if lowered.startswith(f"{hrp}1"):
+            return hrp
+    return None
+
+
 def address_to_scriptpubkey(address: str) -> bytes:
     """
     Convert Bitcoin address to scriptPubKey.
@@ -477,10 +490,8 @@ def address_to_scriptpubkey(address: str) -> bytes:
         scriptPubKey bytes
     """
     # Bech32 (SegWit) addresses
-    if address.startswith(("bc1", "tb1", "bcrt1")):
-        hrp_end = 4 if address.startswith("bcrt") else 2
-        hrp = address[:hrp_end]
-
+    hrp = _segwit_hrp(address)
+    if hrp is not None:
         bech32_decoded = bech32_lib.decode(hrp, address)
         if bech32_decoded[0] is None or bech32_decoded[1] is None:
             raise ValueError(f"Invalid bech32 address: {address}")
@@ -1201,10 +1212,8 @@ def get_address_type(address: str) -> str:
         ValueError: If address is invalid or unknown type
     """
     # Bech32 (SegWit)
-    if address.startswith(("bc1", "tb1", "bcrt1")):
-        hrp_end = 4 if address.startswith("bcrt") else 2
-        hrp = address[:hrp_end]
-
+    hrp = _segwit_hrp(address)
+    if hrp is not None:
         decoded = bech32_lib.decode(hrp, address)
         if decoded[0] is None or decoded[1] is None:
             raise ValueError(f"Invalid bech32 address: {address}")
