@@ -741,6 +741,45 @@ class TestWalletUnlock:
         assert state.wallet_name == target
         assert state.coinjoin_state == CoinjoinState.NOT_RUNNING
 
+    def test_service_started_during_password_check_survives_unauthenticated_switch(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        target = "planted.jmdat"
+        (state.wallets_dir / target).touch()
+        active_name = state.wallet_name
+        maker = MagicMock()
+        maker.stop = AsyncMock()
+
+        async def owner_starts_maker_during_kdf(**_: object) -> None:
+            # The owner's authenticated start_maker runs while the slow
+            # target-wallet password check is awaited.
+            state._maker_ref = maker
+            state.activate_coinjoin_state(CoinjoinState.MAKER_RUNNING)
+
+        with (
+            patch(
+                "jmwalletd.routers.wallet.verify_wallet_password",
+                side_effect=owner_starts_maker_during_kdf,
+            ),
+            patch(
+                "jmwalletd.routers.wallet.open_wallet_with_mnemonic", new_callable=AsyncMock
+            ) as open_wallet,
+        ):
+            response = client.post(
+                f"/api/v1/wallet/{target}/unlock",
+                json={"password": "attacker-password"},
+            )
+
+        assert response.status_code == 401
+        assert 'error="service_state"' in response.headers["WWW-Authenticate"]
+        open_wallet.assert_not_awaited()
+        maker.stop.assert_not_awaited()
+        assert state.wallet_name == active_name
+        assert state.coinjoin_state == CoinjoinState.MAKER_RUNNING
+        state.token_authority.verify_access(token)
+
 
 class TestWalletLock:
     def test_requires_auth(self, client: TestClient) -> None:

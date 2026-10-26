@@ -126,6 +126,20 @@ def _get_running_tumble_schedule(
 router = APIRouter()
 
 
+def _require_session_to_stop_services(state: DaemonState, token: str | None) -> None:
+    """Only the active session may switch wallets while a service runs.
+
+    Switching away locks the active wallet, which stops any maker, taker or
+    tumbler. Must not await, so callers can re-check right before locking.
+    """
+    if state.coinjoin_state == CoinjoinState.NOT_RUNNING:
+        return
+    try:
+        state.token_authority.verify_access(token or "")
+    except pyjwt.InvalidTokenError:
+        raise ServiceAlreadyStarted() from None
+
+
 async def _require_tx_monitor_ready(state: DaemonState, *, lock_on_failure: bool = False) -> None:
     """Reject lifecycle completion while transaction history is unbaselined."""
     if not await state.wait_tx_monitor_ready():
@@ -441,17 +455,11 @@ async def wallet_unlock(
                 refresh_token=tokens.refresh_token,
             )
 
-        # Switching away stops running services, so only the active session may do that.
-        if state.wallet_loaded and state.coinjoin_state != CoinjoinState.NOT_RUNNING:
-            try:
-                state.token_authority.verify_access(token or "")
-            except pyjwt.InvalidTokenError:
-                raise ServiceAlreadyStarted() from None
-
         # Authenticate a target wallet before mutating a different active
         # session. Opening a service early can conflict with its backend, so
         # verification deliberately only decrypts the wallet file here.
         if state.wallet_loaded:
+            _require_session_to_stop_services(state, token)
             try:
                 await verify_wallet_password(
                     wallet_path=wallet_path,
@@ -466,6 +474,9 @@ async def wallet_unlock(
                 )
                 state.record_unlock_failure(walletname)
                 raise InvalidCredentials() from None
+            # Services may have started while the password check awaited; no
+            # await separates this re-check from locking the active wallet.
+            _require_session_to_stop_services(state, token)
             await state._lock_wallet()
 
         try:
