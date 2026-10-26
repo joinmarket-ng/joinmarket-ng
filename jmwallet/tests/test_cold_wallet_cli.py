@@ -45,6 +45,22 @@ def _key(value: int) -> CKey:
     return CKey.from_secret_bytes(value.to_bytes(32, "big"))
 
 
+def test_generate_hot_keypair_creates_private_data_dir(tmp_path: Path) -> None:
+    import os
+    import stat
+
+    data_dir = tmp_path / "missing" / "data"
+    previous_umask = os.umask(0o022)
+    try:
+        result = runner.invoke(app, ["generate-hot-keypair", "--data-dir", str(data_dir)])
+    finally:
+        os.umask(previous_umask)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(data_dir.parent.stat().st_mode) == 0o700
+
+
 def test_generate_hot_keypair_does_not_print_private_key_and_writes_key_file():
     """generate-hot-keypair should avoid stdout key leakage and write a 0600 file."""
     with tempfile.TemporaryDirectory() as tmpdir:

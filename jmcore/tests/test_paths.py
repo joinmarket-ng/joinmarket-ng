@@ -322,6 +322,17 @@ class TestPathUtilities:
             result = get_used_commitments_path(None)
             assert result == tmp_path / "cmtdata" / "commitments.json"
 
+    def test_commitment_directory_is_private_despite_permissive_umask(self, tmp_path: Path) -> None:
+        for get_path in (get_commitment_blacklist_path, get_used_commitments_path):
+            data_dir = tmp_path / get_path.__name__
+            data_dir.mkdir()
+            previous_umask = os.umask(0o022)
+            try:
+                result = get_path(data_dir)
+            finally:
+                os.umask(previous_umask)
+            assert stat.S_IMODE(result.parent.stat().st_mode) == 0o700
+
     def test_get_ignored_makers_path(self, tmp_path: Path) -> None:
         """Test get_ignored_makers_path."""
         result = get_ignored_makers_path(tmp_path)
