@@ -2,7 +2,7 @@
 Tests for descriptor-based wallet scanning.
 """
 
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -566,3 +566,57 @@ async def test_setup_descriptor_wallet_defaults_scan_range_to_wallet_scan_range(
     ranged = [d for d in imported_descriptors if "range" in d]
     assert ranged, "expected ranged base descriptors"
     assert all(d["range"] == [0, 999] for d in ranged)
+
+
+@pytest.mark.asyncio
+async def test_neutrino_bond_discovery_scans_back_to_timelock_epoch(test_mnemonic, tmp_path):
+    """Imported-wallet bond recovery on neutrino covers every possible bond.
+
+    Bond timelocks start in January 2020 (mainnet block ~610691), well before
+    the default ``tip - 105120`` lookback used for ordinary wallet syncs.
+    Coverage recorded by an earlier, narrower scan must not skip the backfill.
+    """
+    from jmwallet.backends.neutrino import NeutrinoBackend
+
+    tip = 921_000
+    backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network="mainnet")
+    backend._server_capabilities.detected = True
+    backend._server_capabilities.has_rescan_status = True
+    backend._server_capabilities.has_persistent_rescan_state = True
+    backend._server_capabilities.has_force_rescan = True
+    backend._initial_rescan_done = True
+    backend._last_rescan_height = tip
+    backend.get_block_height = AsyncMock(return_value=tip)  # type: ignore[method-assign]
+    backend._get_rescan_coverage = AsyncMock(return_value=(tip - 105_120, tip))  # type: ignore[method-assign]
+    backend._wait_for_rescan_status = AsyncMock(  # type: ignore[method-assign]
+        return_value={"in_progress": False, "last_error": ""}
+    )
+    backend._api_call = AsyncMock(return_value={"utxos": []})  # type: ignore[method-assign]
+    wallet = WalletService(test_mnemonic, backend, network="mainnet", data_dir=tmp_path)
+
+    canonical = list(wallet._canonical_bond_address_map())
+    wallet._record_explicit_address_coverage(canonical)
+
+    with patch("jmwallet.backends.neutrino.asyncio.sleep", new=AsyncMock()):
+        await wallet.discover_fidelity_bonds()
+
+    forced = [
+        call.kwargs["data"]
+        for call in backend._api_call.call_args_list
+        if call.args[:2] == ("POST", "v1/rescan") and call.kwargs["data"].get("force")
+    ]
+    assert forced
+    assert set(forced[-1]["addresses"]) == set(canonical)
+    assert forced[-1]["start_height"] <= 610_691
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_neutrino_bond_recovery_start_on_test_networks() -> None:
+    from jmwallet.backends.neutrino import NeutrinoBackend
+
+    for network in ("signet", "regtest"):
+        backend = NeutrinoBackend(neutrino_url="http://localhost:8334", network=network)
+        assert await backend._resolve_scan_start_height(200_000) == 200_000 - 105_120
+        assert await backend._resolve_scan_start_height(200_000, bond_recovery=True) == 0
+        await backend.close()
