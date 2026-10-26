@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 from loguru import logger
 
+from jmcore.settings import BitcoinSettings, JoinMarketSettings
 from jmwalletd.deps import get_daemon_state
 
 
@@ -22,7 +22,9 @@ def test_neutrino_token_from_settings_is_masked(
     authed_client: tuple[TestClient, str], section: str
 ) -> None:
     client, token = authed_client
-    settings = SimpleNamespace(bitcoin=SimpleNamespace(neutrino_auth_token="backend-secret"))
+    settings = JoinMarketSettings.model_construct(
+        bitcoin=BitcoinSettings(neutrino_auth_token="backend-secret")
+    )
     with patch("jmcore.settings.get_settings", return_value=settings):
         response = client.post(
             "/api/v1/wallet/test_wallet.jmdat/configget",

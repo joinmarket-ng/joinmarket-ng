@@ -601,12 +601,12 @@ def _get_setting_value(settings: Any, section: str, field: str) -> Any:
 
     attr_name = section_map.get(section, section.lower())
     subsettings = getattr(settings, attr_name, None)
-    if subsettings is None:
+    if attr_name not in type(settings).model_fields or subsettings is None:
         msg = f"Unknown section: {section}"
         raise KeyError(msg)
 
     value = getattr(subsettings, field, None)
-    if value is None:
+    if field not in type(subsettings).model_fields or value is None:
         msg = f"Unknown field: {field}"
         raise KeyError(msg)
 
