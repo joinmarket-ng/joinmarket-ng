@@ -2789,6 +2789,40 @@ class TestPhaseAuthMakerAuthentication:
         assert session_state.maker_sessions[nick].responded_auth is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("cj_addr", "change_addr"),
+        [
+            ("bcrt1qcj", "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa"),
+            ("bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t", "notanaddress"),
+            # Valid mainnet address, wrong network for a regtest taker.
+            (
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa",
+            ),
+            # Uppercase bech32 decodes for the network but not in the tx builder.
+            (
+                "BCRT1QQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPVXAT9T",
+                "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa",
+            ),
+        ],
+    )
+    async def test_rejects_maker_with_unusable_output_address(self, cj_addr, change_addr):
+        """An !ioauth address the tx builder cannot use must fail the maker at auth.
+
+        Otherwise the round dies later in _phase_build_tx without the maker being
+        reported, and the same maker can keep burning revealed commitments.
+        """
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True,
+            valid_btc_sig=True,
+            cj_addr=cj_addr,
+            change_addr=change_addr,
+        )
+        assert result.success is False
+        assert nick not in session_state.maker_sessions
+        assert result.failed_makers == [nick]
+
+    @pytest.mark.asyncio
     async def test_rejects_maker_declaring_more_inputs_than_cap(self):
         """A maker must not be able to inflate our mining fee without bound.
 
