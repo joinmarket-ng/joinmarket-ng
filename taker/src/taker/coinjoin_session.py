@@ -23,7 +23,12 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from jmcore.bitcoin import address_to_scriptpubkey, get_txid, pubkey_to_p2wpkh_script
+from jmcore.bitcoin import (
+    address_to_scriptpubkey,
+    address_to_scriptpubkey_for_network,
+    get_txid,
+    pubkey_to_p2wpkh_script,
+)
 from jmcore.constants import BITCOIN_DUST_THRESHOLD, DUST_THRESHOLD
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
@@ -968,6 +973,15 @@ class CoinJoinSession:
                         del self.maker_sessions[nick]
                         continue
 
+                    # An address the tx builder cannot decode would only fail the
+                    # round in _phase_build_tx, after commitments were revealed and
+                    # without penalizing the maker.
+                    if not all(self._is_usable_maker_address(a) for a in (cj_addr, change_addr)):
+                        logger.warning(f"Dropping maker {nick}: invalid output address")
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
                     session.cj_address = cj_addr
                     session.change_address = change_addr
                     session.auth_pubkey = auth_pub  # Store for later verification
@@ -1111,6 +1125,14 @@ class CoinJoinSession:
             except (ValueError, KeyError):
                 continue
         return result
+
+    def _is_usable_maker_address(self, address: str) -> bool:
+        network = (self.config.bitcoin_network or self.config.network).value
+        try:
+            script = address_to_scriptpubkey_for_network(address, network)
+            return script == address_to_scriptpubkey(address)
+        except ValueError:
+            return False
 
     async def _phase_build_tx(
         self, destination: str, mixdepth: int, *, destination_is_internal: bool = False

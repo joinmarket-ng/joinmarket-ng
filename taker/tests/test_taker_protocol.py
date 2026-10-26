@@ -28,7 +28,7 @@ from jmcore.constants import DUST_THRESHOLD
 from jmcore.crypto import NickIdentity
 from jmcore.directory_pool import DirectoryConnectionResult
 from jmcore.encryption import CryptoSession
-from jmcore.models import Offer, OfferType
+from jmcore.models import NetworkType, Offer, OfferType
 from jmcore.network import ONION_HOSTID
 from jmcore.protocol import MakerError, MessageType
 from jmwallet.backends.base import Transaction
@@ -2580,6 +2580,8 @@ class TestPhaseAuthMakerAuthentication:
         cj_amount: int = 0,
         utxo_value: int = 1_500_000,
         utxo_list_override: str | None = None,
+        cj_addr: str = "bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t",
+        change_addr: str = "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa",
     ):
         from bitcointx.core.key import CKey
         from jmcore.bitcoin import pubkey_to_p2wpkh_script
@@ -2626,7 +2628,7 @@ class TestPhaseAuthMakerAuthentication:
         else:
             extra = ",".join(f"{i:064x}:{vout}" for i in range(declared_utxos - 1))
             utxo_list = f"{txid}:{vout}" + (f",{extra}" if extra else "")
-        ioauth = f"{utxo_list} {auth_pub.hex()} bcrt1qcj bcrt1qchange {btc_sig}"
+        ioauth = f"{utxo_list} {auth_pub.hex()} {cj_addr} {change_addr} {btc_sig}"
         encrypted = maker_crypto.encrypt(ioauth)
 
         nick = "J5maker"
@@ -2697,6 +2699,7 @@ class TestPhaseAuthMakerAuthentication:
             taker.config.maker_timeout_sec = 5
             taker.config.max_maker_utxos = max_maker_utxos
             taker.config.dust_threshold = 27300
+            taker.config.bitcoin_network = NetworkType.REGTEST
             taker._session.cj_amount = cj_amount
 
             dc = MagicMock()
