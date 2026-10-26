@@ -1937,7 +1937,7 @@ No:  automatic coin selection from one mixdepth." 12 64
         WCHOICE=$(whiptail --title " Wallet Management " \
          --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
           23 78 12 \
-          "BAL"      "View Wallet Info / Balance" \
+          "VIEW"     "View Wallet Info / Balance" \
           "HIST"     "CoinJoin History" \
           "REFRESH"  "Refresh / Reconstruct Wallet History" \
           "IDREG"    "Register Derived Wallet Identity" \
@@ -1955,9 +1955,9 @@ No:  automatic coin selection from one mixdepth." 12 64
 
         case $WCHOICE in
           # --------------------------------------------------------------
-          # BAL - Wallet Info (with submenu)
+          # VIEW - Wallet Info (with submenu)
           # --------------------------------------------------------------
-          BAL)
+          VIEW)
               while true; do
                   check_stale_wallet
                   if ! ensure_active_wallet; then
@@ -1966,9 +1966,10 @@ No:  automatic coin selection from one mixdepth." 12 64
 
                   INFO_CHOICE=$(whiptail --title " Wallet Info " \
                     --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose info display level:" \
-                    18 64 3 \
-                    "BASIC" "Basic balance by mixdepth" \
-                    "EXT" "Extended (detailed address list with status)" \
+                    19 78 4 \
+                    "BASIC" "Basic view (balance by mixdepth)" \
+                    "FULL" "Extended full view (wide pipe table, one line per UTXO)" \
+                    "COMPACT" "Extended compact view (80-column layout)" \
                     "BACK" "Back to Wallet Management" 3>&1 1>&2 2>&3)
 
                   # Handle ESC/Cancel
@@ -1990,9 +1991,9 @@ No:  automatic coin selection from one mixdepth." 12 64
                           )
                           clear
                           ;;
-                      EXT)
+                      FULL)
                           clear
-                          echo "=== Wallet Info (Extended) ==="
+                          echo "=== Wallet Info (Extended, Full) ==="
                           echo ""
                           echo "Active wallet: $(basename "$CURRENT_WALLET")"
                           echo "Preparing wallet..."
@@ -2000,7 +2001,22 @@ No:  automatic coin selection from one mixdepth." 12 64
                           (
                               ensure_wallet_password "$CURRENT_WALLET" || exit 1
                               ensure_wallet_unlocked_global || exit 1
-                              jm-wallet info --extended
+                              jm-wallet info --extended --view full
+                              pause
+                          )
+                          clear
+                          ;;
+                      COMPACT)
+                          clear
+                          echo "=== Wallet Info (Extended, Compact) ==="
+                          echo ""
+                          echo "Active wallet: $(basename "$CURRENT_WALLET")"
+                          echo "Preparing wallet..."
+                          echo ""
+                          (
+                              ensure_wallet_password "$CURRENT_WALLET" || exit 1
+                              ensure_wallet_unlocked_global || exit 1
+                              jm-wallet info --extended --view compact
                               pause
                           )
                           clear
@@ -2385,7 +2401,7 @@ for item in json.load(sys.stdin):
               echo "Please wait..."
               (
                   ensure_wallet_password "$CURRENT_WALLET" || exit 1
-                  # Full unlock, same protection as BAL/HIST/FREEZE: flag-gated
+                  # Full unlock, same protection as VIEW/HIST/FREEZE: flag-gated
                   # BIP39 passphrase prompt with fingerprint confirmation, so
                   # the user knows exactly which wallet the seed belongs to.
                   ensure_wallet_unlocked_global || exit 1

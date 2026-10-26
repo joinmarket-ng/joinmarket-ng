@@ -138,7 +138,7 @@ child.wait()
     assert not _process_exists(child_pid)
 
 
-@pytest.mark.parametrize("view", ["BASIC", "EXT"])
+@pytest.mark.parametrize("view", ["BASIC", "FULL", "COMPACT"])
 @pytest.mark.parametrize("encrypted", [True, False])
 @pytest.mark.parametrize("passphrase", [PASSPHRASE, ""])
 @pytest.mark.parametrize("confirm", [True, False])
@@ -221,6 +221,7 @@ from jmwallet.backends.descriptor_wallet import get_mnemonic_fingerprint
 async def show_info(mnemonic, backend, passphrase, **kwargs):
     print('SELECTED_WALLET=' + get_mnemonic_fingerprint(mnemonic, passphrase))
     print('EXTENDED=' + str(kwargs['extended']))
+    print('VIEW=' + str(kwargs['view']))
 
 with patch('jmwallet.cli.wallet._show_wallet_info', show_info):
     app()
@@ -260,7 +261,9 @@ with patch('jmwallet.cli.wallet._show_wallet_info', show_info):
         assert "Continue with this wallet?" not in result.stdout + result.stderr
     if confirm or not prompts:
         assert f"SELECTED_WALLET={expected}" in result.stdout, result.stdout
-        assert f"EXTENDED={view == 'EXT'}" in result.stdout
+        assert f"EXTENDED={view != 'BASIC'}" in result.stdout
+        expected_view = "legacy" if view == "BASIC" else view.lower()
+        assert f"VIEW={expected_view}" in result.stdout
     else:
         assert "SELECTED_WALLET=" not in result.stdout
     assert PASSPHRASE not in result.stdout + result.stderr

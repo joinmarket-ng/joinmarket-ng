@@ -630,7 +630,7 @@ def test_tui_script_defines_ensure_wallet_password_helper() -> None:
 
 
 def test_tui_script_wallet_info_uses_ensure_wallet_password() -> None:
-    """`jm-wallet info` (both basic and extended) must be wrapped in a
+    """`jm-wallet info` (basic, full and compact) must be wrapped in a
     subshell that calls `ensure_wallet_password` first, so the user is
     prompted via whiptail instead of a raw CLI prompt."""
     content = SCRIPT_PATH.read_text()
@@ -644,11 +644,17 @@ def test_tui_script_wallet_info_uses_ensure_wallet_password() -> None:
     assert "ensure_wallet_password" in window
     assert "jm-wallet info" in window
 
-    ext_idx = content.find("EXT)")
-    assert ext_idx != -1
-    window = content[ext_idx : ext_idx + 800]
+    full_idx = content.find("FULL)")
+    assert full_idx != -1
+    window = content[full_idx : full_idx + 800]
     assert "ensure_wallet_password" in window
-    assert "jm-wallet info --extended" in window
+    assert "jm-wallet info --extended --view full" in window
+
+    compact_idx = content.find("COMPACT)")
+    assert compact_idx != -1
+    window = content[compact_idx : compact_idx + 800]
+    assert "ensure_wallet_password" in window
+    assert "jm-wallet info --extended --view compact" in window
 
 
 def test_tui_script_new_wallet_offers_word_count_choice() -> None:
@@ -1524,18 +1530,18 @@ def test_tui_script_wallet_submenu_uses_check_stale_wallet() -> None:
     assert "check_stale_wallet" in w_block, "W submenu must refresh wallet state"
 
 
-def test_tui_script_bal_submenu_uses_check_stale_wallet() -> None:
-    """BAL submenu loop must call check_stale_wallet.
+def test_tui_script_view_submenu_uses_check_stale_wallet() -> None:
+    """VIEW submenu loop must call check_stale_wallet.
 
     New addition - previously had NO stale check, so WALLET_INFO could
     be stale if user deleted wallet file while in submenu."""
     content = SCRIPT_PATH.read_text()
 
-    # Extract BAL submenu block
-    bal_block = content.split("BAL)", 1)[1].split("HIST)", 1)[0]
+    # Extract VIEW submenu block
+    view_block = content.split("VIEW)", 1)[1].split("HIST)", 1)[0]
 
     # Must now call the helper
-    assert "check_stale_wallet" in bal_block, "BAL submenu must refresh wallet state"
+    assert "check_stale_wallet" in view_block, "VIEW submenu must refresh wallet state"
 
 
 def test_tui_script_maker_submenu_uses_check_stale_wallet() -> None:
@@ -1608,17 +1614,17 @@ def test_tui_script_send_uses_ensure_active_wallet() -> None:
     )
 
 
-def test_tui_script_bal_uses_ensure_active_wallet() -> None:
-    """BAL must use ensure_active_wallet.
+def test_tui_script_view_uses_ensure_active_wallet() -> None:
+    """VIEW must use ensure_active_wallet.
 
     Replaces inline 'No wallet configured' check."""
     content = SCRIPT_PATH.read_text()
 
-    # Extract BAL case block
-    bal_block = content.split("BAL)", 1)[1].split("HIST)", 1)[0]
+    # Extract VIEW case block
+    view_block = content.split("VIEW)", 1)[1].split("HIST)", 1)[0]
 
     # Must use unified helper
-    assert "ensure_active_wallet" in bal_block, "BAL must use unified wallet check"
+    assert "ensure_active_wallet" in view_block, "VIEW must use unified wallet check"
 
 
 def test_tui_script_hist_uses_ensure_active_wallet() -> None:
@@ -2193,7 +2199,7 @@ def test_tui_script_send_uses_subshell_for_password() -> None:
     Bug fix regression test: Previously ensure_wallet_password was called
     outside the subshell, causing MNEMONIC_PASSWORD to leak into the main
     shell. This made the password prompt be skipped on subsequent operations
-    (e.g. after BAL was called before SEND).
+    (e.g. after VIEW was called before SEND).
 
     Using a subshell isolates the password variable automatically."""
     content = SCRIPT_PATH.read_text()
@@ -2246,7 +2252,7 @@ def test_tui_script_seed_uses_subshell_for_password() -> None:
 
 
 def test_tui_script_seed_runs_full_unlock_before_showseed() -> None:
-    """SEED must run ensure_wallet_unlocked_global like BAL/HIST/FREEZE.
+    """SEED must run ensure_wallet_unlocked_global like VIEW/HIST/FREEZE.
 
     Showing seed words is at least as sensitive as balance/history: the
     flag-gated passphrase prompt with fingerprint confirmation must run so
@@ -2377,8 +2383,8 @@ def test_tui_script_cases_end_with_clear() -> None:
     """Critical menu cases must end with clear to prevent terminal flashes."""
     content = SCRIPT_PATH.read_text()
 
-    # Prüfe nur, ob nach SEND/SEED/BAL etc. irgendwo ein clear kommt
-    # (vereinfachte Prüfung)
+    # Only check whether a clear occurs somewhere after SEND/SEED/VIEW etc.
+    # (simplified check)
     assert (
         "S)\n" in content and "clear\n" in content.split("S)\n")[1].split("W)\n")[0]
     ), "SEND should have clear"
