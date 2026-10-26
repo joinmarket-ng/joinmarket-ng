@@ -103,10 +103,31 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
     Returns:
         Configured FastAPI app ready to serve.
     """
+    # ------------------------------------------------------------------
+    # Daemon state singleton.
+    # ------------------------------------------------------------------
+    state = DaemonState(data_dir=data_dir)
+    set_daemon_state(state)
+
+    # Look in data_dir/jam, system path, or Flatpak prefix /app
+    jam_dirs = [
+        state.data_dir / "jam",
+        Path("/app/share/jmwalletd/jam"),
+        Path("/usr/share/jmwalletd/jam"),
+    ]
+    static_dir: Path | None = None
+    for d in jam_dirs:
+        if d.exists() and (d / "index.html").exists():
+            static_dir = d
+            break
+
+    # Swagger UI and ReDoc load scripts from a CDN; keep them off the Jam origin.
     app = FastAPI(
         title="JoinMarket wallet daemon",
         description="JAM-compatible HTTP/WebSocket API for JoinMarket-NG",
         version="0.17.0",
+        docs_url=None if static_dir else "/docs",
+        redoc_url=None if static_dir else "/redoc",
         swagger_ui_init_oauth={
             "clientId": "jmwalletd-local",
             "appName": "JoinMarket Wallet Daemon",
@@ -132,12 +153,6 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
         allow_credentials=False,
     )
     app.add_middleware(RequestBodyLimitMiddleware)
-
-    # ------------------------------------------------------------------
-    # Daemon state singleton.
-    # ------------------------------------------------------------------
-    state = DaemonState(data_dir=data_dir)
-    set_daemon_state(state)
 
     # ------------------------------------------------------------------
     # In-memory log ring buffer so jam's Logs page can fetch recent output.
@@ -235,18 +250,6 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
     # ------------------------------------------------------------------
     # Serve JAM static files (if present).
     # ------------------------------------------------------------------
-    # Look in data_dir/jam, system path, or Flatpak prefix /app
-    jam_dirs = [
-        state.data_dir / "jam",
-        Path("/app/share/jmwalletd/jam"),
-        Path("/usr/share/jmwalletd/jam"),
-    ]
-    static_dir: Path | None = None
-    for d in jam_dirs:
-        if d.exists() and (d / "index.html").exists():
-            static_dir = d
-            break
-
     if static_dir:
         logger.info("Serving JAM from {}", static_dir)
         from starlette.routing import Route
