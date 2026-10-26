@@ -1083,12 +1083,20 @@ prepare_dep_pinning() {
     if pip show jmwalletd &> /dev/null; then
         daemon_installed=true
     fi
+    # An installed tumbler is updated together with maker and taker.
+    local tumbler_installed=false
+    if pip show jm-tumbler &> /dev/null; then
+        tumbler_installed=true
+    fi
     if [[ "${INSTALL_JMWALLETD:-false}" == "true" || "$daemon_installed" == "true" ]]; then
         pkgs+=("maker" "taker" "tumbler" "jmwalletd")
     else
-        [[ "${INSTALL_MAKER:-true}" == "true" ]] && pkgs+=("maker")
-        [[ "${INSTALL_TAKER:-true}" == "true" ]] && pkgs+=("taker")
-        [[ "${INSTALL_TUMBLER:-false}" == "true" ]] && pkgs+=("tumbler")
+        [[ "${INSTALL_MAKER:-true}" == "true" || "$tumbler_installed" == "true" ]] \
+            && pkgs+=("maker")
+        [[ "${INSTALL_TAKER:-true}" == "true" || "$tumbler_installed" == "true" ]] \
+            && pkgs+=("taker")
+        [[ "${INSTALL_TUMBLER:-false}" == "true" || "$tumbler_installed" == "true" ]] \
+            && pkgs+=("tumbler")
     fi
     if [[ "${INSTALL_ORDERBOOK_WATCHER:-false}" == "true" ]] \
         || pip show joinmarket-orderbook-watcher &> /dev/null; then
