@@ -292,6 +292,29 @@ def test_handshake_rejects_unsafe_feature_identifiers(handler, features):
         handler.process_handshake(_valid_handshake(features=features), "127.0.0.1:12345")
 
 
+@pytest.mark.parametrize(
+    "features",
+    [
+        {"f" * 65: True},
+        {"f" * 60_000: True},
+        {f"future-feature-{i}": True for i in range(33)},
+    ],
+)
+def test_handshake_rejects_oversized_feature_sets(handler, features):
+    with pytest.raises(HandshakeError, match="Invalid feature identifier"):
+        handler.process_handshake(_valid_handshake(features=features), "127.0.0.1:12345")
+
+
+def test_handshake_accepts_feature_set_at_limits(handler):
+    features = {f"{i:02d}" + "f" * 62: True for i in range(32)}
+    peer_info, response = handler.process_handshake(
+        _valid_handshake(features=features), "127.0.0.1:12345"
+    )
+
+    assert peer_info.features == features
+    assert response["accepted"] is True
+
+
 def test_handshake_accepts_safe_unknown_feature_identifier(handler):
     peer_info, response = handler.process_handshake(
         _valid_handshake(features={"future-feature.v1": True}), "127.0.0.1:12345"
