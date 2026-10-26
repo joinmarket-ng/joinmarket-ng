@@ -16,10 +16,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from jmcore.settings import get_settings
 from jmwalletd.deps import get_daemon_state, set_daemon_state
@@ -31,6 +33,42 @@ from jmwalletd.errors import (
 )
 from jmwalletd.log_buffer import install_log_sink
 from jmwalletd.state import DaemonState
+
+# Far above the largest API request (a 500-entry freeze batch is about 50 KB).
+_MAX_REQUEST_BODY_BYTES = 1024 * 1024
+_BODY_TOO_LARGE = "Request body too large."
+
+
+class RequestBodyLimitMiddleware:
+    """Reject request bodies above a fixed size before they are buffered."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int = _MAX_REQUEST_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        content_length = Headers(scope=scope).get("content-length", "")
+        if content_length.isdigit() and int(content_length) > self.max_bytes:
+            response = JSONResponse(status_code=413, content={"detail": _BODY_TOO_LARGE})
+            await response(scope, receive, send)
+            return
+
+        received = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise HTTPException(status_code=413, detail=_BODY_TOO_LARGE)
+            return message
+
+        await self.app(scope, limited_receive, send)
 
 
 @asynccontextmanager
@@ -93,6 +131,7 @@ def create_app(*, data_dir: Path | None = None) -> FastAPI:
         allow_headers=["*"],
         allow_credentials=False,
     )
+    app.add_middleware(RequestBodyLimitMiddleware)
 
     # ------------------------------------------------------------------
     # Daemon state singleton.

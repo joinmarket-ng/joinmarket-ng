@@ -174,7 +174,8 @@ headroom covers several bots sharing one Tor client without stream isolation.
 ### Wallet Daemon Admission
 
 Create, recover, and unlock share a serialized lifecycle with at most eight
-active or waiting requests. Excess requests receive HTTP 429. Password failures
+active or waiting requests. Excess requests receive HTTP 429. Request bodies
+larger than 1 MiB receive HTTP 413 before they are buffered. Password failures
 also retain per-wallet retry backoff. Expensive wallet-file cryptography runs
 outside the event loop; cancellation waits for that work to finish before
 releasing lifecycle ownership. Wallet formats and KDF parameters are unchanged.
