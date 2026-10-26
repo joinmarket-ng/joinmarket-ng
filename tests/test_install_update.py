@@ -245,6 +245,7 @@ def _run_update_with_pinning(
     pinned_deps: bool = True,
     fetch_ok: bool = True,
     hash_install_ok: bool = True,
+    installed: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """Run ``update_packages`` with dependency pinning enabled.
 
@@ -296,7 +297,10 @@ read_release_file() {{
 }}
 
 pip() {{
-    [[ "$1" == "show" ]] && return 1
+    if [[ "$1" == "show" ]]; then
+        [[ " {installed} " == *" $2 "* ]] && return 0
+        return 1
+    fi
     {pip_body}
 }}
 python3() {{ return 0; }}
@@ -495,3 +499,16 @@ cleanup_dep_pinning
             "orderbook_watcher/requirements.txt",
         ]
     assert _release_file_paths(result.stdout) == expected_paths
+
+
+def test_update_locks_cover_an_installed_tumbler() -> None:
+    """An installed tumbler is updated with --no-deps, so its locks must be fetched."""
+    result = _run_update_with_pinning(installed="jm-tumbler")
+    assert "EXIT:0" in result.stdout, result.stdout + result.stderr
+    assert _release_file_paths(result.stdout) == [
+        "jmcore/requirements.txt",
+        "jmwallet/requirements.txt",
+        "maker/requirements.txt",
+        "taker/requirements.txt",
+        "tumbler/requirements.txt",
+    ]
