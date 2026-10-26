@@ -293,13 +293,19 @@ class WalletSyncMixin:
             range_end=range_end,
         )
 
-    async def _ensure_explicit_address_coverage(self, addresses: Iterable[str]) -> bool:
-        """Historically scan explicit addresses once per wallet/backend."""
+    async def _ensure_explicit_address_coverage(
+        self, addresses: Iterable[str], *, bond_recovery: bool = False
+    ) -> bool:
+        """Historically scan explicit addresses once per wallet/backend.
+
+        Bond recovery always rescans, because earlier coverage may come from a
+        window narrower than the bond timelock epoch.
+        """
         if self.backend.supports_watch_address is not True:
             return False
         unique_addresses = list(dict.fromkeys(address.strip().lower() for address in addresses))
         uncovered = unique_addresses
-        if self.data_dir is not None:
+        if self.data_dir is not None and not bond_recovery:
             from jmwallet.history_state import get_uncovered_reconstruction_addresses
 
             uncovered = get_uncovered_reconstruction_addresses(
@@ -317,7 +323,10 @@ class WalletSyncMixin:
         if not uncovered:
             return False
 
-        coverage_expanded = await self.backend.ensure_addresses_scanned(uncovered, force=True)
+        if bond_recovery:
+            coverage_expanded = await self.backend.ensure_bond_addresses_scanned(uncovered)
+        else:
+            coverage_expanded = await self.backend.ensure_addresses_scanned(uncovered, force=True)
         if coverage_expanded is True:
             self._clear_reconstruction_cursor()
             self._record_explicit_address_coverage(uncovered)
@@ -984,7 +993,7 @@ class WalletSyncMixin:
             # funded before this call stays invisible whenever the initial
             # rescan already ran (e.g. a warm jmwalletd session). No-op for
             # backends without watch support.
-            await self._ensure_explicit_address_coverage(all_addresses_list)
+            await self._ensure_explicit_address_coverage(all_addresses_list, bond_recovery=True)
             for batch_start in range(0, total_addrs, batch_size):
                 batch_addrs = all_addresses_list[batch_start : batch_start + batch_size]
                 batch_end = batch_start + len(batch_addrs)

@@ -114,7 +114,11 @@ JoinMarket requests a forced historical rescan so persisted global coverage
 does not hide transactions for those newly watched addresses. Servers without
 the force capability fall back to requesting one block below the persisted
 coverage floor; reliable completion confirmation requires a neutrino-api
-version that exposes `GET /v1/rescan/status` (v0.7.0+).
+version that exposes `GET /v1/rescan/status` (v0.7.0+). Without a configured
+`scan_start_height` or a recorded wallet creation height, this recovery rescan
+starts no later than the fidelity-bond timelock epoch (January 2020, block
+610000 on mainnet), even when `scan_lookback_blocks` would start later, and it
+runs again on every recovery attempt.
 
 Completed coverage for registered bond addresses is stored as wallet-scoped
 hashes, so later processes re-register those addresses without repeating the

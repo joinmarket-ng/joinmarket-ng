@@ -57,6 +57,10 @@ GENESIS_BLOCK_HASHES: dict[str, str] = {
 
 _HASH_TO_NETWORK: dict[str, str] = {h: n for n, h in GENESIS_BLOCK_HASHES.items()}
 
+# Fidelity bond timelocks start at timenumber 0 (January 2020). Mainnet block
+# 610000 was mined in late December 2019, so no bond can be funded before it.
+FIDELITY_BOND_EPOCH_HEIGHT_MAINNET = 610_000
+
 
 class NeutrinoNetworkMismatchError(Exception):
     """Raised when the neutrino server is serving a different network."""
@@ -259,6 +263,11 @@ class NeutrinoBackend(BlockchainBackend):
             self._min_valid_blockheight = 834624  # Approximate SegWit on testnet
         elif network == "signet":
             self._min_valid_blockheight = 0  # Signet started with SegWit
+        self._bond_epoch_height: int = (
+            FIDELITY_BOND_EPOCH_HEIGHT_MAINNET
+            if network == "mainnet"
+            else self._min_valid_blockheight
+        )
 
         # Store the explicit user override (may be None).
         self._explicit_scan_start_height: int | None = scan_start_height
@@ -1062,7 +1071,9 @@ class NeutrinoBackend(BlockchainBackend):
         except Exception:
             return (0, 0)
 
-    async def _resolve_scan_start_height(self, tip_height: int) -> int:
+    async def _resolve_scan_start_height(
+        self, tip_height: int, *, bond_recovery: bool = False
+    ) -> int:
         """Compute the effective scan start height for the initial rescan.
 
         Priority order:
@@ -1072,6 +1083,9 @@ class NeutrinoBackend(BlockchainBackend):
         3. Lookback window from the current chain tip (signet/regtest where
            ``_min_valid_blockheight`` is 0).
         4. ``_min_valid_blockheight`` (SegWit activation on mainnet/testnet).
+
+        With ``bond_recovery`` the lookback window never starts after the
+        fidelity bond timelock epoch, since a bond can be older than it.
 
         Returns:
             The block height to start the initial rescan from.
@@ -1091,6 +1105,8 @@ class NeutrinoBackend(BlockchainBackend):
         if self._scan_lookback_blocks > 0 and tip_height > self._scan_lookback_blocks:
             lookback_height = tip_height - self._scan_lookback_blocks
             start = max(lookback_height, self._min_valid_blockheight)
+            if bond_recovery:
+                start = min(start, self._bond_epoch_height)
         else:
             start = self._min_valid_blockheight
 
@@ -2315,8 +2331,16 @@ class NeutrinoBackend(BlockchainBackend):
         async with self._ensure_scan_lock:
             return await self._ensure_addresses_scanned_locked(addresses, force=force)
 
+    async def ensure_bond_addresses_scanned(self, addresses: list[str]) -> bool:
+        if not addresses:
+            return False
+        async with self._ensure_scan_lock:
+            return await self._ensure_addresses_scanned_locked(
+                addresses, force=True, bond_recovery=True
+            )
+
     async def _ensure_addresses_scanned_locked(
-        self, addresses: list[str], *, force: bool = False
+        self, addresses: list[str], *, force: bool = False, bond_recovery: bool = False
     ) -> bool:
         # Only rescan addresses we are not already covering. ``add_watch_address``
         # is idempotent; we use the watched set to detect genuinely new ones.
@@ -2335,7 +2359,9 @@ class NeutrinoBackend(BlockchainBackend):
 
         try:
             tip_height = await self.get_block_height()
-            start_height = await self._resolve_scan_start_height(tip_height)
+            start_height = await self._resolve_scan_start_height(
+                tip_height, bond_recovery=bond_recovery
+            )
 
             # New servers support an explicit force flag. Older servers ignore
             # unknown request fields, so retain the one-block-below-floor

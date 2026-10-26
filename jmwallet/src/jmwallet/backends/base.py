@@ -208,6 +208,15 @@ class BlockchainBackend(ABC):
         """
         return False
 
+    async def ensure_bond_addresses_scanned(self, addresses: list[str]) -> bool:
+        """Force a historical scan of fidelity bond recovery candidates.
+
+        Light-client backends override this to reach back to the bond timelock
+        epoch when no wallet start height is known. Returns whether historical
+        coverage was expanded.
+        """
+        return await self.ensure_addresses_scanned(addresses, force=True)
+
     async def get_address_usage(self, addresses: list[str]) -> set[str] | None:
         """Return addresses known to have history, or ``None`` when unsupported.
 
