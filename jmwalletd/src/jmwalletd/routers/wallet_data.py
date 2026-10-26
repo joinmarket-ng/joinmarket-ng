@@ -17,7 +17,13 @@ from jmcore.protocol import UTXOMetadata
 from jmwallet.history import get_address_history_types, get_used_addresses
 from jmwallet.wallet.bond_registry import create_bond_info, load_registry, save_registry
 from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
-from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
+from jmwalletd.deps import (
+    get_daemon_state,
+    get_optional_token,
+    require_auth,
+    require_current_session,
+    require_wallet_match,
+)
 from jmwalletd.errors import (
     ActionNotAllowed,
     ConfigNotPresent,
@@ -707,6 +713,7 @@ async def rescan_blockchain(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> RescanBlockchainResponse:
     """Trigger a blockchain rescan from the given block height."""
     backend = state.wallet_service.backend
@@ -719,6 +726,9 @@ async def rescan_blockchain(
         logger.info("Rescan tracking task already active; returning existing operation")
         return RescanBlockchainResponse(walletname=walletname)
 
+    # No await from here until the task exists, so a wallet lock either sees it
+    # or has already invalidated this request's token.
+    require_current_session(state, token)
     state.rescanning = True
     state.rescan_progress = 0.0
     state.rescan_error = None

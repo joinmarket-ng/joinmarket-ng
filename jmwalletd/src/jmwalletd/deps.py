@@ -80,6 +80,24 @@ def require_auth(
     return payload
 
 
+def require_current_session(state: DaemonState, token: str | None) -> None:
+    """Re-verify a request's token right before it starts wallet-bound work.
+
+    ``require_auth`` runs before the handler body, with awaits in between, so a
+    wallet lock may have started since. Locking resets the token keys before its
+    first await but only stops work that already exists. Call this with no await
+    between it and starting the work: a token that still verifies here means a
+    later lock will see, and stop, that work.
+
+    Raises:
+        InvalidToken: If the session that authorized the request has ended.
+    """
+    try:
+        state.token_authority.verify_access(token or "")
+    except jwt.InvalidTokenError as exc:
+        raise InvalidToken(str(exc)) from exc
+
+
 def require_auth_allow_expired(
     request: Request,
     state: DaemonState = Depends(get_daemon_state),

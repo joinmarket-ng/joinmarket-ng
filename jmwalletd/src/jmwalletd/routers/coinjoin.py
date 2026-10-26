@@ -12,7 +12,13 @@ from loguru import logger
 
 from jmcore.paths import remove_nick_state, write_nick_state
 from jmcore.settings import get_settings
-from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
+from jmwalletd.deps import (
+    get_daemon_state,
+    get_optional_token,
+    require_auth,
+    require_current_session,
+    require_wallet_match,
+)
 from jmwalletd.errors import (
     ActionNotAllowed,
     BackendNotReady,
@@ -166,6 +172,7 @@ async def do_coinjoin(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Initiate a coinjoin transaction (asynchronous)."""
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
@@ -173,6 +180,9 @@ async def do_coinjoin(
     if not state.wallet_mnemonic:
         raise NoWalletFound("Wallet mnemonic not available in daemon state.")
 
+    # No await from here until the task exists, so a wallet lock either sees it
+    # or has already invalidated this request's token.
+    require_current_session(state, token)
     try:
         from jmwalletd._backend import get_backend
         from taker.config import TakerConfig
@@ -384,6 +394,7 @@ async def start_maker(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Start the yield generator (maker) service."""
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
@@ -400,6 +411,9 @@ async def start_maker(
     except ValueError as exc:
         raise InvalidRequestFormat(f"Invalid maker parameter: {exc}") from exc
 
+    # No await from here until the task exists, so a wallet lock either sees it
+    # or has already invalidated this request's token.
+    require_current_session(state, token)
     try:
         from jmwalletd._backend import get_backend
         from jmwalletd.maker_config import build_daemon_maker_config

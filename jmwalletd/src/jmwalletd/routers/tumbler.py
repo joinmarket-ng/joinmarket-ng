@@ -55,7 +55,13 @@ from tumbler.runner import RunnerContext, TumbleRunner
 from jmcore.paths import write_nick_state
 from jmcore.settings import get_settings
 from jmcore.tasks import spawn_task
-from jmwalletd.deps import get_daemon_state, require_auth, require_wallet_match
+from jmwalletd.deps import (
+    get_daemon_state,
+    get_optional_token,
+    require_auth,
+    require_current_session,
+    require_wallet_match,
+)
 from jmwalletd.errors import (
     ActionNotAllowed,
     BackendNotReady,
@@ -412,6 +418,7 @@ async def start_plan(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Load the pending plan and run it in the background."""
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
@@ -419,6 +426,10 @@ async def start_plan(
     if not state.wallet_mnemonic:
         raise NoWalletFound("Wallet mnemonic not available in daemon state.")
 
+    # Reconciliation may save the plan, so recheck first. No await from here
+    # until the task exists, so a wallet lock either sees it or has already
+    # invalidated this request's token.
+    require_current_session(state, token)
     plan = _reconcile_on_request(state, state.wallet_name)
     if plan is None:
         raise NoWalletFound("No tumbler plan exists for this wallet; create one first.")
