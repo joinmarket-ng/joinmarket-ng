@@ -9,6 +9,7 @@ import contextlib
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import web
 from aiohttp.typedefs import Handler
@@ -44,7 +45,9 @@ class OrderbookServer:
     def __init__(self, settings: OrderbookWatcherSettings, aggregator: OrderbookAggregator) -> None:
         self.settings = settings
         self.aggregator = aggregator
-        self.app = web.Application(middlewares=[_no_store_ui_middleware])
+        self.app = web.Application(
+            middlewares=[_no_store_ui_middleware, self._security_headers_middleware]
+        )
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
         self._update_task: asyncio.Task[Any] | None = None
@@ -53,6 +56,42 @@ class OrderbookServer:
         self._background_update_task: asyncio.Task[Any] | None = None
         self._stopping = False
         self._setup_routes()
+
+    def _mempool_url(self) -> str | None:
+        return self.settings.mempool_web_url or (
+            self.settings.mempool_api_url.replace("/api", "")
+            if self.settings.mempool_api_url
+            else None
+        )
+
+    def _content_security_policy(self) -> str:
+        # The page fetches the block height from the configured mempool URL.
+        connect_src = "'self'"
+        parts = urlsplit(self._mempool_url() or "")
+        if parts.scheme in ("http", "https") and parts.netloc:
+            connect_src += f" {parts.scheme}://{parts.netloc}"
+        return (
+            "default-src 'self'; "
+            f"connect-src {connect_src}; "
+            "img-src 'self' data:; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        )
+
+    @web.middleware
+    async def _security_headers_middleware(
+        self, request: web.Request, handler: Handler
+    ) -> web.StreamResponse:
+        headers = {
+            "Content-Security-Policy": self._content_security_policy(),
+            "X-Content-Type-Options": "nosniff",
+        }
+        try:
+            response: web.StreamResponse = await handler(request)
+        except web.HTTPException as exc:
+            exc.headers.update(headers)
+            raise
+        response.headers.update(headers)
+        return response
 
     def _setup_routes(self) -> None:
         missing_assets = [
@@ -229,12 +268,7 @@ class OrderbookServer:
                 "rel_grid": [str(q) for q in QUANT_REL],
                 "abs_grid": list(QUANT_ABS),
             },
-            "mempool_url": self.settings.mempool_web_url
-            or (
-                self.settings.mempool_api_url.replace("/api", "")
-                if self.settings.mempool_api_url
-                else None
-            ),
+            "mempool_url": self._mempool_url(),
         }
 
     @staticmethod
