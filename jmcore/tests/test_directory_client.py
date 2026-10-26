@@ -1612,7 +1612,7 @@ async def test_fetch_orderbooks_enriches_returned_offers_from_late_peerlist():
 
     calls = 0
 
-    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+    async def mock_listen(duration: float = 5.0, *, keep: Any = None) -> list[dict[str, Any]]:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1653,7 +1653,7 @@ async def test_adaptive_fetch_exits_early_after_quiet_period():
     call_count = 0
     offer_msg = _make_offer_msg()
 
-    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+    async def mock_listen(duration: float = 5.0, *, keep: Any = None) -> list[dict[str, Any]]:
         nonlocal call_count
         call_count += 1
         # First call: return an offer
@@ -1692,7 +1692,7 @@ async def test_adaptive_fetch_respects_min_wait():
     call_count = 0
     offer_msg = _make_offer_msg()
 
-    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+    async def mock_listen(duration: float = 5.0, *, keep: Any = None) -> list[dict[str, Any]]:
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -1727,7 +1727,7 @@ async def test_adaptive_fetch_respects_max_wait():
 
     counter = 0
 
-    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+    async def mock_listen(duration: float = 5.0, *, keep: Any = None) -> list[dict[str, Any]]:
         nonlocal counter
         counter += 1
         # Always return an offer (never quiet)
@@ -1758,7 +1758,7 @@ async def test_adaptive_fetch_no_offers_exits_after_min_wait_plus_quiet():
     client.connection = mock_connection
     client.get_peerlist_with_features = AsyncMock(return_value=[])
 
-    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+    async def mock_listen(duration: float = 5.0, *, keep: Any = None) -> list[dict[str, Any]]:
         await asyncio.sleep(duration)
         return []
 
@@ -1789,7 +1789,7 @@ async def test_adaptive_fetch_counts_different_offer_types():
 
     call_count = 0
 
-    async def mock_listen(duration: float = 5.0) -> list[dict[str, Any]]:
+    async def mock_listen(duration: float = 5.0, *, keep: Any = None) -> list[dict[str, Any]]:
         nonlocal call_count
         call_count += 1
         if call_count == 1:

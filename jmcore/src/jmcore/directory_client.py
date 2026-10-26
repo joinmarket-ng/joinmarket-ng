@@ -1208,7 +1208,12 @@ class DirectoryClient:
         )
         return peers, malformed
 
-    async def listen_for_messages(self, duration: float = 5.0) -> list[dict[str, Any]]:
+    async def listen_for_messages(
+        self,
+        duration: float = 5.0,
+        *,
+        keep: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Listen for messages for a specified duration.
 
@@ -1217,6 +1222,10 @@ class DirectoryClient:
 
         Args:
             duration: How long to listen in seconds
+            keep: Optional filter for callers that only need some messages. Rejected
+                messages are discarded, and messages beyond the collection limits are
+                dropped instead of closing the connection, so relayed traffic from
+                other peers cannot end the caller's collection.
 
         Returns:
             List of received messages
@@ -1235,6 +1244,19 @@ class DirectoryClient:
         total_message_bytes = 0
         start_time = asyncio.get_event_loop().time()
 
+        def collect(message: dict[str, Any]) -> None:
+            nonlocal total_message_bytes
+            if keep is not None and not keep(message):
+                return
+            try:
+                total_message_bytes = self._append_collected_message(
+                    messages, message, total_message_bytes, "listen"
+                )
+            except _DirectoryClientLimitError:
+                if keep is None:
+                    raise
+                logger.trace("Dropping message: listen collection limit reached")
+
         # First, drain any buffered messages into our result list
         # These are messages that were received while waiting for other responses
         while not self._message_buffer.empty():
@@ -1246,9 +1268,7 @@ class DirectoryClient:
                     f"Processing buffered message type {buffered_msg.get('type')}: "
                     f"{buffered_msg.get('line', '')[:80]}..."
                 )
-                total_message_bytes = self._append_collected_message(
-                    messages, buffered_msg, total_message_bytes, "listen"
-                )
+                collect(buffered_msg)
             except asyncio.QueueEmpty:
                 break
             except _DirectoryClientLimitError as e:
@@ -1280,9 +1300,7 @@ class DirectoryClient:
                     consecutive_errors = 0
                     continue
 
-                total_message_bytes = self._append_collected_message(
-                    messages, response, total_message_bytes, "listen"
-                )
+                collect(response)
                 consecutive_errors = 0
 
             except TimeoutError:
@@ -1392,6 +1410,12 @@ class DirectoryClient:
         # Full parsing happens after collection -- this is just for counting.
         offer_prefixes = ("sw0absoffer", "sw0reloffer", "swabsoffer", "swreloffer")
 
+        def is_offer(message: dict[str, Any]) -> bool:
+            return any(prefix in message.get("line", "") for prefix in offer_prefixes)
+
+        def is_orderbook_message(message: dict[str, Any]) -> bool:
+            return is_offer(message) or message.get("type") == MessageType.PEERLIST.value
+
         messages: list[dict[str, Any]] = []
         total_message_bytes = 0
         offer_count = 0
@@ -1419,14 +1443,11 @@ class DirectoryClient:
             if listen_time <= 0:
                 break
 
-            chunk = await self.listen_for_messages(duration=listen_time)
+            # Relayed public traffic is filtered while listening, so a flood can
+            # neither fill the collection nor close the directory connection.
+            chunk = await self.listen_for_messages(duration=listen_time, keep=is_orderbook_message)
             new_offers = 0
             for msg in chunk:
-                # Lightweight offer detection: check if the line contains an offer type
-                line = msg.get("line", "")
-                is_offer = any(prefix in line for prefix in offer_prefixes)
-                if not is_offer and msg.get("type") != MessageType.PEERLIST.value:
-                    continue
                 try:
                     total_message_bytes = self._append_collected_message(
                         messages, msg, total_message_bytes, "orderbook fetch"
@@ -1434,7 +1455,7 @@ class DirectoryClient:
                 except _DirectoryClientLimitError:
                     logger.trace("Dropping orderbook message: collection limit reached")
                     continue
-                if is_offer:
+                if is_offer(msg):
                     new_offers += 1
 
             if new_offers > 0:

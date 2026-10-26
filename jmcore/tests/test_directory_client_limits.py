@@ -165,12 +165,52 @@ async def test_orderbook_fetch_ignores_noise_and_drops_beyond_limit(
         [{"type": MessageType.PUBMSG.value, "line": offer_lines[2]}],
     ]
 
-    async def listen_once(duration: float = 5.0) -> list[dict[str, Any]]:
-        return chunks.pop(0) if chunks else []
+    async def listen_once(duration: float = 5.0, *, keep: Any = None) -> list[dict[str, Any]]:
+        chunk = chunks.pop(0) if chunks else []
+        return [message for message in chunk if keep is None or keep(message)]
 
     client.listen_for_messages = listen_once  # type: ignore[method-assign]
 
     offers, _bonds = await client.fetch_orderbooks(max_wait=3.0, min_wait=0.0, quiet_period=0.0)
+
+    assert sorted((offer.counterparty, offer.oid) for offer in offers) == [
+        (VALID_MAKER_NICKS[0], 0),
+        (VALID_MAKER_NICKS[1], 1),
+    ]
+    connection.close.assert_not_awaited()
+    assert client.connection is connection
+
+
+@pytest.mark.asyncio
+async def test_orderbook_fetch_survives_flood_within_one_listen_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flood through the real receive path is filtered and capped, not fatal."""
+    monkeypatch.setattr("jmcore.directory_client.MAX_COLLECTED_MESSAGES", 2)
+    offers_sent = [
+        f"{nick}!PUBLIC!sw0reloffer {oid} 750000 790107726787 500 0.001"
+        for oid, nick in enumerate((*VALID_MAKER_NICKS, VALID_MAKER_NICKS[0]))
+    ]
+    frames = [json.dumps(_message()).encode("utf-8")] * 50
+    frames += [
+        json.dumps({"type": MessageType.PUBMSG.value, "line": line}).encode("utf-8")
+        for line in offers_sent
+    ]
+
+    async def receive() -> bytes:
+        if frames:
+            return frames.pop(0)
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    connection = AsyncMock()
+    connection.receive.side_effect = receive
+    connection.is_connected = Mock(return_value=True)
+    client = DirectoryClient("host", 1234, "mainnet")
+    client.connection = connection
+    client.get_peerlist_with_features = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    offers, _bonds = await client.fetch_orderbooks(max_wait=0.5, min_wait=0.0, quiet_period=0.0)
 
     assert sorted((offer.counterparty, offer.oid) for offer in offers) == [
         (VALID_MAKER_NICKS[0], 0),

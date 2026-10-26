@@ -123,9 +123,11 @@ changing private transaction message sizes or signed-input lock policy:
 | Watcher bond caches | 4,096 positive entries and 4,096 short-lived retry entries |
 | Watcher mempool verification | At most 256 claims per update, five concurrent lookups, 60-second retry cooldown |
 
-Excess public broadcasts are dropped. Client collection/state exhaustion closes
-the connection and reports failure rather than accepting a partial authoritative
-peerlist. Maker deadlines do not impose a 60-second limit on verified CoinJoin
+Excess public broadcasts are dropped. While fetching a peerlist or orderbook, a
+client also drops relayed traffic beyond its buffer and collection limits, so any
+peer's flood cannot disconnect it; the orderbook may then be partial. Other
+client collection/state exhaustion closes the connection and reports failure
+rather than accepting a partial authoritative peerlist. Maker deadlines do not impose a 60-second limit on verified CoinJoin
 work. These bounds reduce resource exhaustion; they do not prevent Sybil attacks
 or guarantee admission while an adversary continuously occupies available slots.
 
