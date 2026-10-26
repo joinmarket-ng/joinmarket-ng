@@ -659,6 +659,88 @@ class TestWalletUnlock:
         with pytest.raises(InvalidCredentials):
             await wallet_router.wallet_unlock(wallet_name, request, daemon_state)
 
+    @pytest.mark.parametrize(
+        "running",
+        [
+            CoinjoinState.MAKER_RUNNING,
+            CoinjoinState.TAKER_RUNNING,
+            CoinjoinState.TUMBLER_RUNNING,
+        ],
+    )
+    def test_unauthenticated_switch_cannot_stop_running_service(
+        self, authed_client: tuple[TestClient, str], running: CoinjoinState
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        target = "planted.jmdat"
+        (state.wallets_dir / target).touch()
+        active_name = state.wallet_name
+        maker = MagicMock()
+        maker.stop = AsyncMock()
+        state._maker_ref = maker
+        state.activate_coinjoin_state(running)
+        wallet_service = MagicMock()
+        wallet_service.backend.supports_tx_enumeration = False
+        wallet_service.sync = AsyncMock()
+
+        with (
+            patch(
+                "jmwalletd.routers.wallet.verify_wallet_password", new_callable=AsyncMock
+            ) as verify_password,
+            patch(
+                "jmwalletd.routers.wallet.open_wallet_with_mnemonic",
+                new_callable=AsyncMock,
+                return_value=(wallet_service, "abandon " * 11 + "about"),
+            ) as open_wallet,
+        ):
+            response = client.post(
+                f"/api/v1/wallet/{target}/unlock",
+                json={"password": "attacker-password"},
+            )
+
+        assert response.status_code == 401
+        assert 'error="service_state"' in response.headers["WWW-Authenticate"]
+        verify_password.assert_not_awaited()
+        open_wallet.assert_not_awaited()
+        maker.stop.assert_not_awaited()
+        assert state.wallet_name == active_name
+        assert state.coinjoin_state == running
+        state.token_authority.verify_access(token)
+
+    def test_active_session_can_switch_while_service_runs(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        client, token = authed_client
+        state = get_daemon_state()
+        target = "other.jmdat"
+        (state.wallets_dir / target).touch()
+        maker = MagicMock()
+        maker.stop = AsyncMock()
+        state._maker_ref = maker
+        state.activate_coinjoin_state(CoinjoinState.MAKER_RUNNING)
+        wallet_service = MagicMock()
+        wallet_service.backend.supports_tx_enumeration = False
+        wallet_service.sync = AsyncMock()
+
+        with (
+            patch("jmwalletd.routers.wallet.verify_wallet_password", new_callable=AsyncMock),
+            patch(
+                "jmwalletd.routers.wallet.open_wallet_with_mnemonic",
+                new_callable=AsyncMock,
+                return_value=(wallet_service, "abandon " * 11 + "about"),
+            ),
+        ):
+            response = client.post(
+                f"/api/v1/wallet/{target}/unlock",
+                json={"password": "other-password"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 200
+        maker.stop.assert_awaited_once()
+        assert state.wallet_name == target
+        assert state.coinjoin_state == CoinjoinState.NOT_RUNNING
+
 
 class TestWalletLock:
     def test_requires_auth(self, client: TestClient) -> None:
