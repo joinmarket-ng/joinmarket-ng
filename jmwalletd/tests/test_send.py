@@ -117,6 +117,35 @@ async def test_direct_send_refreshes_registered_bonds_and_writes_history(
 @patch("jmwalletd.send.create_send_history_entry")
 @patch("jmwalletd.send.prepare_direct_send", new_callable=AsyncMock)
 @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
+async def test_direct_send_records_canonical_destination(
+    mock_get_backend: AsyncMock,
+    mock_prepare_direct_send: AsyncMock,
+    mock_create_entry: MagicMock,
+    _mock_append_entry: MagicMock,
+    _mock_update_entry: MagicMock,
+) -> None:
+    """History must match wallet addresses, so an uppercase request is recorded lowercase."""
+    wallet = MagicMock()
+    wallet.data_dir = None
+    wallet.sync_with_registered_bonds = AsyncMock()
+    mock_prepare_direct_send.return_value = _make_prepared_tx()
+    backend = MagicMock()
+    backend.broadcast_transaction = AsyncMock(return_value="bb" * 32)
+    mock_get_backend.return_value = backend
+
+    await do_direct_send(
+        wallet_service=wallet, mixdepth=0, amount_sats=50_000, destination="BCRT1QDESTINATION"
+    )
+
+    assert mock_create_entry.call_args.kwargs["destination"] == "bcrt1qdestination"
+
+
+@pytest.mark.asyncio
+@patch("jmwalletd.send.update_send_awaiting_broadcast")
+@patch("jmwalletd.send.append_history_entry")
+@patch("jmwalletd.send.create_send_history_entry")
+@patch("jmwalletd.send.prepare_direct_send", new_callable=AsyncMock)
+@patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
 async def test_direct_send_detail_logs_are_sensitive(
     mock_get_backend: AsyncMock,
     mock_prepare_direct_send: AsyncMock,

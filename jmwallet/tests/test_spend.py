@@ -1227,6 +1227,48 @@ class TestPrepareDirectSend:
 
         assert result.selected_utxos == [(alternative.txid, alternative.vout)]
 
+    @pytest.mark.anyio
+    async def test_prepare_accepts_uppercase_bech32_destination(self) -> None:
+        """BIP173 all-uppercase addresses pay the same script and are reported lowercase."""
+        wallet = _make_mock_wallet([_make_utxo(value=200_000)])
+
+        lower = await prepare_direct_send(
+            wallet=wallet,
+            backend=_make_mock_backend(),
+            mixdepth=0,
+            amount_sats=0,
+            destination=REGTEST_P2WPKH_ADDR,
+            fee_rate=1.0,
+        )
+        upper = await prepare_direct_send(
+            wallet=wallet,
+            backend=_make_mock_backend(),
+            mixdepth=0,
+            amount_sats=0,
+            destination=REGTEST_P2WPKH_ADDR.upper(),
+            fee_rate=1.0,
+        )
+
+        assert upper.destination == REGTEST_P2WPKH_ADDR
+        assert upper.outputs[0]["address"] == REGTEST_P2WPKH_ADDR
+        assert (
+            parse_transaction(upper.tx_hex).outputs[0].script
+            == parse_transaction(lower.tx_hex).outputs[0].script
+        )
+
+    @pytest.mark.anyio
+    async def test_prepare_rejects_mixed_case_bech32_destination(self) -> None:
+        mixed = REGTEST_P2WPKH_ADDR[:8].upper() + REGTEST_P2WPKH_ADDR[8:]
+        with pytest.raises(ValueError, match="Invalid destination address"):
+            await prepare_direct_send(
+                wallet=_make_mock_wallet([_make_utxo(value=200_000)]),
+                backend=_make_mock_backend(),
+                mixdepth=0,
+                amount_sats=0,
+                destination=mixed,
+                fee_rate=1.0,
+            )
+
 
 # ---------------------------------------------------------------------------
 # parse_outpoint

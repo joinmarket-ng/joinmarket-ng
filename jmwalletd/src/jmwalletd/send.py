@@ -109,7 +109,7 @@ async def do_direct_send(
         wallet_service, "fingerprint", ""
     )
     send_entry = create_send_history_entry(
-        destination=destination,
+        destination=prepared.destination,
         change_address=prepared.change_address,
         amount=prepared.send_amount,
         mining_fee=prepared.fee,

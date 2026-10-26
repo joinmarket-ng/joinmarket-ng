@@ -774,7 +774,9 @@ async def prepare_direct_send(
     metadata needed to broadcast and record a history entry. Callers that want
     the full build+sign+broadcast flow should use :func:`direct_send` instead.
     """
-    if not destination.startswith(("bc1", "tb1", "bcrt1")):
+    # BIP173 allows all-uppercase bech32 (common in QR codes); the decoder
+    # below still rejects mixed case.
+    if not destination.lower().startswith(("bc1", "tb1", "bcrt1")):
         msg = "Only bech32 addresses are currently supported"
         raise ValueError(msg)
 
@@ -783,6 +785,8 @@ async def prepare_direct_send(
     # before any fee estimation or UTXO selection side effects.
     network = getattr(wallet, "network", None)
     dest_script = _decode_bech32_scriptpubkey(destination, network=network)
+    # Report the canonical lowercase form so history matches wallet addresses.
+    destination = destination.lower()
 
     # --- Fee rate resolution ---
     fee_source = "manual"
