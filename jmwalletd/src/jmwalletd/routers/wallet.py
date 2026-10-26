@@ -27,6 +27,7 @@ from jmwalletd.errors import (
     InvalidRequestFormat,
     InvalidToken,
     LockExists,
+    ServiceAlreadyStarted,
     UnlockBackoff,
     WalletAlreadyExists,
     WalletAlreadyUnlocked,
@@ -393,6 +394,7 @@ async def wallet_unlock(
     walletname: WalletName,
     body: UnlockWalletRequest,
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> UnlockWalletResponse:
     """Unlock (decrypt) a wallet."""
     async with state.wallet_lifecycle_admission():
@@ -438,6 +440,13 @@ async def wallet_unlock(
                 scope=tokens.scope,
                 refresh_token=tokens.refresh_token,
             )
+
+        # Switching away stops running services, so only the active session may do that.
+        if state.wallet_loaded and state.coinjoin_state != CoinjoinState.NOT_RUNNING:
+            try:
+                state.token_authority.verify_access(token or "")
+            except pyjwt.InvalidTokenError:
+                raise ServiceAlreadyStarted() from None
 
         # Authenticate a target wallet before mutating a different active
         # session. Opening a service early can conflict with its backend, so

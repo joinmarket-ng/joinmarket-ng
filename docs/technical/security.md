@@ -176,9 +176,12 @@ headroom covers several bots sharing one Tor client without stream isolation.
 Create, recover, and unlock share a serialized lifecycle with at most eight
 active or waiting requests. Excess requests receive HTTP 429. Request bodies
 larger than 1 MiB receive HTTP 413 before they are buffered. Password failures
-also retain per-wallet retry backoff. Expensive wallet-file cryptography runs
-outside the event loop; cancellation waits for that work to finish before
-releasing lifecycle ownership. Wallet formats and KDF parameters are unchanged.
+also retain per-wallet retry backoff. While a maker, taker or tumbler runs,
+unlocking a different wallet requires the active session's access token, so an
+unauthenticated client cannot stop those services. Expensive wallet-file
+cryptography runs outside the event loop; cancellation waits for that work to
+finish before releasing lifecycle ownership. Wallet formats and KDF parameters
+are unchanged.
 
 Authentication failures and filesystem errors return generic details. Config
 responses mask backend tokens and password fields, including in-memory overrides;
