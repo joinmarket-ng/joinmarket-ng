@@ -90,3 +90,24 @@ def test_nonsecret_override_still_round_trips(authed_client: tuple[TestClient, s
         headers=headers,
     )
     assert response.json()["configvalue"] == "7000"
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [("BITCOIN", "__dict__"), ("BITCOIN", "__class__"), ("__CLASS__", "model_fields")],
+)
+def test_configget_rejects_undeclared_attributes(
+    authed_client: tuple[TestClient, str], section: str, field: str
+) -> None:
+    client, token = authed_client
+    settings = JoinMarketSettings.model_construct(
+        bitcoin=BitcoinSettings(neutrino_auth_token="backend-secret")
+    )
+    with patch("jmcore.settings.get_settings", return_value=settings):
+        response = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/configget",
+            json={"section": section, "field": field},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 409
+    assert "backend-secret" not in response.text
