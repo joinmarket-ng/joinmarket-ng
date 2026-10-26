@@ -290,6 +290,35 @@ class TestSpendBondCommand:
             )
             assert result.exit_code != 0
 
+    def test_fee_rate_above_safety_cap_rejected(self) -> None:
+        """spend-bond applies the wallet max_fee_rate_sat_vb cap like send."""
+        from jmwallet.wallet.bond_registry import load_registry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            address = _create_funded_bond(data_dir)
+            registry = load_registry(data_dir, "deadbeef")
+            registry.bonds[0].value = 100_000_000
+            save_registry(registry, data_dir, "deadbeef")
+
+            for fee_rate in ("1500", "nan"):
+                result = runner.invoke(
+                    app,
+                    [
+                        "spend-bond",
+                        address,
+                        DEST_ADDRESS,
+                        "--data-dir",
+                        str(data_dir),
+                        "--wallet-fingerprint",
+                        "deadbeef",
+                        "--fee-rate",
+                        fee_rate,
+                    ],
+                )
+                assert result.exit_code == 1, result.output
+                assert _extract_psbt_from_output(result.stdout.split("\n")) is None
+
     def test_fee_deducted_from_value(self) -> None:
         """The send amount in the PSBT should be bond value minus fee."""
         with tempfile.TemporaryDirectory() as tmpdir:
