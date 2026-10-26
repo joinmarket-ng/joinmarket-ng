@@ -37,3 +37,20 @@ def test_root_serves_spa_index(app_with_jam_assets: TestClient) -> None:
     resp = app_with_jam_assets.get("/")
     assert resp.status_code == 200
     assert "<html>jam</html>" in resp.text
+
+
+def test_oversized_request_body_rejected(app: TestClient) -> None:
+    body = b'{"password": "' + b"x" * (2 * 1024 * 1024) + b'"}'
+    url = "/api/v1/wallet/w.jmdat/unlock"
+    headers = {"content-type": "application/json"}
+
+    assert app.post(url, content=body, headers=headers).status_code == 413
+    # Without a Content-Length header the body arrives chunked.
+    chunked = app.post(url, content=iter([body[:1024], body[1024:]]), headers=headers)
+    assert chunked.status_code == 413
+
+
+def test_large_legitimate_request_body_accepted(app: TestClient) -> None:
+    entries = [{"utxo-string": f"{'ab' * 32}:{i}", "freeze": True} for i in range(500)]
+    resp = app.post("/api/v1/wallet/w.jmdat/freeze-batch", json={"entries": entries})
+    assert resp.status_code != 413
