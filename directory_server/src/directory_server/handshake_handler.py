@@ -25,6 +25,10 @@ from jmcore.protocol import (
 )
 from loguru import logger
 
+# Every peerlist entry repeats a peer's features, so bound what a peer may advertise.
+MAX_HANDSHAKE_FEATURES = 32
+MAX_FEATURE_IDENTIFIER_LENGTH = 64
+
 
 class HandshakeError(Exception):
     pass
@@ -80,8 +84,14 @@ class HandshakeHandler:
                 raise HandshakeError("Invalid nickname for peerlist")
             if location_string is not None and not is_safe_peerlist_location(location_string):
                 raise HandshakeError("Invalid location string for peerlist")
-            if not isinstance(features, dict) or not all(
-                is_safe_peerlist_feature(feature) for feature in features
+            if (
+                not isinstance(features, dict)
+                or len(features) > MAX_HANDSHAKE_FEATURES
+                or not all(
+                    is_safe_peerlist_feature(feature)
+                    and len(feature) <= MAX_FEATURE_IDENTIFIER_LENGTH
+                    for feature in features
+                )
             ):
                 raise HandshakeError("Invalid feature identifier")
 
