@@ -128,11 +128,10 @@ def test_market_listing_capture_rejects_private_unicast_and_invalid_nicks(
 
 def test_market_listing_capture_is_bounded_and_drain_clears_queue() -> None:
     client = DirectoryClient("directory-a", 5222, "regtest")
-    sender = NickIdentity(private_key_bytes=b"\x06" * 32)
-    message = _moffer(sender, _listing_raw())
-
-    for _ in range(257):
-        client._capture_market_listing(message)
+    raw = _listing_raw()
+    for index in range(1, 258):
+        sender = NickIdentity(private_key_bytes=index.to_bytes(32, "big"))
+        client._capture_market_listing(_moffer(sender, raw))
 
     assert len(client.drain_market_listings()) == 256
     assert client.drain_market_listings() == []
@@ -140,18 +139,52 @@ def test_market_listing_capture_is_bounded_and_drain_clears_queue() -> None:
 
 def test_unverified_overflow_cannot_displace_valid_listing_batch() -> None:
     client = DirectoryClient("directory-a", 5222, "regtest")
-    sender = NickIdentity(private_key_bytes=b"\x06" * 32)
     raw = _listing_raw()
-    message = _moffer(sender, raw)
-    for _ in range(256):
-        client._capture_market_listing(message)
+    senders = [NickIdentity(private_key_bytes=index.to_bytes(32, "big")) for index in range(1, 257)]
+    for sender in senders:
+        client._capture_market_listing(_moffer(sender, raw))
 
+    forged = json.loads(raw)
+    forged["body"]["price_sats"] = 2
+    client._capture_market_listing(_moffer(senders[0], canonical(forged)))
+
+    assert client.drain_market_listings() == [(sender.nick, raw) for sender in senders]
+    client._capture_market_listing(_moffer(senders[0], raw))
+    assert client.drain_market_listings() == [(senders[0].nick, raw)]
+
+
+def test_duplicate_sender_cannot_monopolize_listing_batch() -> None:
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    attacker = NickIdentity(private_key_bytes=b"\x06" * 32)
+    seller = NickIdentity(private_key_bytes=b"\x07" * 32)
+    raw = _listing_raw()
+    message = _moffer(attacker, b"{}")
+    for _ in range(1_000):
+        client._capture_market_listing(message)
+    client._capture_market_listing(_moffer(seller, raw))
+
+    assert client.drain_market_listings() == [(attacker.nick, b"{}"), (seller.nick, raw)]
+
+
+def test_noncanonical_candidate_does_not_occupy_sender_slot() -> None:
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    sender = NickIdentity(private_key_bytes=b"\x08" * 32)
+    client._capture_market_listing(_moffer(sender, b'{"not": "canonical"}'))
+    raw = _listing_raw()
+    client._capture_market_listing(_moffer(sender, raw))
+
+    assert client.drain_market_listings() == [(sender.nick, raw)]
+
+
+def test_unverified_duplicate_cannot_replace_first_sender_candidate() -> None:
+    client = DirectoryClient("directory-a", 5222, "regtest")
+    sender = NickIdentity(private_key_bytes=b"\x09" * 32)
+    raw = _listing_raw()
+    client._capture_market_listing(_moffer(sender, raw))
     forged = json.loads(raw)
     forged["body"]["price_sats"] = 2
     client._capture_market_listing(_moffer(sender, canonical(forged)))
 
-    assert client.drain_market_listings() == [(sender.nick, raw)] * 256
-    client._capture_market_listing(message)
     assert client.drain_market_listings() == [(sender.nick, raw)]
 
 

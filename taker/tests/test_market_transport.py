@@ -93,7 +93,7 @@ def _transport(
     *,
     key: bytes,
     encryption_key: PrivateKey | None = None,
-    listing_callback: Callable[[], bytes] | None = None,
+    listing_callback: market_transport.ListingCallback | None = None,
     responder: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     on_fault: Callable[[bytes], None] | None = None,
     listen_host: str | None = None,
@@ -125,6 +125,242 @@ def _sealed_request(provider_key: PrivateKey, reply_key: PrivateKey, request_id:
     return base64.b64encode(bytes(SealedBox(provider_key.public_key).encrypt(request))).decode(
         "ascii"
     )
+
+
+def _attach_directory(transport: MarketTransport, name: str = "directory") -> MagicMock:
+    directory = MagicMock(spec=DirectoryClient)
+    directory.send_public_message = AsyncMock()
+    directory.close = AsyncMock()
+    transport.clients[name] = directory
+    return directory
+
+
+@pytest.mark.asyncio
+async def test_mbook_flood_coalesces_while_listing_is_being_built() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def listing() -> bytes:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return b'{"kind":"listing"}'
+
+    seller = _transport(key=b"\x02" * 32, listing_callback=listing)
+    seller.running = True
+    directory = _attach_directory(seller)
+    inbound = _Inbound(MessageType.PUBMSG.value, f"{seller.nick}!PUBLIC!mbook", directory)
+    try:
+        await asyncio.gather(*(seller._run_inbound(inbound) for _ in range(1_000)))
+        await asyncio.wait_for(entered.wait(), 1)
+        assert calls == 1
+        assert len(seller._mbook_replies) == 1
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        directory.send_public_message.assert_awaited_once()
+    finally:
+        release.set()
+        await seller.close()
+
+
+@pytest.mark.asyncio
+async def test_mbook_cooldown_outlives_inbound_timeout_and_coalesces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(market_transport, "MBOOK_REPLY_INTERVAL_SECONDS", 0.05)
+    seller = _transport(key=b"\x02" * 32, listing_callback=lambda: b'{"kind":"listing"}')
+    seller.connection_timeout = 0.01
+    seller.running = True
+    directory = _attach_directory(seller)
+    times: list[float] = []
+
+    async def send(_message: str) -> None:
+        times.append(asyncio.get_running_loop().time())
+
+    directory.send_public_message.side_effect = send
+    inbound = _Inbound(MessageType.PUBMSG.value, f"{seller.nick}!PUBLIC!mbook", directory)
+    try:
+        await seller._run_inbound(inbound)
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        for _ in range(100):
+            await seller._run_inbound(inbound)
+        assert len(seller._mbook_replies) == 1
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        assert len(times) == 2
+        assert times[1] - times[0] >= 0.049
+    finally:
+        await seller.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["callback", "send"])
+async def test_failed_mbook_attempt_keeps_cooldown_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    monkeypatch.setattr(market_transport, "MBOOK_REPLY_INTERVAL_SECONDS", 0.05)
+    calls: list[float] = []
+
+    def listing() -> bytes:
+        calls.append(asyncio.get_running_loop().time())
+        if failure == "callback" and len(calls) == 1:
+            raise RuntimeError("not ready")
+        return b'{"kind":"listing"}'
+
+    seller = _transport(key=b"\x02" * 32, listing_callback=listing)
+    seller.running = True
+    directory = _attach_directory(seller)
+    if failure == "send":
+        directory.send_public_message.side_effect = [ConnectionError("disconnected"), None]
+    try:
+        for _ in range(2):
+            await seller._handle_public(seller.nick, "mbook", directory)
+            await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+            assert not seller._mbook_replies
+        assert len(calls) == 2
+        assert calls[1] - calls[0] >= 0.049
+        assert directory.send_public_message.await_count == (1 if failure == "callback" else 2)
+    finally:
+        await seller.close()
+
+
+@pytest.mark.asyncio
+async def test_mbook_reply_budgets_are_independent_per_directory() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def listing() -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return b'{"kind":"listing"}'
+
+    seller = _transport(key=b"\x02" * 32, listing_callback=listing)
+    seller.running = True
+    first = _attach_directory(seller, "first")
+    second = _attach_directory(seller, "second")
+    try:
+        await seller._handle_public(seller.nick, "mbook", first)
+        await asyncio.wait_for(entered.wait(), 1)
+        await seller._handle_public(seller.nick, "mbook", second)
+        await asyncio.wait_for(seller._mbook_replies[second], 1)
+        second.send_public_message.assert_awaited_once()
+        first.send_public_message.assert_not_awaited()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        first.send_public_message.assert_awaited_once()
+    finally:
+        release.set()
+        await seller.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_deferred_mbook_reply() -> None:
+    seller = _transport(key=b"\x02" * 32, listing_callback=lambda: b'{"kind":"listing"}')
+    seller.running = True
+    directory = _attach_directory(seller)
+    await seller._handle_public(seller.nick, "mbook", directory)
+    await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+    await seller._handle_public(seller.nick, "mbook", directory)
+    pending = seller._mbook_replies[directory]
+
+    await asyncio.wait_for(seller.close(), 1)
+
+    assert pending.cancelled()
+    assert not seller._mbook_replies
+    assert not seller._mbook_reply_at
+    directory.send_public_message.assert_awaited_once()
+    directory.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_replaced_directory_drops_deferred_reply_and_cooldown() -> None:
+    seller = _transport(key=b"\x02" * 32, listing_callback=lambda: b'{"kind":"listing"}')
+    seller.running = True
+    old = _attach_directory(seller)
+    try:
+        await seller._handle_public(seller.nick, "mbook", old)
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        await seller._handle_public(seller.nick, "mbook", old)
+        pending = seller._mbook_replies[old]
+        new = _attach_directory(seller)
+        await seller._prune_mbook_replies()
+        assert pending.cancelled()
+        assert old not in seller._mbook_reply_at
+        await seller._handle_public(seller.nick, "mbook", old)
+        assert not seller._mbook_replies
+        await seller._handle_public(seller.nick, "mbook", new)
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        old.send_public_message.assert_awaited_once()
+        new.send_public_message.assert_awaited_once()
+    finally:
+        await seller.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_mbook_callback_releases_ownership_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(market_transport, "MBOOK_REPLY_INTERVAL_SECONDS", 0.05)
+    canceled = asyncio.Event()
+    calls: list[float] = []
+
+    async def listing() -> bytes:
+        calls.append(asyncio.get_running_loop().time())
+        if len(calls) == 1:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                canceled.set()
+        return b'{"kind":"listing"}'
+
+    seller = _transport(key=b"\x02" * 32, listing_callback=listing)
+    seller.connection_timeout = 0.01
+    seller.running = True
+    directory = _attach_directory(seller)
+    try:
+        await seller._handle_public(seller.nick, "mbook", directory)
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        assert canceled.is_set()
+        assert not seller._mbook_replies
+        directory.send_public_message.assert_not_awaited()
+        await seller._handle_public(seller.nick, "mbook", directory)
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        assert len(calls) == 2
+        assert calls[1] - calls[0] >= 0.049
+        directory.send_public_message.assert_awaited_once()
+    finally:
+        await seller.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_replaced_during_callback_never_receives_reply() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def listing() -> bytes:
+        entered.set()
+        await release.wait()
+        return b'{"kind":"listing"}'
+
+    seller = _transport(key=b"\x02" * 32, listing_callback=listing)
+    seller.running = True
+    old = _attach_directory(seller)
+    try:
+        await seller._handle_public(seller.nick, "mbook", old)
+        await asyncio.wait_for(entered.wait(), 1)
+        new = _attach_directory(seller)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        old.send_public_message.assert_not_awaited()
+        await seller._prune_mbook_replies()
+        await seller._handle_public(seller.nick, "mbook", new)
+        await asyncio.wait_for(asyncio.gather(*seller._mbook_replies.values()), 1)
+        new.send_public_message.assert_awaited_once()
+    finally:
+        release.set()
+        await seller.close()
 
 
 def test_production_direct_location_rejects_clearnet() -> None:

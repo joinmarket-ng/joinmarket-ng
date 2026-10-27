@@ -109,6 +109,12 @@ async def test_directory_advertisement_reaches_separate_http_collections(
     aggregator = OrderbookAggregator([], "regtest", mempool_api_url="")
     seller = NickIdentity(private_key_bytes=b"\x19" * 32)
     directory = DirectoryClient("directory", 5222, "regtest")
+    attacker = NickIdentity(private_key_bytes=b"\x20" * 32)
+    junk = attacker.sign_message(base64.b64encode(b"{}").decode("ascii"), ONION_HOSTID)
+    for _ in range(1_000):
+        directory._capture_market_listing(
+            {"type": MessageType.PUBMSG.value, "line": f"{attacker.nick}!PUBLIC!moffer {junk}"}
+        )
     signed = seller.sign_message(base64.b64encode(listing_raw()).decode("ascii"), ONION_HOSTID)
     directory._capture_market_listing(
         {"type": MessageType.PUBMSG.value, "line": f"{seller.nick}!PUBLIC!moffer {signed}"}

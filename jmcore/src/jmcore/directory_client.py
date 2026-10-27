@@ -16,7 +16,7 @@ import contextlib
 import json
 import struct
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -399,7 +399,7 @@ class DirectoryClient:
         self._market_faults: deque[bytes] = deque()
         # Listings are authenticated only when a caller explicitly drains this
         # bounded public-message buffer. They never enter CoinJoin offer state.
-        self._market_listings: deque[tuple[str, str]] = deque(maxlen=_MAX_MARKET_LISTINGS)
+        self._market_listings: OrderedDict[str, str] = OrderedDict()
 
         # In-flight GETPEERLIST sink. When non-None, the listen() receive loop
         # redirects PEERLIST payloads into this queue instead of handling them
@@ -567,7 +567,7 @@ class DirectoryClient:
         """Return and clear authenticated, canonical public ``moffer`` documents."""
         listings: list[tuple[str, bytes]] = []
         while self._market_listings:
-            sender, rest = self._market_listings.popleft()
+            sender, rest = self._market_listings.popitem(last=False)
             authenticated, command, encoded = verify_signed_privmsg(sender, rest, ONION_HOSTID)
             if not authenticated or command != "moffer":
                 continue
@@ -629,6 +629,8 @@ class DirectoryClient:
         parts = line.split(COMMAND_PREFIX, 2)
         if len(parts) != 3 or not is_valid_nick(parts[0]) or parts[1] != "PUBLIC":
             return
+        if parts[0] in self._market_listings:
+            return
         rest = parts[2]
         if len(rest) > _MAX_MARKET_LISTING_WIRE_BYTES:
             return
@@ -640,11 +642,17 @@ class DirectoryClient:
             return
         try:
             raw = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError):
+            if (
+                len(raw) > MAX_MARKET_LISTING_BYTES
+                or base64.b64encode(raw).decode("ascii") != encoded
+                or canonical(decode_document(raw)) != raw
+            ):
+                return
+        except (binascii.Error, MarketError, ValueError):
             return
-        if len(raw) > MAX_MARKET_LISTING_BYTES or base64.b64encode(raw).decode("ascii") != encoded:
-            return
-        self._market_listings.append((parts[0], rest))
+        # Keep the first candidate per claimed nick. An unauthenticated update
+        # must not replace a valid envelope that is still awaiting verification.
+        self._market_listings[parts[0]] = rest
 
     async def connect(self) -> None:
         """Connect to the directory server and perform handshake."""

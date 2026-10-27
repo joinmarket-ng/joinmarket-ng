@@ -58,6 +58,7 @@ DIRECT_CONNECTION_LIFETIME_SECONDS = 120.0
 # Re-announce at half the listing lifetime so observers never see a gap.
 LISTING_REANNOUNCE_SECONDS = MARKET_LISTING_LIFETIME_SECONDS / 2
 LISTING_ANNOUNCE_RETRY_SECONDS = 5.0
+MBOOK_REPLY_INTERVAL_SECONDS = 5.0
 _SEALED_BOX_OVERHEAD = 48
 _MAX_CIPHERTEXT_BYTES = MAX_MARKET_BYTES + _SEALED_BOX_OVERHEAD
 _MAX_RESPONSE_CACHE = 256
@@ -198,6 +199,8 @@ class MarketTransport(MultiDirectoryClient):
         self._dispatch_task: asyncio.Task[None] | None = None
         self._announce_task: asyncio.Task[None] | None = None
         self.listing_reannounce_seconds = LISTING_REANNOUNCE_SECONDS
+        self._mbook_replies: dict[DirectoryClient, asyncio.Task[None]] = {}
+        self._mbook_reply_at: dict[DirectoryClient, float] = {}
 
     @staticmethod
     def _validate_direct_location(
@@ -273,6 +276,14 @@ class MarketTransport(MultiDirectoryClient):
         if self._workers:
             await asyncio.gather(*tuple(self._workers), return_exceptions=True)
         self._workers.clear()
+
+        replies = tuple(self._mbook_replies.values())
+        for task in replies:
+            task.cancel()
+        if replies:
+            await asyncio.gather(*replies, return_exceptions=True)
+        self._mbook_replies.clear()
+        self._mbook_reply_at.clear()
 
         for connection in tuple(self._incoming_connections):
             with contextlib.suppress(Exception):
@@ -465,6 +476,7 @@ class MarketTransport(MultiDirectoryClient):
             if self.directory_servers and asyncio.get_running_loop().time() >= reconnect_at:
                 await self.reconnect_disconnected()
                 reconnect_at = asyncio.get_running_loop().time() + 10
+            await self._prune_mbook_replies()
             clients = tuple(self.clients.values())
             if not clients:
                 await asyncio.sleep(0.05)
@@ -560,7 +572,21 @@ class MarketTransport(MultiDirectoryClient):
         if rest == "mbook":
             if self.listing_callback is None or directory is None:
                 return
-            await directory.send_public_message(await self._signed_listing())
+            if not self.running or directory not in self.clients.values():
+                return
+            if directory not in self._mbook_replies:
+                task = asyncio.create_task(
+                    self._reply_to_mbook(directory), name="market-discovery-reply"
+                )
+                self._mbook_replies[directory] = task
+
+                def finished(
+                    reply: asyncio.Task[None], client: DirectoryClient = directory
+                ) -> None:
+                    if self._mbook_replies.get(client) is reply:
+                        self._mbook_replies.pop(client)
+
+                task.add_done_callback(finished)
             return
 
         command, separator, data = rest.partition(" ")
@@ -580,6 +606,40 @@ class MarketTransport(MultiDirectoryClient):
                 self._listings.put_nowait((sender, listing))
             except asyncio.QueueFull:
                 return
+
+    async def _reply_to_mbook(self, directory: DirectoryClient) -> None:
+        """Coalesce discovery replies without occupying an inbound worker slot."""
+        try:
+            loop = asyncio.get_running_loop()
+            delay = self._mbook_reply_at.get(directory, 0.0) - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if not self.running or directory not in self.clients.values():
+                return
+            # Failed callbacks and sends consume the same budget as success.
+            self._mbook_reply_at[directory] = loop.time() + MBOOK_REPLY_INTERVAL_SECONDS
+            async with asyncio.timeout(self.connection_timeout):
+                listing = await self._signed_listing()
+                if self.running and directory in self.clients.values():
+                    await directory.send_public_message(listing)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Credential discovery reply failed")
+
+    async def _prune_mbook_replies(self) -> None:
+        """Retire reply work and cooldowns belonging to replaced connections."""
+        current = set(self.clients.values())
+        stale = [
+            task for directory, task in self._mbook_replies.items() if directory not in current
+        ]
+        for task in stale:
+            task.cancel()
+        if stale:
+            await asyncio.gather(*stale, return_exceptions=True)
+        for directory in tuple(self._mbook_reply_at):
+            if directory not in current:
+                self._mbook_reply_at.pop(directory)
 
     async def _handle_private(self, sender: str, rest: str, inbound: _Inbound) -> None:
         authenticated, command, data = verify_signed_privmsg(sender, rest, ONION_HOSTID)
