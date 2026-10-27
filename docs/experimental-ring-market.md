@@ -134,6 +134,12 @@ A participating taker uses `[taker.channel_ring]` with the same keys plus
 remaining capacity, reserve, and timeout settings are listed with their defaults
 in `config.toml.template`.
 
+Read the [ring privacy limits](technical/privacy.md#private-channel-ring-limits)
+before relying on amount splitting, locktime parity, or identity isolation.
+On upgrade, an absent `max_push` key adopts the wider default for new rounds;
+an explicit lower limit is preserved. Smaller custom maximum capacities clamp
+the advertised push limit. Existing journals are not replanned or rewritten.
+
 Enroll every configured node once, with the pubkey read from the node's own
 authenticated interface:
 

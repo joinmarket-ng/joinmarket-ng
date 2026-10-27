@@ -732,8 +732,9 @@ class TestPreferredOfferTypeRoundTrip:
             )
 
 
+@pytest.mark.parametrize("max_push", [None, 500_000, 80_000_000])
 def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
-    tmp_path, sample_mnemonic: str
+    tmp_path, sample_mnemonic: str, max_push: int | None
 ) -> None:
     from jmcore.channel_ring import (
         ChannelRingNodeSettings,
@@ -759,6 +760,8 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
         node_binding_directory=tmp_path / "node-bindings",
         confirmation_depth=6,
     )
+    if max_push is not None:
+        ring.max_push = max_push
     settings = JoinMarketSettings(
         wallet=WalletSettings(address_type="p2tr"),
         taker=TakerSettings(
@@ -769,6 +772,7 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
     config = build_taker_config(settings, mnemonic=sample_mnemonic, passphrase="")
     assert config.channel_ring.enabled
     assert config.channel_ring.confirmation_depth == 6
+    assert config.channel_ring.max_push == (20_000_000 if max_push is None else max_push)
     assert config.channel_ring.nodes["local"].onion_endpoint == "b" * 56 + ".onion:9735"
     assert config.channel_ring.mixdepth_nodes == {0: "local"}
     assert config.channel_ring.node_binding_directory == tmp_path / "node-bindings"

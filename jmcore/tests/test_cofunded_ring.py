@@ -546,6 +546,37 @@ def test_unsigned_payload_rejects_duplicate_input_outpoints() -> None:
         RingUnsignedPayload(**_unsigned_payload_data(payload, changed))
 
 
+@pytest.mark.parametrize("locktime", [1, 800_000, 499_999_999])
+def test_unsigned_payload_accepts_height_locktime_with_non_rbf_sequences(locktime: int) -> None:
+    payload, unsigned_tx = _unsigned_payload()
+    transaction = parse_transaction_bytes(unsigned_tx)
+    inputs = [
+        TxInput.from_hex(item.txid, item.vout, sequence=0xFFFFFFFE) for item in transaction.inputs
+    ]
+    changed = serialize_transaction(2, inputs, transaction.outputs, locktime)
+    assert (
+        RingUnsignedPayload(**_unsigned_payload_data(payload, changed)).unsigned_tx == changed.hex()
+    )
+
+
+@pytest.mark.parametrize(
+    "sequences",
+    [[0xFFFFFFFF] * 4, [0xFFFFFFFD] * 4, [0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFE]],
+)
+def test_unsigned_height_locktime_rejects_final_rbf_or_mixed_sequences(
+    sequences: list[int],
+) -> None:
+    payload, unsigned_tx = _unsigned_payload()
+    transaction = parse_transaction_bytes(unsigned_tx)
+    inputs = [
+        TxInput.from_hex(item.txid, item.vout, sequence=sequence)
+        for item, sequence in zip(transaction.inputs, sequences, strict=True)
+    ]
+    changed = serialize_transaction(2, inputs, transaction.outputs, 800_000)
+    with pytest.raises(ValidationError, match="non-RBF locktime sequences"):
+        RingUnsignedPayload(**_unsigned_payload_data(payload, changed))
+
+
 def test_readiness_state_hash_and_endpoint_signature() -> None:
     manifest = _manifest()
     edge = manifest.edges[0]

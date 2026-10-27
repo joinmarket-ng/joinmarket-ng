@@ -1593,7 +1593,10 @@ class TestNewSettingsWiring:
         assert len(config.offer_configs) == 0
 
 
-def test_channel_ring_settings_round_trip_and_require_tr0_wallet(tmp_path: Path) -> None:
+@pytest.mark.parametrize("max_push", [None, 500_000, 80_000_000])
+def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
+    tmp_path: Path, max_push: int | None
+) -> None:
     from jmcore.channel_ring import ChannelRingNodeSettings, ChannelRingSettings
     from jmcore.settings import JoinMarketSettings, MakerSettings, WalletSettings
 
@@ -1614,6 +1617,8 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(tmp_path: Path)
         max_active_sessions=6,
         max_verified_sessions=3,
     )
+    if max_push is not None:
+        ring.max_push = max_push
     settings = JoinMarketSettings(
         wallet=WalletSettings(address_type="p2tr"),
         maker=MakerSettings(offer_type="tr0absoffer", channel_ring=ring),
@@ -1621,6 +1626,7 @@ def test_channel_ring_settings_round_trip_and_require_tr0_wallet(tmp_path: Path)
     config = build_maker_config(settings, mnemonic=TEST_MNEMONIC, passphrase="")
     assert config.channel_ring.enabled
     assert config.channel_ring.max_active_sessions == 6
+    assert config.channel_ring.max_push == (20_000_000 if max_push is None else max_push)
     assert config.channel_ring.nodes["local"].lnd_macaroon_path == tmp_path / "admin.macaroon"
     assert config.channel_ring.mixdepth_nodes == {0: "local"}
     assert config.channel_ring.node_binding_directory == tmp_path / "node-bindings"

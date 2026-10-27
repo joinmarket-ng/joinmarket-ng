@@ -87,7 +87,7 @@ async def initialize_channel_ring_backend(
         offer_type=cast(Tr0OfferType, offer_type),
         min_channel_capacity=config.min_channel_capacity,
         max_channel_capacity=config.max_channel_capacity,
-        max_push_amount=config.max_push,
+        max_push_amount=min(config.max_push, config.max_channel_capacity),
         dust_limit=354,
         max_reserve=max(config.opener_reserve, config.fundee_reserve),
         max_commitment_fee=config.maximum_commitment_fee,

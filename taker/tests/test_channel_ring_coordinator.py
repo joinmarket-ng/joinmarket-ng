@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 from bitcointx.core.key import CKey
-from jmcore.bitcoin import scriptpubkey_to_address
+from jmcore.bitcoin import parse_transaction_bytes, scriptpubkey_to_address
 from jmcore.channel_ring import ChannelRingConfig, ChannelRingNodeConfig, RingNodeBinding
 from jmcore.channel_ring_store import RingLifecycleState, RingParticipantStore, RingRetirementAction
 from jmcore.cofunded_ring import (
@@ -39,6 +39,7 @@ from jmcore.cofunded_ring import (
     verify_payload,
 )
 from jmcore.models import Offer, OfferType
+from jmcore.transaction_policy import secure_random
 from jmswap.channel_ring_nodes import BoundChannelRingNode
 from jmswap.lnd import (
     AcceptorObservation,
@@ -186,6 +187,12 @@ class FakeChain:
         }
         self.transactions: dict[str, Transaction] = {}
         self.broadcasts: list[str] = []
+        self.height = 0
+        self.height_calls = 0
+
+    async def get_block_height(self) -> int:
+        self.height_calls += 1
+        return self.height
 
     @staticmethod
     def has_mempool_access() -> bool:
@@ -686,6 +693,28 @@ def _harness(
     )
 
 
+@pytest.mark.parametrize(
+    ("height", "backdate", "expected"),
+    [(800_000, False, 800_000), (800_000, True, 799_958), (0, False, 0)],
+)
+async def test_ring_preparation_uses_plain_transaction_locktime_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, height: int, backdate: bool, expected: int
+) -> None:
+    coordinator = _harness(tmp_path)
+    chain = cast(FakeChain, coordinator.chain_backend)
+    chain.height = height
+    monkeypatch.setattr(
+        secure_random, "randint", lambda _a, b: (0 if backdate else 1) if b == 9 else 42
+    )
+    assert await coordinator.prepare(_address(300), 0)
+    transaction = parse_transaction_bytes(coordinator.session.unsigned_tx)
+    assert transaction.locktime == expected
+    assert {item.sequence for item in transaction.inputs} == {
+        0xFFFFFFFE if expected else 0xFFFFFFFF
+    }
+    assert chain.height_calls == 1
+
+
 async def test_complete_coordinator_reaches_signing_with_exact_ring(tmp_path: Path) -> None:
     coordinator = _harness(tmp_path)
     assert await coordinator.prepare(_address(300), 0)
@@ -1112,11 +1141,15 @@ async def test_restart_rebroadcasts_and_confirms_exact_final_transaction(tmp_pat
     coordinator.persist_final_transaction(unsigned)
     record = coordinator._record()
     chain = cast(FakeChain, coordinator.chain_backend)
+    assert parse_transaction_bytes(bytes.fromhex(unsigned)).locktime == 0
+    calls_before_recovery = chain.height_calls
+    chain.height = 800_000
 
     await reconcile_taker_ring_records(
         coordinator.store, FakeNodePool(coordinator.initialized_backend), cast(Any, chain)
     )
     assert chain.broadcasts == [unsigned]
+    assert chain.height_calls == calls_before_recovery
 
     assert record.manifest is not None
     chain.transactions[record.manifest.unsigned_txid] = Transaction(

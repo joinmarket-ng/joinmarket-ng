@@ -16,7 +16,6 @@ FINAL_TAPROOT_COMMITMENT_OVERHEAD_SAT = 660
 
 _V3_ONION_ENDPOINT = re.compile(r"^[a-z2-7]{56}\.onion:(?:[1-9][0-9]{0,4})$")
 _MAX_CHANNEL_CAPACITY_SAT = 100_000_000
-_MAX_PUSH_SAT = 50_000_000
 _MAX_COMMITMENT_FEE_SAT = 1_000_000
 _NODE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 RING_SETUP_HOLD_SLACK_SECONDS = 30.0
@@ -114,7 +113,7 @@ class ChannelRingSettings(BaseModel):
     minimum_makers: int = Field(default=2, ge=2, le=31)
     min_channel_capacity: int = Field(default=1_000_000, ge=1, le=MAX_MONEY)
     max_channel_capacity: int = Field(default=20_000_000, ge=1, le=MAX_MONEY)
-    max_push: int = Field(default=500_000, ge=1, le=MAX_MONEY)
+    max_push: int = Field(default=20_000_000, ge=1, le=MAX_MONEY)
     opener_reserve: int = Field(default=10_000, ge=1, le=MAX_MONEY)
     fundee_reserve: int = Field(default=10_000, ge=1, le=MAX_MONEY)
     maximum_commitment_fee: int = Field(default=100_000, ge=1, le=MAX_MONEY)
@@ -157,7 +156,7 @@ class ChannelRingConfig(BaseModel):
     minimum_makers: int = Field(default=2, ge=2, le=31)
     min_channel_capacity: int = Field(default=1_000_000, ge=1, le=MAX_MONEY)
     max_channel_capacity: int = Field(default=20_000_000, ge=1, le=MAX_MONEY)
-    max_push: int = Field(default=500_000, ge=1, le=MAX_MONEY)
+    max_push: int = Field(default=20_000_000, ge=1, le=MAX_MONEY)
     opener_reserve: int = Field(default=10_000, ge=1, le=MAX_MONEY)
     fundee_reserve: int = Field(default=10_000, ge=1, le=MAX_MONEY)
     maximum_commitment_fee: int = Field(default=100_000, ge=1, le=MAX_MONEY)
@@ -215,8 +214,6 @@ class ChannelRingConfig(BaseModel):
             raise ValueError("minimum channel capacity exceeds maximum")
         if self.max_channel_capacity > _MAX_CHANNEL_CAPACITY_SAT:
             raise ValueError("maximum channel capacity exceeds the conservative 1 BTC cap")
-        if self.max_push > min(_MAX_PUSH_SAT, self.min_channel_capacity - 1):
-            raise ValueError("max_push must remain below every permitted channel capacity")
         if self.maximum_commitment_fee > _MAX_COMMITMENT_FEE_SAT:
             raise ValueError("maximum commitment fee exceeds the anti-grief cap")
         for name, reserve in (

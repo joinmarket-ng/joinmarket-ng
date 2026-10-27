@@ -141,24 +141,91 @@ def _outgoing_bounds(party: RingParty) -> tuple[int, int]:
     )
 
 
+def _capacity_bounds(
+    parties: list[RingParty],
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """Tighten capacities using constraints shared by every feasible cycle."""
+    bounds: dict[tuple[str, str], tuple[int, int]] = {}
+    row_min: dict[str, int] = {}
+    row_max: dict[str, int] = {}
+    for opener in parties:
+        outgoing_lower, outgoing_upper = _outgoing_bounds(opener)
+        for fundee in parties:
+            if opener.party_id == fundee.party_id:
+                continue
+            maximum_push = min(opener.limits.max_push_amount, fundee.limits.max_push_amount)
+            if maximum_push < fundee.limits.minimum_incoming:
+                continue
+            lower = max(
+                opener.limits.min_channel_capacity,
+                fundee.limits.min_channel_capacity,
+                outgoing_lower + fundee.limits.minimum_incoming,
+            )
+            upper = min(
+                opener.limits.max_channel_capacity,
+                fundee.limits.max_channel_capacity,
+                outgoing_upper
+                + min(fundee.residual - fundee.limits.minimum_outgoing, maximum_push),
+            )
+            if lower <= upper:
+                bounds[opener.party_id, fundee.party_id] = (lower, upper)
+        outgoing = [value for (owner, _), value in bounds.items() if owner == opener.party_id]
+        if not outgoing:
+            raise RingPlanningError("no complete feasible cycle: participant cannot open a channel")
+        row_min[opener.party_id] = min(lower for lower, _ in outgoing)
+        row_max[opener.party_id] = max(upper for _, upper in outgoing)
+
+    # Every cycle has one edge per opener, and its capacities sum to the
+    # residual total. These bounds hold for every ordering, not just one cycle.
+    total = sum(party.residual for party in parties)
+    total_min, total_max = sum(row_min.values()), sum(row_max.values())
+    bounds = {
+        (opener, fundee): (
+            max(lower, total - (total_max - row_max[opener])),
+            min(upper, total - (total_min - row_min[opener])),
+        )
+        for (opener, fundee), (lower, upper) in bounds.items()
+    }
+    bounds = {edge: interval for edge, interval in bounds.items() if interval[0] <= interval[1]}
+
+    return bounds
+
+
 def _build_candidate(
     cycle: list[RingParty],
     rng: RingRandom,
+    capacity_bounds: dict[tuple[str, str], tuple[int, int]],
 ) -> CofundedRingPlan | None:
+    count = len(cycle)
+    candidate_intervals = [
+        capacity_bounds.get((opener.party_id, cycle[(index + 1) % count].party_id))
+        for index, opener in enumerate(cycle)
+    ]
+    if any(edge is None for edge in candidate_intervals):
+        return None
+    intervals = [edge for edge in candidate_intervals if edge is not None]
+    total = sum(party.residual for party in cycle)
+    total_min = sum(lower for lower, _ in intervals)
+    total_max = sum(upper for _, upper in intervals)
+    intervals = [
+        (
+            max(lower, total - (total_max - upper)),
+            min(upper, total - (total_min - lower)),
+        )
+        for lower, upper in intervals
+    ]
+    if any(lower > upper for lower, upper in intervals):
+        return None
+
     first_lower, first_upper = _outgoing_bounds(cycle[0])
     outgoing = [rng.randrange(first_lower, first_upper + 1)]
+    proposal_weight = 1
+    rejection_bound = 1
     for index in range(len(cycle) - 1):
         opener = cycle[index]
         fundee = cycle[index + 1]
         fundee_lower, fundee_upper = _outgoing_bounds(fundee)
-        minimum_capacity = max(
-            opener.limits.min_channel_capacity,
-            fundee.limits.min_channel_capacity,
-        )
-        maximum_capacity = min(
-            opener.limits.max_channel_capacity,
-            fundee.limits.max_channel_capacity,
-        )
+        minimum_capacity, maximum_capacity = intervals[index]
         maximum_push = min(opener.limits.max_push_amount, fundee.limits.max_push_amount)
         lower = max(
             fundee_lower,
@@ -171,8 +238,32 @@ def _build_candidate(
         )
         if lower > upper:
             return None
+        proposal_weight *= upper - lower + 1
+        rejection_bound *= min(
+            fundee_upper - fundee_lower + 1,
+            maximum_capacity - minimum_capacity + 1,
+            maximum_push - fundee.limits.minimum_incoming + 1,
+        )
         outgoing.append(rng.randrange(lower, upper + 1))
 
+    closing_capacity = outgoing[-1] + cycle[0].residual - outgoing[0]
+    if not intervals[-1][0] <= closing_capacity <= intervals[-1][1] or cycle[0].residual - outgoing[
+        0
+    ] > min(cycle[-1].limits.max_push_amount, cycle[0].limits.max_push_amount):
+        return None
+    if not 1 <= proposal_weight <= rejection_bound:
+        raise RingPlanningError("ring proposal exceeds its uniform sampling envelope")
+    # The conditional proposal has mass 1/(first_width * proposal_weight).
+    # This exact integer rejection removes its interval-width bias. The
+    # envelope is constant within this cycle, not across different cycles.
+    if rng.randrange(rejection_bound) >= proposal_weight:
+        return None
+
+    # Anchoring removes duplicate representations of physical cycles during
+    # sampling, but the transmitted position must not identify that anchor.
+    offset = rng.randrange(count)
+    cycle = cycle[offset:] + cycle[:offset]
+    outgoing = outgoing[offset:] + outgoing[:offset]
     contributions = [
         PlannedContribution(
             party_id=party.party_id,
@@ -183,7 +274,6 @@ def _build_candidate(
         for index, party in enumerate(cycle)
     ]
     edges: list[PlannedRingEdge] = []
-    count = len(cycle)
     for index, opener in enumerate(cycle):
         fundee_index = (index + 1) % count
         fundee = cycle[fundee_index]
@@ -233,7 +323,12 @@ def plan_cofunded_ring(
     rng: RingRandom | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> CofundedRingPlan:
-    """Plan all supplied parties or raise without returning a partial result."""
+    """Plan all parties with uniform integer splits conditional on the cycle.
+
+    Cycles are proposed uniformly, but acceptance weights their marginal by
+    feasible split count divided by the cycle's rejection envelope. This is not
+    joint-uniform sampling over cycles and splits or a partition-entropy claim.
+    """
 
     if type(taker_participates) is not bool:
         raise RingPlanningError("taker_participates must be a boolean")
@@ -265,10 +360,12 @@ def plan_cofunded_ring(
         if party.limits.min_channel_capacity > party.limits.max_channel_capacity:
             raise RingPlanningError(f"party {party.party_id!r} has inconsistent channel limits")
 
+    ordered = sorted(parties, key=lambda party: party.party_id)
+    capacity_bounds = _capacity_bounds(ordered)
     source = secrets.SystemRandom() if rng is None else rng
     for _ in range(max_attempts):
-        cycle = _shuffled(parties, source)
-        candidate = _build_candidate(cycle, source)
+        cycle = [ordered[0], *_shuffled(ordered[1:], source)]
+        candidate = _build_candidate(cycle, source, capacity_bounds)
         if candidate is not None:
             return candidate
 

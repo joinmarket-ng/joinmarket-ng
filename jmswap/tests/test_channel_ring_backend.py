@@ -117,6 +117,28 @@ async def test_initialize_closes_backend_and_never_returns_capability_on_failure
     assert fake.closed
 
 
+@pytest.mark.parametrize(
+    ("capacity", "push", "advertised"),
+    [
+        (20_000_000, 20_000_000, 20_000_000),
+        (2_000_000, 20_000_000, 2_000_000),
+        (20_000_000, 500_000, 500_000),
+        (100_000_000, 80_000_000, 80_000_000),
+    ],
+)
+async def test_advertised_push_preserves_policy_and_clamps_to_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capacity: int, push: int, advertised: int
+) -> None:
+    fake = FakeBackend()
+    monkeypatch.setattr(LndBackend, "from_paths", lambda *args, **kwargs: fake)
+    ring = config(tmp_path).model_copy(update={"max_channel_capacity": capacity, "max_push": push})
+    initialized = await initialize_channel_ring_backend(
+        ring, node=ring.nodes["md0"], network="regtest", offer_type="tr0absoffer"
+    )
+    assert initialized.backend_limits.max_push_amount == advertised
+    assert initialized.backend_limits.max_channel_capacity == capacity
+
+
 async def test_disabled_backend_cannot_initialize(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="disabled"):
         await initialize_channel_ring_backend(

@@ -629,7 +629,9 @@
 # minimum_makers = 2
 # min_channel_capacity = 1000000
 # max_channel_capacity = 20000000
-# max_push = 500000
+# Fundee's own co-funded contribution, not a gift. Raise with max_channel_capacity;
+# a lower limit can expose a small incoming-amount band. Clamped to maximum capacity.
+# max_push = 20000000
 # opener_reserve = 10000
 # fundee_reserve = 10000
 # maximum_commitment_fee = 100000
@@ -779,7 +781,9 @@
 # minimum_makers = 2
 # min_channel_capacity = 1000000
 # max_channel_capacity = 20000000
-# max_push = 500000
+# Fundee's own co-funded contribution, not a gift. Raise with max_channel_capacity;
+# a lower limit can expose a small incoming-amount band. Clamped to maximum capacity.
+# max_push = 20000000
 # opener_reserve = 10000
 # fundee_reserve = 10000
 # maximum_commitment_fee = 100000

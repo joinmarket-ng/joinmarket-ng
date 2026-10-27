@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import random
 import secrets
+from collections import defaultdict
+from dataclasses import replace
+from fractions import Fraction
+from itertools import permutations, product
+from math import factorial, prod
 
 import pytest
 
@@ -10,6 +15,8 @@ from taker.ring_planner import (
     ParticipantChannelLimits,
     RingParty,
     RingPlanningError,
+    _build_candidate,
+    _capacity_bounds,
     plan_cofunded_ring,
 )
 
@@ -267,3 +274,230 @@ def test_many_randomized_limit_intersections() -> None:
             parties.append(RingParty(party_id, source.randint(150_000, 600_000), limits))
         plan = plan_cofunded_ring(parties, rng=random.Random(seed), max_attempts=20_000)
         _assert_complete(plan, parties)
+
+
+class ScriptedCandidateRandom:
+    """Expose exact proposal probabilities without statistical assertions."""
+
+    def __init__(self, outgoing: tuple[int, ...], *, reject: bool = False, offset: int = 0) -> None:
+        self.outgoing = outgoing
+        self.reject = reject
+        self.offset = offset
+        self.widths: list[int] = []
+        self.envelope = 0
+
+    def shuffle(self, x: list[object]) -> None:
+        raise AssertionError("candidate sampling must not shuffle its fixed cycle")
+
+    def randrange(self, start: int, stop: int | None = None) -> int:
+        if stop is not None:
+            value = self.outgoing[len(self.widths)]
+            assert start <= value < stop
+            self.widths.append(stop - start)
+            return value
+        if not self.envelope:
+            self.envelope = start
+            weight = prod(self.widths[1:])
+            return weight if self.reject else weight - 1
+        assert 0 <= self.offset < start
+        return self.offset
+
+
+def _feasible_splits(cycle: list[RingParty]) -> list[tuple[int, ...]]:
+    feasible = []
+    for outgoing in product(
+        *(
+            range(p.limits.minimum_outgoing, p.residual - p.limits.minimum_incoming + 1)
+            for p in cycle
+        )
+    ):
+        for index, opener in enumerate(cycle):
+            successor = (index + 1) % len(cycle)
+            fundee = cycle[successor]
+            push = fundee.residual - outgoing[successor]
+            capacity = outgoing[index] + push
+            if not (
+                max(opener.limits.min_channel_capacity, fundee.limits.min_channel_capacity)
+                <= capacity
+                <= min(opener.limits.max_channel_capacity, fundee.limits.max_channel_capacity)
+                and push <= min(opener.limits.max_push_amount, fundee.limits.max_push_amount)
+            ):
+                break
+        else:
+            feasible.append(outgoing)
+    return feasible
+
+
+@pytest.mark.parametrize("heterogeneous", [False, True])
+def test_exact_conditional_sampling_mass_and_complete_support(heterogeneous: bool) -> None:
+    limits = _limits(
+        minimum=5,
+        maximum=12,
+        max_push=10,
+        dust=0,
+        outgoing_reserve=2,
+        incoming_reserve=1,
+        commitment_fee=0,
+        overhead=0,
+        margin=1,
+    )
+    parties = sorted(_parties([8, 9, 10], limits), key=lambda party: party.party_id)
+    if heterogeneous:
+        parties[1] = replace(parties[1], limits=replace(limits, max_channel_capacity=10))
+        parties[2] = replace(parties[2], limits=replace(limits, max_push_amount=5))
+    bounds = _capacity_bounds(parties)
+    weights: set[int] = set()
+    supported_cycles = set()
+    for tail in permutations(parties[1:]):
+        cycle = [parties[0], *tail]
+        masses: set[Fraction] = set()
+        envelopes: set[int] = set()
+        for outgoing in _feasible_splits(cycle):
+            source = ScriptedCandidateRandom(outgoing)
+            plan = _build_candidate(cycle, source, bounds)
+            assert plan is not None
+            _assert_complete(plan, parties)
+            assert tuple(c.outgoing for c in plan.contributions) == outgoing
+            envelopes.add(source.envelope)
+            weight = prod(source.widths[1:])
+            weights.add(weight)
+            proposal = Fraction(1, factorial(len(parties) - 1) * prod(source.widths))
+            masses.add(proposal * Fraction(weight, source.envelope))
+            supported_cycles.add(plan.cycle)
+        assert len(envelopes) == 1
+        assert len(masses) == 1
+    assert len(supported_cycles) == factorial(len(parties) - 1)
+    assert len(weights) > 1  # This fixture catches the old interval-width bias.
+
+
+def test_uniform_rejection_boundary_and_transmitted_rotation() -> None:
+    limits = _limits(
+        minimum=5,
+        maximum=12,
+        max_push=10,
+        dust=0,
+        outgoing_reserve=2,
+        incoming_reserve=1,
+        commitment_fee=0,
+        overhead=0,
+        margin=1,
+    )
+    parties = sorted(_parties([8, 9, 10], limits), key=lambda party: party.party_id)
+    bounds = _capacity_bounds(parties)
+    for outgoing in _feasible_splits(parties):
+        source = ScriptedCandidateRandom(outgoing)
+        accepted = _build_candidate(parties, source, bounds)
+        assert accepted is not None  # The last accepted integer is weight - 1.
+        if prod(source.widths[1:]) == source.envelope:
+            continue
+        assert (
+            _build_candidate(parties, ScriptedCandidateRandom(outgoing, reject=True), bounds)
+            is None
+        )  # The next integer must reject, not bias toward narrow intervals.
+        for offset in range(len(parties)):
+            rotated = _build_candidate(
+                parties, ScriptedCandidateRandom(outgoing, offset=offset), bounds
+            )
+            assert rotated is not None
+            assert rotated.cycle == accepted.cycle[offset:] + accepted.cycle[:offset]
+            assert rotated.contributions == (
+                accepted.contributions[offset:] + accepted.contributions[:offset]
+            )
+            assert {(e.opener_id, e.fundee_id, e.capacity) for e in rotated.edges} == {
+                (e.opener_id, e.fundee_id, e.capacity) for e in accepted.edges
+            }
+        break
+    else:
+        pytest.fail("fixture did not exercise a nontrivial rejection boundary")
+
+
+def test_wide_push_allows_fundee_to_contribute_more_than_half_capacity() -> None:
+    limits = _limits(
+        minimum=1_000_000,
+        maximum=20_000_000,
+        max_push=20_000_000,
+        outgoing_reserve=10_000,
+        incoming_reserve=10_000,
+        commitment_fee=100_000,
+        overhead=660,
+        margin=100_000,
+    )
+    parties = _parties([2_000_000, 3_000_000, 4_000_000], limits)
+    plan = plan_cofunded_ring(parties, rng=random.Random(7))
+    _assert_complete(plan, parties)
+    assert any(edge.push_amount * 2 > edge.capacity for edge in plan.edges)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("tight_capacity", [False, True])
+def test_mixed_push_limits_remain_feasible_without_global_envelope_slack(
+    seed: int, tight_capacity: bool
+) -> None:
+    limits = _limits(
+        minimum=1_000_000,
+        maximum=20_000_000,
+        max_push=20_000_000,
+        outgoing_reserve=10_000,
+        incoming_reserve=10_000,
+        commitment_fee=100_000,
+        overhead=660,
+        margin=100_000,
+    )
+    parties = _parties([5_000_000] * 32, limits)
+    for index, party in enumerate(parties):
+        if index % 2 == 0:
+            parties[index] = replace(party, limits=replace(limits, max_push_amount=500_000))
+    if tight_capacity:
+        parties[1] = replace(parties[1], limits=replace(limits, max_channel_capacity=5_005_000))
+    plan = plan_cofunded_ring(parties, rng=random.Random(seed), max_attempts=200)
+    _assert_complete(plan, parties)
+
+
+@pytest.mark.parametrize(
+    ("push", "incoming_floor", "guessing", "worst"),
+    [
+        (5, 2, Fraction(63, 128), Fraction(1, 2)),
+        (24, 2, Fraction(164, 687), Fraction(2, 5)),
+        (24, 3, Fraction(1118, 4497), Fraction(7, 16)),
+    ],
+)
+def test_exact_toy_funding_partition_guessing_probability(
+    push: int, incoming_floor: int, guessing: Fraction, worst: Fraction
+) -> None:
+    """Known single-input residuals, latent splits/cycle, random output slots."""
+    limits = _limits(
+        minimum=8,
+        maximum=30,
+        max_push=push,
+        dust=0,
+        outgoing_reserve=3,
+        incoming_reserve=incoming_floor,
+        commitment_fee=0,
+        overhead=0,
+        margin=0,
+    )
+    parties = [RingParty(str(i), residual, limits) for i, residual in enumerate([12, 18, 24])]
+    bounds = _capacity_bounds(parties)
+    joint: dict[tuple[int, ...], dict[tuple[tuple[str, ...], ...], Fraction]] = defaultdict(
+        lambda: defaultdict(Fraction)
+    )
+    for tail in permutations(parties[1:]):
+        cycle = [parties[0], *tail]
+        for outgoing in _feasible_splits(cycle):
+            source = ScriptedCandidateRandom(outgoing)
+            plan = _build_candidate(cycle, source, bounds)
+            assert plan is not None
+            mass = Fraction(1, 2 * source.widths[0] * source.envelope)
+            for slots in permutations(plan.edges):
+                observation = tuple(edge.capacity for edge in slots)
+                partition = tuple(tuple(sorted((edge.opener_id, edge.fundee_id))) for edge in slots)
+                joint[observation][partition] += mass / 6
+    accepted_mass = sum((sum(partitions.values()) for partitions in joint.values()), Fraction())
+    assert (
+        sum((max(partitions.values()) for partitions in joint.values()), Fraction()) / accepted_mass
+        == guessing
+    )
+    assert (
+        max(max(partitions.values()) / sum(partitions.values()) for partitions in joint.values())
+        == worst
+    )

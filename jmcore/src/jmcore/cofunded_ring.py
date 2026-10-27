@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jmcore.bitcoin import hash256, parse_transaction_bytes, serialize_transaction
 from jmcore.constants import MAX_MONEY
+from jmcore.transaction_policy import NON_RBF_LOCKTIME_SEQUENCE
 
 RING_PAYLOAD_FORMAT: Final = "canonical_json"
 MIN_RING_PARTICIPANTS = 3
@@ -743,13 +744,15 @@ class RingUnsignedPayload(RingPayload):
             or canonical_transaction != transaction_bytes
         ):
             raise ValueError("unsigned_tx must be canonical and contain no signatures or witness")
+        expected_sequence = 0xFFFFFFFF if transaction.locktime == 0 else NON_RBF_LOCKTIME_SEQUENCE
         if (
             transaction.version != 2
-            or transaction.locktime != 0
-            or any(tx_input.sequence != 0xFFFFFFFF for tx_input in transaction.inputs)
+            or transaction.locktime >= 500_000_000
+            or any(tx_input.sequence != expected_sequence for tx_input in transaction.inputs)
         ):
             raise ValueError(
-                "unsigned_tx must use version 2, zero locktime, and final input sequences"
+                "unsigned_tx must use version 2, zero locktime, and final input sequences, "
+                "or a block-height locktime with non-RBF locktime sequences"
             )
         outpoints = [(tx_input.txid, tx_input.vout) for tx_input in transaction.inputs]
         if len(set(outpoints)) != len(outpoints):

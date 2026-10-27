@@ -81,6 +81,7 @@ from taker.tx_builder import (
     FinalizedRingChannelOutput,
     FinalizedRingTransactionPlan,
     build_coinjoin_tx,
+    compute_tx_locktime,
 )
 
 if TYPE_CHECKING:
@@ -666,7 +667,7 @@ class MakerOnlyRingCoordinator:
         )
 
     def _build_unsigned(
-        self, destination: str, tx_fee: int, mixdepth: int
+        self, destination: str, tx_fee: int, mixdepth: int, locktime: int
     ) -> tuple[RingUnsignedPayload, list[WitnessUtxo]]:
         ring_plan = self._transaction_plan(mixdepth)
         selected = self.session.selected_utxos
@@ -699,6 +700,7 @@ class MakerOnlyRingCoordinator:
             tx_fee=tx_fee,
             network=self.session.config.network.value,
             ring_plan=ring_plan,
+            locktime=locktime,
         )
         transaction = parse_transaction(unsigned.hex())
         total_input = sum(utxo.value for utxo in selected) + sum(
@@ -942,7 +944,8 @@ class MakerOnlyRingCoordinator:
             await self._invite(tx_fee, residuals, mixdepth)
             await self._plan()
             await self._open()
-            unsigned, witnesses = self._build_unsigned(destination, tx_fee, mixdepth)
+            locktime = compute_tx_locktime(await self.chain_backend.get_block_height())
+            unsigned, witnesses = self._build_unsigned(destination, tx_fee, mixdepth, locktime)
             await self._readiness_and_sign(unsigned, witnesses)
             return True
         except Exception as exc:

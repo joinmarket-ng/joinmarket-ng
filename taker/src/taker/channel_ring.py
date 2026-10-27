@@ -113,6 +113,7 @@ from taker.tx_builder import (
     FinalizedRingChannelOutput,
     FinalizedRingTransactionPlan,
     build_coinjoin_tx,
+    compute_tx_locktime,
 )
 
 if TYPE_CHECKING:
@@ -991,7 +992,7 @@ class TakerRingCoordinator:
         )
 
     def _build_unsigned(
-        self, destination: str, tx_fee: int
+        self, destination: str, tx_fee: int, locktime: int
     ) -> tuple[RingUnsignedPayload, list[WitnessUtxo]]:
         maker_fee_plan = self.session.maker_fee_plan()
         maker_data = {
@@ -1026,6 +1027,7 @@ class TakerRingCoordinator:
             tx_fee=tx_fee,
             network=self.session.config.network.value,
             ring_plan=ring_plan,
+            locktime=locktime,
         )
         transaction = parse_transaction(unsigned.hex())
         expected_fee = tx_fee + sum(
@@ -1510,7 +1512,8 @@ class TakerRingCoordinator:
             await self._invite(tx_fee, residuals)
             local_plan = await self._plan()
             await self._open(local_plan)
-            unsigned, witnesses = self._build_unsigned(destination, tx_fee)
+            locktime = compute_tx_locktime(await self.chain_backend.get_block_height())
+            unsigned, witnesses = self._build_unsigned(destination, tx_fee, locktime)
             await self._readiness_and_sign(unsigned, witnesses)
             logger.info("Co-funded channel ring reached durable all-party signing authorization")
             return True

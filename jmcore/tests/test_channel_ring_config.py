@@ -187,6 +187,22 @@ def test_two_capable_makers_is_the_minimum_when_taker_joins() -> None:
         ChannelRingSettings(minimum_makers=1)
 
 
+@pytest.mark.parametrize("max_push", [500_000, 20_000_000, 80_000_000])
+def test_push_policy_preserves_explicit_limits_without_minimum_capacity_band(max_push: int) -> None:
+    settings = ChannelRingSettings(**enabled_values(), max_push=max_push)
+    config = ChannelRingConfig.from_settings(settings)
+    assert config.max_push == max_push
+    assert config.min_channel_capacity == 1_000_000
+
+
+def test_absent_push_key_uses_wide_default_with_custom_smaller_capacity() -> None:
+    config = ChannelRingConfig.from_settings(
+        ChannelRingSettings(**enabled_values(), max_channel_capacity=2_000_000)
+    )
+    assert config.max_push == 20_000_000
+    assert config.max_channel_capacity == 2_000_000
+
+
 def test_default_setup_hold_tracks_timeout_and_margin() -> None:
     config = ChannelRingConfig(
         **enabled_values(), setup_timeout_seconds=700.0, hold_safety_margin_seconds=45.0

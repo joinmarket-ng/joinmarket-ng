@@ -354,6 +354,12 @@ class FakeChain:
         self.utxos: dict[tuple[str, int], UTXO] = {}
         self.transactions: dict[str, Transaction] = {}
         self.broadcasts: list[str] = []
+        self.height: int | None = 800_000
+
+    async def get_block_height(self) -> int:
+        if self.height is None:
+            raise RuntimeError("chain tip unavailable")
+        return self.height
 
     async def get_utxo(self, txid: str, vout: int) -> UTXO | None:
         return self.utxos.get((txid, vout))
@@ -531,7 +537,9 @@ class Harness:
             )
         )
 
-    async def unsigned(self, *, outgoing_script: str = OUTGOING_SCRIPT) -> RingUnsignedPayload:
+    async def unsigned(
+        self, *, outgoing_script: str = OUTGOING_SCRIPT, locktime: int = 0
+    ) -> RingUnsignedPayload:
         record = self.record()
         local = record.ring_public_key
         keys = [self.taker_key, local, _key(12), _key(13)]
@@ -572,9 +580,12 @@ class Harness:
         ]
         tx = serialize_transaction(
             2,
-            [TxInput.from_hex(txid, vout) for txid, vout, _, _ in input_specs],
+            [
+                TxInput.from_hex(txid, vout, sequence=0xFFFFFFFE if locktime else 0xFFFFFFFF)
+                for txid, vout, _, _ in input_specs
+            ],
             [TxOutput.from_hex(item.script_pubkey, item.amount) for item in outputs],
-            0,
+            locktime,
         )
         for txid, vout, value, script in input_specs[1:]:
             self.chain.utxos[(txid, vout)] = UTXO(
@@ -749,6 +760,32 @@ async def _prepare_for_unsigned(harness: Harness) -> RingUnsignedPayload:
         )
     )
     return await harness.unsigned()
+
+
+@pytest.mark.parametrize(
+    ("locktime", "tip", "accepted"),
+    [
+        (0, None, True),
+        (800_000, 800_000, True),
+        (799_901, 800_000, True),
+        (800_013, 800_000, False),
+        (800_000, None, False),
+    ],
+)
+async def test_ring_locktime_is_tip_bounded_before_lnd_verification(
+    harness: Harness, locktime: int, tip: int | None, accepted: bool
+) -> None:
+    await _prepare_for_unsigned(harness)
+    harness.chain.height = tip
+    unsigned = await harness.unsigned(locktime=locktime)
+    if accepted:
+        await harness.machine.handle(unsigned)
+        assert harness.record().state is RingLifecycleState.READY
+    else:
+        with pytest.raises(MakerRingError, match="chain tip"):
+            await harness.machine.handle(unsigned)
+        assert harness.record().state is RingLifecycleState.PREPARED_NOT_VERIFIED
+        assert harness.lnd.verified is None
 
 
 def _estimated_fee_rate(unsigned: RingUnsignedPayload, input_total: int) -> float:

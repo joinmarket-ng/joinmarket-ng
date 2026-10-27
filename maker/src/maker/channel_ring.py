@@ -98,6 +98,8 @@ from jmswap.lnd import (
 )
 from loguru import logger
 
+from maker.tx_verification import _verify_locktime
+
 if TYPE_CHECKING:
     from jmswap.channel_ring_nodes import BoundChannelRingNode, ChannelRingNodePool
     from jmswap.lnd import LndBackend
@@ -899,6 +901,18 @@ class MakerRingParticipant:
         if record.state is not RingLifecycleState.PREPARED_NOT_VERIFIED:
             raise MakerRingError("ring_unsigned is out of order")
         self._validate_manifest(payload, record)
+        transaction = parse_transaction(payload.unsigned_tx)
+        current_height: int | None = None
+        if transaction.locktime:
+            try:
+                current_height = await self.chain_backend.get_block_height()
+            except Exception:
+                logger.warning("Could not fetch chain tip for ring locktime check")
+        valid_locktime, error = _verify_locktime(
+            transaction.locktime, current_block_height=current_height
+        )
+        if not valid_locktime:
+            raise MakerRingError(error)
         witnesses = await self._resolve_witness_utxos(payload.unsigned_tx)
         expected_psbt, expected_txid = build_unsigned_psbt(payload.unsigned_tx, witnesses)
         supplied_psbt = base64.b64decode(payload.psbt, validate=True)

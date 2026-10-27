@@ -9,7 +9,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
-from jmcore.bitcoin import address_to_scriptpubkey
+from jmcore.bitcoin import address_to_scriptpubkey, parse_transaction_bytes
 from jmcore.cofunded_ring import (
     PreparedIncomingState,
     PreparedOutgoingState,
@@ -22,6 +22,7 @@ from jmcore.cofunded_ring import (
     RingUnsignedPayload,
     sign_payload,
 )
+from jmcore.transaction_policy import secure_random
 from jmwallet.backends.base import Transaction
 from test_channel_ring_coordinator import (
     MockCoordinator,
@@ -235,6 +236,27 @@ async def test_three_makers_open_without_taker_lnd_and_sign(mixed: bool, tmp_pat
         )
 
 
+@pytest.mark.parametrize(
+    ("height", "backdate", "expected"),
+    [(800_000, False, 800_000), (800_000, True, 799_958), (0, False, 0)],
+)
+async def test_maker_only_preparation_uses_plain_transaction_locktime_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, height: int, backdate: bool, expected: int
+) -> None:
+    coordinator = _coordinator(tmp_path)
+    coordinator.chain_backend.height = height
+    monkeypatch.setattr(
+        secure_random, "randint", lambda _a, b: (0 if backdate else 1) if b == 9 else 42
+    )
+    assert await coordinator.prepare(_address(300), 0)
+    transaction = parse_transaction_bytes(coordinator.session.unsigned_tx)
+    assert transaction.locktime == expected
+    assert {item.sequence for item in transaction.inputs} == {
+        0xFFFFFFFE if expected else 0xFFFFFFFF
+    }
+    assert coordinator.chain_backend.height_calls == 1
+
+
 async def test_invalid_remote_readiness_fails_before_sign_authorization(tmp_path: Path) -> None:
     coordinator = _coordinator(tmp_path, malicious_ready=True)
     assert not await coordinator.prepare(_address(300), 0)
@@ -263,6 +285,9 @@ async def test_only_exact_durable_final_tx_is_rebroadcast_after_restart(tmp_path
     record = coordinator._record()
     assert record.manifest is not None and record.unsigned_tx is not None
     chain = coordinator.chain_backend
+    assert parse_transaction_bytes(bytes.fromhex(record.unsigned_tx)).locktime == 0
+    calls_before_recovery = chain.height_calls
+    chain.height = 800_000
     # A fully authorized but incomplete signature-collection round must not
     # broadcast solely because its journal contains the unsigned candidate.
     await reconcile_maker_only_ring_records(
@@ -284,6 +309,7 @@ async def test_only_exact_durable_final_tx_is_rebroadcast_after_restart(tmp_path
     coordinator.persist_final_transaction(record.unsigned_tx)
     await reconcile_maker_only_ring_records(coordinator.store, chain)
     assert chain.broadcasts == [record.unsigned_tx]
+    assert chain.height_calls == calls_before_recovery
 
     chain.transactions[record.manifest.unsigned_txid] = Transaction(
         txid=record.manifest.unsigned_txid,

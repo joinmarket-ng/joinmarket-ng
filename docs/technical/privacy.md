@@ -248,6 +248,56 @@ proof that subset-sum or transaction-graph analysis is impossible. Ordinary
 makers still receive exact single-owner change, and timing, repeated peers,
 amount bounds, later spends, and implementation fingerprints remain evidence.
 
+### Amount Sampling And Transaction Fingerprints
+
+The fundee's pushed balance is its own co-funded contribution, not a gift from
+the opener. A small `max_push` relative to channel capacity can distinguish
+incoming and outgoing amounts. The default now permits overlapping ranges;
+explicit lower limits remain binding, including those advertised by older peers.
+See `config.toml.template` for the policy and current defaults. Reserve, fee,
+ownership, and per-edge capacity checks still apply.
+
+For each proposed directed cycle, the planner removes sequential interval-width
+bias with exact integer rejection sampling. Splits are uniform **conditional on
+that cycle**. The accepted cycle prior is proportional to its feasible split
+count divided by its rejection envelope, not uniform over all cycles and splits.
+A cycle-independent envelope was rejected because mixed narrow/wide push limits
+exhausted the attempt budget on otherwise feasible large rings. Planning remains
+bounded and can fail without producing a partial plan.
+
+Uniform splits are not automatically uniform ownership partitions. An exact toy
+calculation uses three known residuals `(12, 18, 24)`, one input per party,
+capacities `[8, 30]`, and uniformly permuted output slots. The hidden partition
+assigns an unordered pair of owners to each slot; the observation is the ordered
+capacity tuple. Latent splits, cycle directions, and duplicate-value output
+permutations are aggregated. Define
+`P_guess = sum_observations max_partition P(observation, partition)` and average
+conditional min-entropy as `-log2(P_guess)`.
+
+| Outgoing/incoming floors, push ceiling | P_guess | Average bits | Worst-observation bits |
+| --- | --- | --- | --- |
+| `3 / 2`, `5` | `63/128` | 1.022720 | 1.000000 |
+| `3 / 2`, `24` | `164/687` | 2.066614 | 1.321928 |
+| `3 / 3`, `24` | `1118/4497` | 2.008043 | 1.192645 |
+
+These results use the implemented per-cycle sampler. Both cycles happen to have
+the same envelope in this fixture, so it also matches joint-uniform sampling
+here, not in general. The previous sequential sampler's wide-push average was
+1.992759 bits, while narrow push showed no sampler gain. Symmetric floors made
+both reported entropy measures worse than asymmetric wide push. This model is
+not multi-input ownership clustering, a real-world anonymity estimate, or a
+claim that uniform plans maximize partition entropy.
+
+New ring transactions use the same current-height or randomly backdated
+anti-fee-sniping locktime and non-RBF sequence policy as plain `tr0` transactions.
+Makers bound nonzero locktimes against their own chain tip. This removes one
+fingerprint, not all ways to identify rings or proof that the entire pit is an
+anonymity set. All ring peers must support this transaction policy; older peers
+may reject new rounds. Existing unsigned or signed journals retain their exact
+transaction bytes, including older zero locktimes; recovery never resamples them.
+
+### Coordinator And Cross-Round Limits
+
 The taker coordinates the ring and learns participant inputs, contributions,
 and Lightning identities. Each ring maker learns its two neighbors and its own
 channel balances. Unannounced channels and SCID aliases do not hide this
@@ -257,6 +307,23 @@ pits also links those maker identities publicly: every orderbook request
 receives the bond proofs, and orderbook watchers republish them. A maker that
 needs unlinked sw0 and tr0 identities must run them from separate wallets with
 separate bonds.
+
+Pairwise split negotiation is not implemented. Writing residuals as
+`r_i = out_i + in_i` and capacities as `cap_i = out_i + in_(i+1)` leaves one
+cyclic parameter only if no split is known. Any endpoint's split, including a
+participating taker's, determines the whole cycle; bounds can also eliminate
+the remaining uncertainty. Hiding initial negotiation alone would not help:
+prepared reports and full readiness states currently disclose the splits too.
+A maker-only ring with a noncolluding coordinator would require a separate
+protocol design preserving endpoint accounting and readiness guarantees.
+
+Automatic per-channel or per-ring LND identity rotation is also not implemented.
+Managed node generations support allocation and recovery, but do not constitute
+a production rotation driver. Existing nick rotation is activity-independent,
+not per round. A safe rotation must retain old node keys, bindings, wallet data,
+and recovery journals for funded channels; missing state is not permission to
+replace them. Even fresh LND keys and nicks would not hide a reused bond outpoint.
+Bond-membership proofs are outside this design.
 
 Private channel buyout messages stay between the channel owners, not the
 CoinJoin taker. A cooperative key-path spend avoids explicitly identifying the
