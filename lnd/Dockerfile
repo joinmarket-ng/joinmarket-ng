@@ -27,7 +27,7 @@ RUN git clone https://github.com/lightningnetwork/lnd.git \
     && git apply /patches/*.patch \
     && go test -tags=channelescrowrpc -count=1 ./lnrpc/channelescrowrpc/... \
     && go test -count=1 -run 'TestEscrow' ./channeldb \
-    && go test -count=1 -run 'TestQuiesc' ./htlcswitch \
+    && go test -count=1 -run 'Test(LinkQuiescenceControl|Quiesc)' ./htlcswitch \
     && make release-install
 
 FROM alpine:3.22

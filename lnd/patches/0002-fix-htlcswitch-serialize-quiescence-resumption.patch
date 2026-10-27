@@ -1,0 +1,293 @@
+From b52434fb4d5ac60b7961bfdb336ba25cd2cdbe62 Mon Sep 17 00:00:00 2001
+Date: Tue, 27 Oct 2026 10:27:22 +0100
+Subject: [PATCH] fix(htlcswitch): serialize quiescence resumption on the link
+ loop
+
+Queue initiation and resumption together so a canceled buffered request cannot outlive its rollback. A completion acknowledgment keeps RPC callers from observing unfinished resume hooks.
+---
+ htlcswitch/interfaces.go              |   2 +
+ htlcswitch/link.go                    |  43 +++++--
+ htlcswitch/quiescence_control_test.go | 169 ++++++++++++++++++++++++++
+ 3 files changed, 204 insertions(+), 10 deletions(-)
+ create mode 100644 htlcswitch/quiescence_control_test.go
+
+diff --git a/htlcswitch/interfaces.go b/htlcswitch/interfaces.go
+index 2a2da6be0..418a19006 100644
+--- a/htlcswitch/interfaces.go
++++ b/htlcswitch/interfaces.go
+@@ -191,6 +191,8 @@ type ChannelUpdateHandler interface {
+ 	IsChannelClean() bool
+ 
+ 	// ResumeQuiescence resumes a link that was quiesced through InitStfu.
++	// Resumption and deferred hooks run on the link goroutine. This returns
++	// after they complete or the link begins shutting down.
+ 	ResumeQuiescence()
+ }
+ 
+diff --git a/htlcswitch/link.go b/htlcswitch/link.go
+index 6319cea9b..78a58f6c6 100644
+--- a/htlcswitch/link.go
++++ b/htlcswitch/link.go
+@@ -314,6 +314,15 @@ type ChannelLinkConfig struct {
+ 	QuiescenceTimeout time.Duration
+ }
+ 
++// quiescenceControl serializes initiation and resumption on the link goroutine.
++// A non-nil resumed channel denotes a resume command and is closed only after
++// the quiescer and its deferred hooks have completed. Otherwise stfu is an
++// initiation request.
++type quiescenceControl struct {
++	stfu    StfuReq
++	resumed chan struct{}
++}
++
+ // channelLink is the service which drives a channel's commitment update
+ // state-machine. In the event that an HTLC needs to be propagated to another
+ // link, the forward handler from config is used which sends HTLC to the
+@@ -418,10 +427,9 @@ type channelLink struct {
+ 	// respect to the quiescence protocol.
+ 	quiescer Quiescer
+ 
+-	// quiescenceReqs is a queue of requests to quiesce this link. The
+-	// members of the queue are send-only channels we should call back with
+-	// the result.
+-	quiescenceReqs chan StfuReq
++	// quiescenceReqs is the FIFO of initiation and resumption commands.
++	// Both transitions run on the link goroutine, including deferred hooks.
++	quiescenceReqs chan quiescenceControl
+ 
+ 	// cg is a helper that encapsulates a wait group and quit channel and
+ 	// allows contexts that either block or cancel on those depending on
+@@ -517,9 +525,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
+ 		qsm = &quiescerNoop{}
+ 	}
+ 
+-	quiescenceReqs := make(
+-		chan fn.Req[fn.Unit, fn.Result[lntypes.ChannelParty]], 1,
+-	)
++	quiescenceReqs := make(chan quiescenceControl, 1)
+ 
+ 	return &channelLink{
+ 		cfg:                 cfg,
+@@ -800,7 +806,7 @@ func (l *channelLink) InitStfu() <-chan fn.Result[lntypes.ChannelParty] {
+ 	)
+ 
+ 	select {
+-	case l.quiescenceReqs <- req:
++	case l.quiescenceReqs <- quiescenceControl{stfu: req}:
+ 	case <-l.cg.Done():
+ 		req.Resolve(fn.Err[lntypes.ChannelParty](ErrLinkShuttingDown))
+ 	}
+@@ -815,8 +821,20 @@ func (l *channelLink) IsChannelClean() bool {
+ }
+ 
+ // ResumeQuiescence returns a locally quiesced link to normal operation.
++// It must be called outside the link goroutine and waits for deferred hooks to
++// complete, unless the link is shutting down.
+ func (l *channelLink) ResumeQuiescence() {
+-	l.quiescer.Resume()
++	resumed := make(chan struct{})
++	select {
++	case l.quiescenceReqs <- quiescenceControl{resumed: resumed}:
++	case <-l.cg.Done():
++		return
++	}
++
++	select {
++	case <-resumed:
++	case <-l.cg.Done():
++	}
+ }
+ 
+ // isReestablished returns true if the link has successfully completed the
+@@ -1455,7 +1473,12 @@ func (l *channelLink) htlcManager(ctx context.Context) {
+ 		// A user-initiated quiescence request is received. We now
+ 		// forward it to the quiescer.
+ 		case qReq := <-l.quiescenceReqs:
+-			err := l.handleQuiescenceReq(qReq)
++			if qReq.resumed != nil {
++				l.quiescer.Resume()
++				close(qReq.resumed)
++				continue
++			}
++			err := l.handleQuiescenceReq(qReq.stfu)
+ 			if err != nil {
+ 				l.log.Errorf("failed handle quiescence "+
+ 					"req: %v", err)
+diff --git a/htlcswitch/quiescence_control_test.go b/htlcswitch/quiescence_control_test.go
+new file mode 100644
+index 000000000..63a7ca698
+--- /dev/null
++++ b/htlcswitch/quiescence_control_test.go
+@@ -0,0 +1,169 @@
++package htlcswitch
++
++import (
++	"testing"
++	"time"
++
++	"github.com/btcsuite/btcd/btcutil"
++	"github.com/lightningnetwork/lnd/fn/v2"
++	"github.com/lightningnetwork/lnd/lntypes"
++	"github.com/lightningnetwork/lnd/lnwire"
++	"github.com/stretchr/testify/require"
++)
++
++func receiveQuiescenceControl(t *testing.T,
++	requests <-chan quiescenceControl) quiescenceControl {
++
++	t.Helper()
++	select {
++	case request := <-requests:
++		return request
++	case <-time.After(5 * time.Second):
++		t.Fatal("quiescence command was not enqueued")
++		return quiescenceControl{}
++	}
++}
++
++func awaitQuiescenceSignal(t *testing.T, signal <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-signal:
++	case <-time.After(5 * time.Second):
++		t.Fatal("quiescence operation did not finish")
++	}
++}
++
++func TestLinkQuiescenceControlInitBeforeResume(t *testing.T) {
++	t.Parallel()
++
++	h, err := newSingleLinkTestHarness(
++		t, 5*btcutil.SatoshiPerBitcoin, btcutil.SatoshiPerBitcoin,
++	)
++	require.NoError(t, err)
++	link := h.aliceLink.(*channelLink)
++	q := initQuiescerTestHarness(lntypes.Local)
++	link.quiescer = q.quiescer
++
++	result := link.InitStfu()
++	initCommand := receiveQuiescenceControl(t, link.quiescenceReqs)
++	resumed := make(chan struct{})
++	go func() {
++		link.ResumeQuiescence()
++		close(resumed)
++	}()
++	resumeCommand := receiveQuiescenceControl(t, link.quiescenceReqs)
++	require.NotNil(t, resumeCommand.resumed)
++
++	// Put both observed public operations back in their original order.
++	// The manager must initiate before it processes the cancellation.
++	link.quiescenceReqs <- initCommand
++	require.NoError(t, h.start())
++	t.Cleanup(link.Stop)
++	select {
++	case link.quiescenceReqs <- resumeCommand:
++	case <-time.After(5 * time.Second):
++		t.Fatal("link did not accept its queued resume")
++	}
++	awaitQuiescenceSignal(t, resumed)
++
++	select {
++	case value := <-result:
++		_, err := value.Unpack()
++		require.ErrorIs(t, err, ErrQuiescenceCanceled)
++	case <-time.After(5 * time.Second):
++		t.Fatal("abandoned initiation was not canceled")
++	}
++	require.True(t, q.quiescer.CanSendUpdates())
++}
++
++func TestLinkQuiescenceControlResumeCompletion(t *testing.T) {
++	t.Parallel()
++
++	h, err := newSingleLinkTestHarness(
++		t, 5*btcutil.SatoshiPerBitcoin, btcutil.SatoshiPerBitcoin,
++	)
++	require.NoError(t, err)
++	link := h.aliceLink.(*channelLink)
++	q := initQuiescerTestHarness(lntypes.Local)
++	link.quiescer = q.quiescer
++	require.NoError(t, q.quiescer.RecvStfu(lnwire.Stfu{
++		ChanID: cid, Initiator: true,
++	}))
++	require.NoError(t, q.quiescer.SendOwedStfu())
++	require.False(t, q.quiescer.CanSendUpdates())
++
++	entered, release, completed := make(chan struct{}), make(chan struct{}),
++		make(chan struct{})
++	q.quiescer.OnResume(func() {
++		close(entered)
++		<-release
++		close(completed)
++	})
++	t.Cleanup(func() {
++		select {
++		case <-release:
++		default:
++			close(release)
++		}
++		link.Stop()
++	})
++
++	resumed := make(chan struct{})
++	go func() {
++		link.ResumeQuiescence()
++		close(resumed)
++	}()
++	command := receiveQuiescenceControl(t, link.quiescenceReqs)
++	select {
++	case <-entered:
++		t.Fatal("resume hook ran outside the link manager")
++	default:
++	}
++	link.quiescenceReqs <- command
++	require.NoError(t, h.start())
++	awaitQuiescenceSignal(t, entered)
++	select {
++	case <-resumed:
++		t.Fatal("resume returned before its hook completed")
++	default:
++	}
++	close(release)
++	awaitQuiescenceSignal(t, resumed)
++	select {
++	case <-completed:
++	default:
++		t.Fatal("resume acknowledged unfinished hooks")
++	}
++	require.True(t, q.quiescer.CanSendUpdates())
++}
++
++func TestLinkQuiescenceControlShutdown(t *testing.T) {
++	for _, waitForAck := range []bool{false, true} {
++		t.Run(map[bool]string{false: "enqueue", true: "ack"}[waitForAck],
++			func(t *testing.T) {
++				t.Parallel()
++				link := &channelLink{
++					cg: fn.NewContextGuard(),
++					quiescenceReqs: make(
++						chan quiescenceControl, 1,
++					),
++				}
++				if !waitForAck {
++					link.quiescenceReqs <- quiescenceControl{}
++				}
++				resumed := make(chan struct{})
++				go func() {
++					link.ResumeQuiescence()
++					close(resumed)
++				}()
++				if waitForAck {
++					command := receiveQuiescenceControl(
++						t, link.quiescenceReqs,
++					)
++					require.NotNil(t, command.resumed)
++				}
++				link.cg.Quit()
++				awaitQuiescenceSignal(t, resumed)
++			})
++	}
++}
+-- 
+2.56.0
