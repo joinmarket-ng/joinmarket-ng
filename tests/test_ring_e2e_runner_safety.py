@@ -306,7 +306,8 @@ def test_proxy_address_stays_valid_after_lnd_startup(runner_env, suite: str) -> 
     env, _, _, log = runner_env
     # Pinned LND resolves the proxy at startup, not on each dial. Replacing Tor
     # changes its generation here, making authenticated readiness impossible.
-    env.update(FAKE_PROXY_LIFECYCLE="1", RING_E2E_PEER_READY_TIMEOUT_SECONDS="1")
+    # Allow real interpreter startup for every edge in the mocked peer matrix.
+    env.update(FAKE_PROXY_LIFECYCLE="1", RING_E2E_PEER_READY_TIMEOUT_SECONDS="10")
     result = run(env, suite)
     assert result.returncode == 0, result.stderr
     assert Path(env["FAKE_PYTEST_LOG"]).exists()
