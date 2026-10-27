@@ -14,7 +14,12 @@ from typing import cast
 import pytest
 from _taker_market_helpers import FakeHoldInvoices
 from bitcointx.core.key import CKey  # type: ignore[import-not-found]
-from jmcore.bitcoin import address_to_scriptpubkey_for_network, hash160
+from jmcore.bitcoin import (
+    address_to_scriptpubkey_for_network,
+    create_p2tr_scriptpubkey,
+    hash160,
+    taproot_tweak_pubkey,
+)
 from jmcore.credential_market import (
     Allocation,
     BondReference,
@@ -31,7 +36,7 @@ from jmcore.credential_market import (
     document_hash,
     sign_document,
 )
-from jmcore.external_podle import ExternalPoDLEOutpoint
+from jmcore.external_podle import ExternalPoDLE, ExternalPoDLEOutpoint
 from jmcore.market_faults import MarketFaultCache
 from jmcore.market_store import MarketStore
 from jmcore.models import NetworkType
@@ -163,6 +168,43 @@ def _podle_metadata(owner: CKey) -> dict[str, object]:
         "blockheight": 1,
         "index": 0,
     }
+
+
+@pytest.mark.parametrize("p2tr", [False, True])
+@pytest.mark.parametrize("key_value", [1, 2])
+def test_export_podle_binds_proof_to_output_key(tmp_path: Path, p2tr: bool, key_value: int) -> None:
+    owner = _key(key_value)
+    owner_file = tmp_path / "owner.key"
+    _write(owner_file, owner.secret_bytes.hex().encode("ascii"))
+    metadata = _podle_metadata(owner)
+    if p2tr:
+        _, output_key = taproot_tweak_pubkey(bytes(owner.xonly_pub))
+        metadata["scriptpubkey"] = create_p2tr_scriptpubkey(output_key).hex()
+    metadata_file = tmp_path / "metadata.json"
+    _json(metadata_file, metadata)
+    output = tmp_path / "podle.json"
+
+    assert (
+        market_cli.run(
+            [
+                "export-podle",
+                "--owner-key",
+                str(owner_file),
+                "--metadata",
+                str(metadata_file),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    record = ExternalPoDLE.model_validate_json(output.read_text())
+    assert record.scriptpubkey == metadata["scriptpubkey"]
+    if p2tr:
+        assert record.P[2:] == output_key.hex()
+    else:
+        assert record.P == bytes(owner.pub).hex()
 
 
 def test_offline_seller_buyer_lifecycle_uses_real_crypto(

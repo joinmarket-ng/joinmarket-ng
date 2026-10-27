@@ -509,7 +509,12 @@ def _command_export_podle(args: argparse.Namespace) -> None:
         index = metadata.get("index", 0)
         if not isinstance(network, str) or not isinstance(scriptpubkey, str):
             raise ValueError
-        proof = generate_podle(_secp_key(args.owner_key).secret_bytes, outpoint.to_string(), index)
+        proof = generate_podle(
+            _secp_key(args.owner_key).secret_bytes,
+            outpoint.to_string(),
+            index,
+            p2tr=len(scriptpubkey) == 68 and scriptpubkey.startswith("5120"),
+        )
         record = ExternalPoDLE(
             version=1,
             network=cast(Network, network),
