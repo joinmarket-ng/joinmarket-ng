@@ -338,9 +338,9 @@ from pathlib import Path
 from jmcore.wallet_metadata import selected_identity
 try:
     identity = selected_identity(Path(sys.argv[1]))
-    print(f"{identity.fingerprint} (BIP39: {identity.bip39})" if identity else "identity unconfirmed")
+    print(identity.fingerprint if identity else "(unconfirmed)")
 except (OSError, ValueError):
-    print("identity unavailable; register/select explicitly")
+    print("(unavailable; register/select explicitly)")
 PY
 }
 
@@ -369,6 +369,36 @@ PY
 get_maker_env_password() {
     [ -f "$MAKER_ENV" ] || return 1
     "$TUI_PYTHON" -m jmcore.maker_env "$MAKER_ENV" MNEMONIC_PASSWORD
+}
+
+# Helper: Truncate long wallet names for the menu header (max 24 chars).
+truncate_wallet_name() {
+    local name="$1"
+    if [ "${#name}" -gt 24 ]; then
+        printf '%s…' "${name:0:23}"
+    else
+        printf '%s' "$name"
+    fi
+}
+
+# Helper: Refresh the two-line menu header globals from CURRENT_WALLET.
+update_wallet_header() {
+    if [ -n "$CURRENT_WALLET" ]; then
+        WALLET_NAME=$(truncate_wallet_name "$(basename "$CURRENT_WALLET")")
+        IDENTITY_LINE="Fingerprint:   $(wallet_identity_summary "$CURRENT_WALLET")"
+    else
+        WALLET_NAME="(none configured)"
+        IDENTITY_LINE=""
+    fi
+}
+
+# Helper: Print the two-line header shown on top of whiptail menus.
+# Used via $(menu_header); command substitution strips the trailing newline.
+menu_header() {
+    printf 'Active Wallet: %s | Maker Bot: %s\n' "$WALLET_NAME" "$MAKER_STATUS"
+    if [ -n "$IDENTITY_LINE" ]; then
+        printf '%s' "$IDENTITY_LINE"
+    fi
 }
 
 # Helper: Read the staged BIP39 passphrase from .maker.env (empty if absent).
@@ -1364,9 +1394,9 @@ stage_maker_password() {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: Stale wallet check for all loops that display WALLET_INFO.
+# Helper: Stale wallet check for all loops that display the menu header.
 # Refreshes CURRENT_WALLET from config, checks if the file still exists,
-# and updates WALLET_INFO. Called at the top of every menu loop so the
+# and refreshes the menu header. Called at the top of every menu loop so the
 # display stays accurate even if the wallet file is deleted externally.
 # ---------------------------------------------------------------------------
 check_stale_wallet() {
@@ -1382,12 +1412,8 @@ check_stale_wallet() {
         CURRENT_WALLET=""
         rm -f "$FINGERPRINT_CACHE"
     fi
-    if [ -n "$CURRENT_WALLET" ]; then
-        local wallet_name
-        wallet_name=$(basename "$CURRENT_WALLET")
-        WALLET_INFO="Active Wallet: ${wallet_name} | $(wallet_identity_summary "$CURRENT_WALLET")"
-    else
-        WALLET_INFO="Active Wallet: (none configured)"
+    update_wallet_header
+    if [ -z "$CURRENT_WALLET" ]; then
         rm -f "$FINGERPRINT_CACHE"
     fi
 }
@@ -1396,7 +1422,7 @@ check_stale_wallet() {
 # Helper: Ensure an active wallet is configured and available.
 #
 # WARNING: Do not call from subshells - modifies global CURRENT_WALLET
-# and WALLET_INFO.
+# and the menu header globals (WALLET_NAME, IDENTITY_LINE).
 #
 # - Refreshes CURRENT_WALLET from config
 # - Silently cleans up stale config (file no longer exists)
@@ -1405,7 +1431,7 @@ check_stale_wallet() {
 #   - 1 wallet exists → auto-set as active, offer password storage
 #   - Multiple wallets → picker, offer password storage
 # - Password storage is ONLY offered when wallet just changed
-# - Updates WALLET_INFO whenever CURRENT_WALLET changes
+# - Updates the menu header whenever CURRENT_WALLET changes
 # Returns 0 if a wallet is ready, 1 to abort.
 # ---------------------------------------------------------------------------
 ensure_active_wallet() {
@@ -1425,9 +1451,7 @@ ensure_active_wallet() {
 
     # Already have a valid wallet - no password offer
     if [ -n "$CURRENT_WALLET" ] && [ -f "$CURRENT_WALLET" ]; then
-        local wallet_name
-        wallet_name=$(basename "$CURRENT_WALLET")
-        WALLET_INFO="Active Wallet: ${wallet_name} | $(wallet_identity_summary "$CURRENT_WALLET")"
+        update_wallet_header
         return 0
     fi
 
@@ -1497,8 +1521,8 @@ ensure_active_wallet() {
         fi
     fi
 
-    # Update WALLET_INFO
-    WALLET_INFO="Active Wallet: $(basename "$CURRENT_WALLET") | $(wallet_identity_summary "$CURRENT_WALLET")"
+    # Update the two-line menu header
+    update_wallet_header
 
     # Offer password storage ONLY when wallet just changed
     if [ "$wallet_just_changed" = "yes" ]; then
@@ -1655,7 +1679,7 @@ while true; do
   MAIN_MENU_ITEMS+=("X" "Exit to JoinMarket-NG CLI Shell")
 
   CHOICE=$(whiptail --title " JoinMarket-NG Menu " \
-      --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+      --menu "\n$(menu_header)" \
       "$MAIN_MENU_HEIGHT" 64 "$MAIN_MENU_LIST_HEIGHT" \
       "${MAIN_MENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
 
@@ -1935,7 +1959,7 @@ No:  automatic coin selection from one mixdepth." 12 64
         check_stale_wallet
 
         WCHOICE=$(whiptail --title " Wallet Management " \
-         --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+         --menu "\n$(menu_header)" \
           23 78 12 \
           "VIEW"     "View Wallet Info / Balance" \
           "HIST"     "CoinJoin History" \
@@ -1965,7 +1989,7 @@ No:  automatic coin selection from one mixdepth." 12 64
                   fi
 
                   INFO_CHOICE=$(whiptail --title " Wallet Info " \
-                    --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose info display level:" \
+                    --menu "\n$(menu_header)\n\nChoose info display level:" \
                     19 78 4 \
                     "BASIC" "Basic view (balance by mixdepth)" \
                     "FULL" "Extended full view (wide pipe table, one line per UTXO)" \
@@ -2315,7 +2339,7 @@ for item in json.load(sys.stdin):
               done <<< "$WALLETS"
 
               WNAME=$(whiptail --title " Select Active Wallet " --notags \
-                  --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose a wallet:" \
+                  --menu "\n$(menu_header)\n\nChoose a wallet:" \
                   18 64 6 \
                   "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3) || continue
 
@@ -2392,7 +2416,7 @@ for item in json.load(sys.stdin):
               fi
 
               if ! whiptail --title " Security Warning " \
-                  --yesno "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nYou are about to display your BIP39 seed words.\n\nWARNING: Anyone with these words can spend all your funds.\nDo not share them, photograph them, or paste them into any website.\n\nMake sure you are in a private setting!\n\nContinue?" \
+                  --yesno "\n$(menu_header)\n\nYou are about to display your BIP39 seed words.\n\nWARNING: Anyone with these words can spend all your funds.\nDo not share them, photograph them, or paste them into any website.\n\nMake sure you are in a private setting!\n\nContinue?" \
                   17 78 --defaultno 3>&1 1>&2 2>&3; then
                   continue
               fi
@@ -2440,7 +2464,7 @@ for item in json.load(sys.stdin):
       fi
 
       MCHOICE=$(whiptail --title " Maker Bot Control " \
-        --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+        --menu "\n$(menu_header)" \
         18 64 6 \
         "START"   "Start Maker Bot" \
         "STOP"    "Stop Maker Bot" \
@@ -2582,7 +2606,7 @@ for item in json.load(sys.stdin):
               while true; do
                 check_stale_wallet
                 BCHOICE=$(whiptail --title " Fidelity Bonds " \
-                  --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nFidelity Bonds lock coins until a date to boost maker reputation.\nExpired bonds appear in wallet balance and are spendable." \
+                  --menu "\n$(menu_header)\n\nFidelity Bonds lock coins until a date to boost maker reputation.\nExpired bonds appear in wallet balance and are spendable." \
                   18 72 3 \
                   "LIST"   "List existing Fidelity Bonds" \
                   "CREATE" "Generate a new bond address (lock coins)" \
@@ -2652,7 +2676,7 @@ for item in json.load(sys.stdin):
                             while true; do
                                 clear
                                 LOCKDATE=$(prompt_param "Fidelity Bond Lockdate" \
-                                  "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nEnter lockdate as YYYY-MM.\nCoins are NOT spendable until this date!" \
+                                  "\n$(menu_header)\n\nEnter lockdate as YYYY-MM.\nCoins are NOT spendable until this date!" \
                                   "") || exit 1
                                 if ! [[ "$LOCKDATE" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
                                     whiptail --title " Date Error " --msgbox "Invalid date format.\nUse YYYY-MM (e.g. 2027-06)." 8 50
@@ -2678,10 +2702,10 @@ for item in json.load(sys.stdin):
                                 # Final confirmation with explicit lock warning
                                 if [[ "$LOCKDATE" < "$CURRENT_YM" ]]; then
                                     # Past date - coins are already spendable
-                                    CONFIRM_TEXT="\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE} (Date is in the past)\n\nWARNING: This lockdate is in the past.\n         All coins on this address are already SPENDABLE.\n         This is only useful for recreating existing bond addresses.\n\nProceed?"
+                                    CONFIRM_TEXT="\n$(menu_header)\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE} (Date is in the past)\n\nWARNING: This lockdate is in the past.\n         All coins on this address are already SPENDABLE.\n         This is only useful for recreating existing bond addresses.\n\nProceed?"
                                 else
                                     # Future date - coins will be locked
-                                    CONFIRM_TEXT="\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE}\n\nWARNING: Coins sent to this address will be LOCKED\n         and NOT spendable until ${LOCKDATE}.\n\nProceed?"
+                                    CONFIRM_TEXT="\n$(menu_header)\n\nGenerate a Fidelity Bond address?\n\nLockdate: ${LOCKDATE}\n\nWARNING: Coins sent to this address will be LOCKED\n         and NOT spendable until ${LOCKDATE}.\n\nProceed?"
                                 fi
 
                                 if ! whiptail --title " Confirm Fidelity Bond " \
@@ -2780,7 +2804,7 @@ for item in json.load(sys.stdin):
       while true; do
         check_stale_wallet
         CCHOICE=$(whiptail --title " Config Center " \
-          --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS" \
+          --menu "\n$(menu_header)" \
           22 64 10 \
           "LOG"    "Configure Log Level" \
           "PPFLAG" "Configure BIP39 Onboarding" \
@@ -2800,7 +2824,7 @@ for item in json.load(sys.stdin):
             CURRENT_LOG="${LOGGING__LEVEL:-INFO}"
 
             LOG_CHOICE=$(whiptail --title " Log Level " --notags \
-              --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nSelect log level:\n\nCurrent: ${CURRENT_LOG}" \
+              --menu "\n$(menu_header)\n\nSelect log level:\n\nCurrent: ${CURRENT_LOG}" \
               20 68 6 \
               "GLOBAL"  "Follow global logging (or session environment)" \
               "TRACE"   "TRACE   - Most verbose troubleshooting output" \
@@ -2870,7 +2894,7 @@ for item in json.load(sys.stdin):
             fi
 
             if whiptail --title " Delete Password " --yesno \
-              "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nDelete the stored password for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the password on next use." \
+              "\n$(menu_header)\n\nDelete the stored password for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the password on next use." \
               13 60 --defaultno 3>&1 1>&2 2>&3; then
 
               if clear_config_value wallet mnemonic_password; then
@@ -2894,7 +2918,7 @@ for item in json.load(sys.stdin):
             fi
 
             if whiptail --title " Delete Passphrase " --yesno \
-              "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nDelete the stored BIP39 passphrase for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the passphrase on next use." \
+              "\n$(menu_header)\n\nDelete the stored BIP39 passphrase for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the passphrase on next use." \
               13 60 --defaultno 3>&1 1>&2 2>&3; then
 
               if clear_config_value wallet bip39_passphrase && rm -f "$MAKER_ENV" "$FINGERPRINT_CACHE"; then
@@ -3062,7 +3086,7 @@ except (json.JSONDecodeError, AttributeError):
       while true; do
         check_stale_wallet
         UCHOICE=$(whiptail --title " Update JoinMarket-NG (current: ${CURRENT_LABEL}) " \
-            --menu "\n$WALLET_INFO | Maker Bot: $MAKER_STATUS\n\nChoose update channel:" \
+            --menu "\n$(menu_header)\n\nChoose update channel:" \
             16 70 4 \
             "STABLE"  "Latest stable release (v${LATEST_STABLE})" \
             "DEV"     "Latest main commit (${LATEST_MAIN})" \

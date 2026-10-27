@@ -65,7 +65,13 @@ def test_selected_identity_display_does_not_need_unlock_or_cache(
         )
         select_identity(wallet_path, fingerprint)
     content = SCRIPT_PATH.read_text()
-    names = ("wallet_identity_summary", "check_stale_wallet", "ensure_active_wallet")
+    names = (
+        "truncate_wallet_name",
+        "update_wallet_header",
+        "wallet_identity_summary",
+        "check_stale_wallet",
+        "ensure_active_wallet",
+    )
     functions = "\n".join(
         name + "()" + content.split(name + "()", 1)[1].split("\n}", 1)[0] + "\n}"
         for name in names
@@ -76,9 +82,9 @@ def test_selected_identity_display_does_not_need_unlock_or_cache(
 get_mnemonic_file() { echo "$TEST_WALLET"; }
 whiptail() { exit 99; }
 check_stale_wallet
-echo "$WALLET_INFO"
+echo "$IDENTITY_LINE"
 ensure_active_wallet || exit 1
-echo "$WALLET_INFO"
+echo "$IDENTITY_LINE"
 """
     )
     env = os.environ | {
@@ -89,7 +95,9 @@ echo "$WALLET_INFO"
     result = _run_test_shell(["bash", "-c", script], input_text="", env=env, timeout=30)
     assert result.returncode == 0, result.stderr
     expected = (
-        f"{fingerprint} (BIP39: required)" if registered else "identity unconfirmed"
+        f"Fingerprint:   {fingerprint}"
+        if registered
+        else "Fingerprint:   (unconfirmed)"
     )
     assert result.stdout.count(expected) == 2
     assert not (tmp_path / "absent-cache").exists()

@@ -22,6 +22,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "jmcore" / "src" / "jmcore" / "data" / "menu.joinmarket-ng.sh"
 
 
+def _extract_script_function(content: str, name: str) -> str:
+    """Return the definition of a bash function from the menu script."""
+    return (
+        name + "() {" + content.split(f"\n{name}() {{", 1)[1].split("\n}", 1)[0] + "\n}"
+    )
+
+
 def test_import_recovery_warning_precedes_activation(tmp_path: Path) -> None:
     """Successful import acknowledges recovery limits before clearing the notice."""
     content = SCRIPT_PATH.read_text()
@@ -211,16 +218,24 @@ def test_tui_main_menu_arguments_and_cancellation(
     tmp_path: Path, raspiblitz: bool, maker_running: bool, dialog_status: int
 ) -> None:
     """Both menu variants preserve arguments and reset items on each rendering."""
-    content = SCRIPT_PATH.read_text().split("# Main Loop\n", 1)[1]
-    menu = content.split("while true; do\n", 1)[1].split("  case $CHOICE in", 1)[0]
+    content = SCRIPT_PATH.read_text()
+    menu = (
+        content.split("# Main Loop\n", 1)[1]
+        .split("while true; do\n", 1)[1]
+        .split("  case $CHOICE in", 1)[0]
+    )
     script = (
-        """
+        _extract_script_function(content, "menu_header")
+        + """
         RASPIBLITZ="$1"
         MAKER_RUNNING="$2"
         DIALOG_STATUS="$3"
         ARGS_DIR="$4"
         pgrep() { [ "$MAKER_RUNNING" = 1 ]; }
-        check_stale_wallet() { WALLET_INFO='active wallet'; }
+        check_stale_wallet() {
+            WALLET_NAME='active wallet'
+            IDENTITY_LINE='Fingerprint:   0123456789abcdef'
+        }
         exit_jm_ng() { echo EXIT_CALLED; exit 0; }
         whiptail() {
             printf '%s\\0' "$@" > "$ARGS_DIR/menu-$attempt.args"
@@ -252,7 +267,8 @@ def test_tui_main_menu_arguments_and_cancellation(
         "--title",
         " JoinMarket-NG Menu ",
         "--menu",
-        f"\\nactive wallet | Maker Bot: {'RUNNING' if maker_running else 'STOPPED'}",
+        "\\nActive Wallet: active wallet | Maker Bot: "
+        f"{'RUNNING' if maker_running else 'STOPPED'}\nFingerprint:   0123456789abcdef",
         "21" if raspiblitz else "18",
         "64",
         "8" if raspiblitz else "7",
@@ -281,6 +297,59 @@ def test_tui_main_menu_arguments_and_cancellation(
         assert not (tmp_path / "menu-2.args").exists()
     else:
         assert result.stdout.splitlines() == ["CHOICE=W STATUS=0"] * 2
+
+
+@pytest.mark.parametrize(
+    "wallet_name,identity_line,expected",
+    [
+        (
+            "wallet.mnemonic",
+            "Fingerprint:   0123456789abcdef",
+            "Active Wallet: wallet.mnemonic | Maker Bot: STOPPED\n"
+            "Fingerprint:   0123456789abcdef",
+        ),
+        (
+            "wallet.mnemonic",
+            "",
+            "Active Wallet: wallet.mnemonic | Maker Bot: STOPPED",
+        ),
+    ],
+)
+def test_tui_menu_header_layout(
+    wallet_name: str, identity_line: str, expected: str
+) -> None:
+    """The menu header shows the identity line only when a wallet is active."""
+    content = SCRIPT_PATH.read_text()
+    script = (
+        _extract_script_function(content, "menu_header")
+        + f'\nWALLET_NAME="{wallet_name}"\n'
+        + f'IDENTITY_LINE="{identity_line}"\nMAKER_STATUS=STOPPED\nmenu_header\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=True, timeout=5
+    )
+    assert result.stdout.rstrip("\n") == expected
+
+
+@pytest.mark.parametrize(
+    "wallet_name,expected",
+    [
+        ("short.mnemonic", "short.mnemonic"),
+        ("x" * 24, "x" * 24),
+        ("a-very-long-wallet-name.mnemonic", "a-very-long-wallet-name…"),
+    ],
+)
+def test_tui_truncate_wallet_name(wallet_name: str, expected: str) -> None:
+    """Wallet names longer than 24 chars are end-truncated with an ellipsis."""
+    content = SCRIPT_PATH.read_text()
+    script = (
+        _extract_script_function(content, "truncate_wallet_name")
+        + f'\ntruncate_wallet_name "{wallet_name}"\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=True, timeout=5
+    )
+    assert result.stdout.rstrip("\n") == expected
 
 
 def test_tui_prefers_its_virtual_environment() -> None:
@@ -346,9 +415,7 @@ def test_tui_update_only_targets_running_installation(
     """Update must not run the installer against a different installation."""
     content = SCRIPT_PATH.read_text()
     name = "updater_manages_running_installation"
-    function = (
-        name + "() {" + content.split(f"\n{name}() {{", 1)[1].split("\n}", 1)[0] + "\n}"
-    )
+    function = _extract_script_function(content, name)
     update_flow = content.split("\n    U)\n", 1)[1]
     assert update_flow.index(f"! RUNNING_PREFIX=$({name})") < update_flow.index(
         'TRUSTED_INSTALLER="$DATA_DIR/install.sh"'
@@ -1233,7 +1300,7 @@ def test_tui_clears_stale_mnemonic_file_entry() -> None:
     loop must detect that and clear the dangling config values."""
     content = SCRIPT_PATH.read_text()
     main_loop = content.split("while true; do", 1)[1]
-    # Both detection and cleanup must happen before we compute WALLET_INFO.
+    # Both detection and cleanup must happen before we refresh the menu header.
     assert '[ ! -f "$CURRENT_WALLET" ]' in main_loop
     assert "clear_active_wallet_config" in main_loop
     # And the stale-config path must surface a warning so the user knows
@@ -1349,7 +1416,7 @@ def test_tui_script_has_ensure_active_wallet_helper() -> None:
     assert "ensure_active_wallet()" in content
 
     # Must include warning comment about subshell usage (modifies CURRENT_WALLET
-    # and WALLET_INFO globals, so calling from subshell loses changes)
+    # and the menu header globals, so calling from subshell loses changes)
     assert "Do not call from subshells" in content
 
     # Must track whether wallet was just changed to control password storage
@@ -1526,14 +1593,14 @@ def test_tui_script_wallet_submenu_uses_check_stale_wallet() -> None:
     # Extract W submenu block
     w_block = content.split("W)\n", 1)[1].split("M)\n", 1)[0]
 
-    # Must call the helper to keep WALLET_INFO fresh
+    # Must call the helper to keep the menu header fresh
     assert "check_stale_wallet" in w_block, "W submenu must refresh wallet state"
 
 
 def test_tui_script_view_submenu_uses_check_stale_wallet() -> None:
     """VIEW submenu loop must call check_stale_wallet.
 
-    New addition - previously had NO stale check, so WALLET_INFO could
+    New addition - previously had NO stale check, so the menu header could
     be stale if user deleted wallet file while in submenu."""
     content = SCRIPT_PATH.read_text()
 
