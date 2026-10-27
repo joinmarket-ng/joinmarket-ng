@@ -140,6 +140,7 @@ python -m pip install --upgrade pip
 
 python -m pip install -e ./jmcore
 python -m pip install -e ./jmwallet
+python -m pip install -e ./jmswap
 python -m pip install -e ./maker
 python -m pip install -e ./taker
 python -m pip install -e ./tumbler
@@ -237,7 +238,7 @@ cmake --build $secpBuild --config Release
 $secpDll = Get-ChildItem $secpBuild -Recurse -Filter "*secp256k1*.dll" | Select-Object -First 1
 Copy-Item $secpDll.FullName .\.venv\Scripts\secp256k1.dll
 python -m pip install --upgrade pip
-pip install .\jmcore .\jmwallet .\taker
+pip install .\jmcore .\jmwallet .\jmswap .\taker
 ```
 
 When upgrading an existing Windows installation, rebuild and replace its

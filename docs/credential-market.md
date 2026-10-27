@@ -79,7 +79,7 @@ payment format or schema migration path.
 For a source checkout, install the CLI:
 
 ```bash
-python -m pip install ./jmcore ./jmwallet ./taker
+python -m pip install ./jmcore ./jmwallet ./jmswap ./taker
 ```
 
 Invoice signatures use the maintained `python-bitcointx` fork already pinned by
@@ -234,6 +234,10 @@ Use LND's default `invoice.macaroon`; selling never needs more. Run a separate
 LND node from any ring channel node, and give it at least one public channel
 with enough inbound liquidity, because the invoices carry no route hints.
 `serve` refuses to start without these settings.
+
+Do not enable `gc-canceled-invoices-on-the-fly` on this node. It deletes expired
+and canceled hold invoices, which the seller must treat as unfinished; their
+inventory and active quote slots remain reserved.
 
 Set `--price-sats` to the price you want: every quote's invoice is created for
 exactly that amount. The buyer still relies on the signed quote and its own

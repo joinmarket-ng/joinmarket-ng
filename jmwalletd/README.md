@@ -28,7 +28,7 @@ Install in a virtualenv from repo root (jmwalletd uses the maker, taker, and
 tumbler components at runtime):
 
 ```bash
-python -m pip install -e ./jmcore -e ./jmwallet -e ./maker -e ./taker \
+python -m pip install -e ./jmcore -e ./jmwallet -e ./jmswap -e ./maker -e ./taker \
     -e ./tumbler -e ./jmwalletd
 ```
 

@@ -223,7 +223,7 @@ Complete persisted intent can replay interrupted submissions within the original
 safety bounds, without replacing an issued invoice or changing its payment hash.
 This requires retained LND history. Incomplete intent and late unknown outcomes
 remain lookup-only; a failed replay is not proof that a delayed original cannot
-pay. See the [buyout recovery restrictions](../jmswap/README.md).
+pay. See the [buyout recovery restrictions](https://github.com/joinmarket-ng/joinmarket-ng/blob/main/jmswap/README.md).
 
 ### 4. Buy a PoDLE or Rent a Bond
 
