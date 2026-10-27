@@ -259,6 +259,7 @@ async def test_accepted_auth_and_first_ring_dispatch_keep_original_node_resource
     else:
         await bot.close_offer_admission()
     await bot._handle_auth("peer", "auth ciphertext")
+    await asyncio.wait_for(asyncio.gather(*bot._session_handler_tasks), 2)
     authenticated.assert_awaited_once()
     session.state = CoinJoinState.IOAUTH_SENT
     crypto = cast(MagicMock, session.inner.crypto)
@@ -274,6 +275,7 @@ async def test_accepted_auth_and_first_ring_dispatch_keep_original_node_resource
     factory = Mock(return_value=participant)
     monkeypatch.setattr(channel_ring, "MakerRingParticipant", factory)
     await bot._handle_ring("peer", "ring ciphertext signature pubkey")
+    await asyncio.wait_for(asyncio.gather(*bot._session_handler_tasks), 2)
     participant.handle.assert_awaited_once_with(invitation)
     assert factory.call_args is not None
     assert factory.call_args.kwargs["initialized_backend"] is original_node

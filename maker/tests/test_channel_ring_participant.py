@@ -1372,6 +1372,7 @@ async def test_timeout_reconciliation_retires_unsigned_signing_ring(tmp_path: Pa
     bot._broadcast_commitment = AsyncMock(return_value=True)  # type: ignore[method-assign]
     bot._prune_pending_signed_rounds = AsyncMock()  # type: ignore[method-assign]
     bot._direct_connection_rate_limiter = Mock()
+    bot._message_rate_limiter = Mock()
 
     await bot._cleanup_timed_out_sessions()
 

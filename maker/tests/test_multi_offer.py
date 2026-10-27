@@ -682,6 +682,7 @@ class TestMakerBotMultiOfferFill:
                 if not overlap:
                     release.set()
                     await asyncio.wait_for(first, 2)
+                    await asyncio.wait_for(asyncio.gather(*maker_bot._session_handler_tasks), 2)
                 second = asyncio.create_task(
                     maker_bot._handle_tx("taker", "tx ciphertext", source="directory:server")
                 )
@@ -690,11 +691,15 @@ class TestMakerBotMultiOfferFill:
                 assert signer.await_count == 1
                 release.set()
                 await asyncio.wait_for(asyncio.gather(*tasks), 2)
+                await asyncio.wait_for(asyncio.gather(*maker_bot._session_handler_tasks), 2)
             finally:
                 release.set()
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.wait_for(
+                    asyncio.gather(*maker_bot._session_handler_tasks, return_exceptions=True), 2
+                )
         signer.assert_awaited_once()
         session.send_response.assert_awaited_once_with(maker_bot, "sig", {"signature": "signature"})
         maker_bot._register_pending_signed_round.assert_awaited_once()
