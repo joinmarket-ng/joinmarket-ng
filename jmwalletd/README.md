@@ -18,6 +18,9 @@ For full documentation, see
 - WebSocket notifications on `/ws`, `/api/v1/ws`, and `/jmws`
 - JWT auth (access and refresh tokens)
 - Orderbook proxy endpoints under `/obwatch/*`
+- Experimental wallet-native credential seller and explicit ledger maintenance
+  under `/api/v1/wallet/{walletname}/market/*`, documented in the
+  [credential market guide](../docs/credential-market.md#native-seller-operations)
 
 ## Run
 
@@ -25,7 +28,7 @@ Install in a virtualenv from repo root (jmwalletd uses the maker, taker, and
 tumbler components at runtime):
 
 ```bash
-python -m pip install -e ./jmcore -e ./jmwallet -e ./maker -e ./taker \
+python -m pip install -e ./jmcore -e ./jmwallet -e ./jmswap -e ./maker -e ./taker \
     -e ./tumbler -e ./jmwalletd
 ```
 

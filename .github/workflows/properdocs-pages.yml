@@ -30,6 +30,7 @@ jobs:
           pip install \
             -e jmcore \
             -e jmwallet \
+            -e jmswap \
             -e taker \
             -e maker \
             -e directory_server \

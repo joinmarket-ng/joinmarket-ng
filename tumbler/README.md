@@ -12,7 +12,7 @@ For implementation details, see
 Install editable packages:
 
 ```bash
-pip install -e jmcore -e jmwallet -e taker -e maker
+pip install -e jmcore -e jmwallet -e jmswap -e taker -e maker
 pip install -e tumbler[dev]
 ```
 

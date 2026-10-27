@@ -1,23 +1,31 @@
-"""Narrow TOML config access for the shell TUI.
+"""Narrow TOML config access for the shell TUI and setup.
 
-The TUI only needs to read, set, and remove string values in named top-level
-tables. Keeping that surface here avoids shell parsing and preserves comments
-and unrelated configuration through TOMLKit.
+The shell's single-key API keeps its string/boolean contract. Coupled setup
+edits validate one complete scalar candidate before replacement. Both preserve
+comments and unrelated configuration through TOMLKit.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import re
+import stat
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TypeAlias, cast
 
 import tomlkit
 from tomlkit.items import Comment, Item, Table, Whitespace
 from tomlkit.toml_document import TOMLDocument
 
-from jmcore.secure_files import atomic_write_sensitive_file, read_sensitive_file
+from jmcore.secure_files import (
+    atomic_write_private,
+    atomic_write_sensitive_file,
+    read_sensitive_file,
+)
 
 
 class ConfigFileError(Exception):
@@ -26,6 +34,7 @@ class ConfigFileError(Exception):
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _BANNER_RE = re.compile(r"^#\s*=+\s*$")
+ConfigScalar: TypeAlias = str | bool | int | float
 
 
 def _validate_identifier(kind: str, value: str) -> None:
@@ -113,7 +122,7 @@ def _next_table_section(document: TOMLDocument, section: str) -> str | None:
 
 
 def _insert_table_value(
-    table: Table, key: str, value: str | bool | Item, next_section: str | None
+    table: Table, key: str, value: ConfigScalar | Item, next_section: str | None
 ) -> None:
     """Append a new key, keeping the next chapter's banner comments last."""
     cut = _chapter_banner_cut(table, next_section)
@@ -180,39 +189,153 @@ def set_config_value(
             raise ConfigFileError("boolean config value must be 'true' or 'false'")
         typed_value = stripped == "true"
     document = _read_document(path)
+    if _set_document_value(document, section, key, typed_value, allow_numbers=False):
+        _write_document(path, document)
+
+
+def _scalar_kind(value: Any, *, allow_numbers: bool) -> str:
+    if isinstance(value, Item):
+        value = value.unwrap()
+    if type(value) is bool:
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if allow_numbers and type(value) is int:
+        return "integer"
+    if allow_numbers and type(value) is float:
+        return "float"
+    raise ConfigFileError(
+        "config value is not a string or boolean"
+        if not allow_numbers
+        else "config value must be a string, boolean, integer, or float"
+    )
+
+
+def _set_document_value(
+    document: TOMLDocument,
+    section: str,
+    key: str,
+    typed_value: ConfigScalar,
+    *,
+    allow_numbers: bool,
+) -> bool:
+    """Edit one AST value, including banner repair, without reading or writing files."""
+    new_kind = _scalar_kind(typed_value, allow_numbers=allow_numbers)
     next_section = _next_table_section(document, section)
-    insertion_value: str | bool | Item = typed_value
+    insertion_value: ConfigScalar | Item = typed_value
     table = _get_table(document, section)
     if table is None:
         table = tomlkit.table()
         document[section] = table
     elif key in table:
         current_value = table[key]
-        if isinstance(current_value, bool):
-            if not as_bool:
-                raise ConfigFileError("config value is a boolean, not a string")
-        elif isinstance(current_value, str):
-            if as_bool:
-                raise ConfigFileError("config value is a string, not a boolean")
-        else:
-            raise ConfigFileError("config value is not a string or boolean")
+        old_kind = _scalar_kind(current_value, allow_numbers=allow_numbers)
+        if old_kind != new_kind:
+            old_article = "an" if old_kind == "integer" else "a"
+            new_article = "an" if new_kind == "integer" else "a"
+            raise ConfigFileError(
+                f"config value is {old_article} {old_kind}, not {new_article} {new_kind}"
+            )
         key_index = _table_key_index(table, key)
         cut = _chapter_banner_cut(table, next_section)
         if cut is not None and key_index is not None and key_index > cut:
             # The key sits after the next chapter's banner comments, which
             # makes it look like it belongs to that chapter. Move it back.
             table[key] = typed_value
-            insertion_value = table.item(key)
+            # The assignment above installs a scalar, never a table proxy.
+            insertion_value = cast(Item, table.item(key))
             table.remove(key)
         elif current_value == typed_value:
-            return
+            return False
         else:
             table[key] = typed_value
-            _write_document(path, document)
-            return
+            return True
 
     _insert_table_value(table, key, insertion_value, next_section)
-    _write_document(path, document)
+    return True
+
+
+@dataclass(frozen=True)
+class _ConfigSnapshot:
+    target: Path
+    contents: bytes | None
+    identity: tuple[int, int, int, int] | None
+
+
+def _file_identity(info: Any) -> tuple[int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def _snapshot_target(target: Path) -> _ConfigSnapshot:
+    try:
+        before = target.lstat()
+    except FileNotFoundError:
+        return _ConfigSnapshot(target, None, None)
+    if not stat.S_ISREG(before.st_mode):
+        raise ConfigFileError("config target is not a regular file")
+    contents = read_sensitive_file(target)
+    after = target.lstat()
+    if _file_identity(before) != _file_identity(after) or len(contents) != after.st_size:
+        raise ConfigFileError("config changed while reading")
+    return _ConfigSnapshot(target, contents, _file_identity(after))
+
+
+def update_config_values(
+    path: Path,
+    updates: Mapping[str, Mapping[str, ConfigScalar]],
+    *,
+    validate: Callable[[Mapping[str, Any]], object],
+) -> None:
+    """Validate and atomically replace one complete candidate of coupled edits.
+
+    The caller must exclude concurrent editors for this SHORT transaction,
+    outside interactive prompting. Snapshot checks detect conflicts, not an
+    arbitrary external writer racing after the final check. Aliases retain
+    their original resolved target. A no-op preserves bytes/no replacement,
+    but sensitive reads may tighten permissions as existing setters do.
+
+    Validation receives a detached plain mapping, even for empty/no-op updates.
+    It must validate that candidate alone (not environment overrides); its
+    returned/defaulted values are never persisted. Missing config proves no
+    wallet or history state and authorizes no node creation.
+    """
+    try:
+        snapshot = _snapshot_target(path.resolve(strict=False))
+        document = (
+            tomlkit.parse(snapshot.contents.decode("utf-8"))
+            if snapshot.contents is not None
+            else tomlkit.document()
+        )
+        before = tomlkit.dumps(document)
+        for section, values in updates.items():
+            _validate_identifier("section", section)
+            for key, value in values.items():
+                _validate_identifier("key", key)
+                _set_document_value(document, section, key, value, allow_numbers=True)
+        try:
+            validate(copy.deepcopy(document.unwrap()))
+        except Exception:
+            # Callback errors may embed passwords or other sensitive inputs.
+            raise ConfigFileError("config candidate validation failed") from None
+        if path.resolve(strict=False) != snapshot.target:
+            raise ConfigFileError("config alias changed during editing")
+        if _snapshot_target(snapshot.target) != snapshot:
+            raise ConfigFileError("config changed during editing")
+        after = tomlkit.dumps(document)
+        if after != before:
+            # Do not resolve an alias again at commit: replace the SAME target
+            # that was read and checked, not a newly redirected destination.
+            atomic_write_private(snapshot.target, after.encode("utf-8"))
+    except ConfigFileError:
+        raise
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        UnicodeDecodeError,
+        tomlkit.exceptions.ParseError,
+    ) as exc:
+        raise ConfigFileError("cannot update valid TOML config") from exc
 
 
 def remove_config_value(path: Path, section: str, key: str) -> None:

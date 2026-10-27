@@ -927,6 +927,8 @@ def info(
             creation_height=resolved.creation_height if resolved else None,
             mnemonic_file=resolved.mnemonic_file if resolved else None,
             scan_status_only=scan_status,
+            address_type=settings.wallet.address_type,
+            lightning_settings=settings if settings.lightning.mode == "managed" else None,
         )
     )
 
@@ -1001,6 +1003,17 @@ def _balance_footer_lines(
     return lines
 
 
+async def _lightning_lines(settings: Any, mnemonic: str, bip39_passphrase: str) -> list[str]:
+    """The managed Lightning node lines of `jm-wallet info` (lightning.mode = "managed")."""
+    try:
+        from jmswap.managed_status import wallet_lightning_lines
+    except ImportError:
+        return ["  Unavailable: install the jmswap package to manage Lightning nodes"]
+    from jmcore.crypto import mnemonic_to_seed
+
+    return await wallet_lightning_lines(settings, mnemonic_to_seed(mnemonic, bip39_passphrase))
+
+
 async def _show_wallet_info(
     mnemonic: str,
     backend_settings: ResolvedBackendSettings,
@@ -1019,6 +1032,8 @@ async def _show_wallet_info(
     creation_height: int | None = None,
     mnemonic_file: Path | None = None,
     scan_status_only: bool = False,
+    address_type: str = "p2wpkh",
+    lightning_settings: Any | None = None,
 ) -> None:
     """Show wallet info implementation.
 
@@ -1152,6 +1167,7 @@ async def _show_wallet_info(
         max_sats_freeze_reuse=max_sats_freeze_reuse,
         reconstruct_history=reconstruct_history,
         mnemonic_file=mnemonic_file,
+        address_type=address_type,
     )
 
     try:
@@ -1337,6 +1353,11 @@ async def _show_wallet_info(
                         md_suffix_parts.append(f"{fb_balance:,} Fidelity Bonds")
                 suffix = f" ({', '.join(md_suffix_parts)})" if md_suffix_parts else ""
                 print(f"  Mixdepth {md}: {balance:>{md_balance_width},} sats{suffix}")
+
+        if lightning_settings is not None:
+            print(f"\n{colorize('Lightning Nodes by Mixdepth:', ANSI_BOLD_YELLOW)}")
+            for line in await _lightning_lines(lightning_settings, mnemonic, bip39_passphrase):
+                print(line)
 
         for line in _balance_footer_lines(
             spendable_balance,
@@ -2668,6 +2689,7 @@ def rescan(
             mixdepth_count=settings.wallet.mixdepth_count,
             max_sats_freeze_reuse=settings.wallet.max_sats_freeze_reuse,
             reconstruct_history=settings.wallet.reconstruct_history,
+            address_type=settings.wallet.address_type,
         )
     )
 
@@ -2685,6 +2707,7 @@ async def _run_rescan(
     max_sats_freeze_reuse: int = -1,
     reconstruct_history: bool = True,
     mnemonic_file: Path | None = None,
+    address_type: str = "p2wpkh",
 ) -> None:
     """Implementation of ``jm-wallet rescan``.
 
@@ -2728,6 +2751,7 @@ async def _run_rescan(
             max_sats_freeze_reuse=max_sats_freeze_reuse,
             reconstruct_history=reconstruct_history,
             mnemonic_file=mnemonic_file,
+            address_type=address_type,
         )
 
     try:

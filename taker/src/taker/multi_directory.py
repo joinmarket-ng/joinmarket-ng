@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +27,7 @@ from jmcore.directory_client import (
 from jmcore.directory_pool import DirectoryClientPool
 from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID, OnionPeer
+from jmcore.network import ConnectionError as NetworkConnectionError
 from jmcore.nick_auth import NickAuthMode
 from jmcore.protocol import (
     NOT_SERVING_ONION_HOSTNAME,
@@ -33,6 +36,7 @@ from jmcore.protocol import (
     parse_jm_message,
 )
 from jmcore.randomness import secure_random
+from jmcore.tasks import parse_directory_address
 from loguru import logger
 
 
@@ -154,6 +158,9 @@ class MultiDirectoryClient(DirectoryClientPool):
         # True = nick is present on this server, False = gone from this server
         # A nick is only considered completely gone when ALL servers report False
         self._active_nicks: dict[str, dict[str, bool]] = {}
+        self._directory_read_phase = asyncio.Lock()
+        self._directory_generation = 0
+        self._closing = False
 
     def _build_client_kwargs(self, host: str, port: int) -> dict[str, Any]:
         """Inject the taker's ``neutrino_compat`` flag into the base kwargs."""
@@ -531,6 +538,7 @@ class MultiDirectoryClient(DirectoryClientPool):
         :meth:`DirectoryClientPool.connect_all_parallel` that preserves
         the historical name used by the taker codebase.
         """
+        self._closing = False
         return await self.connect_all_parallel()
 
     async def close_all(self) -> None:
@@ -541,14 +549,149 @@ class MultiDirectoryClient(DirectoryClientPool):
         close the relay channels. Directory client teardown is handled
         by :meth:`DirectoryClientPool.close_all`.
         """
+        self._closing = True
+        self._directory_generation += 1
         await self._cleanup_peer_connections()
         await super().close_all()
+
+    @asynccontextmanager
+    async def _exclusive_directory_reads(self) -> AsyncIterator[None]:
+        if self._directory_read_phase.locked():
+            raise RuntimeError("Orderbook recovery and response collection must not overlap")
+        async with self._directory_read_phase:
+            yield
+
+    @staticmethod
+    def _is_transport_failure(error: Exception) -> bool:
+        # Policy/resource rejection can also close a socket. Its closed state or
+        # error text is not evidence that reconnecting is appropriate.
+        cause: BaseException | None = error
+        seen: set[int] = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if isinstance(cause, (NetworkConnectionError, OSError)):
+                return True
+            cause = cause.__cause__
+        return False
+
+    async def _discard_directory(self, server: str, client: DirectoryClient) -> None:
+        if self.clients.get(server) is client:
+            self.clients.pop(server)
+        try:
+            await client.close()
+        except Exception as error:
+            logger.debug(f"Error closing failed directory {server}: {error}")
+
+    async def _connect_for_orderbook(
+        self, server: str, generation: int, deadline: float
+    ) -> DirectoryClient | None:
+        if (
+            self._closing
+            or generation != self._directory_generation
+            or asyncio.get_running_loop().time() >= deadline
+        ):
+            return None
+        async with asyncio.timeout_at(deadline):
+            result = await self.connect_to_directory(server)
+        if result is None:
+            return None
+        node_id, candidate = result
+        adopted = False
+        try:
+            if self._closing or generation != self._directory_generation:
+                return None
+            current = self.clients.get(node_id)
+            if current is not None:
+                return current
+            self.clients[node_id] = candidate
+            async with asyncio.timeout_at(deadline):
+                await self._on_directory_connected(node_id, candidate)
+            if self._closing or generation != self._directory_generation:
+                return None
+            if self.clients.get(node_id) is not candidate:
+                return self.clients.get(node_id)
+            adopted = True
+            return candidate
+        finally:
+            if not adopted:
+                await self._discard_directory(node_id, candidate)
+
+    async def _recover_orderbook(
+        self, max_wait: float, min_wait: float, quiet_period: float
+    ) -> list[tuple[str, list[Offer]]]:
+        deadline = asyncio.get_running_loop().time() + max_wait
+        generation = self._directory_generation
+        targets = dict.fromkeys(self.clients)
+        for server in self.directory_servers:
+            try:
+                host, port = parse_directory_address(server)
+            except Exception:
+                continue
+            targets[f"{host}:{port}"] = None
+
+        async def fetch(server: str) -> tuple[str, list[Offer]]:
+            client = self.clients.get(server)
+            # Initially absent directories get one connection attempt, not a
+            # connect/fail/reconnect loop. Existing clients may be replaced once.
+            recovery_used = client is None
+            try:
+                if client is None:
+                    client = await self._connect_for_orderbook(server, generation, deadline)
+                while client is not None and not self._closing:
+                    try:
+                        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                        offers, _ = await client.fetch_orderbooks(
+                            max_wait=remaining,
+                            min_wait=min(min_wait, remaining),
+                            quiet_period=quiet_period,
+                            deadline=deadline,
+                        )
+                        if (
+                            self._closing
+                            or generation != self._directory_generation
+                            or self.clients.get(server) is not client
+                        ):
+                            return server, []
+                        return server, offers
+                    except TimeoutError:
+                        raise
+                    except Exception as error:
+                        if not self._is_transport_failure(error):
+                            logger.warning(f"Failed to fetch orderbook from {server}: {error}")
+                            return server, []
+                        await self._discard_directory(server, client)
+                        if recovery_used:
+                            return server, []
+                        recovery_used = True
+                        # A different caller may already have replaced the
+                        # failed instance. Never overwrite or close it.
+                        client = self.clients.get(server)
+                        if client is None:
+                            client = await self._connect_for_orderbook(server, generation, deadline)
+            except TimeoutError:
+                logger.warning(f"Orderbook deadline expired for {server}")
+                if client is not None:
+                    await self._discard_directory(server, client)
+            except asyncio.CancelledError:
+                if client is not None:
+                    await self._discard_directory(server, client)
+                raise
+            return server, []
+
+        if self._closing or max_wait <= 0:
+            return []
+        async with self._exclusive_directory_reads():
+            async with asyncio.TaskGroup() as group:
+                tasks = [group.create_task(fetch(server)) for server in targets]
+            return [task.result() for task in tasks]
 
     async def fetch_orderbook(
         self,
         max_wait: float = 120.0,
         min_wait: float = 30.0,
         quiet_period: float = 15.0,
+        *,
+        reconnect: bool = False,
     ) -> list[Offer]:
         """
         Fetch orderbook from all connected directory servers in parallel.
@@ -561,6 +704,14 @@ class MultiDirectoryClient(DirectoryClientPool):
             max_wait: Hard ceiling in seconds (default: 120s).
             min_wait: Minimum seconds before early exit is allowed (default: 30s).
             quiet_period: Seconds of silence before exiting early (default: 15s).
+            reconnect: Before maker selection only, recover each failed transport
+                at most once using the same identity/authentication policy. In this
+                mode max_wait covers the entire fetch, PEERLIST, and handshake.
+
+        Fetches must not overlap a channel-bound protocol exchange. Recovery is
+        mutually exclusive with response collection; legacy finite fetches retain
+        their existing timing and nonconcurrent-use precondition. No background
+        reader or CoinJoin/payment retry is started here.
         """
         offers_by_key: dict[tuple[str, int], Offer] = {}
         positive_features_by_key: dict[tuple[str, int], set[str]] = {}
@@ -580,8 +731,11 @@ class MultiDirectoryClient(DirectoryClientPool):
                 return (server, [])
 
         # Fetch from all directories in parallel
-        tasks = [fetch_from_server(server, client) for server, client in self.clients.items()]
-        results = await asyncio.gather(*tasks)
+        if reconnect:
+            results = await self._recover_orderbook(max_wait, min_wait, quiet_period)
+        else:
+            tasks = [fetch_from_server(server, client) for server, client in self.clients.items()]
+            results = await asyncio.gather(*tasks)
 
         # Aggregate and deduplicate offers. A delayed directory response must
         # not let an older certificate suppress a renewal for the same offer.
@@ -624,11 +778,10 @@ class MultiDirectoryClient(DirectoryClientPool):
         log_routing: bool = False,
         force_channel: str | None = None,
     ) -> str:
-        """Send a private message, respecting channel consistency for CoinJoin sessions.
+        """Send a private message over the chosen onion-network route.
 
-        CRITICAL: Within a single CoinJoin session, all messages to a maker MUST use the
-        same communication channel (either direct or a specific directory). Mixing channels
-        causes the maker to reject messages as they appear to be from different sessions.
+        Direct peers and directory relays share the onion-network signing host ID.
+        A session can switch between those routes without changing its identity.
 
         Message routing priority (when force_channel is None):
         1. Direct peer connection (if connected and prefer_direct_connections=True)
@@ -642,6 +795,7 @@ class MultiDirectoryClient(DirectoryClientPool):
             force_channel: If set, only use this channel:
                 - "direct" = peer-to-peer onion connection
                 - "directory:<host>:<port>" = relay through specific directory
+                - "directory" = directory relay only, preferring one listing the peer
 
         Returns:
             Channel used: "direct" or "directory:<host>:<port>"
@@ -649,8 +803,8 @@ class MultiDirectoryClient(DirectoryClientPool):
         # Get maker's direct onion location if available
         maker_location = self._get_peer_location(recipient)
 
-        # If force_channel is set, use only that channel
-        if force_channel:
+        # If force_channel names one channel, use only that channel
+        if force_channel and force_channel != "directory":
             if force_channel == "direct":
                 peer = self._get_connected_peer(recipient)
                 if not peer:
@@ -684,7 +838,7 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         # No forced channel - choose best available
         # Try direct connection first if available
-        if self.prefer_direct_connections:
+        if self.prefer_direct_connections and force_channel != "directory":
             peer = self._get_connected_peer(recipient)
             if peer:
                 try:
@@ -701,7 +855,7 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         # Fall back to directory relay
         # Opportunistically start direct connection for future messages
-        if self.prefer_direct_connections and maker_location:
+        if self.prefer_direct_connections and maker_location and force_channel != "directory":
             self._try_direct_connect(recipient)
 
         # Identify valid directories for this recipient
@@ -751,14 +905,76 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         raise RuntimeError(f"Failed to send !{command} to {recipient} via any directory")
 
+    async def _listen_for_response_batch(
+        self,
+        server: str,
+        client: DirectoryClient,
+        duration: float,
+        errors_reported: set[str],
+    ) -> list[dict[str, Any]]:
+        """Read one directory batch, evicting only the failed client instance."""
+        try:
+            return await client.listen_for_messages(duration=duration)
+        except DirectoryClientError as e:
+            logger.warning(f"Error listening to {server}: {e}")
+            # A reconnect may replace this client while its listener is still
+            # unwinding. Only tear down the object that failed.
+            if self.clients.get(server) is client:
+                self.clients.pop(server)
+            try:
+                await client.close()
+            except Exception as close_error:
+                logger.debug(f"Error closing failed directory {server}: {close_error}")
+        except Exception as e:
+            if server not in errors_reported:
+                errors_reported.add(server)
+                logger.warning(f"Error listening to {server}: {e}")
+            else:
+                logger.debug(f"Error listening to {server}: {e}")
+        return []
+
     async def wait_for_responses(
         self,
         expected_nicks: list[str],
         expected_command: str,
         timeout: float = 60.0,
         expected_counts: dict[str, int] | None = None,
+        on_stalled: tuple[float, Callable[[set[str]], Awaitable[None]]] | None = None,
+        response_progress: dict[str, dict[str, Any]] | None = None,
+        response_filter: Callable[[str, str], bool] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Collect one response phase without overlapping preselection recovery."""
+        async with self._exclusive_directory_reads():
+            return await self._wait_for_responses(
+                expected_nicks,
+                expected_command,
+                timeout,
+                expected_counts,
+                on_stalled,
+                response_progress,
+                response_filter,
+            )
+
+    async def _wait_for_responses(
+        self,
+        expected_nicks: list[str],
+        expected_command: str,
+        timeout: float = 60.0,
+        expected_counts: dict[str, int] | None = None,
+        on_stalled: tuple[float, Callable[[set[str]], Awaitable[None]]] | None = None,
+        response_progress: dict[str, dict[str, Any]] | None = None,
+        response_filter: Callable[[str, str], bool] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Wait for responses from multiple makers at once.
+
+        ``on_stalled=(delay, callback)`` calls ``callback`` once, after ``delay``
+        seconds, with the nicks that have not answered at all yet. It runs alongside
+        response collection and is canceled and joined when this phase ends. The
+        wait keeps its original deadline and everything already received.
+
+        ``response_progress`` retains partial responses even if collection is
+        canceled. ``response_filter`` consumes informational frames before any
+        counting or deduplication, without extending the original deadline.
 
         Listens for responses from BOTH:
         - Directory server message streams (via client.listen_for_messages())
@@ -791,13 +1007,16 @@ class MultiDirectoryClient(DirectoryClientPool):
             timeout: Maximum time to wait in seconds
             expected_counts: For !sig, dict of nick -> expected signature count
         """
-        # Track if this command expects multiple messages per maker
-        accumulate_responses = expected_command == "!sig"
+        # Signature and ring-readiness phases intentionally return multiple
+        # authenticated messages from each peer.
+        accumulate_responses = expected_command == "!sig" or expected_counts is not None
 
-        responses: dict[str, dict[str, Any]] = {}
+        responses: dict[str, dict[str, Any]] = (
+            response_progress if response_progress is not None else {}
+        )
         remaining_nicks = set(expected_nicks)
         deduplicator = ResponseDeduplicator()
-        # For !sig accumulation: track seen data per nick to drop cross-directory
+        # For multi-response phases: track seen data per nick to drop cross-directory
         # duplicates (the same signature relayed by multiple directory servers).
         seen_sig_data: dict[str, set[str]] = {}
         loop = asyncio.get_event_loop()
@@ -810,21 +1029,15 @@ class MultiDirectoryClient(DirectoryClientPool):
             """Check if we have all expected responses."""
             if remaining_nicks:
                 return False
-            if accumulate_responses and expected_counts:
-                # For !sig, check if we have all expected signatures
-                for nick, expected in expected_counts.items():
-                    if nick not in responses:
-                        return False
-                    response = responses[nick]
-                    if response.get("error"):
-                        continue
-                    data = response.get("data", [])
-                    if not isinstance(data, list):
-                        return False
-                    received = len(data)
-                    if received < expected:
-                        return False
-            return True
+            if not accumulate_responses or not expected_counts:
+                return True
+            # process_message owns this dict: accumulated data is always a list,
+            # except for terminal errors, which satisfy the wait immediately.
+            return all(
+                nick in responses
+                and (responses[nick].get("error") or len(responses[nick]["data"]) >= expected)
+                for nick, expected in expected_counts.items()
+            )
 
         def process_message(msg: dict[str, Any], source: str) -> None:
             """Process a single message from any source (directory or direct)."""
@@ -873,6 +1086,9 @@ class MultiDirectoryClient(DirectoryClientPool):
             if command != expected_command.lstrip("!"):
                 return
 
+            if response_filter is not None and not response_filter(from_nick, payload):
+                return
+
             if responses.get(from_nick, {}).get("error"):
                 logger.warning(f"Ignoring late {expected_command} from {from_nick} after !error")
                 return
@@ -900,84 +1116,88 @@ class MultiDirectoryClient(DirectoryClientPool):
                     f"from {from_nick} via {source}"
                 )
 
-        while not is_complete():
-            elapsed = loop.time() - start_time
-            if elapsed >= timeout:
-                if not accumulate_responses:
-                    logger.warning(
-                        f"Timeout waiting for {expected_command} from: {remaining_nicks}"
-                    )
-                elif expected_counts:
-                    # Log which makers haven't sent all signatures
-                    for nick, expected in expected_counts.items():
-                        received = len(responses.get(nick, {}).get("data", []))
-                        if received < expected:
-                            logger.warning(f"Timeout: {nick} sent {received}/{expected} signatures")
-                break
-
-            remaining_time = min(5.0, timeout - elapsed)  # Listen in 5s chunks
-
-            # First, drain any pending direct peer messages (non-blocking)
-            while True:
-                try:
-                    msg = self._direct_message_queue.get_nowait()
-                    self._direct_message_queue_bytes = max(
-                        0, self._direct_message_queue_bytes - self._direct_message_size(msg)
-                    )
-                    process_message(msg, "direct")
-                except asyncio.QueueEmpty:
+        retry_task: asyncio.Future[None] | None = None
+        try:
+            while not is_complete():
+                elapsed = loop.time() - start_time
+                if retry_task is not None and retry_task.done():
+                    retry_task.result()
+                if elapsed >= timeout:
+                    if expected_command == "!ring":
+                        for ordinal, nick in enumerate(expected_nicks, 1):
+                            data = responses.get(nick, {}).get("data", [])
+                            received = len(data) if isinstance(data, list) else int(bool(data))
+                            expected = (expected_counts or {}).get(nick, 1)
+                            if received < expected:
+                                logger.warning(
+                                    "Ring response timeout: participant {} sent {}/{} responses",
+                                    ordinal,
+                                    received,
+                                    expected,
+                                )
+                    elif not accumulate_responses:
+                        logger.warning(
+                            f"Timeout waiting for {expected_command} from: {remaining_nicks}"
+                        )
+                    elif expected_counts:
+                        # Log which makers haven't sent all signatures
+                        for nick, expected in expected_counts.items():
+                            received = len(responses.get(nick, {}).get("data", []))
+                            if received < expected:
+                                logger.warning(
+                                    f"Timeout: {nick} sent {received}/{expected} signatures"
+                                )
                     break
 
-            # Check if we have everything after processing direct messages
-            if is_complete():
-                break
-
-            # Listen to all directory clients concurrently for shorter duration
-            # Use 1s chunks to allow more frequent checking of direct message queue
-            listen_duration = min(1.0, remaining_time)
-
-            async def listen_to_client(
-                server: str, client: DirectoryClient
-            ) -> list[tuple[str, dict[str, Any]]]:
-                try:
-                    messages = await client.listen_for_messages(duration=listen_duration)
-                    return [(server, msg) for msg in messages]
-                except DirectoryClientError as e:
-                    logger.warning(f"Error listening to {server}: {e}")
-                    # A reconnect may replace this client while its listener is
-                    # still unwinding. Only tear down the object that failed.
-                    if self.clients.get(server) is client:
-                        self.clients.pop(server)
+                # First, drain any pending direct peer messages (non-blocking).
+                # A queued response must not trigger an unnecessary retry.
+                while True:
                     try:
-                        await client.close()
-                    except Exception as close_error:
-                        logger.debug(f"Error closing failed directory {server}: {close_error}")
-                    return []
-                except Exception as e:
-                    if server not in listen_errors_reported:
-                        listen_errors_reported.add(server)
-                        logger.warning(f"Error listening to {server}: {e}")
-                    else:
-                        logger.debug(f"Error listening to {server}: {e}")
-                    return []
+                        msg = self._direct_message_queue.get_nowait()
+                        self._direct_message_queue_bytes = max(
+                            0, self._direct_message_queue_bytes - self._direct_message_size(msg)
+                        )
+                        process_message(msg, "direct")
+                    except asyncio.QueueEmpty:
+                        break
 
-            # Gather messages from all directories concurrently
-            listen_started = loop.time()
-            results = await asyncio.gather(
-                *[listen_to_client(s, c) for s, c in self.clients.items()]
-            )
-            for result_list in results:
-                for server, msg in result_list:
-                    process_message(msg, f"directory:{server}")
+                if is_complete():
+                    break
 
-            # Pace the loop: when every directory listen fails immediately
-            # (e.g. all connections closed) or there are no directory clients
-            # at all, the gather above returns in microseconds. Without a
-            # sleep this degenerates into a busy loop that spins thousands of
-            # iterations per second until the timeout, flooding the log.
-            listen_elapsed = loop.time() - listen_started
-            if listen_elapsed < listen_duration and not is_complete():
-                await asyncio.sleep(listen_duration - listen_elapsed)
+                if on_stalled is not None and elapsed >= on_stalled[0]:
+                    stalled_callback, on_stalled = on_stalled[1], None
+                    retry_task = asyncio.ensure_future(stalled_callback(set(remaining_nicks)))
+
+                # Keep polling while a fallback write is blocked. Wake for the
+                # fallback timer too, even when it is shorter than one second.
+                listen_duration = min(1.0, timeout - elapsed)
+                if on_stalled is not None:
+                    listen_duration = min(listen_duration, on_stalled[0] - elapsed)
+
+                listen_started = loop.time()
+                clients = list(self.clients.items())
+                results = await asyncio.gather(
+                    *[
+                        self._listen_for_response_batch(
+                            s, c, listen_duration, listen_errors_reported
+                        )
+                        for s, c in clients
+                    ]
+                )
+                for (server, _), messages in zip(clients, results, strict=True):
+                    for msg in messages:
+                        process_message(msg, f"directory:{server}")
+
+                # Pace empty or immediately failing listeners to avoid a busy loop.
+                listen_elapsed = loop.time() - listen_started
+                if listen_elapsed < listen_duration and not is_complete():
+                    await asyncio.sleep(listen_duration - listen_elapsed)
+        finally:
+            if retry_task is not None:
+                retry_task.cancel()
+                await asyncio.gather(retry_task, return_exceptions=True)
+        if retry_task is not None and not retry_task.cancelled():
+            retry_task.result()
 
         # Log deduplication stats if there were duplicates
         stats = deduplicator.stats

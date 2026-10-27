@@ -58,6 +58,11 @@ Set fee limits in `[taker]` in your configuration. Consult the installed
 `jm-taker coinjoin --help` for per-run overrides. The
 [configuration reference](technical/configuration.md) explains precedence.
 
+For the experimental Taproot pit, channel rings, buyouts, and purchased PoDLE
+credentials (`external_podle_mode = "only"`, or `"prefer"` to buy one
+automatically), see [Experimental Ring Market](experimental-ring-market.md)
+and the [standard Taproot setup](technical/standard-taproot-setup.md).
+
 Maker fees and mining fees are separate costs. More participants and inputs
 usually make a larger transaction. Additional equal outputs do not represent
 a guaranteed anonymity set. If there are too few suitable offers, wait or

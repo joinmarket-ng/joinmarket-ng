@@ -9,7 +9,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 
-python -m pip install --upgrade --upgrade-strategy eager -e './jmcore[dev]' -e './jmwallet[dev]' -e './maker[dev]' -e './taker[dev]' -e './directory_server[dev]' -e './orderbook_watcher[dev]' -e './jmwalletd[dev]' -e './tumbler[dev]'
+python -m pip install --upgrade --upgrade-strategy eager -e './jmcore[dev]' -e './jmwallet[dev]' -e './jmswap[dev]' -e './maker[dev]' -e './taker[dev]' -e './directory_server[dev]' -e './orderbook_watcher[dev]' -e './jmwalletd[dev]' -e './tumbler[dev]'
 ```
 
 CI's unit jobs install dependencies in a fresh environment. Repeat the install
@@ -155,7 +155,7 @@ If you want to run the steps manually:
 
 ```bash
 python -m pip install -r requirements-docs.txt
-python -m pip install -e jmcore -e jmwallet -e taker -e maker -e directory_server -e orderbook_watcher -e jmwalletd -e tumbler
+python -m pip install -e jmcore -e jmwallet -e jmswap -e taker -e maker -e directory_server -e orderbook_watcher -e jmwalletd -e tumbler
 python -m properdocs build --strict -f properdocs.yml
 ```
 
@@ -208,7 +208,7 @@ scripts/update-base-images.sh \
   && prek autoupdate \
   && prek clean \
   && python -m pip install --upgrade --upgrade-strategy eager \
-    -e './jmcore[dev]' -e './jmwallet[dev]' -e './maker[dev]' -e './taker[dev]' \
+    -e './jmcore[dev]' -e './jmwallet[dev]' -e './jmswap[dev]' -e './maker[dev]' -e './taker[dev]' \
     -e './directory_server[dev]' -e './orderbook_watcher[dev]' \
     -e './jmwalletd[dev]' -e './tumbler[dev]' \
   && scripts/update_readme_help.py --exit-zero-on-changes \

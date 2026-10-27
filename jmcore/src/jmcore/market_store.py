@@ -1,0 +1,3053 @@
+"""Durable local seller state for the native credential market.
+
+This module deliberately has no network, wallet, or payment-backend dependency.
+Callers validate settlement before calling :meth:`MarketStore.finalize`; this
+store only makes the resulting allocation and delivery irreversible.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import stat
+import threading
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, cast, get_args
+
+from bitcointx.core.key import CKey, CPubKey  # type: ignore[import-not-found]
+from nacl.exceptions import CryptoError
+from nacl.public import PublicKey, SealedBox
+from pydantic import ValidationError
+from typing_extensions import TypedDict
+
+from jmcore.bond_advertisements import (
+    ADVERTISEMENT_FILE,
+    AdvertisementRecordError,
+    BitcoinNetwork,
+    locked_advertisements,
+)
+from jmcore.credential_market import (
+    MARKET_PODLE_RETRIES,
+    Allocation,
+    BondCredential,
+    BondReference,
+    CredentialPackage,
+    Delivery,
+    MarketAuthorization,
+    MarketError,
+    MarketModel,
+    MarketQuote,
+    PaymentTerms,
+    SignedDocument,
+    bond_resource,
+    canonical,
+    decode_document,
+    document_hash,
+    period_at_height,
+    sign_document,
+    validate_credential,
+    verify_authorization,
+)
+from jmcore.external_podle import ExternalPoDLE
+from jmcore.market_keys import BoundMarketKeys
+from jmcore.paths import get_market_store_path
+from jmcore.secure_files import atomic_write_private, exclusive_file_lock, read_private_file
+
+Product = Literal["podle", "bond"]
+PaymentRail = Literal["lightning"]
+LedgerMode = Literal["standalone", "wallet"]
+# The value of a PoDLE backing outpoint (txid, vout) in sats, or None if unknown.
+BackingLookup = Callable[[str, int], int | None]
+WalletLedgerDiagnosisState = Literal[
+    "absent", "standalone", "disabled", "activating", "ready", "recovery_required", "unavailable"
+]
+
+
+class WalletLedgerDiagnosis(TypedDict):
+    """A momentary, non-authoritative wallet ledger inspection result."""
+
+    state: WalletLedgerDiagnosisState
+    reason: str
+
+
+HoldState = Literal["reserved", "open", "canceling", "canceled", "settling", "settled"]
+
+_STANDALONE_MODE = "standalone"
+_WALLET_MODE = "wallet"
+_BOUND_ADVERTISEMENT_MODE = "wallet-bound-advertisements-v2"
+_ADVERTISEMENT_NETWORK_KEY = "bond_advertisement_network"
+_ADVERTISEMENT_WALLET_KEY = "bond_advertisement_wallet_id"
+_UNSUPPORTED_SCHEMA_MESSAGE = "unsupported market store format; keep the file for inspection"
+# A hold invoice outlives its quote, so a payment sent just before the quote
+# expires can still be accepted and completed.
+HOLD_INVOICE_GRACE_SECONDS = 120
+_ACTIVE_HOLD_SQL = "('reserved', 'open', 'canceling', 'settling')"
+_MAX_PRICE_SATS = 2_100_000_000_000_000
+_WALLET_LEDGER_INTENT_VERSION = 1
+_MAX_ACTIVE_QUOTES = 64
+_MAX_QUOTE_TTL = 900
+_MAX_REQUEST_ID_LENGTH = 32
+_MAX_OPAQUE_ID_LENGTH = 256
+_HEX32_LENGTH = 64
+
+
+@dataclass(frozen=True)
+class HoldReservation:
+    """A quote reservation waiting for its hold invoice."""
+
+    quote_id: str
+    payment_hash: bytes
+    amount_sats: int
+    quote_expires_at: int
+    invoice_expires_at: int
+
+
+@dataclass(frozen=True)
+class HoldInvoice:
+    """One unfinished hold invoice, as the settlement reconciler sees it."""
+
+    quote_id: str
+    payment_hash: bytes
+    preimage: bytes
+    amount_sats: int
+    product: Product
+    state: HoldState
+    quote_state: str | None
+    credential_attached: bool
+    created_at: int
+    quote_expires_at: int
+    invoice_expires_at: int
+
+
+class MarketStoreError(Exception):
+    """The local market store cannot safely complete an operation."""
+
+
+class MarketStoreConflictError(MarketStoreError):
+    """An immutable market identifier or reservation has already been used."""
+
+
+class MarketStoreUnavailableError(MarketStoreError):
+    """No eligible inventory or payment request is available."""
+
+
+class MarketStoreExpiredError(MarketStoreError):
+    """A quote is no longer live and cannot be settled."""
+
+
+class MarketStoreCorruptError(MarketStoreError):
+    """On-disk store contents are invalid and must not be reset implicitly."""
+
+
+_HOLD_INVOICE_SCHEMA = (
+    """
+    CREATE TABLE hold_invoices (
+        quote_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        request_fingerprint BLOB NOT NULL,
+        authorization BLOB NOT NULL,
+        rail TEXT NOT NULL CHECK (rail = 'lightning'),
+        payment_hash TEXT NOT NULL UNIQUE,
+        preimage TEXT NOT NULL,
+        amount_sats INTEGER NOT NULL,
+        inventory_id INTEGER NOT NULL REFERENCES inventory(id),
+        buyer_pubkey TEXT NOT NULL,
+        product TEXT NOT NULL CHECK (product IN ('podle', 'bond')),
+        resource TEXT NOT NULL,
+        certificate_pubkey TEXT,
+        created_at INTEGER NOT NULL,
+        quote_expires_at INTEGER NOT NULL,
+        invoice_expires_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (
+            state IN ('reserved', 'open', 'canceling', 'canceled', 'settling', 'settled')
+        )
+    )
+    """,
+    "CREATE INDEX hold_invoices_state ON hold_invoices(state)",
+)
+_HOLD_INVOICE_COLUMNS = {
+    "quote_id",
+    "request_id",
+    "request_fingerprint",
+    "authorization",
+    "rail",
+    "payment_hash",
+    "preimage",
+    "amount_sats",
+    "inventory_id",
+    "buyer_pubkey",
+    "product",
+    "resource",
+    "certificate_pubkey",
+    "created_at",
+    "quote_expires_at",
+    "invoice_expires_at",
+    "state",
+}
+
+
+class MarketStore:
+    """A synchronous, process-safe durable seller lifecycle store.
+
+    Every mutation uses ``BEGIN IMMEDIATE`` with SQLite ``synchronous=FULL``.
+    Each quote is paid through its own hold invoice. Inventory returns only after
+    the invoice is confirmed canceled, and a payment request is retained forever
+    so a late payment cannot fund another quote.
+    """
+
+    def __init__(self, path: Path, *, wallet_id: str | None = None, create: bool = True) -> None:
+        if not isinstance(path, Path):
+            raise TypeError("path must be a pathlib.Path")
+        if path.is_symlink():
+            raise MarketStoreError("market store path must not be a symlink")
+        if wallet_id is not None:
+            self._require_hex32(wallet_id, "wallet_id")
+
+        self.path = path
+        self.wallet_id = wallet_id
+        self._closed = False
+        self._lock = threading.RLock()
+        self._observed_advertisement_binding: tuple[str, str] | None = None
+        if not create and not self.path.is_file():
+            raise MarketStoreUnavailableError("market store does not exist")
+        self._prepare_parent()
+        if not self.path.exists() and self._intent_artifact_exists():
+            raise MarketStoreCorruptError("wallet ledger intent exists without its market store")
+        created = self._create_private_database_file() if create else False
+        try:
+            self._connection = sqlite3.connect(
+                self.path if create else self.path.absolute().as_uri() + "?mode=rw",
+                uri=not create,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=30.0,
+            )
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA busy_timeout = 30000")
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA journal_mode = DELETE")
+            self._connection.execute("PRAGMA synchronous = FULL")
+            self._initialize(created)
+            self._harden_permissions()
+        except (MarketStoreError, OSError, sqlite3.DatabaseError) as exc:
+            if hasattr(self, "_connection"):
+                with suppress(sqlite3.Error):
+                    self._connection.close()
+            if isinstance(exc, MarketStoreError):
+                raise
+            raise MarketStoreCorruptError("could not open private market store") from exc
+
+    @property
+    def is_wallet_ledger(self) -> bool:
+        """Whether this store has a validated wallet-scoped PoDLE ledger."""
+        with self._lock:
+            if self._ledger_mode(self._connection) != _WALLET_MODE:
+                return False
+            self._verify_wallet_ledger(self._connection)
+            return True
+
+    def wallet_state(self) -> Literal["disabled", "activating", "ready", "recovery_required"]:
+        """Return the bound wallet's durable activation state.
+
+        A missing ledger row is deliberately treated as disabled only after the
+        enclosing database schema has been validated.
+        """
+        with self._lock:
+            if self._ledger_mode(self._connection) == _STANDALONE_MODE:
+                return "disabled"
+            self._require_wallet_ledger(self._connection)
+            if self.wallet_id is None:
+                return "disabled"
+            row = self._connection.execute(
+                "SELECT state FROM wallet_ledger WHERE wallet_id = ?", (self.wallet_id,)
+            ).fetchone()
+            if row is None:
+                return "disabled"
+            state = row["state"]
+            if state not in ("disabled", "activating", "ready", "recovery_required"):
+                raise MarketStoreCorruptError("wallet ledger state is invalid")
+            return cast(Literal["disabled", "activating", "ready", "recovery_required"], state)
+
+    @property
+    def advertisement_binding(self) -> tuple[str, str] | None:
+        """The independent required-history binding, not proof that history is available."""
+        with self._lock:
+            return self._check_advertisement_binding(self._connection)
+
+    @classmethod
+    def inspect_advertisement_binding(
+        cls,
+        path: Path,
+        *,
+        require_ready: bool = False,
+    ) -> tuple[str, str] | None:
+        """Inspect the persisted requirement without creating a store or history file."""
+        if path.is_symlink():
+            raise MarketStoreCorruptError("market store path must not be a symlink")
+        if not path.exists():
+            if os.path.lexists(path.with_name(f"{path.name}.wallet-ledger")):
+                raise MarketStoreCorruptError(
+                    "wallet ledger intent exists without its market store"
+                )
+            return None
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                path.absolute().as_uri() + "?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+            connection.row_factory = sqlite3.Row
+            inspection = cls.__new__(cls)
+            inspection.path = path
+            inspection.wallet_id = None
+            inspection._connection = connection
+            inspection._closed = False
+            inspection._lock = threading.RLock()
+            connection.execute("BEGIN")
+            binding = cls._advertisement_binding(connection)
+            if binding is not None and require_ready:
+                inspection._verify_schema(readonly=True)
+                if cls._wallet_state_for_connection(connection, binding[0]) != "ready":
+                    raise MarketStoreUnavailableError("bound advertisement ledger is not ready")
+            return binding
+        except sqlite3.Error as exc:
+            raise MarketStoreCorruptError(
+                "could not inspect advertisement history requirement"
+            ) from exc
+        finally:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.rollback()
+                with suppress(sqlite3.Error):
+                    connection.close()
+
+    @classmethod
+    def diagnose_wallet(
+        cls, path: Path, *, wallet_id: str, commitments_path: Path
+    ) -> WalletLedgerDiagnosis:
+        """Inspect wallet-ledger artifacts without changing files or permissions.
+
+        This is deliberately only a momentary observation. Callers must still open
+        and validate the store normally before taking an operational action.
+        """
+
+        unavailable = cls._wallet_diagnosis("unavailable", "inspection unavailable")
+        if not isinstance(path, Path) or not isinstance(commitments_path, Path):
+            return unavailable
+        try:
+            cls._require_hex32(wallet_id, "wallet_id")
+            canonical_path = cls._canonical_commitments_path(commitments_path)
+            database_before = cls._artifact_signature(path)
+            intent_path = path.with_name(f"{path.name}.wallet-ledger")
+            intent_before = cls._artifact_signature(intent_path)
+            if cls._has_sqlite_sidecars(path):
+                return unavailable
+        except (MarketStoreError, OSError, TypeError, ValueError):
+            return unavailable
+
+        if database_before is None:
+            if intent_before is None:
+                diagnosis = cls._wallet_diagnosis("absent", "no ledger artifacts")
+            else:
+                diagnosis = cls._wallet_diagnosis(
+                    "recovery_required", "ledger artifacts are incomplete"
+                )
+            return cls._finish_wallet_diagnosis(
+                path, intent_path, database_before, intent_before, diagnosis
+            )
+        if not cls._signature_is_regular(database_before):
+            diagnosis = cls._wallet_diagnosis(
+                "recovery_required", "market store artifact is invalid"
+            )
+            return cls._finish_wallet_diagnosis(
+                path, intent_path, database_before, intent_before, diagnosis
+            )
+        if intent_before is not None and not cls._signature_is_regular(intent_before):
+            diagnosis = cls._wallet_diagnosis(
+                "recovery_required", "ledger intent artifact is invalid"
+            )
+            return cls._finish_wallet_diagnosis(
+                path, intent_path, database_before, intent_before, diagnosis
+            )
+
+        connection: sqlite3.Connection | None = None
+        diagnosis = cls._wallet_diagnosis("recovery_required", "wallet ledger is invalid")
+        try:
+            connection = sqlite3.connect(
+                path.absolute().as_uri() + "?mode=ro&immutable=1",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=30.0,
+            )
+            connection.row_factory = sqlite3.Row
+            inspection = cls.__new__(cls)
+            inspection.path = path
+            inspection.wallet_id = wallet_id
+            inspection._connection = connection
+            inspection._closed = False
+            inspection._lock = threading.RLock()
+            inspection._verify_schema(readonly=True)
+            if inspection._ledger_mode(connection) == _STANDALONE_MODE:
+                diagnosis = cls._wallet_diagnosis("standalone", "standalone market store")
+            else:
+                bound_path = inspection._verify_wallet_ledger(connection, readonly=True)
+                if bound_path != canonical_path:
+                    diagnosis = cls._wallet_diagnosis(
+                        "recovery_required", "commitments binding does not match"
+                    )
+                else:
+                    state = inspection._wallet_state_for_connection(connection, wallet_id)
+                    diagnosis = cls._wallet_diagnosis(state, f"wallet ledger is {state}")
+        except sqlite3.DatabaseError:
+            diagnosis = cls._wallet_diagnosis("unavailable", "inspection unavailable")
+        except (MarketStoreError, OSError, TypeError, ValueError):
+            diagnosis = cls._wallet_diagnosis("recovery_required", "wallet ledger is invalid")
+        finally:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.close()
+
+        return cls._finish_wallet_diagnosis(
+            path, intent_path, database_before, intent_before, diagnosis
+        )
+
+    @classmethod
+    def _scan_bond_leases(
+        cls,
+        path: Path,
+        bonds: list[BondReference],
+        height: int,
+        *,
+        advertisement_binding: tuple[str, str] | None = None,
+    ) -> frozenset[tuple[str, int]]:
+        """:func:`blocked_bond_outpoints` over a read-only connection."""
+        period = period_at_height(height)
+        blocked: set[tuple[str, int]] = set()
+        try:
+            connection = sqlite3.connect(
+                path.absolute().as_uri() + "?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+        except sqlite3.Error as exc:
+            raise MarketStoreCorruptError("could not read the market store") from exc
+        try:
+            connection.row_factory = sqlite3.Row
+            inspection = cls.__new__(cls)
+            inspection.path = path
+            inspection.wallet_id = (
+                None if advertisement_binding is None else advertisement_binding[0]
+            )
+            inspection._connection = connection
+            inspection._closed = False
+            inspection._lock = threading.RLock()
+            # One snapshot: a reservation moves inventory and hold together.
+            connection.execute("BEGIN")
+            inspection._verify_schema(readonly=True)
+            if advertisement_binding is not None and (
+                inspection._advertisement_binding(connection) != advertisement_binding
+                or inspection._wallet_state_for_connection(connection, inspection.wallet_id)
+                != "ready"
+                or any(bond.network != advertisement_binding[1] for bond in bonds)
+            ):
+                raise MarketStoreUnavailableError(
+                    "bound advertisement ledger is not ready or matching"
+                )
+            states = {str(row[0]) for row in connection.execute("SELECT state FROM wallet_ledger")}
+            if states - {"ready", "disabled"}:
+                raise MarketStoreError("the wallet ledger's lease history is not confirmed")
+            for row in connection.execute(
+                "SELECT authorization FROM hold_invoices "
+                "WHERE product = 'bond' AND state != 'canceled'"
+            ):
+                document = cls._signed_document_from_storage(bytes(row[0]))
+                try:
+                    authority = MarketAuthorization.model_validate(document.body)
+                except ValidationError as exc:
+                    raise MarketStoreCorruptError("stored bond authorization is invalid") from exc
+                if height <= (authority.period + 1) * 2016:
+                    blocked.add((authority.bond.outpoint.txid, authority.bond.outpoint.vout))
+            for bond in bonds:
+                if connection.execute(
+                    "SELECT 1 FROM inventory WHERE product = 'bond' AND resource IN (?, ?)",
+                    (bond_resource(bond, period), bond_resource(bond, period + 1)),
+                ).fetchone():
+                    blocked.add((bond.outpoint.txid, bond.outpoint.vout))
+        except sqlite3.Error as exc:
+            raise MarketStoreCorruptError("could not read the market store") from exc
+        finally:
+            with suppress(sqlite3.Error):
+                connection.rollback()
+            with suppress(sqlite3.Error):
+                connection.close()
+        return frozenset(blocked)
+
+    @classmethod
+    def _finish_wallet_diagnosis(
+        cls,
+        path: Path,
+        intent_path: Path,
+        database_before: tuple[int, int, int, int, int, int] | None,
+        intent_before: tuple[int, int, int, int, int, int] | None,
+        diagnosis: WalletLedgerDiagnosis,
+    ) -> WalletLedgerDiagnosis:
+        try:
+            if (
+                cls._has_sqlite_sidecars(path)
+                or cls._artifact_signature(path) != database_before
+                or cls._artifact_signature(intent_path) != intent_before
+            ):
+                return cls._wallet_diagnosis("unavailable", "inspection unavailable")
+        except OSError:
+            return cls._wallet_diagnosis("unavailable", "inspection unavailable")
+        return diagnosis
+
+    @staticmethod
+    def _wallet_diagnosis(state: WalletLedgerDiagnosisState, reason: str) -> WalletLedgerDiagnosis:
+        return {"state": state, "reason": reason}
+
+    @staticmethod
+    def _artifact_signature(path: Path) -> tuple[int, int, int, int, int, int] | None:
+        try:
+            artifact = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        return (
+            artifact.st_dev,
+            artifact.st_ino,
+            artifact.st_mode,
+            artifact.st_size,
+            artifact.st_mtime_ns,
+            artifact.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _signature_is_regular(signature: tuple[int, int, int, int, int, int]) -> bool:
+        return stat.S_ISREG(signature[2])
+
+    @staticmethod
+    def _has_sqlite_sidecars(path: Path) -> bool:
+        return any(
+            os.path.lexists(path.with_name(f"{path.name}{suffix}"))
+            for suffix in ("-journal", "-wal", "-shm")
+        )
+
+    def check_commitments_path(self, path: Path) -> None:
+        """Require an exact canonical binding to the activated commitments file."""
+        canonical_path = self._canonical_commitments_path(path)
+        with self._lock:
+            self._require_wallet_ledger(self._connection, canonical_path)
+
+    def activate_wallet(
+        self,
+        commitments_path: Path,
+        *,
+        history_confirmed: bool = False,
+        bound_advertisements_network: str | None = None,
+    ) -> None:
+        """Explicitly bind and import the complete legacy PoDLE history once.
+
+        The caller's confirmation is required because a missing or incomplete JSON
+        file cannot prove that it contains all historical commitment use.
+        """
+        if self.wallet_id is None:
+            raise MarketStoreError("wallet activation requires a bound wallet_id")
+        if history_confirmed is not True:
+            raise MarketStoreError("wallet activation requires history_confirmed=True")
+        if (
+            bound_advertisements_network is not None
+            and bound_advertisements_network not in get_args(BitcoinNetwork)
+        ):
+            raise MarketStoreError("bound advertisement network is invalid")
+        canonical_path = self._canonical_commitments_path(commitments_path)
+        commitments_lock = canonical_path.with_name(f"{canonical_path.name}.lock")
+        init_lock = self.path.with_name(f"{self.path.name}.init.lock")
+        history_scope = (
+            locked_advertisements(
+                self.path.with_name(ADVERTISEMENT_FILE),
+                wallet_id=self.wallet_id,
+                network=bound_advertisements_network,
+                require_bound=True,
+            )
+            if bound_advertisements_network is not None
+            else nullcontext()
+        )
+        with (
+            history_scope,
+            exclusive_file_lock(commitments_lock),
+            exclusive_file_lock(init_lock),
+            self._lock,
+        ):
+            self._activate_wallet_locked(canonical_path, bound_advertisements_network)
+
+    def recover_wallet(self, commitments_path: Path, *, history_confirmed: bool = False) -> None:
+        """Explicitly merge a complete confirmed history into a failed activation."""
+
+        if self.wallet_id is None:
+            raise MarketStoreError("wallet recovery requires a bound wallet_id")
+        if history_confirmed is not True:
+            raise MarketStoreError("wallet recovery requires history_confirmed=True")
+        canonical_path = self._canonical_commitments_path(commitments_path)
+        self._require_existing_regular_commitments_history(canonical_path)
+        commitments_lock = canonical_path.with_name(f"{canonical_path.name}.lock")
+        init_lock = self.path.with_name(f"{self.path.name}.init.lock")
+        with exclusive_file_lock(commitments_lock), exclusive_file_lock(init_lock), self._lock:
+            self._require_existing_regular_commitments_history(canonical_path)
+            self._recover_wallet_locked(canonical_path)
+
+    def mark_recovery_required(self) -> None:
+        """Permanently stop wallet-scoped issuance until an explicit recovery exists."""
+        if self.wallet_id is None:
+            raise MarketStoreError("marking recovery requires a bound wallet_id")
+        with self._transaction() as connection:
+            self._require_wallet_ledger(connection)
+            self._ensure_wallet_row(connection, self.wallet_id)
+            connection.execute(
+                "UPDATE wallet_ledger SET state = 'recovery_required' WHERE wallet_id = ?",
+                (self.wallet_id,),
+            )
+
+    @classmethod
+    def rebind_wallet(
+        cls,
+        path: Path,
+        *,
+        wallet_id: str,
+        previous_commitments_path: Path,
+        commitments_path: Path,
+        history_confirmed: bool = False,
+        writers_stopped: bool = False,
+    ) -> None:
+        """Explicitly complete a data-directory move, including interrupted attempts.
+
+        All writers of both the original and destination directories must be stopped.
+        This changes a binding in an existing complete ledger, never copies or rebuilds
+        one. A durable transition blocks ordinary operations until both artifacts agree.
+        """
+        if history_confirmed is not True or writers_stopped is not True:
+            raise MarketStoreError("rebinding requires confirmed history and stopped writers")
+        cls._require_hex32(wallet_id, "wallet_id")
+        source = cls._canonical_commitments_path(previous_commitments_path)
+        target = cls._canonical_commitments_path(commitments_path)
+        if source == target:
+            raise MarketStoreError("rebinding requires different commitments paths")
+        if not isinstance(path, Path) or path.is_symlink() or not path.is_file():
+            raise MarketStoreError("rebinding requires an existing regular market store")
+        cls._require_existing_regular_commitments_history(target)
+        path = path.resolve()
+        history_lock = target.with_name(f"{target.name}.lock")
+        init_lock = path.with_name(f"{path.name}.init.lock")
+        with exclusive_file_lock(history_lock), exclusive_file_lock(init_lock):
+            # Normal open deliberately refuses a pending transition. This private
+            # maintenance handle validates that exact transition before any mutation.
+            store = cls.__new__(cls)
+            store.path = path
+            store.wallet_id = wallet_id
+            store._closed = False
+            store._lock = threading.RLock()
+            try:
+                store._connection = sqlite3.connect(
+                    path.as_uri() + "?mode=rw", uri=True, isolation_level=None, timeout=30.0
+                )
+                store._connection.row_factory = sqlite3.Row
+                store._connection.execute("PRAGMA foreign_keys = ON")
+                store._connection.execute("PRAGMA synchronous = FULL")
+                store._rebind_wallet_locked(source, target)
+            except (OSError, sqlite3.DatabaseError) as exc:
+                raise MarketStoreCorruptError("could not complete wallet ledger rebinding") from exc
+            finally:
+                if hasattr(store, "_connection"):
+                    store.close()
+
+    def _rebind_wallet_locked(self, source: Path, target: Path) -> None:
+        paths = (source, target)
+        marker = canonical({"from": str(source), "to": str(target)}).decode("ascii")
+        with self._transaction() as connection:
+            if self._check_advertisement_binding(connection) is not None:
+                raise MarketStoreUnavailableError(
+                    "bound advertisement history requires coupled recovery before rebinding"
+                )
+            self._verify_schema(rebind_paths=paths)
+            bound = self._verify_wallet_ledger(connection, rebind_paths=paths)
+            if self._wallet_state_for_connection(connection, self.wallet_id) == "disabled":
+                raise MarketStoreUnavailableError("rebinding requires an activated wallet")
+            pending = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'commitments_rebind'"
+            ).fetchone()
+            if bound == target and pending is None:
+                completed = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'commitments_rebind_completed'"
+                ).fetchone()
+                if completed is None or completed["value"] != marker:
+                    raise MarketStoreError(
+                        "previous commitments path does not match completed rebinding"
+                    )
+                return
+            connection.execute(
+                "INSERT INTO metadata (key, value) VALUES ('commitments_rebind', ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (marker,),
+            )
+
+        # The committed marker gates local use and seller issuance throughout the
+        # history merge and the non-atomic update of SQLite plus the intent file.
+        used, external = self._read_commitments_history(target, require_existing=True)
+        with self._transaction() as connection:
+            self._verify_schema(rebind_paths=paths)
+            self._import_commitments_history(connection, used, external)
+            connection.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'commitments_path'", (str(target),)
+            )
+        self._write_wallet_intent(target)
+        with self._transaction() as connection:
+            self._verify_schema(rebind_paths=paths)
+            connection.execute(
+                "INSERT INTO metadata (key, value) VALUES ('commitments_rebind_completed', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (marker,),
+            )
+            connection.execute("DELETE FROM metadata WHERE key = 'commitments_rebind'")
+            self._verify_wallet_ledger(connection, target)
+
+    def hold_local(self, commitment: str) -> bool:
+        """Record a local PoDLE hold unless the global commitment is unavailable."""
+        self._require_hex32(commitment, "commitment")
+        with self._transaction() as connection:
+            self._require_local_ledger_access(connection, mutation=True)
+            row = self._ownership_row(connection, commitment)
+            if row is not None:
+                return False
+            self._ensure_bound_wallet_disabled_row(connection)
+            connection.execute(
+                """
+                INSERT INTO podle_ownership (commitment, wallet_id, state, inventory_id)
+                VALUES (?, ?, 'held_local', NULL)
+                """,
+                (commitment, self.wallet_id),
+            )
+            return True
+
+    def claim_local(self, commitment: str) -> bool:
+        """Make local PoDLE use permanent without racing market inventory insertion."""
+        self._require_hex32(commitment, "commitment")
+        with self._transaction() as connection:
+            self._require_local_ledger_access(connection, mutation=True)
+            row = self._ownership_row(connection, commitment)
+            if row is None:
+                self._ensure_bound_wallet_disabled_row(connection)
+                connection.execute(
+                    """
+                    INSERT INTO podle_ownership (commitment, wallet_id, state, inventory_id)
+                    VALUES (?, ?, 'used', NULL)
+                    """,
+                    (commitment, self.wallet_id),
+                )
+                return True
+            if row["state"] != "held_local":
+                return False
+            owner = row["wallet_id"]
+            if owner is not None and owner != self.wallet_id:
+                return False
+            self._ensure_bound_wallet_disabled_row(connection)
+            connection.execute(
+                """
+                UPDATE podle_ownership
+                SET wallet_id = ?, state = 'used'
+                WHERE commitment = ? AND state = 'held_local'
+                """,
+                (self.wallet_id, commitment),
+            )
+            return True
+
+    def is_available_for_local(self, commitment: str) -> bool:
+        """Return whether a commitment remains locally usable for this wallet."""
+        self._require_hex32(commitment, "commitment")
+        with self._lock:
+            if not self._require_local_ledger_access(self._connection, mutation=False):
+                return False
+            row = self._ownership_row(self._connection, commitment)
+            if row is None:
+                return True
+            return row["state"] == "held_local" and (
+                row["wallet_id"] is None or row["wallet_id"] == self.wallet_id
+            )
+
+    def unavailable_local_commitments(self) -> set[str]:
+        """Snapshot exclusions for selection; final use still requires claim_local."""
+        with self._lock:
+            if not self._require_local_ledger_access(self._connection, mutation=False):
+                raise MarketStoreUnavailableError("wallet ledger is not available for local use")
+            rows = self._connection.execute(
+                """
+                SELECT commitment FROM podle_ownership
+                WHERE state != 'held_local'
+                   OR (wallet_id IS NOT NULL AND wallet_id IS NOT ?)
+                UNION ALL
+                SELECT resource FROM inventory WHERE product = 'podle'
+                """,
+                (self.wallet_id,),
+            )
+            return {str(row[0]) for row in rows}
+
+    def close(self) -> None:
+        """Close the SQLite connection after flushing already committed state."""
+        with self._lock:
+            if not self._closed:
+                self._connection.close()
+                self._closed = True
+
+    def __enter__(self) -> MarketStore:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+    def add_inventory(
+        self,
+        product: Product,
+        resource: str,
+        credential: dict[str, Any] | None,
+    ) -> None:
+        """Add one credential resource that has not been offered before.
+
+        PoDLE inventory is fully validated on insert. Bond inventory may omit its
+        certificate while a quote waits for the bond owner to provide it.
+        """
+        self._require_product(product)
+        self._require_hex32(resource, "resource")
+        encoded_credential, certificate_pubkey = self._validate_inventory_credential(
+            product, resource, credential
+        )
+        # Legacy insertion retains its contract. Live wallet callers use typed
+        # admission; the required mode must never fall through this old API.
+        if product == "bond" and self.advertisement_binding is not None:
+            raise MarketStoreUnavailableError("bound bond inventory requires typed bond admission")
+        if product == "bond":
+            try:
+                # Preserve valid v1 insertion semantics, but a v2/orphaned or
+                # unreadable record cannot silently select the legacy path.
+                with locked_advertisements(self.path.with_name(ADVERTISEMENT_FILE), blocking=False):
+                    self._insert_inventory(
+                        product, resource, encoded_credential, certificate_pubkey
+                    )
+            except (AdvertisementRecordError, OSError) as exc:
+                raise MarketStoreUnavailableError(
+                    "bond advertisement admission is unavailable"
+                ) from exc
+            return
+        self._insert_inventory(product, resource, encoded_credential, certificate_pubkey)
+
+    def add_bond_inventory(
+        self,
+        bond: BondReference,
+        period: int,
+        credential: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically check advertisement eligibility and durably designate one lease.
+
+        Admission precedes SQLite locking. A busy history lock fails closed
+        rather than blocking an event-loop caller or cancellation monitor.
+        """
+        self._require_int(period, "bond period", minimum=0)
+        bond = BondReference.model_validate(bond.model_dump(mode="json"))
+        resource = bond_resource(bond, period)
+        encoded, certificate = self._validate_inventory_credential("bond", resource, credential)
+        if credential is not None:
+            supplied = BondCredential.model_validate(credential)
+            if supplied.bond != bond or supplied.cert_expiry != period + 1:
+                raise MarketStoreConflictError("bond credential does not match the admitted period")
+        try:
+            with locked_advertisements(
+                self.path.with_name(ADVERTISEMENT_FILE),
+                wallet_id=self.wallet_id,
+                network=bond.network,
+                blocking=False,
+            ) as history:
+                binding = self.advertisement_binding
+                snapshot = history.snapshot
+                if binding is not None:
+                    if binding != (self.wallet_id, bond.network):
+                        raise MarketStoreConflictError("bond advertisement wallet/network mismatch")
+                    history.require_bound()
+                elif snapshot is not None and snapshot.version == 2:
+                    raise MarketStoreUnavailableError("bound advertisement ledger is not activated")
+                if snapshot is not None and not snapshot.rentable(
+                    (bond.outpoint.txid, bond.outpoint.vout), period
+                ):
+                    raise MarketStoreConflictError(
+                        "the bond may be advertised in this lease period"
+                    )
+                self._insert_inventory("bond", resource, encoded, certificate, bond_admitted=True)
+        except (AdvertisementRecordError, OSError) as exc:
+            raise MarketStoreUnavailableError(
+                "bond advertisement admission is unavailable"
+            ) from exc
+
+    def _insert_inventory(
+        self,
+        product: Product,
+        resource: str,
+        encoded_credential: bytes | None,
+        certificate_pubkey: str | None,
+        *,
+        bond_admitted: bool = False,
+    ) -> None:
+        with self._transaction() as connection:
+            wallet_ledger = self._require_seller_wallet_ready(connection)
+            if (
+                product == "bond"
+                and self._check_advertisement_binding(connection) is not None
+                and not bond_admitted
+            ):
+                raise MarketStoreUnavailableError(
+                    "bound bond inventory requires typed bond admission"
+                )
+            existing = connection.execute(
+                "SELECT id FROM inventory WHERE product = ? AND resource = ?",
+                (product, resource),
+            ).fetchone()
+            if existing is not None:
+                raise MarketStoreConflictError("inventory resource has already been recorded")
+            # A standalone store has no wallet to own inventory, but it still keeps
+            # PoDLE ownership rows so activation never has to rebuild them.
+            owner = self.wallet_id if wallet_ledger else None
+            if product == "podle":
+                ownership = self._ownership_row(connection, resource)
+                if ownership is not None:
+                    raise MarketStoreConflictError("PoDLE commitment already has an owner")
+            cursor = connection.execute(
+                """
+                INSERT INTO inventory (
+                    product, resource, credential, certificate_pubkey, state,
+                    reservation_quote_id, wallet_id
+                ) VALUES (?, ?, ?, ?, 'available', NULL, ?)
+                """,
+                (product, resource, encoded_credential, certificate_pubkey, owner),
+            )
+            if product == "podle":
+                connection.execute(
+                    """
+                    INSERT INTO podle_ownership (commitment, wallet_id, state, inventory_id)
+                    VALUES (?, ?, 'market_inventory', ?)
+                    """,
+                    (resource, owner, cursor.lastrowid),
+                )
+
+    def seller_runtime(self) -> AbstractContextManager[None]:
+        """Hold the single seller-runtime lock that owns hold-invoice settlement.
+
+        Only the holder may create, settle, or cancel hold invoices for this store,
+        so two serving processes never race on the same invoice.
+        """
+        return self._seller_runtime_lock()
+
+    @contextmanager
+    def _seller_runtime_lock(self) -> Iterator[None]:
+        lock_path = self.path.with_name(f"{self.path.name}.seller.lock")
+        try:
+            with exclusive_file_lock(lock_path, blocking=False):
+                yield
+        except BlockingIOError:
+            raise MarketStoreError(
+                "another seller runtime is already serving this market store"
+            ) from None
+
+    def reserve_hold_quote(
+        self,
+        authorization: SignedDocument,
+        seller_key: CKey | BoundMarketKeys,
+        buyer_pubkey: str,
+        product: Product,
+        certificate_pubkey: str | None,
+        rail: PaymentRail,
+        max_price_sats: int,
+        price_sats: int,
+        now: int,
+        height: int,
+        *,
+        ttl: int = 300,
+        request_id: str,
+        min_backing_sats: int | None = None,
+        backing_sats: BackingLookup | None = None,
+        require_backing: bool = False,
+    ) -> SignedDocument | HoldReservation:
+        """Reserve inventory and a fresh hold-invoice preimage for one quote request.
+
+        ``min_backing_sats`` restricts PoDLE inventory to backing UTXOs worth at
+        least that much, as reported by ``backing_sats``; inventory whose value is
+        unknown never qualifies. ``require_backing`` applies that rule to every
+        PoDLE request, so a seller only sells inventory its lookup currently values.
+
+        Nothing is signed and no invoice exists yet. The reservation is durable
+        before the caller creates the hold invoice, so after a crash the settlement
+        reconciler can cancel it. ``request_id`` is an immutable idempotency key:
+        replaying it returns the issued signed quote, or the same reservation while
+        its invoice is still being created.
+        """
+        self._require_signed_document(authorization, "authorization")
+        seller_pubkey = self._seller_pubkey(seller_key)
+        self._require_hex32(buyer_pubkey, "buyer_pubkey")
+        self._validate_sealed_box_pubkey(buyer_pubkey)
+        self._require_product(product)
+        self._validate_certificate_pubkey(product, certificate_pubkey)
+        self._require_rail(rail)
+        self._require_int(max_price_sats, "max_price_sats", minimum=1)
+        self._require_int(price_sats, "price_sats", minimum=1, maximum=_MAX_PRICE_SATS)
+        self._require_int(now, "now", minimum=1)
+        self._require_int(height, "height", minimum=1)
+        self._require_int(ttl, "ttl", minimum=1, maximum=_MAX_QUOTE_TTL)
+        self._require_request_id(request_id)
+        if min_backing_sats is not None:
+            self._require_int(min_backing_sats, "min_backing_sats", minimum=1)
+            if product != "podle":
+                raise MarketStoreError("min_backing_sats applies to PoDLE inventory only")
+        parameters: dict[str, Any] = {
+            "authorization": authorization.model_dump(mode="json"),
+            "seller_pubkey": seller_pubkey,
+            "buyer_pubkey": buyer_pubkey,
+            "product": product,
+            "certificate_pubkey": certificate_pubkey,
+            "rail": rail,
+            "max_price_sats": max_price_sats,
+            "ttl": ttl,
+        }
+        # Added only when set, so fingerprints of earlier requests are unchanged.
+        if min_backing_sats is not None:
+            parameters["min_backing_sats"] = min_backing_sats
+        fingerprint = canonical(parameters)
+
+        with self._transaction() as connection:
+            wallet_ledger = self._require_seller_wallet_ready(connection)
+            self._require_bound_seller_wallet(connection, seller_key, wallet_ledger)
+            self._expire_live_quotes(connection, now)
+            existing = connection.execute(
+                "SELECT * FROM quotes WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                if bytes(existing["request_fingerprint"]) != fingerprint:
+                    raise MarketStoreConflictError(
+                        "request_id is bound to different quote parameters"
+                    )
+                if isinstance(seller_key, BoundMarketKeys):
+                    authority, _quote = self._verified_quote_from_row(existing)
+                    seller_key.validate_seller_authorization(authority)
+                return self._signed_document_from_storage(bytes(existing["quote_document"]))
+            hold = connection.execute(
+                "SELECT * FROM hold_invoices WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if hold is not None:
+                if bytes(hold["request_fingerprint"]) != fingerprint:
+                    raise MarketStoreConflictError(
+                        "request_id is bound to different quote parameters"
+                    )
+                if hold["state"] != "reserved" or int(hold["quote_expires_at"]) <= now:
+                    raise MarketStoreUnavailableError("quote reservation is no longer available")
+                return self._hold_reservation(hold)
+
+            authority = self._validate_authorization(authorization, seller_pubkey, height)
+            if isinstance(seller_key, BoundMarketKeys):
+                seller_key.validate_seller_authorization(authority)
+            if price_sats > max_price_sats:
+                raise MarketStoreUnavailableError("seller price exceeds buyer price limit")
+            active = connection.execute(
+                f"SELECT COUNT(*) AS count FROM hold_invoices WHERE state IN {_ACTIVE_HOLD_SQL}"
+            ).fetchone()
+            if active is None or int(active["count"]) >= _MAX_ACTIVE_QUOTES:
+                raise MarketStoreUnavailableError("maximum active quote capacity reached")
+            inventory_row = self._select_inventory(
+                connection,
+                authority,
+                product,
+                certificate_pubkey,
+                min_backing_sats=min_backing_sats,
+                backing_sats=backing_sats,
+                require_backing=require_backing,
+            )
+            if inventory_row is None:
+                raise MarketStoreUnavailableError("no matching credential inventory is available")
+
+            quote_id = secrets.token_hex(32)
+            preimage = secrets.token_bytes(32)
+            cursor = connection.execute(
+                """
+                UPDATE inventory
+                SET state = 'reserved', reservation_quote_id = ?
+                WHERE id = ? AND state = 'available'
+                """,
+                (quote_id, int(inventory_row["id"])),
+            )
+            if cursor.rowcount != 1:
+                raise MarketStoreUnavailableError("inventory was reserved by another writer")
+            connection.execute(
+                """
+                INSERT INTO hold_invoices (
+                    quote_id, request_id, request_fingerprint, authorization, rail,
+                    payment_hash, preimage, amount_sats, inventory_id, buyer_pubkey,
+                    product, resource, certificate_pubkey, created_at, quote_expires_at,
+                    invoice_expires_at, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')
+                """,
+                (
+                    quote_id,
+                    request_id,
+                    fingerprint,
+                    canonical(authorization),
+                    rail,
+                    hashlib.sha256(preimage).hexdigest(),
+                    preimage.hex(),
+                    price_sats,
+                    int(inventory_row["id"]),
+                    buyer_pubkey,
+                    product,
+                    str(inventory_row["resource"]),
+                    certificate_pubkey,
+                    now,
+                    now + ttl,
+                    now + ttl + HOLD_INVOICE_GRACE_SECONDS,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM hold_invoices WHERE quote_id = ?", (quote_id,)
+            ).fetchone()
+            return self._hold_reservation(row)
+
+    def issue_hold_quote(
+        self,
+        quote_id: str,
+        seller_key: CKey | BoundMarketKeys,
+        terms: PaymentTerms,
+        payment_id: str,
+        now: int,
+    ) -> SignedDocument:
+        """Sign and publish the quote for a reservation whose hold invoice exists.
+
+        ``payment_id`` is the caller-validated ``ln:<payment_hash>`` of
+        ``terms.request``; it must commit to the reserved preimage.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        seller_pubkey = self._seller_pubkey(seller_key)
+        if not isinstance(terms, PaymentTerms):
+            raise TypeError("terms must be a PaymentTerms")
+        try:
+            validated_terms = PaymentTerms.model_validate(terms.model_dump(mode="json"))
+        except ValidationError as exc:
+            raise MarketError("invalid payment terms") from exc
+        self._require_opaque_identifier(payment_id, "payment_id", _MAX_OPAQUE_ID_LENGTH)
+        self._require_int(now, "now", minimum=1)
+
+        with self._transaction() as connection:
+            wallet_ledger = self._require_seller_wallet_ready(connection)
+            self._require_bound_seller_wallet(connection, seller_key, wallet_ledger)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("quote reservation does not exist")
+            existing = self._quote_row(connection, quote_id)
+            if existing is not None:
+                _authority, quote = self._verified_quote_from_row(existing)
+                if quote.payment != validated_terms:
+                    raise MarketStoreConflictError("quote was issued with different payment terms")
+                return self._signed_document_from_storage(bytes(existing["quote_document"]))
+            if hold["state"] != "reserved":
+                raise MarketStoreUnavailableError("quote reservation is no longer available")
+            if payment_id != f"ln:{hold['payment_hash']}":
+                raise MarketStoreConflictError("payment request does not commit to the reservation")
+            if validated_terms.rail != hold["rail"] or validated_terms.amount_sats != int(
+                hold["amount_sats"]
+            ):
+                raise MarketStoreConflictError("payment terms do not match the reservation")
+            if now >= int(hold["quote_expires_at"]):
+                raise MarketStoreExpiredError("quote reservation has expired")
+            authorization = self._signed_document_from_storage(bytes(hold["authorization"]))
+            try:
+                authority = verify_authorization(authorization)
+            except (MarketError, ValidationError, ValueError) as exc:
+                raise MarketStoreCorruptError("stored authorization is invalid") from exc
+            self._require_matching_seller(authority, seller_pubkey)
+            if isinstance(seller_key, BoundMarketKeys):
+                seller_key.validate_seller_authorization(authority)
+            inventory = connection.execute(
+                "SELECT credential, state, reservation_quote_id FROM inventory WHERE id = ?",
+                (int(hold["inventory_id"]),),
+            ).fetchone()
+            if (
+                inventory is None
+                or inventory["state"] != "reserved"
+                or inventory["reservation_quote_id"] != quote_id
+            ):
+                raise MarketStoreCorruptError("quote inventory reservation is missing")
+            quote = MarketQuote(
+                authorization=authorization,
+                quote_id=quote_id,
+                buyer_pubkey=str(hold["buyer_pubkey"]),
+                product=cast(Product, hold["product"]),
+                resource=str(hold["resource"]),
+                certificate_pubkey=hold["certificate_pubkey"],
+                payment=validated_terms,
+                created_at=int(hold["created_at"]),
+                expires_at=int(hold["quote_expires_at"]),
+            )
+            quote_document = self._sign_document(quote, seller_key)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO payments (payment_id, rail, request, terms, state, quote_id)
+                    VALUES (?, ?, ?, ?, 'reserved', ?)
+                    """,
+                    (
+                        payment_id,
+                        validated_terms.rail,
+                        validated_terms.request,
+                        canonical(validated_terms),
+                        quote_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise MarketStoreConflictError("payment request has already been used") from exc
+            connection.execute(
+                """
+                INSERT INTO quotes (
+                    quote_id, request_id, request_fingerprint, quote_document,
+                    buyer_pubkey, product, resource, certificate_pubkey, inventory_id,
+                    payment_id, created_at, expires_at, state, pending_credential,
+                    settlement_ref, package, sealed_delivery
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, NULL, NULL, NULL)
+                """,
+                (
+                    quote_id,
+                    str(hold["request_id"]),
+                    bytes(hold["request_fingerprint"]),
+                    canonical(quote_document),
+                    quote.buyer_pubkey,
+                    quote.product,
+                    quote.resource,
+                    quote.certificate_pubkey,
+                    int(hold["inventory_id"]),
+                    payment_id,
+                    quote.created_at,
+                    quote.expires_at,
+                    inventory["credential"],
+                ),
+            )
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'open' WHERE quote_id = ? AND state = 'reserved'",
+                (quote_id,),
+            )
+            return quote_document
+
+    def hold_invoices(self, now: int) -> list[HoldInvoice]:
+        """Return every hold invoice whose outcome is not final yet, oldest first."""
+        self._require_int(now, "now", minimum=1)
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            self._expire_live_quotes(connection, now)
+            rows = connection.execute(
+                f"""
+                SELECT h.*, q.state AS quote_state,
+                       q.pending_credential IS NOT NULL AS has_credential
+                FROM hold_invoices h LEFT JOIN quotes q ON q.quote_id = h.quote_id
+                WHERE h.state IN {_ACTIVE_HOLD_SQL}
+                ORDER BY h.created_at, h.quote_id
+                """
+            ).fetchall()
+            return [
+                HoldInvoice(
+                    quote_id=str(row["quote_id"]),
+                    payment_hash=bytes.fromhex(str(row["payment_hash"])),
+                    preimage=bytes.fromhex(str(row["preimage"])),
+                    amount_sats=int(row["amount_sats"]),
+                    product=cast(Product, row["product"]),
+                    state=cast(HoldState, row["state"]),
+                    quote_state=row["quote_state"],
+                    credential_attached=bool(row["has_credential"]),
+                    created_at=int(row["created_at"]),
+                    quote_expires_at=int(row["quote_expires_at"]),
+                    invoice_expires_at=int(row["invoice_expires_at"]),
+                )
+                for row in rows
+            ]
+
+    def hold_inventory_credential(self, payment_hash: bytes) -> dict[str, Any] | None:
+        """Return the stocked credential a hold invoice sells, if it has one.
+
+        PoDLE inventory carries its credential from stocking; bond inventory
+        does not, and an unknown payment hash has none.
+        """
+        if type(payment_hash) is not bytes or len(payment_hash) != 32:
+            raise ValueError("payment_hash must be 32 bytes")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT inventory.credential FROM hold_invoices
+                JOIN inventory ON inventory.id = hold_invoices.inventory_id
+                WHERE hold_invoices.payment_hash = ?
+                """,
+                (payment_hash.hex(),),
+            ).fetchone()
+        if row is None or row["credential"] is None:
+            return None
+        return cast(dict[str, Any], json.loads(bytes(row["credential"])))
+
+    def hold_product(self, payment_hash: bytes) -> Product | None:
+        """Return the product a hold invoice sells; None for an unknown payment hash."""
+        if type(payment_hash) is not bytes or len(payment_hash) != 32:
+            raise ValueError("payment_hash must be 32 bytes")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT inventory.product FROM hold_invoices
+                JOIN inventory ON inventory.id = hold_invoices.inventory_id
+                WHERE hold_invoices.payment_hash = ?
+                """,
+                (payment_hash.hex(),),
+            ).fetchone()
+        return None if row is None else cast(Product, str(row["product"]))
+
+    def begin_hold_cancel(self, quote_id: str) -> None:
+        """Durably record the intent to cancel before calling ``CancelInvoice``.
+
+        Refused once settlement has been decided, so the two outcomes are exclusive.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] in ("canceling", "canceled"):
+                return
+            if hold["state"] not in ("reserved", "open"):
+                raise MarketStoreConflictError("hold invoice is being settled")
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceling' WHERE quote_id = ?", (quote_id,)
+            )
+
+    def abandon_undeliverable_settlement(self, quote_id: str, height: int) -> bool:
+        """Turn a pending settlement into a refund once its package is unusable.
+
+        A prepared package is bound to its authorization's retarget period; the
+        buyer cannot import it in a later period, so the held payment must be
+        canceled instead of settled. The prepared allocation stays consumed.
+        Returns whether the hold invoice now awaits cancellation.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "canceling":
+                return True
+            if hold["state"] != "settling":
+                return False
+            row = self._quote_row(connection, quote_id)
+            if row is None:
+                raise MarketStoreCorruptError("hold invoice has no quote")
+            authority, _ = self._verified_quote_from_row(row)
+            if authority.period == period_at_height(height):
+                return False
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceling' WHERE quote_id = ?", (quote_id,)
+            )
+            return True
+
+    def abandon_settlement(self, quote_id: str) -> bool:
+        """Turn a pending settlement into a refund because its credential stopped verifying.
+
+        The seller checks the credential again before each settlement attempt;
+        a credential that no longer verifies (a spent PoDLE backing coin) must
+        not be charged for. The prepared allocation stays consumed. Returns
+        whether the hold invoice now awaits cancellation.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "canceling":
+                return True
+            if hold["state"] != "settling":
+                return False
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceling' WHERE quote_id = ?", (quote_id,)
+            )
+            return True
+
+    def cancel_unpublished_reservation(self, quote_id: str) -> bool:
+        """Finish canceling a reservation whose quote was never issued, without LND.
+
+        Issuing requires the ``reserved`` state, which a canceling hold never
+        returns to, so its payment request never left this store and nobody can
+        pay an invoice created for it, even one whose creation lands late.
+        Returns whether the hold is now canceled; a published quote is untouched.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] != "canceling" or self._quote_row(connection, quote_id) is not None:
+                return False
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceled' WHERE quote_id = ?", (quote_id,)
+            )
+            connection.execute(
+                """
+                UPDATE inventory SET state = 'available', reservation_quote_id = NULL
+                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
+                """,
+                (int(hold["inventory_id"]), quote_id),
+            )
+            return True
+
+    def complete_hold_cancel(self, quote_id: str) -> None:
+        """Record that LND reports the hold invoice canceled.
+
+        Inventory returns only for an allocation that was never prepared. A
+        prepared allocation whose payment was lost stays consumed and undelivered.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "canceled":
+                return
+            if hold["state"] not in ("canceling", "settling"):
+                raise MarketStoreConflictError("hold invoice cancellation was not started")
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'canceled' WHERE quote_id = ?", (quote_id,)
+            )
+            quote = self._quote_row(connection, quote_id)
+            if quote is not None and quote["state"] == "finalized":
+                return
+            connection.execute(
+                "UPDATE quotes SET state = 'expired' WHERE quote_id = ? AND state = 'live'",
+                (quote_id,),
+            )
+            connection.execute(
+                """
+                UPDATE inventory SET state = 'available', reservation_quote_id = NULL
+                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
+                """,
+                (int(hold["inventory_id"]), quote_id),
+            )
+
+    def complete_hold_settle(self, quote_id: str) -> None:
+        """Record that LND reports the hold invoice settled; delivery becomes available."""
+        self._require_hex32(quote_id, "quote_id")
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreUnavailableError("hold invoice does not exist")
+            if hold["state"] == "settled":
+                return
+            if hold["state"] != "settling":
+                raise MarketStoreConflictError("hold invoice settlement was not started")
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'settled' WHERE quote_id = ?", (quote_id,)
+            )
+
+    def get_quote(self, quote_id: str) -> SignedDocument:
+        """Return the locally persisted signed quote, including terminal quotes."""
+        self._require_hex32(quote_id, "quote_id")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM quotes WHERE quote_id = ?", (quote_id,)
+            ).fetchone()
+        if row is None:
+            raise MarketStoreUnavailableError("quote does not exist")
+        self._verified_quote_from_row(row)
+        return self._signed_document_from_storage(bytes(row["quote_document"]))
+
+    def pending(self, now: int) -> list[SignedDocument]:
+        """Return at most 64 quotes that can still be paid.
+
+        These are live quotes and expired quotes whose hold invoice is still open,
+        since an HTLC accepted just before expiry still needs the credential.
+        """
+        self._require_int(now, "now", minimum=1)
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _WALLET_MODE:
+                self._require_wallet_ledger(connection)
+            self._expire_live_quotes(connection, now)
+            rows = connection.execute(
+                """
+                SELECT q.* FROM quotes q
+                LEFT JOIN hold_invoices h ON h.quote_id = q.quote_id
+                WHERE q.state = 'live'
+                    OR (q.state = 'expired' AND h.state = 'open' AND h.invoice_expires_at > ?)
+                ORDER BY q.created_at, q.quote_id
+                LIMIT ?
+                """,
+                (now, _MAX_ACTIVE_QUOTES),
+            ).fetchall()
+            for row in rows:
+                self._verified_quote_from_row(row)
+            return [
+                self._signed_document_from_storage(bytes(row["quote_document"])) for row in rows
+            ]
+
+    def attach_credential(self, quote_id: str, credential: dict[str, Any]) -> None:
+        """Persist one credential while the quote's payment can still be accepted."""
+        self._require_hex32(quote_id, "quote_id")
+        if type(credential) is not dict:
+            raise TypeError("credential must be a dict")
+        encoded_credential = canonical(credential)
+        with self._transaction() as connection:
+            self._require_seller_wallet_ready(connection)
+            row = self._quote_row(connection, quote_id)
+            if row is None:
+                raise MarketStoreUnavailableError("quote does not exist")
+            hold = self._hold_row(connection, quote_id)
+            if row["state"] != "live" and not (
+                row["state"] == "expired" and hold is not None and hold["state"] == "open"
+            ):
+                raise MarketStoreExpiredError("quote is no longer live")
+            self._require_quote_wallet_ownership(connection, row)
+            authority, quote = self._verified_quote_from_row(row)
+            allocation = self._allocation_for_quote(authority, quote)
+            self._validate_credential_for_allocation(authority, allocation, credential)
+            previous = row["pending_credential"]
+            if previous is not None:
+                if bytes(previous) != encoded_credential:
+                    raise MarketStoreConflictError("quote already has a different credential")
+                return
+            connection.execute(
+                "UPDATE quotes SET pending_credential = ? WHERE quote_id = ?",
+                (encoded_credential, quote_id),
+            )
+
+    def finalize(
+        self,
+        quote_id: str,
+        seller_key: CKey | BoundMarketKeys,
+        now: int,
+        height: int,
+    ) -> CredentialPackage:
+        """Irreversibly prepare the allocation for a quote whose payment is held.
+
+        The caller must have observed the hold invoice ACCEPTED for at least the
+        quoted amount. The same transaction records the intent to settle, so the
+        invoice can no longer be canceled through this store, and the package is
+        withheld from delivery until :meth:`complete_hold_settle`. Once committed,
+        a crash cannot cause a second allocation for the same resource.
+        """
+        self._require_hex32(quote_id, "quote_id")
+        seller_pubkey = self._seller_pubkey(seller_key)
+        self._require_int(now, "now", minimum=1)
+        self._require_int(height, "height", minimum=1)
+
+        with self._transaction() as connection:
+            wallet_ledger = self._require_seller_wallet_ready(connection)
+            self._require_bound_seller_wallet(connection, seller_key, wallet_ledger)
+            row = self._quote_row(connection, quote_id)
+            if row is None:
+                raise MarketStoreUnavailableError("quote does not exist")
+            authority, quote = self._verified_quote_from_row(row)
+            # A restarted wallet seller has the current period's scoped key.
+            # Expired allocations must select the refund path before checking
+            # whether that new key could sign the old authorization.
+            if row["state"] != "finalized" and authority.period != period_at_height(height):
+                raise MarketStoreExpiredError("quote is from a different retarget period")
+            if isinstance(seller_key, BoundMarketKeys):
+                seller_key.validate_seller_authorization(authority)
+            self._require_matching_seller(authority, seller_pubkey)
+            self._require_quote_wallet_ownership(connection, row)
+            hold = self._hold_row(connection, quote_id)
+            if hold is None:
+                raise MarketStoreExpiredError("quote has no hold invoice")
+            settlement_ref = f"ln:{hold['payment_hash']}"
+            if row["state"] == "finalized":
+                if row["settlement_ref"] != settlement_ref:
+                    raise MarketStoreCorruptError("finalized quote has a foreign settlement")
+                package = row["package"]
+                if package is None:
+                    raise MarketStoreCorruptError("finalized quote has no credential package")
+                return self._package_from_storage(bytes(package))
+
+            if hold["state"] != "open":
+                raise MarketStoreExpiredError("quote hold invoice is no longer open")
+            self._expire_live_quotes(connection, now)
+            row = self._quote_row(connection, quote_id)
+            # An expired quote with an open hold invoice still holds its inventory;
+            # an HTLC accepted before the invoice expired may complete the sale.
+            if row is None or row["state"] not in ("live", "expired"):
+                raise MarketStoreExpiredError("quote has expired")
+            settlement_owner = connection.execute(
+                "SELECT quote_id FROM quotes WHERE settlement_ref = ?", (settlement_ref,)
+            ).fetchone()
+            if settlement_owner is not None:
+                raise MarketStoreConflictError("settlement reference has already been used")
+            inventory = connection.execute(
+                "SELECT state, reservation_quote_id FROM inventory WHERE id = ?",
+                (int(row["inventory_id"]),),
+            ).fetchone()
+            if (
+                inventory is None
+                or inventory["state"] != "reserved"
+                or inventory["reservation_quote_id"] != quote_id
+            ):
+                raise MarketStoreCorruptError("quote inventory reservation is missing")
+            payment = connection.execute(
+                "SELECT state, quote_id, terms FROM payments WHERE payment_id = ?",
+                (str(row["payment_id"]),),
+            ).fetchone()
+            if payment is None or payment["state"] != "reserved" or payment["quote_id"] != quote_id:
+                raise MarketStoreCorruptError("quote payment reservation is missing")
+            if quote.payment != self._payment_terms_from_storage(bytes(payment["terms"])):
+                raise MarketStoreCorruptError("stored quote payment does not match reservation")
+            pending_credential = row["pending_credential"]
+            if pending_credential is None:
+                raise MarketStoreUnavailableError("quote has no attached credential")
+            credential = self._credential_from_storage(bytes(pending_credential))
+            allocation = self._allocation_for_quote(authority, quote)
+            self._validate_credential_for_allocation(authority, allocation, credential)
+            allocation_document = self._sign_document(allocation, seller_key)
+            delivery_document = self._sign_document(
+                Delivery(allocation=document_hash(allocation_document.body), credential=credential),
+                seller_key,
+            )
+            package = CredentialPackage(
+                authorization=quote.authorization,
+                allocation=allocation_document,
+                delivery=delivery_document,
+            )
+            package.verify()
+            encoded_package = canonical(package)
+            sealed_delivery = self._seal_package(package, quote.buyer_pubkey)
+            connection.execute(
+                """
+                UPDATE quotes
+                SET state = 'finalized', settlement_ref = ?, package = ?, sealed_delivery = ?
+                WHERE quote_id = ? AND state IN ('live', 'expired')
+                """,
+                (settlement_ref, encoded_package, sealed_delivery, quote_id),
+            )
+            connection.execute(
+                "UPDATE hold_invoices SET state = 'settling' WHERE quote_id = ? AND state = 'open'",
+                (quote_id,),
+            )
+            connection.execute(
+                """
+                UPDATE inventory SET state = 'consumed'
+                WHERE id = ? AND state = 'reserved' AND reservation_quote_id = ?
+                """,
+                (int(row["inventory_id"]), quote_id),
+            )
+            connection.execute(
+                """
+                UPDATE payments SET state = 'consumed'
+                WHERE payment_id = ? AND state = 'reserved' AND quote_id = ?
+                """,
+                (str(row["payment_id"]), quote_id),
+            )
+            return package
+
+    def get_delivery(self, quote_id: str) -> str | None:
+        """Return the cached sealed-box package once its payment has settled."""
+        self._require_hex32(quote_id, "quote_id")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT q.sealed_delivery, h.state AS hold_state FROM quotes q
+                LEFT JOIN hold_invoices h ON h.quote_id = q.quote_id
+                WHERE q.quote_id = ?
+                """,
+                (quote_id,),
+            ).fetchone()
+        if row is None:
+            raise MarketStoreUnavailableError("quote does not exist")
+        if row["hold_state"] != "settled":
+            return None
+        delivery = row["sealed_delivery"]
+        if delivery is None:
+            return None
+        if not isinstance(delivery, str):
+            raise MarketStoreCorruptError("sealed delivery is invalid")
+        return delivery
+
+    def get_package(self, quote_id: str) -> CredentialPackage | None:
+        """Return settled local package evidence for explicit CLI export/import only."""
+        self._require_hex32(quote_id, "quote_id")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT q.package, h.state AS hold_state FROM quotes q
+                LEFT JOIN hold_invoices h ON h.quote_id = q.quote_id
+                WHERE q.quote_id = ?
+                """,
+                (quote_id,),
+            ).fetchone()
+        if row is None:
+            raise MarketStoreUnavailableError("quote does not exist")
+        if row["hold_state"] != "settled":
+            return None
+        package = row["package"]
+        if package is None:
+            return None
+        return self._package_from_storage(bytes(package))
+
+    def _prepare_parent(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.path.parent, 0o700)
+        except OSError as exc:
+            raise MarketStoreError("could not create private market store directory") from exc
+
+    def _create_private_database_file(self) -> bool:
+        try:
+            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            raise MarketStoreError("could not create private market store") from exc
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        return True
+
+    def _initialize(self, created: bool) -> None:
+        lock_path = self.path.with_name(f"{self.path.name}.init.lock")
+        with exclusive_file_lock(lock_path), self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                if created:
+                    self._create_schema()
+                else:
+                    self._verify_schema()
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def _create_schema(self) -> None:
+        statements = (
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE wallet_ledger (
+                wallet_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK (
+                    state IN ('disabled', 'activating', 'ready', 'recovery_required')
+                )
+            )
+            """,
+            """
+            CREATE TABLE inventory (
+                id INTEGER PRIMARY KEY,
+                product TEXT NOT NULL CHECK (product IN ('podle', 'bond')),
+                resource TEXT NOT NULL,
+                credential BLOB,
+                certificate_pubkey TEXT,
+                state TEXT NOT NULL CHECK (state IN ('available', 'reserved', 'consumed')),
+                reservation_quote_id TEXT,
+                wallet_id TEXT REFERENCES wallet_ledger(wallet_id),
+                UNIQUE (product, resource)
+            )
+            """,
+            """
+            CREATE TABLE podle_ownership (
+                commitment TEXT PRIMARY KEY,
+                wallet_id TEXT REFERENCES wallet_ledger(wallet_id),
+                state TEXT NOT NULL CHECK (state IN ('held_local', 'used', 'market_inventory')),
+                inventory_id INTEGER UNIQUE REFERENCES inventory(id)
+            )
+            """,
+            """
+            CREATE TABLE payments (
+                payment_id TEXT PRIMARY KEY,
+                rail TEXT NOT NULL CHECK (rail = 'lightning'),
+                request TEXT NOT NULL UNIQUE,
+                terms BLOB NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('available', 'reserved', 'consumed')),
+                quote_id TEXT UNIQUE
+            )
+            """,
+            """
+            CREATE TABLE quotes (
+                quote_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                request_fingerprint BLOB NOT NULL,
+                quote_document BLOB NOT NULL,
+                buyer_pubkey TEXT NOT NULL,
+                product TEXT NOT NULL CHECK (product IN ('podle', 'bond')),
+                resource TEXT NOT NULL,
+                certificate_pubkey TEXT,
+                inventory_id INTEGER NOT NULL REFERENCES inventory(id),
+                payment_id TEXT NOT NULL UNIQUE REFERENCES payments(payment_id),
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('live', 'expired', 'finalized')),
+                pending_credential BLOB,
+                settlement_ref TEXT UNIQUE,
+                package BLOB,
+                sealed_delivery TEXT
+            )
+            """,
+            "CREATE INDEX quotes_live_expiry ON quotes(state, expires_at)",
+            "CREATE INDEX wallet_ledger_state ON wallet_ledger(state)",
+            *_HOLD_INVOICE_SCHEMA,
+            f"INSERT INTO metadata (key, value) VALUES ('ledger_mode', '{_STANDALONE_MODE}')",
+        )
+        for statement in statements:
+            self._connection.execute(statement)
+
+    def _verify_schema(
+        self, *, readonly: bool = False, rebind_paths: tuple[Path, Path] | None = None
+    ) -> None:
+        integrity = self._connection.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            raise MarketStoreCorruptError("market store integrity check failed")
+        tables = self._table_names(self._connection)
+        if not {
+            "metadata",
+            "inventory",
+            "payments",
+            "quotes",
+            "wallet_ledger",
+            "podle_ownership",
+            "hold_invoices",
+        }.issubset(tables):
+            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
+        current_columns = {
+            "metadata": {"key", "value"},
+            "payments": {"payment_id", "rail", "request", "terms", "state", "quote_id"},
+            "quotes": {
+                "quote_id",
+                "request_id",
+                "request_fingerprint",
+                "quote_document",
+                "buyer_pubkey",
+                "product",
+                "resource",
+                "certificate_pubkey",
+                "inventory_id",
+                "payment_id",
+                "created_at",
+                "expires_at",
+                "state",
+                "pending_credential",
+                "settlement_ref",
+                "package",
+                "sealed_delivery",
+            },
+            "hold_invoices": _HOLD_INVOICE_COLUMNS,
+        }
+        for table, columns in current_columns.items():
+            if not columns.issubset(self._table_columns(self._connection, table)):
+                raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
+        quote_without_hold = self._connection.execute(
+            """
+            SELECT 1 FROM quotes
+            WHERE NOT EXISTS (
+                SELECT 1 FROM hold_invoices WHERE hold_invoices.quote_id = quotes.quote_id
+            ) LIMIT 1
+            """
+        ).fetchone()
+        if quote_without_hold is not None:
+            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
+        self._verify_ledger_structure(self._connection)
+        if self._ledger_mode(self._connection) == _STANDALONE_MODE:
+            self._verify_standalone_ledger(self._connection)
+            return
+        self._verify_wallet_ledger(self._connection, readonly=readonly, rebind_paths=rebind_paths)
+
+    @classmethod
+    def _ledger_header(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> tuple[LedgerMode, tuple[str, str] | None]:
+        """Read mode and its indivisible requirement in one metadata snapshot."""
+        rows = connection.execute(
+            "SELECT key, value FROM metadata WHERE key IN (?, ?, ?)",
+            ("ledger_mode", _ADVERTISEMENT_NETWORK_KEY, _ADVERTISEMENT_WALLET_KEY),
+        ).fetchall()
+        values = {row["key"]: row["value"] for row in rows}
+        if len(values) != len(rows):
+            raise MarketStoreCorruptError("market ledger metadata has duplicate keys")
+        mode = values.get("ledger_mode")
+        if mode == _BOUND_ADVERTISEMENT_MODE:
+            network, wallet = (
+                values.get(_ADVERTISEMENT_NETWORK_KEY),
+                values.get(_ADVERTISEMENT_WALLET_KEY),
+            )
+            if (
+                not isinstance(network, str)
+                or network not in get_args(BitcoinNetwork)
+                or not isinstance(wallet, str)
+            ):
+                raise MarketStoreCorruptError("bound advertisement metadata is incomplete")
+            try:
+                cls._require_hex32(wallet, "advertisement wallet_id")
+            except ValueError as exc:
+                raise MarketStoreCorruptError(
+                    "bound advertisement wallet identity is invalid"
+                ) from exc
+            return cast(LedgerMode, _WALLET_MODE), (wallet, network)
+        if (
+            mode not in (_STANDALONE_MODE, _WALLET_MODE)
+            or _ADVERTISEMENT_NETWORK_KEY in values
+            or _ADVERTISEMENT_WALLET_KEY in values
+        ):
+            raise MarketStoreCorruptError(_UNSUPPORTED_SCHEMA_MESSAGE)
+        return cast(LedgerMode, mode), None
+
+    @classmethod
+    def _ledger_mode(cls, connection: sqlite3.Connection) -> LedgerMode:
+        """Project the compatible public mode without discarding required metadata."""
+        return cls._ledger_header(connection)[0]
+
+    @classmethod
+    def _advertisement_binding(cls, connection: sqlite3.Connection) -> tuple[str, str] | None:
+        return cls._ledger_header(connection)[1]
+
+    def _check_advertisement_binding(
+        self, connection: sqlite3.Connection
+    ) -> tuple[str, str] | None:
+        binding = self._advertisement_binding(connection)
+        observed = getattr(self, "_observed_advertisement_binding", None)
+        if observed is not None and observed != binding:
+            raise MarketStoreCorruptError("required advertisement binding changed or disappeared")
+        if binding is not None:
+            self._observed_advertisement_binding = binding
+        return binding
+
+    def _verify_standalone_ledger(self, connection: sqlite3.Connection) -> None:
+        """Require that no partially written wallet activation exists."""
+        if self._has_activation_residue(connection) or self._intent_artifact_exists():
+            raise MarketStoreCorruptError(
+                "standalone store has interrupted wallet ledger activation"
+            )
+        self._verify_podle_ownership(connection)
+
+    @staticmethod
+    def _has_activation_residue(connection: sqlite3.Connection) -> bool:
+        return (
+            connection.execute(
+                """
+                SELECT 1 FROM metadata WHERE key IN ('commitments_path', 'commitments_rebind')
+                UNION ALL
+                SELECT 1 FROM wallet_ledger
+                LIMIT 1
+                """
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _table_names(connection: sqlite3.Connection) -> set[str]:
+        return {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    @staticmethod
+    def _has_foreign_key(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        target_table: str,
+        target_column: str,
+    ) -> bool:
+        return any(
+            row["from"] == column and row["table"] == target_table and row["to"] == target_column
+            for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        )
+
+    @staticmethod
+    def _has_unique_key(
+        connection: sqlite3.Connection, table: str, columns: tuple[str, ...]
+    ) -> bool:
+        table_columns = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        primary_key = tuple(
+            str(row["name"])
+            for row in sorted(table_columns, key=lambda row: int(row["pk"]))
+            if int(row["pk"]) > 0
+        )
+        if primary_key == columns:
+            return True
+        for index in connection.execute(f"PRAGMA index_list({table})"):
+            if not int(index["unique"]) or int(index["partial"]):
+                continue
+            index_columns = tuple(
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM pragma_index_info(?) ORDER BY seqno", (index["name"],)
+                )
+            )
+            if index_columns == columns:
+                return True
+        return False
+
+    def _require_wallet_ledger(
+        self, connection: sqlite3.Connection, expected_path: Path | None = None
+    ) -> Path:
+        if self._ledger_mode(connection) != _WALLET_MODE:
+            raise MarketStoreError("wallet ledger has not been activated")
+        return self._wallet_ledger_path(connection, expected_path)
+
+    @classmethod
+    def _verify_ledger_structure(cls, connection: sqlite3.Connection) -> None:
+        expected_columns = {
+            "wallet_ledger": {"wallet_id", "state"},
+            "podle_ownership": {"commitment", "wallet_id", "state", "inventory_id"},
+            "inventory": {
+                "id",
+                "product",
+                "resource",
+                "credential",
+                "certificate_pubkey",
+                "state",
+                "reservation_quote_id",
+                "wallet_id",
+            },
+        }
+        for table, columns in expected_columns.items():
+            if not columns.issubset(cls._table_columns(connection, table)):
+                raise MarketStoreCorruptError("wallet ledger table has an invalid layout")
+        if (
+            not cls._has_unique_key(connection, "wallet_ledger", ("wallet_id",))
+            or not cls._has_unique_key(connection, "podle_ownership", ("commitment",))
+            or not cls._has_unique_key(connection, "podle_ownership", ("inventory_id",))
+            or not cls._has_foreign_key(
+                connection, "inventory", "wallet_id", "wallet_ledger", "wallet_id"
+            )
+            or not cls._has_foreign_key(
+                connection, "podle_ownership", "wallet_id", "wallet_ledger", "wallet_id"
+            )
+            or not cls._has_foreign_key(
+                connection, "podle_ownership", "inventory_id", "inventory", "id"
+            )
+        ):
+            raise MarketStoreCorruptError("wallet ledger foreign keys are missing")
+
+    @classmethod
+    def _verify_podle_ownership(cls, connection: sqlite3.Connection) -> None:
+        """Require that every PoDLE row agrees with its market inventory row."""
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise MarketStoreCorruptError("wallet ledger foreign key check failed")
+        ownership_rows = connection.execute(
+            """
+            SELECT ownership.commitment, ownership.wallet_id, ownership.state,
+                   ownership.inventory_id, inventory.product, inventory.resource,
+                   inventory.wallet_id AS inventory_wallet_id
+            FROM podle_ownership AS ownership
+            LEFT JOIN inventory ON inventory.id = ownership.inventory_id
+            """
+        ).fetchall()
+        for ownership in ownership_rows:
+            try:
+                cls._require_hex32(str(ownership["commitment"]), "stored commitment")
+            except ValueError as exc:
+                raise MarketStoreCorruptError("wallet ledger commitment is invalid") from exc
+            state = ownership["state"]
+            if state not in ("held_local", "used", "market_inventory"):
+                raise MarketStoreCorruptError("PoDLE ownership state is invalid")
+            if state == "market_inventory":
+                if (
+                    ownership["inventory_id"] is None
+                    or ownership["product"] != "podle"
+                    or ownership["resource"] != ownership["commitment"]
+                    or ownership["inventory_wallet_id"] != ownership["wallet_id"]
+                ):
+                    raise MarketStoreCorruptError("market PoDLE ownership does not match inventory")
+            elif ownership["inventory_id"] is not None:
+                raise MarketStoreCorruptError("local PoDLE ownership references market inventory")
+        inventory_rows = connection.execute(
+            """
+            SELECT inventory.id, inventory.resource, inventory.wallet_id,
+                   ownership.commitment, ownership.wallet_id AS ownership_wallet_id,
+                   ownership.state, ownership.inventory_id
+            FROM inventory
+            LEFT JOIN podle_ownership AS ownership ON ownership.inventory_id = inventory.id
+            WHERE inventory.product = 'podle'
+            """
+        ).fetchall()
+        for inventory in inventory_rows:
+            if (
+                inventory["commitment"] != inventory["resource"]
+                or inventory["ownership_wallet_id"] != inventory["wallet_id"]
+                or inventory["state"] != "market_inventory"
+                or inventory["inventory_id"] != inventory["id"]
+            ):
+                raise MarketStoreCorruptError("market inventory has no matching PoDLE ownership")
+
+    def _verify_wallet_ledger(
+        self,
+        connection: sqlite3.Connection,
+        expected_path: Path | None = None,
+        *,
+        readonly: bool = False,
+        rebind_paths: tuple[Path, Path] | None = None,
+    ) -> Path:
+        if self._ledger_mode(connection) != _WALLET_MODE:
+            raise MarketStoreError("wallet ledger has not been activated")
+        self._verify_ledger_structure(connection)
+        wallet_states: set[str] = set()
+        for row in connection.execute("SELECT wallet_id, state FROM wallet_ledger"):
+            try:
+                self._require_hex32(str(row["wallet_id"]), "stored wallet_id")
+            except ValueError as exc:
+                raise MarketStoreCorruptError("wallet ledger wallet_id is invalid") from exc
+            if row["state"] not in ("disabled", "activating", "ready", "recovery_required"):
+                raise MarketStoreCorruptError("wallet ledger state is invalid")
+            wallet_states.add(str(row["state"]))
+        if not wallet_states or wallet_states == {"disabled"}:
+            raise MarketStoreCorruptError("wallet ledger has no activation state")
+        self._verify_podle_ownership(connection)
+        return self._wallet_ledger_path(
+            connection, expected_path, readonly=readonly, rebind_paths=rebind_paths
+        )
+
+    def _wallet_ledger_path(
+        self,
+        connection: sqlite3.Connection,
+        expected_path: Path | None = None,
+        *,
+        readonly: bool = False,
+        rebind_paths: tuple[Path, Path] | None = None,
+    ) -> Path:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'commitments_path'"
+        ).fetchone()
+        if row is None or not isinstance(row["value"], str):
+            raise MarketStoreCorruptError("wallet ledger commitments path is missing")
+        try:
+            metadata_path = self._canonical_commitments_path(Path(row["value"]))
+        except (MarketStoreError, TypeError, ValueError) as exc:
+            raise MarketStoreCorruptError("wallet ledger commitments path is invalid") from exc
+        if str(metadata_path) != row["value"]:
+            raise MarketStoreCorruptError("wallet ledger commitments path is not canonical")
+        if (
+            self._check_advertisement_binding(connection) is not None
+            and self.path.resolve() != get_market_store_path(metadata_path.parent.parent).resolve()
+        ):
+            raise MarketStoreCorruptError(
+                "bound advertisement ledger data-directory binding changed"
+            )
+        intent_path = self._read_wallet_intent(readonly=readonly)
+        pending = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'commitments_rebind'"
+        ).fetchone()
+        if pending is not None:
+            if rebind_paths is None:
+                raise MarketStoreCorruptError(
+                    "wallet ledger rebinding requires explicit completion"
+                )
+            source, target = rebind_paths
+            marker = canonical({"from": str(source), "to": str(target)}).decode("ascii")
+            if pending["value"] != marker or (metadata_path, intent_path) not in (
+                (source, source),
+                (target, source),
+                (target, target),
+            ):
+                raise MarketStoreCorruptError("wallet ledger rebinding artifacts do not match")
+            return metadata_path
+        if intent_path != metadata_path:
+            raise MarketStoreCorruptError("wallet ledger intent does not match database binding")
+        if rebind_paths is not None and metadata_path not in rebind_paths:
+            raise MarketStoreError("previous commitments path does not match wallet ledger binding")
+        if expected_path is not None and metadata_path != expected_path:
+            raise MarketStoreError("commitments path does not match wallet ledger binding")
+        return metadata_path
+
+    def _intent_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.wallet-ledger")
+
+    def _intent_artifact_exists(self) -> bool:
+        return os.path.lexists(self._intent_path())
+
+    @staticmethod
+    def _canonical_commitments_path(path: Path) -> Path:
+        if not isinstance(path, Path):
+            raise TypeError("commitments_path must be a pathlib.Path")
+        if ".." in path.parts:
+            raise ValueError("commitments_path must not contain parent traversal")
+        if path.is_symlink():
+            raise MarketStoreError("commitments_path must not be a symlink")
+        try:
+            canonical_path = path.resolve(strict=False)
+        except OSError as exc:
+            raise MarketStoreError("could not canonicalize commitments_path") from exc
+        if canonical_path.is_symlink():
+            raise MarketStoreError("commitments_path must not be a symlink")
+        return canonical_path
+
+    @staticmethod
+    def _wallet_intent_bytes(commitments_path: Path) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "commitments_path": str(commitments_path),
+                    "version": _WALLET_LEDGER_INTENT_VERSION,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            + b"\n"
+        )
+
+    def _write_wallet_intent(self, commitments_path: Path) -> None:
+        intent_path = self._intent_path()
+        if intent_path.is_symlink():
+            raise MarketStoreCorruptError("wallet ledger intent must not be a symlink")
+        try:
+            atomic_write_private(intent_path, self._wallet_intent_bytes(commitments_path))
+            self._fsync_parent(intent_path.parent)
+        except OSError as exc:
+            raise MarketStoreError("could not durably write wallet ledger intent") from exc
+
+    @staticmethod
+    def _fsync_parent(path: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _read_wallet_intent(self, *, readonly: bool = False) -> Path:
+        intent_path = self._intent_path()
+        if not self._intent_artifact_exists() or intent_path.is_symlink():
+            raise MarketStoreCorruptError("wallet ledger intent is missing or invalid")
+        try:
+            if readonly:
+                descriptor = os.open(
+                    intent_path,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
+                )
+                try:
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise OSError("wallet ledger intent must be a regular file")
+                    with os.fdopen(descriptor, "rb") as intent_file:
+                        descriptor = -1
+                        raw = intent_file.read()
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+            else:
+                raw = read_private_file(intent_path)
+            data = json.loads(raw)
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"version", "commitments_path"}
+                or data["version"] != _WALLET_LEDGER_INTENT_VERSION
+                or not isinstance(data["commitments_path"], str)
+            ):
+                raise ValueError("invalid wallet ledger intent")
+            commitments_path = self._canonical_commitments_path(Path(data["commitments_path"]))
+            if str(commitments_path) != data["commitments_path"]:
+                raise ValueError("wallet ledger intent path is not canonical")
+            if raw != self._wallet_intent_bytes(commitments_path):
+                raise ValueError("wallet ledger intent is not canonical JSON")
+            return commitments_path
+        except (MarketStoreError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MarketStoreCorruptError("wallet ledger intent is invalid") from exc
+
+    def _activate_wallet_locked(
+        self,
+        commitments_path: Path,
+        bound_advertisements_network: str | None = None,
+    ) -> None:
+        mode = self._ledger_mode(self._connection)
+        binding = self._check_advertisement_binding(self._connection)
+        if binding is not None and (
+            binding[0] != self.wallet_id
+            or (
+                bound_advertisements_network is not None
+                and binding[1] != bound_advertisements_network
+            )
+        ):
+            raise MarketStoreConflictError(
+                "bound advertisement activation identity/network mismatch"
+            )
+        if mode == _WALLET_MODE and binding is None and bound_advertisements_network is not None:
+            raise MarketStoreError(
+                "existing wallet ledgers cannot acquire fresh history implicitly"
+            )
+        if mode == _WALLET_MODE:
+            self._verify_wallet_ledger(self._connection, commitments_path)
+            state = self._wallet_state_for_connection(self._connection, self.wallet_id)
+            if state == "ready":
+                return
+            if state in ("activating", "recovery_required"):
+                raise MarketStoreUnavailableError("wallet ledger requires explicit recovery")
+        else:
+            # The durable intent precedes the mode switch, so an interrupted
+            # activation fails closed instead of reopening as a standalone store.
+            self._write_wallet_intent(commitments_path)
+
+        with self._transaction() as connection:
+            if self._ledger_mode(connection) == _STANDALONE_MODE:
+                self._enter_wallet_mode(connection, commitments_path, bound_advertisements_network)
+            else:
+                self._require_wallet_ledger(connection, commitments_path)
+            state = self._wallet_state_for_connection(connection, self.wallet_id)
+            if state == "ready":
+                return
+            if state in ("activating", "recovery_required"):
+                raise MarketStoreUnavailableError("wallet ledger requires explicit recovery")
+            self._ensure_wallet_row(connection, self.wallet_id)
+            connection.execute(
+                "UPDATE wallet_ledger SET state = 'activating' WHERE wallet_id = ?",
+                (self.wallet_id,),
+            )
+
+        try:
+            used, external = self._read_commitments_history(commitments_path)
+            with self._transaction() as connection:
+                self._require_wallet_ledger(connection, commitments_path)
+                if self._wallet_state_for_connection(connection, self.wallet_id) != "activating":
+                    raise MarketStoreCorruptError(
+                        "wallet ledger activation state changed unexpectedly"
+                    )
+                self._import_commitments_history(connection, used, external)
+                connection.execute(
+                    "UPDATE wallet_ledger SET state = 'ready' WHERE wallet_id = ?",
+                    (self.wallet_id,),
+                )
+        except Exception:
+            self._set_recovery_required_after_activation_failure(commitments_path)
+            raise
+
+    def _recover_wallet_locked(self, commitments_path: Path) -> None:
+        self._verify_schema()
+        if self._check_advertisement_binding(self._connection) is not None:
+            raise MarketStoreUnavailableError(
+                "bound advertisement history requires coupled recovery"
+            )
+        if self._ledger_mode(self._connection) != _WALLET_MODE:
+            raise MarketStoreError("wallet ledger has not been activated")
+        self._verify_wallet_ledger(self._connection, commitments_path)
+        state = self._wallet_state_for_connection(self._connection, self.wallet_id)
+        if state == "ready":
+            return
+        if state == "disabled":
+            raise MarketStoreUnavailableError("wallet ledger must be activated before recovery")
+        if state not in ("activating", "recovery_required"):
+            raise MarketStoreCorruptError("wallet ledger recovery state is invalid")
+
+        # Persist the fail-closed state before looking at caller-confirmed history.
+        with self._transaction() as connection:
+            self._verify_schema()
+            self._verify_wallet_ledger(connection, commitments_path)
+            state = self._wallet_state_for_connection(connection, self.wallet_id)
+            if state == "ready":
+                return
+            if state == "disabled":
+                raise MarketStoreUnavailableError("wallet ledger must be activated before recovery")
+            if state not in ("activating", "recovery_required"):
+                raise MarketStoreCorruptError("wallet ledger recovery state is invalid")
+            connection.execute(
+                "UPDATE wallet_ledger SET state = 'recovery_required' WHERE wallet_id = ?",
+                (self.wallet_id,),
+            )
+
+        used, external = self._read_commitments_history(commitments_path, require_existing=True)
+        with self._transaction() as connection:
+            self._verify_schema()
+            self._verify_wallet_ledger(connection, commitments_path)
+            if self._wallet_state_for_connection(connection, self.wallet_id) != "recovery_required":
+                raise MarketStoreCorruptError("wallet ledger recovery state changed unexpectedly")
+            self._import_commitments_history(connection, used, external)
+            connection.execute(
+                "UPDATE wallet_ledger SET state = 'ready' WHERE wallet_id = ?",
+                (self.wallet_id,),
+            )
+
+    def _enter_wallet_mode(
+        self,
+        connection: sqlite3.Connection,
+        commitments_path: Path,
+        bound_advertisements_network: str | None = None,
+    ) -> None:
+        """Bind this store to one wallet by recording the mode and its binding.
+
+        The schema already carries every ledger table, so activation only makes
+        the explicit wallet mode and its commitments binding durable.
+        """
+        if self._has_activation_residue(connection):
+            raise MarketStoreCorruptError(
+                "standalone store has interrupted wallet ledger activation"
+            )
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'ledger_mode'",
+            (_WALLET_MODE if bound_advertisements_network is None else _BOUND_ADVERTISEMENT_MODE,),
+        )
+        if bound_advertisements_network is not None:
+            connection.executemany(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                (
+                    (_ADVERTISEMENT_NETWORK_KEY, bound_advertisements_network),
+                    (_ADVERTISEMENT_WALLET_KEY, self.wallet_id),
+                ),
+            )
+        connection.execute(
+            "INSERT INTO metadata (key, value) VALUES ('commitments_path', ?)",
+            (str(commitments_path),),
+        )
+
+    def _read_commitments_history(
+        self, commitments_path: Path, *, require_existing: bool = False
+    ) -> tuple[set[str], dict[str, ExternalPoDLE]]:
+        if not require_existing and not commitments_path.exists():
+            if commitments_path.is_symlink():
+                raise MarketStoreCorruptError("commitments path must not be a symlink")
+            return set(), {}
+        try:
+            raw = read_private_file(commitments_path)
+            data = json.loads(raw)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MarketStoreCorruptError("could not read commitments history") from exc
+        if not isinstance(data, dict):
+            raise MarketStoreCorruptError("commitments history must be a JSON object")
+        used = data.get("used")
+        external_v1 = data.get("external_v1", {})
+        if not isinstance(used, list) or not isinstance(external_v1, dict):
+            raise MarketStoreCorruptError("commitments history has an invalid PoDLE section")
+        imported_used: set[str] = set()
+        for commitment in used:
+            try:
+                self._require_hex32(commitment, "used commitment")
+            except ValueError as exc:
+                raise MarketStoreCorruptError(
+                    "commitments history has an invalid used commitment"
+                ) from exc
+            imported_used.add(commitment)
+        imported_external: dict[str, ExternalPoDLE] = {}
+        for commitment, record_data in external_v1.items():
+            if not isinstance(commitment, str) or not isinstance(record_data, dict):
+                raise MarketStoreCorruptError("commitments history has an invalid external PoDLE")
+            try:
+                self._require_hex32(commitment, "external commitment")
+                record = ExternalPoDLE.model_validate(record_data)
+            except (ValidationError, ValueError) as exc:
+                raise MarketStoreCorruptError(
+                    "commitments history has an invalid external PoDLE"
+                ) from exc
+            if record.commitment != commitment:
+                raise MarketStoreCorruptError("external PoDLE key does not match its commitment")
+            imported_external[commitment] = record
+        return imported_used, imported_external
+
+    @staticmethod
+    def _require_existing_regular_commitments_history(commitments_path: Path) -> None:
+        try:
+            history = os.lstat(commitments_path)
+        except FileNotFoundError as exc:
+            raise MarketStoreError("commitments history must exist for recovery") from exc
+        except OSError as exc:
+            raise MarketStoreError("could not inspect commitments history for recovery") from exc
+        if not stat.S_ISREG(history.st_mode):
+            raise MarketStoreError("commitments history must be a regular file for recovery")
+
+    def _import_commitments_history(
+        self,
+        connection: sqlite3.Connection,
+        used: set[str],
+        external: dict[str, ExternalPoDLE],
+    ) -> None:
+        for commitment in sorted(used):
+            row = self._ownership_row(connection, commitment)
+            if row is not None and row["state"] == "market_inventory":
+                raise MarketStoreCorruptError("used commitment collides with market inventory")
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO podle_ownership (commitment, wallet_id, state, inventory_id)
+                    VALUES (?, NULL, 'used', NULL)
+                    """,
+                    (commitment,),
+                )
+            elif row["state"] == "held_local":
+                connection.execute(
+                    """
+                    UPDATE podle_ownership
+                    SET state = 'used', inventory_id = NULL
+                    WHERE commitment = ?
+                    """,
+                    (commitment,),
+                )
+        for commitment in sorted(external):
+            if commitment in used:
+                continue
+            row = self._ownership_row(connection, commitment)
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO podle_ownership (commitment, wallet_id, state, inventory_id)
+                    VALUES (?, NULL, 'held_local', NULL)
+                    """,
+                    (commitment,),
+                )
+                continue
+            if row["state"] == "market_inventory":
+                raise MarketStoreCorruptError("external PoDLE collides with market inventory")
+            if row["state"] == "used":
+                continue
+            # This shared JSON projection may include another wallet's hold.
+            # Its existing authoritative owner remains unchanged across switches.
+
+    def _set_recovery_required_after_activation_failure(self, commitments_path: Path) -> None:
+        try:
+            with self._transaction() as connection:
+                self._require_wallet_ledger(connection, commitments_path)
+                self._ensure_wallet_row(connection, self.wallet_id)
+                connection.execute(
+                    "UPDATE wallet_ledger SET state = 'recovery_required' WHERE wallet_id = ?",
+                    (self.wallet_id,),
+                )
+        except Exception:
+            # The committed activating state remains fail-closed if recovery marking cannot persist.
+            pass
+
+    def _ownership_row(self, connection: sqlite3.Connection, commitment: str) -> sqlite3.Row | None:
+        ownership = cast(
+            sqlite3.Row | None,
+            connection.execute(
+                "SELECT commitment, wallet_id, state, inventory_id FROM podle_ownership WHERE commitment = ?",
+                (commitment,),
+            ).fetchone(),
+        )
+        if ownership is not None:
+            return ownership
+        inventory = connection.execute(
+            """
+            SELECT id FROM inventory
+            WHERE product = 'podle' AND resource = ?
+            """,
+            (commitment,),
+        ).fetchone()
+        if inventory is not None:
+            raise MarketStoreCorruptError("market inventory has no matching PoDLE ownership")
+        return None
+
+    @staticmethod
+    def _ensure_wallet_row(connection: sqlite3.Connection, wallet_id: str | None) -> None:
+        if wallet_id is None:
+            return
+        connection.execute(
+            "INSERT INTO wallet_ledger (wallet_id, state) VALUES (?, 'disabled') ON CONFLICT DO NOTHING",
+            (wallet_id,),
+        )
+
+    def _ensure_bound_wallet_disabled_row(self, connection: sqlite3.Connection) -> None:
+        self._ensure_wallet_row(connection, self.wallet_id)
+
+    @staticmethod
+    def _wallet_state_for_connection(
+        connection: sqlite3.Connection, wallet_id: str | None
+    ) -> Literal["disabled", "activating", "ready", "recovery_required"]:
+        if wallet_id is None:
+            return "disabled"
+        row = connection.execute(
+            "SELECT state FROM wallet_ledger WHERE wallet_id = ?", (wallet_id,)
+        ).fetchone()
+        if row is None:
+            return "disabled"
+        state = row["state"]
+        if state not in ("disabled", "activating", "ready", "recovery_required"):
+            raise MarketStoreCorruptError("wallet ledger state is invalid")
+        return cast(Literal["disabled", "activating", "ready", "recovery_required"], state)
+
+    def _require_seller_wallet_ready(self, connection: sqlite3.Connection) -> bool:
+        if self._ledger_mode(connection) == _STANDALONE_MODE:
+            return False
+        self._require_wallet_ledger(connection)
+        if (
+            self.wallet_id is None
+            or self._wallet_state_for_connection(connection, self.wallet_id) != "ready"
+        ):
+            raise MarketStoreUnavailableError("wallet ledger is not ready for market issuance")
+        binding = self._check_advertisement_binding(connection)
+        if binding is not None and binding[0] != self.wallet_id:
+            raise MarketStoreConflictError("bound advertisement ledger belongs to another wallet")
+        return True
+
+    def _require_local_ledger_access(
+        self, connection: sqlite3.Connection, *, mutation: bool
+    ) -> bool:
+        self._require_wallet_ledger(connection)
+        if self.wallet_id is not None:
+            state = self._wallet_state_for_connection(connection, self.wallet_id)
+            if state in ("activating", "recovery_required"):
+                if mutation:
+                    raise MarketStoreUnavailableError(
+                        "wallet ledger is not available for local use"
+                    )
+                return False
+            return True
+        blocked = connection.execute(
+            """
+            SELECT 1 FROM wallet_ledger
+            WHERE state IN ('activating', 'recovery_required') LIMIT 1
+            """
+        ).fetchone()
+        if blocked is not None:
+            if mutation:
+                raise MarketStoreUnavailableError(
+                    "wallet identity is required while recovery is pending"
+                )
+            return False
+        return True
+
+    def _require_quote_wallet_ownership(
+        self, connection: sqlite3.Connection, quote: sqlite3.Row
+    ) -> None:
+        inventory = connection.execute(
+            "SELECT wallet_id FROM inventory WHERE id = ?", (int(quote["inventory_id"]),)
+        ).fetchone()
+        if inventory is None:
+            raise MarketStoreCorruptError("quote inventory is missing")
+        if inventory["wallet_id"] not in (None, self.wallet_id):
+            raise MarketStoreUnavailableError("quote inventory belongs to a different wallet")
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        if self._closed:
+            raise MarketStoreError("market store is closed")
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                yield self._connection
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+            finally:
+                self._harden_permissions()
+
+    def _harden_permissions(self) -> None:
+        try:
+            os.chmod(self.path, 0o600)
+            for suffix in ("-journal", "-wal", "-shm"):
+                journal = self.path.with_name(f"{self.path.name}{suffix}")
+                if journal.exists():
+                    os.chmod(journal, 0o600)
+        except OSError as exc:
+            raise MarketStoreError("could not secure private market store files") from exc
+
+    @staticmethod
+    def _require_int(value: int, name: str, *, minimum: int, maximum: int | None = None) -> None:
+        if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+            maximum_message = f" and at most {maximum}" if maximum is not None else ""
+            raise ValueError(f"{name} must be an integer at least {minimum}{maximum_message}")
+
+    @staticmethod
+    def _require_hex32(value: str, name: str) -> None:
+        if not isinstance(value, str) or len(value) != _HEX32_LENGTH:
+            raise ValueError(f"{name} must be 32 bytes of lowercase hexadecimal")
+        try:
+            decoded = bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be 32 bytes of lowercase hexadecimal") from exc
+        if value != decoded.hex():
+            raise ValueError(f"{name} must be 32 bytes of lowercase hexadecimal")
+
+    @staticmethod
+    def _require_product(product: Product) -> None:
+        if product not in ("podle", "bond"):
+            raise ValueError("product must be podle or bond")
+
+    @staticmethod
+    def _require_rail(rail: str) -> None:
+        if rail != "lightning":
+            raise ValueError("rail must be lightning")
+
+    @staticmethod
+    def _require_opaque_identifier(value: str, name: str, maximum: int) -> None:
+        if not isinstance(value, str) or not value or len(value) > maximum or not value.isascii():
+            raise ValueError(
+                f"{name} must be a non-empty ASCII string no longer than {maximum} bytes"
+            )
+
+    def _require_request_id(self, request_id: str) -> None:
+        if not isinstance(request_id, str) or len(request_id) != _MAX_REQUEST_ID_LENGTH:
+            raise ValueError("request_id must be 16 bytes of lowercase hexadecimal")
+        try:
+            decoded = bytes.fromhex(request_id)
+        except ValueError as exc:
+            raise ValueError("request_id must be 16 bytes of lowercase hexadecimal") from exc
+        if request_id != decoded.hex():
+            raise ValueError("request_id must be 16 bytes of lowercase hexadecimal")
+
+    @staticmethod
+    def _require_signed_document(document: SignedDocument, name: str) -> None:
+        if not isinstance(document, SignedDocument):
+            raise TypeError(f"{name} must be a SignedDocument")
+
+    @staticmethod
+    def _seller_pubkey(seller_key: CKey | BoundMarketKeys) -> str:
+        if isinstance(seller_key, BoundMarketKeys):
+            return seller_key.signing_public_key().hex()
+        if isinstance(seller_key, CKey):
+            return bytes(seller_key.pub).hex()
+        raise TypeError("seller_key must be a CKey or BoundMarketKeys")
+
+    @staticmethod
+    def _sign_document(body: MarketModel, seller_key: CKey | BoundMarketKeys) -> SignedDocument:
+        if isinstance(seller_key, BoundMarketKeys):
+            return seller_key.sign_document(body)
+        return sign_document(body, seller_key)
+
+    def _require_bound_seller_wallet(
+        self,
+        connection: sqlite3.Connection,
+        seller_key: CKey | BoundMarketKeys,
+        wallet_ledger: bool,
+    ) -> None:
+        binding = self._check_advertisement_binding(connection)
+        if not isinstance(seller_key, BoundMarketKeys):
+            if binding is not None:
+                raise MarketStoreUnavailableError("bound advertisement ledger requires wallet keys")
+            return
+        if not wallet_ledger or self.wallet_id is None:
+            raise MarketStoreUnavailableError("wallet-bound seller requires a ready wallet ledger")
+        if seller_key.wallet_id != self.wallet_id:
+            raise MarketStoreConflictError("wallet-bound seller does not match the store wallet")
+        if binding is not None and seller_key.scope.network != binding[1]:
+            raise MarketStoreConflictError("wallet-bound seller network does not match the ledger")
+
+    @staticmethod
+    def _validate_sealed_box_pubkey(value: str) -> None:
+        try:
+            recipient = PublicKey(bytes.fromhex(value))
+            SealedBox(recipient).encrypt(b"")
+        except (CryptoError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("buyer_pubkey must be a valid X25519 public key") from exc
+
+    def _validate_certificate_pubkey(
+        self, product: Product, certificate_pubkey: str | None
+    ) -> None:
+        if product == "bond":
+            if certificate_pubkey is None:
+                raise ValueError("bond quotes require certificate_pubkey")
+            self._require_compressed_pubkey(certificate_pubkey, "certificate_pubkey")
+        elif certificate_pubkey is not None:
+            raise ValueError("podle quotes cannot include certificate_pubkey")
+
+    @staticmethod
+    def _require_compressed_pubkey(value: str, name: str) -> None:
+        if not isinstance(value, str) or len(value) != 66 or value[:2] not in ("02", "03"):
+            raise ValueError(f"{name} must be a compressed lowercase secp256k1 public key")
+        try:
+            decoded = bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a compressed lowercase secp256k1 public key") from exc
+        if value != decoded.hex() or not CPubKey(decoded).is_fullyvalid():
+            raise ValueError(f"{name} must be a compressed lowercase secp256k1 public key")
+
+    def _validate_inventory_credential(
+        self,
+        product: Product,
+        resource: str,
+        credential: dict[str, Any] | None,
+    ) -> tuple[bytes | None, str | None]:
+        if product == "podle":
+            if type(credential) is not dict:
+                raise ValueError("podle inventory requires a credential dict")
+            try:
+                podle = ExternalPoDLE.model_validate(credential)
+            except ValidationError as exc:
+                raise MarketError("invalid PoDLE inventory credential") from exc
+            if podle.commitment != resource:
+                raise MarketError("PoDLE inventory resource does not match credential")
+            if podle.index >= MARKET_PODLE_RETRIES:
+                raise MarketError("Market PoDLE index exceeds the standard maker retry range")
+            return canonical(podle), None
+        if credential is None:
+            return None, None
+        if type(credential) is not dict:
+            raise TypeError("credential must be a dict or None")
+        try:
+            bond = BondCredential.model_validate(credential)
+            bond.verify()
+        except (MarketError, ValidationError, ValueError) as exc:
+            raise MarketError("invalid bond inventory credential") from exc
+        if resource != bond_resource(bond.bond, bond.cert_expiry - 1):
+            raise MarketError("bond inventory resource does not match credential period")
+        self._require_compressed_pubkey(bond.cert_pubkey, "bond certificate public key")
+        return canonical(bond), bond.cert_pubkey
+
+    def _validate_authorization(
+        self,
+        authorization: SignedDocument,
+        seller_pubkey: str,
+        height: int,
+    ) -> MarketAuthorization:
+        try:
+            authority = verify_authorization(authorization)
+        except (MarketError, ValidationError, ValueError) as exc:
+            raise MarketError("invalid seller authorization") from exc
+        self._require_matching_seller(authority, seller_pubkey)
+        if authority.period != period_at_height(height):
+            raise MarketStoreExpiredError("authorization is from a different retarget period")
+        return authority
+
+    @staticmethod
+    def _require_matching_seller(authority: MarketAuthorization, seller_pubkey: str) -> None:
+        if authority.seller_pubkey != seller_pubkey:
+            raise MarketStoreConflictError("seller key does not match authorization")
+
+    def _select_inventory(
+        self,
+        connection: sqlite3.Connection,
+        authority: MarketAuthorization,
+        product: Product,
+        certificate_pubkey: str | None,
+        *,
+        min_backing_sats: int | None = None,
+        backing_sats: BackingLookup | None = None,
+        require_backing: bool = False,
+    ) -> sqlite3.Row | None:
+        # Unowned rows belong to a standalone store; owned rows require this wallet.
+        if product == "podle":
+            rows = connection.execute(
+                """
+                SELECT inventory.id, inventory.resource, inventory.credential
+                FROM inventory
+                JOIN podle_ownership ON podle_ownership.inventory_id = inventory.id
+                WHERE inventory.product = 'podle' AND inventory.state = 'available'
+                  AND podle_ownership.state = 'market_inventory'
+                  AND (podle_ownership.wallet_id IS NULL OR podle_ownership.wallet_id = ?)
+                ORDER BY inventory.id
+                """,
+                (self.wallet_id,),
+            )
+            if min_backing_sats is None and not require_backing:
+                return cast(sqlite3.Row | None, rows.fetchone())
+            if backing_sats is None:
+                return None
+            minimum = min_backing_sats or 1
+            for row in rows:
+                outpoint = json.loads(bytes(row["credential"]))["outpoint"]
+                value = backing_sats(outpoint["txid"], outpoint["vout"])
+                if value is not None and value >= minimum:
+                    return cast(sqlite3.Row, row)
+            return None
+        expected_resource = bond_resource(authority.bond, authority.period)
+        return cast(
+            sqlite3.Row | None,
+            connection.execute(
+                """
+                SELECT id, resource, credential FROM inventory
+                WHERE product = 'bond' AND resource = ? AND state = 'available'
+                  AND (certificate_pubkey IS NULL OR certificate_pubkey = ?)
+                  AND (wallet_id IS NULL OR wallet_id = ?)
+                ORDER BY id
+                LIMIT 1
+                """,
+                (expected_resource, certificate_pubkey, self.wallet_id),
+            ).fetchone(),
+        )
+
+    @staticmethod
+    def _expire_live_quotes(connection: sqlite3.Connection, now: int) -> None:
+        """Mark stale quotes expired.
+
+        Inventory stays reserved until LND confirms
+        the invoice canceled (:meth:`complete_hold_cancel`); an HTLC may still be
+        accepted until the invoice itself expires.
+        """
+        expired = connection.execute(
+            "SELECT quote_id FROM quotes WHERE state = 'live' AND expires_at <= ?",
+            (now,),
+        ).fetchall()
+        for row in expired:
+            connection.execute(
+                "UPDATE quotes SET state = 'expired' WHERE quote_id = ? AND state = 'live'",
+                (str(row["quote_id"]),),
+            )
+
+    @staticmethod
+    def _hold_row(connection: sqlite3.Connection, quote_id: str) -> sqlite3.Row | None:
+        return cast(
+            sqlite3.Row | None,
+            connection.execute(
+                "SELECT * FROM hold_invoices WHERE quote_id = ?", (quote_id,)
+            ).fetchone(),
+        )
+
+    @staticmethod
+    def _hold_reservation(row: sqlite3.Row) -> HoldReservation:
+        return HoldReservation(
+            quote_id=str(row["quote_id"]),
+            payment_hash=bytes.fromhex(str(row["payment_hash"])),
+            amount_sats=int(row["amount_sats"]),
+            quote_expires_at=int(row["quote_expires_at"]),
+            invoice_expires_at=int(row["invoice_expires_at"]),
+        )
+
+    @staticmethod
+    def _quote_row(connection: sqlite3.Connection, quote_id: str) -> sqlite3.Row | None:
+        return cast(
+            sqlite3.Row | None,
+            connection.execute("SELECT * FROM quotes WHERE quote_id = ?", (quote_id,)).fetchone(),
+        )
+
+    def _verified_quote_from_row(self, row: sqlite3.Row) -> tuple[MarketAuthorization, MarketQuote]:
+        try:
+            document = self._signed_document_from_storage(bytes(row["quote_document"]))
+            candidate = MarketQuote.model_validate(document.body)
+            authority = verify_authorization(candidate.authorization)
+            quote = document.verified(MarketQuote, authority.seller_pubkey)
+        except (MarketError, ValidationError, ValueError) as exc:
+            raise MarketStoreCorruptError("stored quote is not a valid signed document") from exc
+        if (
+            quote.quote_id != row["quote_id"]
+            or quote.buyer_pubkey != row["buyer_pubkey"]
+            or quote.product != row["product"]
+            or quote.resource != row["resource"]
+            or quote.certificate_pubkey != row["certificate_pubkey"]
+            or quote.created_at != row["created_at"]
+            or quote.expires_at != row["expires_at"]
+        ):
+            raise MarketStoreCorruptError("stored quote indexes do not match signed quote")
+        if quote.product == "bond" and quote.resource != bond_resource(
+            authority.bond, authority.period
+        ):
+            raise MarketStoreCorruptError("stored bond quote resource is invalid")
+        return authority, quote
+
+    @staticmethod
+    def _allocation_for_quote(authority: MarketAuthorization, quote: MarketQuote) -> Allocation:
+        return Allocation(
+            authorization=document_hash(quote.authorization.body),
+            allocation_id=quote.quote_id,
+            buyer_tag=hashlib.sha256(bytes.fromhex(quote.buyer_pubkey)).hexdigest(),
+            product=quote.product,
+            resource=quote.resource,
+            certificate_pubkey=quote.certificate_pubkey,
+        )
+
+    @staticmethod
+    def _validate_credential_for_allocation(
+        authority: MarketAuthorization,
+        allocation: Allocation,
+        credential: dict[str, Any],
+    ) -> None:
+        try:
+            validate_credential(authority, allocation, credential)
+        except (MarketError, ValidationError, ValueError) as exc:
+            raise MarketError("credential does not match quote") from exc
+
+    @staticmethod
+    def _signed_document_from_storage(value: bytes) -> SignedDocument:
+        try:
+            return SignedDocument.model_validate(decode_document(value))
+        except (MarketError, ValidationError, ValueError) as exc:
+            raise MarketStoreCorruptError("stored signed document is invalid") from exc
+
+    @staticmethod
+    def _payment_terms_from_storage(value: bytes) -> PaymentTerms:
+        try:
+            return PaymentTerms.model_validate(decode_document(value))
+        except (MarketError, ValidationError, ValueError) as exc:
+            raise MarketStoreCorruptError("stored payment terms are invalid") from exc
+
+    @staticmethod
+    def _credential_from_storage(value: bytes) -> dict[str, Any]:
+        try:
+            credential = decode_document(value)
+        except MarketError as exc:
+            raise MarketStoreCorruptError("stored credential is invalid") from exc
+        return credential
+
+    @staticmethod
+    def _package_from_storage(value: bytes) -> CredentialPackage:
+        try:
+            package = CredentialPackage.model_validate(decode_document(value))
+            package.verify()
+            return package
+        except (MarketError, ValidationError, ValueError) as exc:
+            raise MarketStoreCorruptError("stored credential package is invalid") from exc
+
+    @staticmethod
+    def _seal_package(package: CredentialPackage, buyer_pubkey: str) -> str:
+        try:
+            recipient = PublicKey(bytes.fromhex(buyer_pubkey))
+            ciphertext = SealedBox(recipient).encrypt(canonical(package))
+        except (TypeError, ValueError) as exc:
+            raise MarketStoreError("could not seal credential package") from exc
+        return base64.b64encode(bytes(ciphertext)).decode("ascii")
+
+
+def blocked_bond_outpoints(
+    path: Path,
+    bonds: Iterable[BondReference],
+    height: int,
+    *,
+    advertisement_binding: tuple[str, str] | None = None,
+) -> frozenset[tuple[str, int]]:
+    """Outpoints of bonds their owner must not advertise at ``height``.
+
+    A leased bond advertised by its owner during the lease would equivocate its
+    certificate. A bond is blocked from the reservation of a hold for its lease
+    until the invoice is confirmed canceled or the lease ends, through block
+    ``(period + 1) * 2016`` where its certificate still verifies, whatever state
+    the hold is in; later leases block it already. Stocking a lease of one of
+    ``bonds`` for this period or the next designates that bond for rent and
+    blocks it too, even before a sale, so a seller in another process can only
+    lease a bond that is already blocked. Holds match by outpoint, stock by the
+    full bond reference.
+
+    The store is only read. No store means no lease was ever recorded for this
+    data directory (a store deleted without its ledger intent is not detected).
+    Raises :class:`MarketStoreError` when the lease history is unknown: an
+    unreadable or invalid store, a ledger intent without its store, or a
+    wallet ledger that is activating, rebinding or needs recovery.
+    """
+    if path.is_symlink():
+        raise MarketStoreError("market store path must not be a symlink")
+    if not path.exists():
+        if os.path.lexists(path.with_name(f"{path.name}.wallet-ledger")):
+            raise MarketStoreCorruptError("wallet ledger intent exists without its market store")
+        if advertisement_binding is not None:
+            raise MarketStoreUnavailableError("bound advertisement ledger is missing")
+        return frozenset()
+    return MarketStore._scan_bond_leases(
+        path, list(bonds), height, advertisement_binding=advertisement_binding
+    )

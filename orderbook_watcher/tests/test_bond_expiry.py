@@ -345,6 +345,54 @@ def test_cross_nick_renewal_survives_deduplication_and_linking() -> None:
     assert renewed_offer.fidelity_bond_value == 123
 
 
+def test_shared_bond_links_sw0_and_tr0_nicks() -> None:
+    """One bond backing a sw0 and a tr0 nick weights the offers of both pits."""
+    aggregator = _aggregator(AsyncMock())
+    sw0_bond = _bond(counterparty="Sw0Maker", bond_value=123)
+    tr0_data = dict(sw0_bond.fidelity_bond_data or {})
+    tr0_data["maker_nick"] = "Tr0Maker"
+    tr0_bond = sw0_bond.model_copy(
+        update={"counterparty": "Tr0Maker", "fidelity_bond_data": tr0_data}
+    )
+    sw0_offer = _offer(sw0_bond, oid=0)
+    tr0_offer = _offer(tr0_bond, oid=0)
+    tr0_offer.ordertype = OfferType.TR0_RELATIVE
+    bond_key = f"{sw0_bond.utxo_txid}:{sw0_bond.utxo_vout}"
+
+    offers = aggregator._deduplicate_bond_backed_offers(
+        [
+            (sw0_offer, 1000.0, bond_key, "dir1"),
+            (tr0_offer, 1005.0, bond_key, "dir1"),
+        ]
+    )
+    orderbook = OrderBook(offers=offers, fidelity_bonds=[sw0_bond, tr0_bond])
+    aggregator._deduplicate_bonds(orderbook)
+    aggregator._link_bonds_to_offers(orderbook)
+
+    assert offers == [sw0_offer, tr0_offer]
+    assert orderbook.fidelity_bonds == [sw0_bond]
+    assert sw0_offer.fidelity_bond_value == 123
+    assert tr0_offer.fidelity_bond_value == 123
+
+
+def test_shared_bond_does_not_link_second_nick_in_same_pit() -> None:
+    aggregator = _aggregator(AsyncMock())
+    first = _bond(counterparty="FirstMaker", bond_value=123)
+    second_data = dict(first.fidelity_bond_data or {})
+    second_data["maker_nick"] = "SecondMaker"
+    second = first.model_copy(
+        update={"counterparty": "SecondMaker", "fidelity_bond_data": second_data}
+    )
+    first_offer = _offer(first, oid=0)
+    second_offer = _offer(second, oid=1)
+    orderbook = OrderBook(offers=[first_offer, second_offer], fidelity_bonds=[first])
+
+    aggregator._link_bonds_to_offers(orderbook)
+
+    assert first_offer.fidelity_bond_value == 123
+    assert second_offer.fidelity_bond_value == 0
+
+
 def test_higher_expiry_conflicting_claim_cannot_suppress_valid_offer() -> None:
     backend = AsyncMock()
     aggregator = _aggregator(backend)

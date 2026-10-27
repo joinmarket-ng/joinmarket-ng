@@ -49,6 +49,49 @@ consolidation nor randomness guarantees privacy. Existing policy names now use
 these revised rules on future rounds, without a wallet migration or startup sweep.
 See [selection rules and privacy tradeoffs](../docs/technical/wallet.md#utxo-selection).
 
+## Experimental PoDLE Sales and Bond Rental
+
+A Taproot maker with `[lightning]` enabled and an owned fidelity bond can sell
+PoDLE commitments of its current offer mixdepth to takers, and rent out its
+other bonds. Activate the wallet market ledger once, then enable either:
+
+```bash
+jm-maker activate-market-ledger
+jm-maker start --sell-podle   # or [maker] sell_podle = true
+jm-maker start --rent-bonds   # or [maker] rent_bonds = true
+```
+
+A maker without a usable bond can instead lease one each retarget period,
+paid from its mixdepth 0 node within a price cap:
+
+```bash
+jm-maker start --lease-bond   # or [maker] lease_bond = true
+```
+
+Each buyer learns the sold coin, never coins of another mixdepth. The
+advertised bond is never rented. Sales pause with a warning when a
+precondition is missing; the maker keeps running. See
+[the credential market](../docs/credential-market.md#maker-podle-sales).
+
+## Experimental Channel Buyout Funding
+
+A Taproot maker can use one explicitly prepared private channel buyout with
+`jm-maker start --buyout-config buyer.toml --buyout-session SESSION_ID`. This is
+experimental and disabled unless both options are given; read
+[Experimental Ring Market](../docs/experimental-ring-market.md) first.
+
+The configuration must match the wallet fingerprint, Bitcoin network, and source
+mixdepth. A Bitcoin Core backend and an ordinary wallet input for authentication
+are required. The maker reserves escrow change, offers only the bound mixdepth,
+and consumes the prepared session for at most one round. After reservation or
+cancellation, it withdraws offers with the normal publication delay and continues
+monitoring settlement. It does not switch to ordinary wallet funding. Stopping
+the maker leaves the journal intact; resume monitoring with
+`jm-buyout --config buyer.toml serve`.
+
+Existing makers started without both buyout options behave as before. Startup
+does not discover or migrate buyout journals.
+
 ## Multiple Local Instances
 
 If you want to run more than one maker on the same machine, give each maker
@@ -96,6 +139,11 @@ existing 1 sat/vB fallback if estimation fails; `-1` also bypasses this fallback
 If no positive source is available and the static floor is disabled, no positive
 minimum is imposed. This does not guarantee relay or confirmation. Neutrino
 makers cannot verify foreign prevouts and do not enforce this fee policy.
+
+The pre-signing rate uses an estimated witness size. Taproot makers use known
+P2WPKH input scripts where present, otherwise assume Taproot key spends, and
+count the actual serialized outputs. Unknown or script-path witnesses can be
+larger, so this estimate is not a guarantee of the final signed fee rate.
 
 Explicit configured floors are preserved; omitted floors follow the current
 configuration default on restart. DEBUG logs identify the resolved floor and its source.

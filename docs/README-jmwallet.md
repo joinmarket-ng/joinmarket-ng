@@ -3,6 +3,20 @@
 Use these tasks after [setting up a wallet](getting-started.md). For options in
 your installed version, run `jm-wallet --help` and `jm-wallet <command> --help`.
 
+The `address`, `info`, and `send` commands use `[wallet].address_type` from the
+selected configuration: `"p2wpkh"` (the default, BIP84) or `"p2tr"` (Taproot,
+BIP86). Use a separate wallet and data directory when experimenting with Taproot
+channel rings. Changing this setting selects a different derivation branch; it
+does not move existing funds. If an older CLI created SegWit addresses despite
+an explicit `"p2tr"` setting, those funds remain on the BIP84 branch and can be
+accessed with a `"p2wpkh"` configuration.
+
+Fidelity bonds are different: both configurations use the standard P2WSH
+timelocked bonds derived from `m/84'/coin'/0'/2/timenumber`, so the same seed
+and locktime identify the same bond in both pits. Switching the ordinary address
+type does not migrate bonds or reset their recovery markers. There are no
+Taproot fidelity bonds.
+
 ## Receiving Funds
 
 Reserve a new address before giving it to a payer. Mixdepth 0 is the normal

@@ -303,6 +303,7 @@ class TestRunCounterpartiesOption:
 @pytest.mark.asyncio
 async def test_run_maker_factory_updates_rotated_nick_state(tmp_path: Path) -> None:
     config = SimpleNamespace(
+        address_type="p2wpkh",
         mnemonic=SecretStr("abandon " * 11 + "about"),
         passphrase=SecretStr(""),
         bitcoin_network=None,

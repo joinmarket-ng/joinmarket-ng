@@ -32,7 +32,13 @@ from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_con
 from jmcore.models import Offer
 from jmcore.network import ONION_HOSTID
 from jmcore.notifications import get_notifier
-from jmcore.protocol import COMMAND_PREFIX, JM_VERSION, MessageType
+from jmcore.protocol import (
+    COMMAND_PREFIX,
+    FEATURE_PRIVATE_CHANNEL_RING,
+    JM_VERSION,
+    RING_OPEN_DIAGNOSTICS_TOKEN,
+    MessageType,
+)
 from jmcore.rate_limiter import RateLimitAction, RateLimiter
 from jmcore.tasks import parse_directory_address, spawn_task
 from jmwallet.backends.base import BlockchainBackend
@@ -281,7 +287,8 @@ class ProtocolHandlersMixin:
             # Respond to orderbook requests with PRIVMSG (including bond if available)
             if to_nick == "PUBLIC" and command == "orderbook":
                 if (
-                    generation_id != self.current_generation_id
+                    self._offer_admission_closed
+                    or generation_id != self.current_generation_id
                     or generation.state is not GenerationState.ACCEPTING
                 ):
                     return
@@ -351,7 +358,11 @@ class ProtocolHandlersMixin:
         try:
             generation_id = self.current_generation_id if generation_id is None else generation_id
             generation = self._generation(generation_id)
-            if generation is None or generation.state is not GenerationState.ACCEPTING:
+            if (
+                self._offer_admission_closed
+                or generation is None
+                or generation.state is not GenerationState.ACCEPTING
+            ):
                 return
             if not self._directory_orderbook_response_limiter.try_consume():
                 self._orderbook_response_counts["directory_suppressed"] += 1
@@ -371,6 +382,8 @@ class ProtocolHandlersMixin:
                 else generation.current_offers
             )
             responses: list[tuple[str, str]] = []
+            # One lease-guard decision per response.
+            bond = self._advertised_bond()
             for offer in offers:
                 # Format offer data (parameters without the command)
                 order_type_str = offer.ordertype.value
@@ -378,9 +391,9 @@ class ProtocolHandlersMixin:
 
                 # Append fidelity bond proof if we have one
                 # CRITICAL: The bond proof must be signed with the taker's nick
-                if self.fidelity_bond is not None:
+                if bond is not None:
                     bond_proof = create_fidelity_bond_proof(
-                        bond=self.fidelity_bond,
+                        bond=bond,
                         maker_nick=generation.nick_identity.nick,
                         taker_nick=taker_nick,  # Sign for THIS specific taker
                         current_block_height=self.current_block_height,
@@ -400,6 +413,8 @@ class ProtocolHandlersMixin:
                     # clients below because listeners can remove failed connections.
                     async with asyncio.timeout(_ORDERBOOK_SEND_TIMEOUT_SEC):
                         for order_type_str, data in responses:
+                            if self._offer_admission_closed:
+                                return
                             try:
                                 await client.send_private_message(taker_nick, order_type_str, data)
                                 logger.trace(f"Sent {order_type_str} offer to {taker_nick}")
@@ -449,7 +464,11 @@ class ProtocolHandlersMixin:
         try:
             generation_id = self.current_generation_id if generation_id is None else generation_id
             generation = self._generation(generation_id)
-            if generation is None or generation.state is not GenerationState.ACCEPTING:
+            if (
+                self._offer_admission_closed
+                or generation is None
+                or generation.state is not GenerationState.ACCEPTING
+            ):
                 return
             if not self._direct_orderbook_response_limiter.try_consume():
                 self._orderbook_response_counts["direct_suppressed"] += 1
@@ -466,15 +485,19 @@ class ProtocolHandlersMixin:
                 if generation_id == self.current_generation_id
                 else generation.current_offers
             )
+            # One lease-guard decision per response.
+            bond = self._advertised_bond()
             for offer in offers:
+                if self._offer_admission_closed:
+                    return
                 # Format offer data (parameters without the command)
                 order_type_str = offer.ordertype.value
                 data = f"{offer.oid} {offer.minsize} {offer.maxsize} {offer.txfee} {offer.cjfee}"
 
                 # Append fidelity bond proof if we have one
-                if self.fidelity_bond is not None:
+                if bond is not None:
                     bond_proof = create_fidelity_bond_proof(
-                        bond=self.fidelity_bond,
+                        bond=bond,
                         maker_nick=generation.nick_identity.nick,
                         taker_nick=taker_nick,
                         current_block_height=self.current_block_height,
@@ -550,6 +573,10 @@ class ProtocolHandlersMixin:
                 await self._handle_tx(
                     from_nick, command, source=source, generation_id=generation_id
                 )
+            elif command.startswith("ring"):
+                await self._handle_ring(
+                    from_nick, command, source=source, generation_id=generation_id
+                )
             elif command.startswith("push"):
                 await self._handle_push(
                     from_nick, command, source=source, generation_id=generation_id
@@ -580,6 +607,12 @@ class ProtocolHandlersMixin:
         simultaneously, each with a unique ID.
         """
         reservation_owned = False
+        fill_admitted = False
+        if (
+            getattr(self, "_stopping", False) is True
+            or getattr(self, "_fill_admission_closed", False) is True
+        ):
+            return
         session: MakerSession | None = None
         log_context: AbstractContextManager[None] | None = None
         try:
@@ -707,9 +740,19 @@ class ProtocolHandlersMixin:
                 return
 
             refresh_fee_policy = getattr(self, "_initialize_minimum_fee_policy", None)
+            # Validation and registration are synchronous. Closing admission
+            # later must not invalidate this session's accepted protocol work.
+            self._active_fill_admissions += 1
+            self._fill_admissions_idle.clear()
+            fill_admitted = True
             if inspect.iscoroutinefunction(refresh_fee_policy):
                 await refresh_fee_policy(announce=False)
             minimum_fee_rate = getattr(self, "minimum_fee_rate_sat_vb", None)
+            # The same prepared buyout instance backs every round this maker
+            # serves; its durable record, not any in-memory flag, decides
+            # whether a second concurrent fill may actually consume it.
+            buyout = getattr(self, "buyout", None)
+            reserve_funder = getattr(self, "reserve_funder", None)
 
             session_inner = CoinJoinSession(
                 taker_nick=taker_nick,
@@ -722,10 +765,17 @@ class ProtocolHandlersMixin:
                 input_lock_ttl_sec=self.config.pending_tx_timeout_min * 60,
                 merge_algorithm=self.config.merge_algorithm.value,
                 mixdepth_selection_policy=self.config.mixdepth_selection_policy,
+                allowed_mixdepths=(
+                    frozenset(self.config.channel_ring.mixdepth_nodes)
+                    if self.config.channel_ring.enabled
+                    else None
+                ),
                 restrict_md0=not self.config.allow_mixdepth_zero_merge,
                 minimum_fee_rate_sat_vb=(
                     minimum_fee_rate if isinstance(minimum_fee_rate, (int, float)) else None
                 ),
+                buyout=buyout,
+                reserve_claim=None if reserve_funder is None else reserve_funder.claim,
             )
             session = MakerSession(inner=session_inner, generation_id=generation_id)
 
@@ -737,6 +787,10 @@ class ProtocolHandlersMixin:
             # Pass the taker's NaCl pubkey for setting up encryption
             success, response = await session.handle_fill(amount, commitment, taker_pk)
 
+            if getattr(self, "_stopping", False) is True:
+                self._release_commitment_reservation(commitment)
+                reservation_owned = False
+                return
             if success:
                 session_key = (generation_id, taker_nick)
                 previous_session = self.active_sessions.get(session_key)
@@ -760,6 +814,9 @@ class ProtocolHandlersMixin:
                     self._release_podle_outpoint(previous_session)
                     self._release_commitment_reservation(previous_session.commitment.hex())
 
+                if self.channel_ring_capability_validated:
+                    response.setdefault("features", []).append(FEATURE_PRIVATE_CHANNEL_RING)
+                    response["ring_open_diagnostics"] = True
                 self.active_sessions[session_key] = session
                 logger.info(
                     f"Created CoinJoin session with {taker_nick} "
@@ -794,6 +851,10 @@ class ProtocolHandlersMixin:
             logger.error("Failed to handle !fill")
             logger.bind(sensitive=True).error(f"Failed to handle !fill: {e}")
         finally:
+            if fill_admitted:
+                self._active_fill_admissions -= 1
+                if self._active_fill_admissions == 0:
+                    self._fill_admissions_idle.set()
             if log_context is not None:
                 log_context.__exit__(None, None, None)
 
@@ -866,6 +927,8 @@ class ProtocolHandlersMixin:
         message on the connection. The session lock still runs a session's
         handlers in order.
         """
+        if getattr(self, "_stopping", False) is True:
+            return
         if session.pending_handlers >= MAX_HANDLERS_PER_SESSION:
             self._log_rate_limited(
                 "maker-session-handler-busy",
@@ -890,12 +953,14 @@ class ProtocolHandlersMixin:
 
         task = asyncio.create_task(session.run_handler(self, handler), name=name)
         task.add_done_callback(handler_finished)
+        self._session_handler_tasks.add(task)
         task.add_done_callback(self._session_handler_done)
         self._register_detached_handler_task(task)
 
     def _session_handler_done(self: MakerBotProtocol, task: asyncio.Task[None]) -> None:
         """Release handler admission and remove completed detached tasks."""
         self._detached_handler_tasks.discard(task)
+        self._session_handler_tasks.discard(task)
         self._session_handler_task_count -= 1
         try:
             task.result()
@@ -976,6 +1041,8 @@ class ProtocolHandlersMixin:
         self._release_podle_outpoint(session)
         session.detached = True
         session.detached_event.set()
+        if session.ring_participant is not None:
+            session.ring_participant.cancel_acceptor_task()
         state = session.state
         logger.debug("Cleaning up timed out session: {} (state={})", session.taker_nick, state)
 
@@ -1068,6 +1135,40 @@ class ProtocolHandlersMixin:
                 logger.error(
                     f"Pending signed-round input ownership was lost for {record.taker_nick}"
                 )
+
+    async def _handle_ring(
+        self: MakerBotProtocol,
+        taker_nick: str,
+        msg: str,
+        source: str = "unknown",
+        generation_id: int | None = None,
+    ) -> None:
+        """Dispatch !ring to the per-taker MakerSession.
+
+        Mirrors :meth:`_handle_tx`: the ring phase only ever runs inside an
+        authenticated CoinJoin session of a live generation.
+        """
+        generation_id = self.current_generation_id if generation_id is None else generation_id
+        generation = self._generation(generation_id)
+        if (
+            generation is None
+            or generation.state is GenerationState.CLOSED
+            or (
+                generation.grace_deadline is not None
+                and time.monotonic() >= generation.grace_deadline
+            )
+        ):
+            return
+        session = self.active_sessions.get((generation_id, taker_nick))
+        if session is None:
+            logger.warning(f"No active session for {taker_nick}")
+            return
+
+        await self._dispatch_session_handler(
+            session,
+            lambda: session.on_ring(self, msg, source),
+            name=f"maker-ring-{taker_nick}",
+        )
 
     async def _handle_push(
         self: MakerBotProtocol,
@@ -1171,6 +1272,19 @@ class ProtocolHandlersMixin:
                 # race a second broadcast attempt. The renewed persisted lease
                 # remains for the complete pending-broadcast window.
                 self._pending_signed_rounds.pop(key, None)
+
+            # A ring participant must bind the broadcast transaction to the
+            # exact round it co-funded before this maker relays it.
+            ring_session = self.active_sessions.get((generation_id, taker_nick))
+            if ring_session is not None and ring_session.ring_participant is not None:
+                try:
+                    await ring_session.ring_participant.observe_final_transaction(tx_hex)
+                except Exception as e:
+                    logger.error("Rejected substituted ring !push transaction")
+                    logger.bind(sensitive=True).error(
+                        f"Rejected substituted ring !push transaction: {e}"
+                    )
+                    return
 
             logger.info(f"Received matched !push from {taker_nick}, broadcasting transaction...")
 
@@ -1480,6 +1594,8 @@ class ProtocolHandlersMixin:
                 features = data.get("features", [])
                 if features:
                     msg_content += f" features={','.join(features)}"
+                if data.get("ring_open_diagnostics") is True:
+                    msg_content += f" {RING_OPEN_DIAGNOSTICS_TOKEN}"
             else:
                 # Fallback to JSON for unknown commands
                 msg_content = json.dumps(data)

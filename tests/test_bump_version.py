@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 import importlib.util
+import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+
+
+def test_release_updates_the_swap_component_with_the_other_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_bump_version_module()
+    # Exercise the real release inventory against copies, never the checkout.
+    projects = []
+    for source in module.PYPROJECT_FILES:
+        project = tmp_path / source.parent.name / source.name
+        project.parent.mkdir()
+        project.write_text(source.read_text())
+        projects.append(project)
+    assert {project.parent.name for project in projects} >= {"jmcore", "jmswap"}
+    monkeypatch.setattr(module, "PYPROJECT_FILES", projects)
+
+    module.update_pyproject_files("1.2.3")
+
+    for project in projects:
+        assert tomllib.loads(project.read_text())["project"]["version"] == "1.2.3"
 
 
 def _load_bump_version_module():

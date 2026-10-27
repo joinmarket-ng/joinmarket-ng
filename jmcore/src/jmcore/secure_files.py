@@ -6,8 +6,10 @@ import errno
 import logging
 import os
 import stat
+import sys
 import tempfile
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -137,8 +139,36 @@ def read_sensitive_file(path: Path) -> bytes:
         return sensitive_file.read()
 
 
-def atomic_write_private(path: Path, data: bytes) -> None:
-    """Atomically write bytes without exposing a permissively-mode temporary file."""
+def sync_parent_directories(path: Path) -> None:
+    """Flush directory entries through the parent chain on POSIX filesystems.
+
+    This includes newly created ancestors whose entries a leaf-only flush would
+    miss. Errors propagate: callers must not acknowledge durable publication
+    after an unsupported or failed flush. Windows keeps its existing file-flush
+    contract; directory descriptors are not portable there.
+    """
+    if os.name != "posix":
+        return
+    directory = path.parent.resolve(strict=True)
+    while True:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if directory.parent == directory:
+            break
+        directory = directory.parent
+
+
+def atomic_write_private(path: Path, data: bytes, *, replace: bool = True) -> None:
+    """Atomically publish private bytes, optionally refusing ANY existing destination.
+
+    The default replacement contract is unchanged. ``replace=False`` publishes
+    a complete inode with an atomic hard link, never falls back to overwriting,
+    and flushes parent entries before returning. If a post-link flush fails the
+    file may already exist: callers must inspect/resume, not blindly recreate.
+    """
     _reject_parent_traversal(path)
     parent = path.parent
     if parent.is_symlink():
@@ -159,7 +189,12 @@ def atomic_write_private(path: Path, data: bytes) -> None:
             temp_file.write(data)
             temp_file.flush()
             os.fsync(temp_file.fileno())
-        os.replace(temp_path, path)
+        if replace:
+            os.replace(temp_path, path)
+        else:
+            os.link(temp_path, path, follow_symlinks=False)
+            temp_path.unlink()
+            sync_parent_directories(path)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -170,3 +205,41 @@ def atomic_write_private(path: Path, data: bytes) -> None:
 def atomic_write_sensitive_file(path: Path, data: bytes) -> None:
     """Atomically update a sensitive file while preserving configured aliases."""
     atomic_write_private(path.resolve(strict=False), data)
+
+
+@contextmanager
+def exclusive_file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
+    """Lock a stable sidecar inode across processes without replacing or deleting it."""
+    _reject_parent_traversal(path)
+    if path.is_symlink():
+        raise OSError("refusing to lock a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "r+b") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError("lock must be a regular file")
+        if sys.platform == "win32":
+            import msvcrt
+
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+            msvcrt.locking(handle.fileno(), mode, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            os.fchmod(handle.fileno(), 0o600)
+            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), flags)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

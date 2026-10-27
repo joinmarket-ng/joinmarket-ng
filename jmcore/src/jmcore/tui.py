@@ -72,6 +72,22 @@ def main() -> None:
     """Launch the JoinMarket-NG TUI menu."""
     exit_if_version_requested(sys.argv[1:])
 
+    if sys.argv[1:2] == ["setup"]:
+        try:
+            from jmwallet.onboarding import main as setup_main
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"jmwallet", "jmwallet.onboarding"}:
+                raise
+            print(
+                "Guided setup requires the jm-wallet component from this installation.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+        # The current interpreter pins this optional composition-root import to
+        # the same installation. Setup does not depend on the shell menu.
+        setup_main(sys.argv[2:])
+        return
+
     # Pre-flight: whiptail is required
     if not shutil.which("whiptail"):
         print(

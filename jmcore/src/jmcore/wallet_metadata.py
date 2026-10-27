@@ -109,9 +109,14 @@ def _check_version(meta: dict[str, Any]) -> None:
         raise ValueError("Unsupported wallet identity metadata version")
 
 
-def write_mnemonic_meta(mnemonic_file: Path, meta: dict[str, Any]) -> None:
+def encode_mnemonic_meta(meta: dict[str, Any]) -> bytes:
+    """Encode the existing sidecar format for ordinary or no-clobber publication."""
     _check_version(meta)
-    atomic_write_private(meta_path(mnemonic_file), (json.dumps(meta, indent=2) + "\n").encode())
+    return (json.dumps(meta, indent=2) + "\n").encode()
+
+
+def write_mnemonic_meta(mnemonic_file: Path, meta: dict[str, Any]) -> None:
+    atomic_write_private(meta_path(mnemonic_file), encode_mnemonic_meta(meta))
 
 
 def registered_identities(mnemonic_file: Path) -> dict[str, WalletIdentity]:

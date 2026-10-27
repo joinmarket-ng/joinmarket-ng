@@ -15,6 +15,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
+from jmcore.channel_ring_store import RingParticipantStore
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
@@ -36,6 +37,7 @@ from maker.rate_limiting import (
 )
 
 if TYPE_CHECKING:
+    from jmswap.channel_ring_nodes import ChannelRingNodePool
     from jmwallet.history import TransactionHistoryEntry
 
     from maker.direct_connection import DirectConnectionState
@@ -91,6 +93,15 @@ class MakerBotProtocol(Protocol):
     _pending_signed_rounds: dict[tuple[int, str, str], PendingSignedRound]
     _pending_signed_rounds_lock: asyncio.Lock
     minimum_fee_rate_sat_vb: float
+    channel_ring_capability_validated: bool
+    _channel_ring_nodes: ChannelRingNodePool | None
+    _stopping: bool
+    _fill_admission_closed: bool
+    _offer_admission_closed: bool
+    _active_fill_admissions: int
+    _fill_admissions_idle: asyncio.Event
+    _session_handler_tasks: set[asyncio.Task[None]]
+    _channel_ring_store: RingParticipantStore | None
 
     # -- Cross-mixin methods --
 
@@ -114,6 +125,10 @@ class MakerBotProtocol(Protocol):
         self, taker_nick: str, msg: str, source: str = "unknown", generation_id: int | None = None
     ) -> None: ...
 
+    async def _handle_ring(
+        self, taker_nick: str, msg: str, source: str = "unknown", generation_id: int | None = None
+    ) -> None: ...
+
     async def _handle_push(
         self, taker_nick: str, msg: str, source: str = "unknown", generation_id: int | None = None
     ) -> None: ...
@@ -126,6 +141,8 @@ class MakerBotProtocol(Protocol):
     async def _cleanup_timed_out_sessions(self) -> None: ...
 
     def _start_session_cleanup_task(self) -> None: ...
+
+    def _advertised_bond(self) -> FidelityBondInfo | None: ...
 
     def _abort_for_fatal_error(self, error: Exception) -> None: ...
 
@@ -165,6 +182,8 @@ class MakerBotProtocol(Protocol):
     async def _resync_wallet_and_update_offers(self) -> None: ...
 
     def _format_offer_announcement(self, offer: Offer, include_bond: bool = False) -> str: ...
+
+    def _queue_offer_withdrawals(self, generation: MakerGeneration) -> None: ...
 
     # Defined in BackgroundTasksMixin, called by ProtocolHandlersMixin and MakerSession
     async def _deferred_wallet_resync(self) -> None: ...

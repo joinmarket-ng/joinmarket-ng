@@ -3,6 +3,7 @@ Tests for maker configuration validation.
 """
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from jmcore.models import OfferType
@@ -96,6 +97,57 @@ def test_minimum_fee_policy_upgrade_round_trip(maker_toml: str, floor: float, ta
     assert config.min_fee_rate_sat_vb == settings.maker.min_fee_rate_sat_vb == floor
     assert config.min_fee_block_target == settings.maker.min_fee_block_target == target
     assert MakerConfig(mnemonic=TEST_MNEMONIC).min_fee_rate_sat_vb == 0.0
+
+
+@pytest.mark.parametrize(
+    ("address_type", "offer_type"),
+    [
+        ("p2wpkh", OfferType.SW0_RELATIVE),
+        ("p2wpkh", OfferType.SW0_ABSOLUTE),
+        ("p2tr", OfferType.TR0_RELATIVE),
+        ("p2tr", OfferType.TR0_ABSOLUTE),
+    ],
+)
+def test_offer_family_matches_wallet_address_type(
+    address_type: Literal["p2wpkh", "p2tr"], offer_type: OfferType
+) -> None:
+    config = MakerConfig(
+        mnemonic=TEST_MNEMONIC,
+        address_type=address_type,
+        offer_type=offer_type,
+    )
+    assert config.offer_type == offer_type
+
+
+def test_taproot_offer_on_segwit_wallet_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2wpkh",
+            offer_type=OfferType.TR0_RELATIVE,
+        )
+
+
+def test_segwit_offer_on_taproot_wallet_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2tr",
+            offer_type=OfferType.SW0_ABSOLUTE,
+        )
+
+
+def test_mixed_offer_families_are_rejected() -> None:
+    """A maker serves exactly one pit, so even one foreign offer config fails."""
+    with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+        MakerConfig(
+            mnemonic=TEST_MNEMONIC,
+            address_type="p2tr",
+            offer_configs=[
+                OfferConfig(offer_type=OfferType.TR0_RELATIVE),
+                OfferConfig(offer_type=OfferType.SW0_ABSOLUTE),
+            ],
+        )
 
 
 def test_maximum_maker_lock_windows_fit_metadata_ttl_cap() -> None:
@@ -562,6 +614,31 @@ class TestBuildMakerConfig:
         assert config.offer_type == OfferType.SW0_RELATIVE
         assert config.cj_fee_relative == "0.002"
 
+    def test_tr0_relative_offer_logs_relative_fee(self) -> None:
+        """A tr0 relative offer must not be logged as an absolute fee."""
+        from jmcore.settings import JoinMarketSettings
+        from loguru import logger
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "tr0reloffer"
+
+        records: list[str] = []
+        sink_id = logger.add(
+            lambda message: records.append(message.record["message"]), level="INFO"
+        )
+        try:
+            build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        finally:
+            logger.remove(sink_id)
+
+        offer_messages = [message for message in records if message.startswith("Offer config:")]
+        assert len(offer_messages) == 1
+        assert "relative fee=" in offer_messages[0]
+        assert "absolute fee=" not in offer_messages[0]
+
     def test_max_sats_freeze_reuse_forwarded(self) -> None:
         """``wallet.max_sats_freeze_reuse`` must reach the MakerConfig (#529)."""
         from jmcore.settings import JoinMarketSettings
@@ -603,6 +680,89 @@ class TestBuildMakerConfig:
             passphrase="",
         )
         assert config.wallet_with_passphrase is False
+
+    def test_wallet_address_type_forwarded(self) -> None:
+        """wallet.address_type must reach the MakerConfig."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        assert settings.wallet.address_type == "p2wpkh"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.address_type == "p2wpkh"
+
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "tr0reloffer"
+        config = build_maker_config(
+            settings=settings,
+            mnemonic=TEST_MNEMONIC,
+            passphrase="",
+        )
+        assert config.address_type == "p2tr"
+
+    def test_taproot_wallet_serves_taproot_offers(self) -> None:
+        """A p2tr wallet must produce tr0 offers for every fee source (JMP-0010)."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "tr0absoffer"
+
+        # Offer family from settings.
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.offer_type == OfferType.TR0_ABSOLUTE
+
+        # CLI relative/absolute fees pick the family from the wallet.
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", cj_fee_relative="0.002"
+        )
+        assert config.offer_type == OfferType.TR0_RELATIVE
+        assert config.cj_fee_relative == "0.002"
+
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", cj_fee_absolute=2_000
+        )
+        assert config.offer_type == OfferType.TR0_ABSOLUTE
+        assert config.cj_fee_absolute == 2_000
+
+        # Dual offers stay inside the Taproot pit.
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", dual_offers=True
+        )
+        assert [offer.offer_type for offer in config.offer_configs] == [
+            OfferType.TR0_RELATIVE,
+            OfferType.TR0_ABSOLUTE,
+        ]
+
+    def test_taproot_wallet_with_segwit_offer_type_is_rejected(self) -> None:
+        """A tr0 wallet configured with an sw0 offer must fail before the bot starts."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.wallet.address_type = "p2tr"
+        settings.maker.offer_type = "sw0reloffer"
+        with pytest.raises(ValidationError, match="requires a 'p2wpkh' wallet"):
+            build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+
+    def test_segwit_wallet_with_taproot_offer_type_is_rejected(self) -> None:
+        """An sw0 wallet configured with a tr0 offer must fail before the bot starts."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings()
+        settings.maker.offer_type = "tr0reloffer"
+        with pytest.raises(ValidationError, match="requires a 'p2tr' wallet"):
+            build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
 
     def test_max_sats_freeze_reuse_defaults_to_freeze_all(self) -> None:
         """Default ``max_sats_freeze_reuse`` is -1 (freeze all reuse)."""
@@ -823,6 +983,83 @@ class TestBuildMakerConfig:
             passphrase="",
         )
         assert config.allow_mixdepth_zero_merge is True
+
+    def test_podle_sales_settings_reach_maker_config(self) -> None:
+        """[maker] sell_podle and podle_price_sats are wired; the CLI flag overrides them."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            lightning={"mode": "manual"},
+            maker={"sell_podle": True, "podle_price_sats": 500},
+        )
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.sell_podle is True and config.podle_price_sats == 500
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", sell_podle=False
+        )
+        assert config.sell_podle is False
+
+        plain = JoinMarketSettings()
+        assert build_maker_config(plain, TEST_MNEMONIC, "").sell_podle is False
+        with pytest.raises(ValueError, match="requires \\[lightning\\]"):
+            build_maker_config(plain, TEST_MNEMONIC, "", sell_podle=True)
+
+    def test_bond_rental_settings_reach_maker_config(self) -> None:
+        """[maker] rent_bonds and bond_rent_rate are wired; the CLI flag overrides them."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            lightning={"mode": "manual"},
+            maker={"rent_bonds": True, "bond_rent_rate": 0.02},
+        )
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert config.rent_bonds is True and config.bond_rent_rate == 0.02
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", rent_bonds=False
+        )
+        assert config.rent_bonds is False
+
+        plain = JoinMarketSettings()
+        assert build_maker_config(plain, TEST_MNEMONIC, "").rent_bonds is False
+        with pytest.raises(ValueError, match="requires \\[lightning\\]"):
+            build_maker_config(plain, TEST_MNEMONIC, "", rent_bonds=True)
+        with pytest.raises(ValueError, match="rent_bonds requires lightning"):
+            JoinMarketSettings(maker={"rent_bonds": True})
+
+    def test_bond_lease_settings_reach_maker_config(self) -> None:
+        """[maker] lease_bond and its caps are wired; the CLI flag overrides them."""
+        from jmcore.settings import JoinMarketSettings
+
+        from maker.cli import build_maker_config
+
+        settings = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            lightning={"mode": "manual"},
+            maker={"lease_bond": True, "lease_bond_max_sats": 9_000, "lease_bond_max_rate": 0.05},
+        )
+        config = build_maker_config(settings=settings, mnemonic=TEST_MNEMONIC, passphrase="")
+        assert (config.lease_bond, config.lease_bond_max_sats, config.lease_bond_max_rate) == (
+            True,
+            9_000,
+            0.05,
+        )
+        config = build_maker_config(
+            settings=settings, mnemonic=TEST_MNEMONIC, passphrase="", lease_bond=False
+        )
+        assert config.lease_bond is False
+
+        plain = JoinMarketSettings()
+        assert build_maker_config(plain, TEST_MNEMONIC, "").lease_bond is False
+        with pytest.raises(ValueError, match="requires \\[lightning\\]"):
+            build_maker_config(plain, TEST_MNEMONIC, "", lease_bond=True)
+        with pytest.raises(ValueError, match="lease_bond requires lightning"):
+            JoinMarketSettings(maker={"lease_bond": True})
 
     def test_randomization_factors_passed_from_settings(self) -> None:
         """Randomization factors set in config.toml must propagate to MakerConfig.
@@ -1354,3 +1591,119 @@ class TestNewSettingsWiring:
         )
         # No explicit dual_offers -> single offer mode
         assert len(config.offer_configs) == 0
+
+
+@pytest.mark.parametrize("max_push", [None, 500_000, 80_000_000])
+def test_channel_ring_settings_round_trip_and_require_tr0_wallet(
+    tmp_path: Path, max_push: int | None
+) -> None:
+    from jmcore.channel_ring import ChannelRingNodeSettings, ChannelRingSettings
+    from jmcore.settings import JoinMarketSettings, MakerSettings, WalletSettings
+
+    from maker.cli import build_maker_config
+
+    ring = ChannelRingSettings(
+        enabled=True,
+        nodes={
+            "local": ChannelRingNodeSettings(
+                lnd_grpc_url="https://127.0.0.1:10009",
+                lnd_tls_cert_path=tmp_path / "tls.cert",
+                lnd_macaroon_path=tmp_path / "admin.macaroon",
+                onion_endpoint="a" * 56 + ".onion:9735",
+            )
+        },
+        mixdepth_nodes={0: "local"},
+        node_binding_directory=tmp_path / "node-bindings",
+        max_active_sessions=6,
+        max_verified_sessions=3,
+    )
+    if max_push is not None:
+        ring.max_push = max_push
+    settings = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        maker=MakerSettings(offer_type="tr0absoffer", channel_ring=ring),
+    )
+    config = build_maker_config(settings, mnemonic=TEST_MNEMONIC, passphrase="")
+    assert config.channel_ring.enabled
+    assert config.channel_ring.max_active_sessions == 6
+    assert config.channel_ring.max_push == (20_000_000 if max_push is None else max_push)
+    assert config.channel_ring.nodes["local"].lnd_macaroon_path == tmp_path / "admin.macaroon"
+    assert config.channel_ring.mixdepth_nodes == {0: "local"}
+    assert config.channel_ring.node_binding_directory == tmp_path / "node-bindings"
+
+    incompatible = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2wpkh"),
+        maker=MakerSettings(offer_type="tr0absoffer", channel_ring=ring),
+    )
+    with pytest.raises(ValueError, match="p2tr wallet"):
+        build_maker_config(incompatible, mnemonic=TEST_MNEMONIC, passphrase="")
+
+    wrong_offer = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        maker=MakerSettings(offer_type="sw0absoffer", channel_ring=ring),
+    )
+    with pytest.raises(ValueError, match="tr0 maker offers"):
+        build_maker_config(wrong_offer, mnemonic=TEST_MNEMONIC, passphrase="")
+
+    no_maker_node = JoinMarketSettings(
+        wallet=WalletSettings(address_type="p2tr"),
+        maker=MakerSettings(
+            offer_type="tr0absoffer",
+            channel_ring=ring.model_copy(update={"mixdepth_nodes": {}}),
+        ),
+    )
+    with pytest.raises(ValueError, match="enabled maker channel ring requires local"):
+        build_maker_config(no_maker_node, mnemonic=TEST_MNEMONIC, passphrase="")
+
+    with pytest.raises(ValueError, match="taker_participates"):
+        MakerSettings(
+            offer_type="tr0absoffer",
+            channel_ring={**ring.model_dump(), "taker_participates": False},
+        )
+
+
+def test_managed_lightning_wires_the_maker_ring_to_its_nodes(tmp_path: Path) -> None:
+    from jmcore.crypto import mnemonic_to_seed
+    from jmcore.settings import JoinMarketSettings
+    from jmswap.lightning_context import wallet_identity_of
+    from jmswap.managed_nodes import (
+        ManagedNodePaths,
+        NodeState,
+        RegistryStore,
+        allocate_node,
+        new_registry,
+    )
+
+    from maker.cli import build_maker_config
+
+    identity = wallet_identity_of(mnemonic_to_seed(TEST_MNEMONIC, ""))
+    paths = ManagedNodePaths.for_wallet(tmp_path, "signet", identity)
+    registry = new_registry("signet", identity)
+    node = allocate_node(registry, 0, birthday=1, ports=(21000, 21001))
+    node.state = NodeState.ACTIVE
+    node.onion_endpoint = "a" * 56 + ".onion:9735"
+    RegistryStore(paths).update(lambda current: registry)
+    settings = JoinMarketSettings(
+        network_config={"network": "signet"},
+        wallet={"address_type": "p2tr"},
+        lightning={"mode": "managed", "reserve_min_sats": 20_000, "reserve_max_sats": 90_000},
+    )
+
+    config = build_maker_config(settings, mnemonic=TEST_MNEMONIC, passphrase="", data_dir=tmp_path)
+
+    assert config.channel_ring.enabled
+    assert config.channel_ring.mixdepth_nodes == {0: node.name}
+    assert config.channel_ring.reserve_funding == (20_000, 90_000)
+    assert config.channel_ring.nodes[node.name].lnd_grpc_url == "https://127.0.0.1:21001"
+    assert config.channel_ring.node_binding_directory == paths.bindings_dir
+
+
+def test_disabled_channel_ring_round_trip_preserves_default_behavior() -> None:
+    from jmcore.settings import JoinMarketSettings
+
+    from maker.cli import build_maker_config
+
+    config = build_maker_config(JoinMarketSettings(), mnemonic=TEST_MNEMONIC, passphrase="")
+    assert config.channel_ring.enabled is False
+    assert config.channel_ring.nodes == {}
+    assert config.channel_ring.mixdepth_nodes == {}

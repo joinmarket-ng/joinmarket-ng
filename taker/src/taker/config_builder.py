@@ -226,6 +226,7 @@ def build_taker_config_kwargs(
         broadcast_policy = BroadcastPolicy.MULTIPLE_PEERS
 
     # Import SecretStr for wrapping sensitive values
+    from jmswap.lightning_context import channel_ring_config
     from pydantic import SecretStr
 
     return {
@@ -246,6 +247,7 @@ def build_taker_config_kwargs(
         "connection_timeout": settings.tor.connection_timeout,
         "mixdepth_count": settings.wallet.mixdepth_count,
         "gap_limit": settings.wallet.gap_limit,
+        "address_type": settings.wallet.address_type,
         "scan_range": settings.wallet.scan_range,
         "dust_threshold": settings.wallet.dust_threshold,
         "max_sats_freeze_reuse": settings.wallet.max_sats_freeze_reuse,
@@ -291,13 +293,25 @@ def build_taker_config_kwargs(
         "broadcast_peer_count": settings.taker.broadcast_peer_count,
         "minimum_makers": effective_minimum_makers,
         "max_maker_replacement_attempts": settings.taker.max_maker_replacement_attempts,
+        "preferred_offer_type": settings.taker.preferred_offer_type,
         "rescan_interval_sec": settings.taker.rescan_interval_sec,
         "pending_tx_abandon_hours": settings.taker.pending_tx_abandon_hours,
         "select_utxos": select_utxos,
         "taker_utxo_age": settings.taker.taker_utxo_age,
         "taker_utxo_retries": settings.taker.taker_utxo_retries,
         "taker_utxo_amtpercent": settings.taker.taker_utxo_amtpercent,
+        "external_podle_mode": settings.taker.external_podle_mode,
+        "market_fault_exclusion": settings.taker.market_fault_exclusion,
         "max_maker_utxos": settings.taker.max_maker_utxos,
+        "channel_ring": channel_ring_config(
+            settings.lightning.mode,
+            settings.taker.channel_ring,
+            mnemonic=mnemonic,
+            passphrase=passphrase,
+            data_dir=effective_data_dir,
+            network=NetworkType(effective_bitcoin_network).value,
+            reserve_sats=(settings.lightning.reserve_min_sats, settings.lightning.reserve_max_sats),
+        ),
     }
 
 

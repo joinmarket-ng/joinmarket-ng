@@ -12,19 +12,27 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
+from jmcore import experimental
+from jmcore.channel_ring import ChannelRingConfig
+from jmcore.channel_ring_store import (
+    RingLifecycleState,
+    RingParticipantRecord,
+    RingParticipantStore,
+)
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
 from jmcore.deduplication import MessageDeduplicator
 from jmcore.directory_client import DirectoryClient
+from jmcore.experimental import warn_experimental
 from jmcore.fee_policy import resolve_min_fee_rate
 from jmcore.models import Offer
 from jmcore.network import HiddenServiceListener, TCPConnection
 from jmcore.notifications import get_notifier
-from jmcore.paths import read_nick_state
+from jmcore.paths import get_default_data_dir, get_nick_state_component, read_nick_state
 from jmcore.protocol import (
     JM_VERSION,
 )
@@ -46,6 +54,8 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 
 from maker.background_tasks import BackgroundTasksMixin
+from maker.bond_leases import BondLeaseGuard
+from maker.coinjoin import bound_buyout_mixdepth
 from maker.config import MakerConfig
 from maker.direct_connection import DirectConnectionMixin, DirectConnectionState
 from maker.directory_pool import MakerDirectoryPool
@@ -71,6 +81,13 @@ from maker.rate_limiting import (
     OrderbookRateLimiter,
     ProcessWideTokenBucket,
 )
+
+if TYPE_CHECKING:
+    # A maker without a prepared channel buyout or ring never imports jmswap at
+    # runtime.
+    from jmswap.channel_ring_nodes import ChannelRingNodePool
+    from jmswap.coinjoin_funding import ChannelBuyout
+    from jmswap.lightning_reserve import ReserveFunder
 
 # Approximately 64MB of memory for str->float mapping (including overhead)
 MAX_LOG_RATE_LIMIT_ENTRIES = 200000
@@ -111,6 +128,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         backend: BlockchainBackend,
         config: MakerConfig,
         nick_change_callback: Callable[[str, str], None] | None = None,
+        *,
+        buyout: ChannelBuyout | None = None,
     ):
         self.wallet = wallet
         self.backend = backend
@@ -126,6 +145,46 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.nick_identity = NickIdentity(JM_VERSION)
         self.nick = self.nick_identity.nick
 
+        # A Taproot (tr0) maker signs BIP341 sighashes that commit to every
+        # input's prevout, including foreign participants' inputs, so it needs a
+        # backend that can resolve arbitrary outpoints. A light client (Neutrino)
+        # cannot; fail fast at startup rather than advertising tr0 offers and
+        # refusing every fill (see docs/technical/production-checklist.md).
+        if getattr(self.wallet, "address_type", None) == "p2tr" and not (
+            backend.can_resolve_foreign_prevouts()
+        ):
+            raise ValueError(
+                "A tr0 (Taproot) maker requires a backend that can resolve arbitrary "
+                "prevouts (Bitcoin Core / descriptor wallet); the configured light-client "
+                "backend cannot, so it could never sign a tr0 CoinJoin. Use a Core backend "
+                "or configure a p2wpkh (sw0) wallet instead."
+            )
+        # A round funds its non-CoinJoin output from either a prepared buyout
+        # escrow or a co-funded ring, never both: each one owns the change
+        # output of the round it funds. Reject the combination before the
+        # buyout is bound, so this configuration error is reported instead of
+        # a confusing binding failure, and long before any offer is advertised
+        # or any input is reserved.
+        if buyout is not None and config.channel_ring.enabled:
+            raise ValueError(
+                "A prepared channel buyout and an enabled co-funded channel ring cannot "
+                "be used by the same maker: both claim the round's non-CoinJoin change "
+                "output. Disable channel_ring or drop --buyout-config/--buyout-session."
+            )
+        # One prepared channel buyout, shared by every offer manager and every
+        # CoinJoin session this bot creates, including those of rotated
+        # identities: the durable record behind it is single-use, so there is
+        # nothing to copy per identity. Validated once here so a buyout bound
+        # to another wallet, network, mixdepth or backend never reaches a round.
+        self.buyout = buyout
+        # Set by the CLI in managed Lightning mode: CoinJoin outputs may then
+        # top up the reserves of the mixdepths' nodes.
+        self.reserve_funder: ReserveFunder | None = None
+        self.buyout_mixdepth = (
+            -1
+            if buyout is None
+            else bound_buyout_mixdepth(buyout, wallet, backend, config.address_type)
+        )
         self.directory_clients: dict[str, DirectoryClient] = {}
         # Shared connection plumbing (parsing, SOCKS isolation creds,
         # DirectoryClient construction, retry loop). The pool stores its
@@ -137,16 +196,42 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             nick_identity=self.nick_identity,
             neutrino_compat=backend.can_provide_neutrino_metadata(),
         )
+        self.channel_ring_capability_validated = False
+        self._channel_ring_nodes: ChannelRingNodePool | None = None
+        self._channel_ring_store: RingParticipantStore | None = None
+        self._channel_ring_recovery_tasks: dict[str, asyncio.Task[object]] = {}
+        if isinstance(config.channel_ring, ChannelRingConfig) and config.channel_ring.enabled:
+            data_directory = config.data_dir or get_default_data_dir()
+            self._channel_ring_store = RingParticipantStore(
+                config.channel_ring.persistence_path(data_directory),
+                max_active_sessions=config.channel_ring.max_active_sessions,
+                max_verified_sessions=config.channel_ring.max_verified_sessions,
+            )
         self._directory_pool.clients = self.directory_clients
-        self.offer_manager = OfferManager(self.wallet, config, self.nick)
+        self.offer_manager = OfferManager(
+            self.wallet,
+            config,
+            self.nick,
+            buyout=self.buyout,
+            buyout_mixdepth=self.buyout_mixdepth,
+        )
         self.active_sessions: dict[tuple[int, str], MakerSession] = {}
         self._reserved_commitments: set[str] = set()
         self._active_podle_outpoints: dict[tuple[str, int], MakerSession] = {}
         self.current_offers: list[Offer] = []
         self.fidelity_bond: FidelityBondInfo | None = None
+        # Installed by start(); gates every bond proof on the market's lease history.
+        self.bond_lease_guard: BondLeaseGuard | None = None
         self.current_block_height: int = 0  # Cached block height for bond proof generation
 
         self.running = False
+        self._stopping = False
+        self._fill_admission_closed = False
+        self._offer_admission_closed = False
+        self._active_fill_admissions = 0
+        self._fill_admissions_idle = asyncio.Event()
+        self._fill_admissions_idle.set()
+        self._session_handler_tasks: set[asyncio.Task[None]] = set()
         self.listen_tasks: list[asyncio.Task[None]] = []
         self._session_cleanup_task: asyncio.Task[None] | None = None
         self._session_handler_task_count = 0
@@ -265,7 +350,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # Own wallet nicks to exclude from CoinJoin sessions (self-CoinJoin protection)
         # Read the taker nick from state file if running both components from same wallet
         self._own_wallet_nicks: set[str] = set()
-        taker_nick = read_nick_state(config.data_dir, "taker")
+        # Only the taker trading in the same pit can meet us in a CoinJoin.
+        taker_nick = read_nick_state(
+            config.data_dir, get_nick_state_component("taker", config.address_type)
+        )
         if taker_nick:
             self._own_wallet_nicks.add(taker_nick)
             logger.info(f"Self-CoinJoin protection: excluding taker nick {taker_nick}")
@@ -568,7 +656,13 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
         generation_id = max(self.generations, default=-1) + 1
         identity = NickIdentity(JM_VERSION)
-        offer_manager = OfferManager(self.wallet, self.config, identity.nick)
+        offer_manager = OfferManager(
+            self.wallet,
+            self.config,
+            identity.nick,
+            buyout=self.buyout,
+            buyout_mixdepth=self.buyout_mixdepth,
+        )
         offers = await offer_manager.create_offers()
         listener: HiddenServiceListener | None = None
         tor_control: TorControlClient | None = None
@@ -1024,6 +1118,14 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             build_ref = get_build_ref() or "unknown"
             logger.info(f"Starting maker bot (version={version}, commit={commit}, ref={build_ref})")
             logger.bind(sensitive=True).info(f"Starting maker bot (nick: {self.nick})")
+            warn_experimental(
+                [
+                    *([experimental.TAPROOT_PIT] if self.config.address_type == "p2tr" else []),
+                    *([experimental.CHANNEL_RING] if self.config.channel_ring.enabled else []),
+                    *([experimental.CHANNEL_BUYOUT] if self.buyout is not None else []),
+                ],
+                str(self.config.bitcoin_network or self.config.network),
+            )
 
             await self._initialize_minimum_fee_policy()
 
@@ -1184,7 +1286,24 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             )
 
             # Find fidelity bond for proof generation
-            # If a specific bond is selected in config, use it; otherwise use the best one
+            # If a specific bond is selected in config, use it; otherwise use the best one.
+            # A bond this data directory leased to another maker is never selected.
+            leased: frozenset[tuple[str, int]] = frozenset()
+            if not self.config.no_fidelity_bond:
+                from jmcore.paths import get_market_store_path
+
+                self.bond_lease_guard = BondLeaseGuard(
+                    get_market_store_path(resolved_data_dir),
+                    (self.config.bitcoin_network or self.config.network).value,
+                    wallet_id=self.wallet.market_wallet_id,
+                )
+                # Unknown history selects as before; the guard then suppresses proofs.
+                leased = (
+                    await self.bond_lease_guard.refresh(
+                        await find_fidelity_bonds(self.wallet), self.current_block_height
+                    )
+                    or frozenset()
+                )
             if self.config.no_fidelity_bond:
                 self.fidelity_bond = None
                 logger.warning("Fidelity bond disabled (offers will have no bond proof)")
@@ -1195,7 +1314,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 self.fidelity_bond = next(
                     (b for b in bonds if b.txid == sel_txid and b.vout == sel_vout), None
                 )
-                if self.fidelity_bond:
+                if self.fidelity_bond and (sel_txid, sel_vout) in leased:
+                    logger.warning(
+                        "Selected fidelity bond is leased to another maker, "
+                        "falling back to best available"
+                    )
+                    logger.bind(sensitive=True).warning(
+                        f"Selected fidelity bond {sel_txid[:16]}...:{sel_vout} is leased, "
+                        "falling back to best available"
+                    )
+                    self.fidelity_bond = await self._best_fidelity_bond(leased)
+                elif self.fidelity_bond:
                     logger.bind(sensitive=True).info(
                         f"Using selected fidelity bond: {sel_txid[:16]}...:{sel_vout}, "
                         f"value={self.fidelity_bond.value:,} sats, "
@@ -1209,19 +1338,29 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                         f"Selected fidelity bond {sel_txid[:16]}...:{sel_vout} not found, "
                         "falling back to best available"
                     )
-                    self.fidelity_bond = await get_best_fidelity_bond(
-                        self.wallet, current_block_height=self.current_block_height
-                    )
+                    self.fidelity_bond = await self._best_fidelity_bond(leased)
             else:
                 # Auto-select the best (largest bond value) fidelity bond
-                self.fidelity_bond = await get_best_fidelity_bond(
-                    self.wallet, current_block_height=self.current_block_height
-                )
+                self.fidelity_bond = await self._best_fidelity_bond(leased)
+            if self.fidelity_bond is not None and self.config.lease_bond:
+                try:
+                    ensure_fidelity_bond_certificate_valid(
+                        self.fidelity_bond, self.current_block_height
+                    )
+                except ExpiredFidelityBondCertificateError:
+                    self.release_expired_bond()
             if self.fidelity_bond:
                 ensure_fidelity_bond_certificate_valid(
                     self.fidelity_bond,
                     self.current_block_height,
                 )
+                if self.bond_lease_guard is not None:
+                    # Record the advertised bond before the first proof is sent.
+                    await self.bond_lease_guard.refresh(
+                        [self.fidelity_bond],
+                        self.current_block_height,
+                        advertising=self.fidelity_bond,
+                    )
                 logger.bind(sensitive=True).info(
                     f"Fidelity bond found: {self.fidelity_bond.txid[:16]}..., "
                     f"value={self.fidelity_bond.value:,} sats, "
@@ -1320,6 +1459,59 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             # Determine the onion address to advertise
             onion_host = self.config.onion_host
 
+            if self.config.channel_ring.enabled or self.config.channel_ring.nodes:
+                from jmswap.channel_ring_nodes import (
+                    channel_ring_wallet_identity,
+                    initialize_channel_ring_nodes,
+                )
+
+                offer_type = self.config.get_effective_offer_configs()[0].offer_type.value
+                self._channel_ring_nodes = await initialize_channel_ring_nodes(
+                    self.config.channel_ring,
+                    network=self.config.network.value,
+                    offer_type=offer_type,
+                    wallet_identity=channel_ring_wallet_identity(
+                        self.wallet.master_key.get_public_key_bytes()
+                    ),
+                    mixdepth_count=self.wallet.mixdepth_count,
+                    data_directory=self.config.data_dir or get_default_data_dir(),
+                )
+                self._channel_ring_store = self._channel_ring_nodes.store
+                from jmswap.channel_ring import wallet_escrow_authorizer_pubkey
+
+                from maker.channel_ring import reconcile_ring_records
+
+                retired_records = await reconcile_ring_records(
+                    self._channel_ring_store,
+                    self._channel_ring_nodes,
+                    self.backend,
+                    self._channel_ring_recovery_tasks,
+                    acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                    escrow_authorizer_pubkey=wallet_escrow_authorizer_pubkey(self.wallet),
+                )
+                report = self._channel_ring_store.load_all()
+                if not self._renew_channel_ring_input_locks():
+                    raise RuntimeError("could not restore an active channel-ring input reservation")
+                self._release_retired_ring_inputs(retired_records)
+                if self.config.channel_ring.enabled:
+                    await self._channel_ring_nodes.enable_funding()
+                active = sum(record.active for record in report.records)
+                verified = sum(record.verified_unresolved for record in report.records)
+                capacity_available = (
+                    not report.corruptions
+                    and active < self.config.channel_ring.max_active_sessions
+                    and verified < self.config.channel_ring.max_verified_sessions
+                )
+                if capacity_available and self.config.channel_ring.enabled:
+                    self.channel_ring_capability_validated = True
+                    self._directory_pool.enable_private_channel_ring()
+                    logger.info("Validated private channel-ring LND backend")
+                else:
+                    logger.warning(
+                        "Private channel ring is not advertised: durable participant "
+                        "capacity is exhausted or records are corrupt"
+                    )
+
             logger.info("Connecting to directory servers...")
             await self._connect_to_directories_with_retry()
 
@@ -1367,6 +1559,17 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             rescan_task = asyncio.create_task(self._periodic_rescan())
             self.listen_tasks.append(rescan_task)
 
+            if self.bond_lease_guard is not None and (
+                self.fidelity_bond is not None or self.config.lease_bond
+            ):
+                self.listen_tasks.append(
+                    asyncio.create_task(
+                        self.bond_lease_guard.run(
+                            lambda: self.fidelity_bond, lambda: self.current_block_height
+                        )
+                    )
+                )
+
             # Start periodic rate limit status logging task
             status_task = asyncio.create_task(self._periodic_rate_limit_status())
             self.listen_tasks.append(status_task)
@@ -1390,6 +1593,10 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
                 )
                 self.listen_tasks.append(self._tor_onion_monitor_task)
 
+            if self._channel_ring_nodes is not None and self._channel_ring_store is not None:
+                ring_task = asyncio.create_task(self._periodic_channel_ring_reconciliation())
+                self.listen_tasks.append(ring_task)
+
             # Start periodic summary notification task (if enabled)
             notifier = get_notifier()
             if notifier.config.notify_summary:
@@ -1410,10 +1617,50 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
             logger.bind(sensitive=True).error(f"Failed to start maker bot: {e}")
             raise
 
+    async def close_offer_admission(self) -> None:
+        """Close new fills/publication and attempt withdrawal, never retire resources.
+
+        Both gates and all retained identities' queued withdrawals are set
+        before the first wait. A completed call drains accepted fill handlers
+        and attempts delivery to connected directories. Offline withdrawals
+        remain pending, not guaranteed delivered: a noncurrent identity may
+        lack a reconnect worker. An already-started public or private send may
+        still land. Canceling this wait leaves the gates and queued debt.
+
+        Accepted sessions, generation routing, recovery tasks, and node leases
+        remain intact. Market sellers have their own admission boundary. This
+        transient operation proves neither financial quiescence nor clearance
+        to retire an identity or node; a new process starts open as before.
+        """
+        self._fill_admission_closed = True
+        self._offer_admission_closed = True
+        for generation in list(self.generations.values()):
+            self._queue_offer_withdrawals(generation)
+        await self.close_fill_admission()
+        await self._flush_offer_delivery()
+
+    async def close_fill_admission(self) -> None:
+        """Reject new fills and await already-accepted fill handlers, not sessions.
+
+        Acceptance occurs after synchronous offer validation, before the fill's
+        first await. An accepted session may still authenticate, acquire its
+        first ring binding, or consume a reserve after this method returns.
+        Treat the whole session as outstanding, not only existing ring records.
+
+        The sticky gate closes when this coroutine executes. Canceling its wait
+        cancels neither handlers nor settlement/recovery tasks. This does not
+        withdraw offers, stop resources, establish financial quiescence, or
+        authorize node retirement. A new process starts open as before.
+        """
+        self._fill_admission_closed = True
+        await self._fill_admissions_idle.wait()
+
     async def stop(self) -> None:
         """Stop the maker bot"""
         logger.info("Stopping maker bot...")
+        self._stopping = True
         self.running = False
+        ring_sessions = list(self.active_sessions.values())
         # Either task may be mid-rotation; cancel both so rollback runs first.
         for rotation_task in (self._identity_renewal_task, self._tor_onion_monitor_task):
             if rotation_task is not None:
@@ -1458,13 +1705,55 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         # their directory dispatchers.
         for listener_task in self.listen_tasks:
             listener_task.cancel()
+        for recovery_task in self._channel_ring_recovery_tasks.values():
+            recovery_task.cancel()
+        for session in self.active_sessions.values():
+            if session.ring_participant is not None:
+                session.ring_participant.cancel_acceptor_task()
 
         if self.listen_tasks:
             _, pending_listeners = await asyncio.wait(set(self.listen_tasks), timeout=2.0)
             for listener_task in pending_listeners:
                 listener_task.cancel()
+        if self._channel_ring_nodes is not None:
+            # A bounded shutdown must not hand the journal lease to another
+            # process while cancellation-suppressing writers are still alive.
+            producers = set(self.listen_tasks) | set(expiration_tasks)
+            if cleanup_task is not None:
+                producers.add(cleanup_task)
+            if producers:
+                await asyncio.gather(*producers, return_exceptions=True)
+            # Dispatcher cancellation can register detached handlers during
+            # that await. Direct-connection handlers are tracked too, even
+            # before their dispatcher detaches them.
+            ring_writers = self._session_handler_tasks | self._detached_handler_tasks
+            for writer in ring_writers:
+                if not writer.done():
+                    writer.cancel()
+            if ring_writers:
+                await asyncio.gather(*ring_writers, return_exceptions=True)
+            ring_acceptors = [
+                session.ring_participant.acceptor_task
+                for session in ring_sessions
+                if session.ring_participant is not None
+                and session.ring_participant.acceptor_task is not None
+            ]
+            for acceptor in ring_acceptors:
+                acceptor.cancel()
+            if ring_acceptors:
+                await asyncio.gather(*ring_acceptors, return_exceptions=True)
         self.listen_tasks.clear()
         self._session_cleanup_task = None
+        if self._channel_ring_recovery_tasks:
+            await asyncio.gather(
+                *self._channel_ring_recovery_tasks.values(), return_exceptions=True
+            )
+            self._channel_ring_recovery_tasks.clear()
+
+        if self._channel_ring_nodes is not None:
+            await self._channel_ring_nodes.close()
+            self._channel_ring_nodes = None
+            self.channel_ring_capability_validated = False
 
         # Close every generation. The compatibility aliases point at the
         # current record, so generation-owned cleanup also handles replacement
@@ -1491,12 +1780,125 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         """Stop listener tasks so ``start`` can propagate a fatal background error."""
         if self._fatal_error is None:
             self._fatal_error = error
+        # Merely clearing ``running`` does not prevent an already-connected
+        # taker from entering a fill handler before the listeners unwind.
+        self._stopping = True
         self.running = False
 
         current_task = asyncio.current_task()
         for listener_task in self.listen_tasks:
             if listener_task is not current_task:
                 listener_task.cancel()
+
+    async def _periodic_channel_ring_reconciliation(self) -> None:
+        from jmswap.channel_ring import wallet_escrow_authorizer_pubkey
+
+        from maker.channel_ring import reconcile_ring_records
+
+        while self.running:
+            try:
+                assert self._channel_ring_store is not None
+                assert self._channel_ring_nodes is not None
+                active_identities = frozenset(
+                    f"{session.taker_nick}:{session.commitment.hex()}"
+                    for session in self.active_sessions.values()
+                )
+                retired_records = await reconcile_ring_records(
+                    self._channel_ring_store,
+                    self._channel_ring_nodes,
+                    self.backend,
+                    self._channel_ring_recovery_tasks,
+                    acceptor_timeout_seconds=self.config.channel_ring.phase_timeout_seconds,
+                    escrow_authorizer_pubkey=wallet_escrow_authorizer_pubkey(self.wallet),
+                    active_session_identities=active_identities,
+                )
+                if not self._renew_channel_ring_input_locks():
+                    raise RuntimeError("channel-ring input reservation renewal failed")
+                self._release_retired_ring_inputs(retired_records)
+            except Exception as exc:
+                self.channel_ring_capability_validated = False
+                logger.error("Stopping maker: channel-ring input safety check failed")
+                logger.bind(sensitive=True).error("Channel-ring recovery failure: {}", exc)
+                self._abort_for_fatal_error(
+                    RuntimeError(
+                        "channel-ring input safety check failed; operator recovery required"
+                    )
+                )
+                return
+            await asyncio.sleep(self.config.channel_ring.phase_timeout_seconds)
+
+    def _release_retired_ring_inputs(
+        self, retired_records: tuple[RingParticipantRecord, ...]
+    ) -> None:
+        """Release retired owners' leases, then acknowledge completed retirement.
+
+        No await separates the journal check, wallet release, and acknowledgment.
+        Active revisions take responsibility for any inputs they reused. A crash
+        before acknowledgment simply retries the owner-qualified release.
+        """
+        if not retired_records:
+            return
+        assert self._channel_ring_store is not None
+        report = self._channel_ring_store.load_all()
+        if report.corruptions:
+            raise RuntimeError("cannot release ring inputs while corrupt records exist")
+        protected = {
+            outpoint
+            for item in report.records
+            if item.active
+            for outpoint in item.local_input_outpoints
+        }
+        current_records = {item.key: item for item in report.records}
+        for retired in retired_records:
+            record = current_records.get(retired.key)
+            if record is None or record.state is not RingLifecycleState.RETIRED:
+                continue
+            if record.input_lock_owner is None or not record.local_input_outpoints:
+                continue
+            releasable = set(record.local_input_outpoints) - protected
+            if releasable:
+                self.wallet.release_coinjoin_inputs(
+                    {(item.txid, item.vout) for item in releasable},
+                    owner=record.input_lock_owner,
+                )
+            if record.unsigned_retirement_pending:
+                self._channel_ring_store.transition(
+                    record.key,
+                    RingLifecycleState.RETIRED,
+                    updates={"unsigned_retirement_pending": False},
+                )
+
+    def _renew_channel_ring_input_locks(self) -> bool:
+        """Keep the wallet leases of active durable ring records alive.
+
+        Renewal comes first so an existing lease this owner already holds is
+        extended instead of colliding with itself. Acquisition is only a
+        fallback for leases that are missing or expired (typically after a
+        restart), and it still fails closed when a live lock belongs to another
+        owner. Records without a persisted owner are never restored, because an
+        absent owner proves nothing about who holds the coins.
+        """
+        if self._channel_ring_store is None:
+            return True
+        report = self._channel_ring_store.load_all()
+        if report.corruptions:
+            return False
+        ttl = max(
+            self.config.pending_tx_timeout_min * 60,
+            self.config.pending_tx_abandon_hours * 3600,
+        )
+        for record in report.records:
+            if not record.active or not record.local_input_outpoints:
+                continue
+            owner = record.input_lock_owner
+            if owner is None:
+                return False
+            outpoints = {(item.txid, item.vout) for item in record.local_input_outpoints}
+            if self.wallet.renew_coinjoin_inputs(outpoints, ttl=ttl, owner=owner):
+                continue
+            if not self.wallet.reserve_coinjoin_inputs(outpoints, ttl=ttl, owner=owner):
+                return False
+        return True
 
     def _log_rate_limited(
         self,
@@ -1593,10 +1995,15 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         self.current_block_height = await self.backend.get_block_height()
         logger.debug(f"Updated block height: {self.current_block_height}")
         if self.fidelity_bond is not None:
-            ensure_fidelity_bond_certificate_valid(
-                self.fidelity_bond,
-                self.current_block_height,
-            )
+            try:
+                ensure_fidelity_bond_certificate_valid(
+                    self.fidelity_bond,
+                    self.current_block_height,
+                )
+            except ExpiredFidelityBondCertificateError:
+                if not self.config.lease_bond:
+                    raise
+                self.release_expired_bond()
 
         # Update pending history immediately after sync (in case of restart)
         await self._update_pending_history()
@@ -1647,6 +2054,9 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         overlapping rescan uses it to detect that the offers it wants already
         exist and must not be rebuilt (which would re-randomize unchanged terms).
         """
+        if self._offer_admission_closed:
+            await self._flush_offer_delivery()
+            return
         generation = self._generation()
         if generation is None:
             return
@@ -1689,6 +2099,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         adopted = False
         try:
             new_offers = await offer_manager.create_offers()
+            if not self._can_publish_generation(generation):
+                return
 
             if self.current_offers == new_offers:
                 logger.debug("Offers unchanged, skipping re-announcement")
@@ -1781,7 +2193,8 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
     def _can_publish_generation(self, generation: MakerGeneration) -> bool:
         """Whether this identity may still publish offers of its own."""
         return (
-            generation.generation_id == self.current_generation_id
+            not self._offer_admission_closed
+            and generation.generation_id == self.current_generation_id
             and self._generation(generation.generation_id) is generation
             and cast(MakerGeneration, generation).state is GenerationState.ACCEPTING
         )
@@ -1795,10 +2208,34 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
     async def _deliver_pending(self, generation: MakerGeneration) -> None:
         """Send whatever this generation's directories still owe."""
+        if self._offer_admission_closed:
+            self._queue_offer_withdrawals(generation)
         await generation.offer_delivery.flush(self._generation_clients(generation.generation_id))
+
+    def _queue_offer_withdrawals(self, generation: MakerGeneration) -> None:
+        """Supersede even offline announcements without changing session-owned offers."""
+        delivery = generation.offer_delivery
+        offers = (
+            self.current_offers
+            if generation.generation_id == self.current_generation_id
+            else generation.current_offers
+        )
+        offer_ids = {offer.oid for offer in offers} | {
+            oid for updates in delivery.pending.values() for oid in updates
+        }
+        node_ids = (
+            set(self._generation_clients(generation.generation_id))
+            | set(delivery.pending)
+            | {node_id for _, node_id in generation.directory_pool.list_disconnected()}
+        )
+        delivery.queue(node_ids, dict.fromkeys(offer_ids, None))
 
     async def _flush_offer_delivery(self) -> None:
         """Retry public offer messages the current identity still owes."""
+        if self._offer_admission_closed:
+            for retained in list(self.generations.values()):
+                await self._deliver_pending(retained)
+            return
         generation = self._generation()
         if generation is None or generation.state is not GenerationState.ACCEPTING:
             return
@@ -1830,10 +2267,98 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
 
     async def _announce_generation_offers(self, generation: MakerGeneration) -> None:
         """Announce offers using only the identity that owns them."""
+        if self._offer_admission_closed:
+            await self._deliver_pending(generation)
+            return
         clients = self._generation_clients(generation.generation_id)
         delivery = generation.offer_delivery
         delivery.queue(clients, self._public_offer_payloads(generation.current_offers))
         await delivery.flush(clients)
+
+    async def _best_fidelity_bond(
+        self, exclude: Collection[tuple[str, int]]
+    ) -> FidelityBondInfo | None:
+        """The best usable bond; with ``lease_bond``, None when every certificate expired."""
+        try:
+            return await get_best_fidelity_bond(
+                self.wallet, current_block_height=self.current_block_height, exclude=exclude
+            )
+        except ExpiredFidelityBondCertificateError:
+            if not self.config.lease_bond:
+                raise
+            logger.warning("Every fidelity bond certificate has expired; leasing a bond instead")
+            return None
+
+    def release_expired_bond(self) -> None:
+        """Stop advertising a bond whose certificate expired, so one can be leased.
+
+        Only with ``lease_bond``: otherwise an expired certificate stops the maker.
+        """
+        logger.warning(
+            "The fidelity bond certificate has expired; offers carry no bond proof "
+            "until a new lease is bought. For a cold storage bond of your own, sign a "
+            "new certificate instead (jm-wallet prepare-certificate-message, then "
+            "jm-wallet import-certificate) and restart the maker."
+        )
+        self.fidelity_bond = None
+
+    async def adopt_leased_bond(self, bond: FidelityBondInfo, height: int) -> None:
+        """Advertise a newly leased bond while no other bond is advertised.
+
+        Owned bonds are chosen only at startup, so this never replaces one.
+        """
+        if self.fidelity_bond is not None:
+            raise ValueError("a fidelity bond is already advertised")
+        self.fidelity_bond = bond
+        if self.bond_lease_guard is not None:
+            # Proofs wait until the guard has recorded the bond as advertised.
+            await self.bond_lease_guard.refresh([bond], height, advertising=bond)
+        logger.info(
+            f"Advertising a leased fidelity bond until block {(bond.cert_expiry or 0) * 2016}"
+        )
+        logger.bind(sensitive=True).info(
+            f"Leased fidelity bond {bond.txid[:16]}...:{bond.vout}, value={bond.value:,} sats, "
+            f"bond_value={bond.bond_value:,}"
+        )
+
+    def _advertised_bond(self) -> FidelityBondInfo | None:
+        """The selected bond, unless the lease guard forbids advertising it now."""
+        bond = self.fidelity_bond
+        if bond is None:
+            return bond
+        if self.bond_lease_guard is None:
+            # Preserve the legacy embedding fallback, but never let a missing
+            # guard bypass a fresh wallet's persisted history requirement.
+            from jmcore.bond_advertisements import (
+                BoundAdvertisementRecord,
+                advertisement_record_path,
+                read_advertisements,
+            )
+            from jmcore.market_store import MarketStore
+            from jmcore.paths import get_default_data_dir, get_market_store_path
+
+            data_dir = (
+                Path(self.config.data_dir) if self.config.data_dir else get_default_data_dir()
+            )
+            try:
+                if (
+                    MarketStore.inspect_advertisement_binding(get_market_store_path(data_dir))
+                    is not None
+                ):
+                    return None
+                record = read_advertisements(
+                    advertisement_record_path(data_dir),
+                    wallet_id=self.wallet.market_wallet_id,
+                    network=(self.config.bitcoin_network or self.config.network).value,
+                )
+                if isinstance(record, BoundAdvertisementRecord):
+                    return None
+            except Exception:
+                return None
+            return bond
+        if self.bond_lease_guard.allows(bond):
+            return bond
+        return None
 
     def _format_offer_announcement(self, offer: Offer, include_bond: bool = False) -> str:
         """Format offer for announcement.
@@ -1860,11 +2385,11 @@ class MakerBot(BackgroundTasksMixin, ProtocolHandlersMixin, DirectConnectionMixi
         )
 
         # Append fidelity bond proof ONLY for private responses
-        if include_bond and self.fidelity_bond is not None:
+        if include_bond and (bond := self._advertised_bond()) is not None:
             # For private response, we use the requesting taker's nick
             # The ownership signature proves we control the UTXO
             bond_proof = create_fidelity_bond_proof(
-                bond=self.fidelity_bond,
+                bond=bond,
                 maker_nick=self.nick,
                 taker_nick=self.nick,  # Will be updated when sending to specific taker
                 current_block_height=self.current_block_height,

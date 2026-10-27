@@ -17,6 +17,7 @@ This section covers protocol behavior, architecture, privacy model, configuratio
 | [Maker Verification](maker-verification-checklist.md) | Checks required before signing |
 | [Threat Model](threat-model.md) | Adversaries, assumptions, and limits |
 | [Neutrino TLS](neutrino-tls.md) | Backend authentication and credential handling |
+| [Standard Taproot Setup](standard-taproot-setup.md) | Managed Lightning nodes, rings, and market integration (design) |
 | [Development](development.md) | Development guidelines and setup |
 | [Best Practices](best-practices.md) | Recommended practices and patterns |
 | [References](references.md) | External references and resources |

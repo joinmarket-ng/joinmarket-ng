@@ -28,7 +28,7 @@ and tumbler). To install from a clone in a virtualenv instead:
 ```bash
 python -m venv jmvenv
 source jmvenv/bin/activate
-python -m pip install -e ./jmcore -e ./jmwallet -e ./maker -e ./taker \
+python -m pip install -e ./jmcore -e ./jmwallet -e ./jmswap -e ./maker -e ./taker \
     -e ./tumbler -e ./jmwalletd
 ```
 

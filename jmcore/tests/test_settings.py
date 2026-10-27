@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from jmcore.models import NetworkType
+from jmcore.models import NetworkType, OfferType
 from jmcore.nick_auth import NickAuthMode
 from jmcore.settings import (
     BitcoinSettings,
@@ -175,23 +175,33 @@ class TestConfigTemplate:
         derived_env_names: set[str] = set()
         expected_env_names: set[str] = set()
 
-        for section in JoinMarketSettings.model_fields:
-            nested_settings = getattr(settings, section, None)
+        pending = [
+            (section, getattr(settings, section, None))
+            for section in JoinMarketSettings.model_fields
+        ]
+        while pending:
+            section, nested_settings = pending.pop()
             if not isinstance(nested_settings, BaseModel):
                 continue
-
+            child_models = {
+                name: value
+                for name in type(nested_settings).model_fields
+                if isinstance((value := getattr(nested_settings, name)), BaseModel)
+            }
             canonical_keys = template_keys.get(section)
             assert canonical_keys is not None, f"Missing [{section}] in config.toml.template"
             excluded = excluded_fields.get(section, set())
-            expected_keys = set(type(nested_settings).model_fields) - excluded
+            expected_keys = set(type(nested_settings).model_fields) - set(child_models) - excluded
             # Excluded fields are also documented (commented) in the template,
             # so subtract them from the template side as well.
             assert canonical_keys - excluded == expected_keys
 
+            env_section = section.replace(".", "__")
             derived_env_names.update(
-                f"{section}__{key}".upper() for key in canonical_keys - excluded
+                f"{env_section}__{key}".upper() for key in canonical_keys - excluded
             )
-            expected_env_names.update(f"{section}__{key}".upper() for key in expected_keys)
+            expected_env_names.update(f"{env_section}__{key}".upper() for key in expected_keys)
+            pending.extend((f"{section}.{name}", value) for name, value in child_models.items())
 
         assert JoinMarketSettings.model_config["env_nested_delimiter"] == "__"
         assert derived_env_names == expected_env_names
@@ -395,6 +405,67 @@ class TestSettingsDefaults:
         assert settings.maker.orderbook_violation_severe_threshold == 50
         assert settings.maker.orderbook_ban_duration == 3600.0
 
+    def test_p2tr_wallet_is_the_pit_switch(self) -> None:
+        """Unset offer types follow a P2TR wallet into the Taproot pit."""
+        settings = JoinMarketSettings(wallet={"address_type": "p2tr"})
+
+        assert settings.maker.offer_type == "tr0reloffer"
+        assert settings.taker.preferred_offer_type is OfferType.TR0_RELATIVE
+
+    def test_explicit_offer_types_survive_the_pit_switch(self) -> None:
+        """An explicit choice is kept, so a mismatch still fails in component config."""
+        settings = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            maker={"offer_type": "tr0absoffer"},
+            taker={"preferred_offer_type": "sw0reloffer"},
+        )
+
+        assert settings.maker.offer_type == "tr0absoffer"
+        assert settings.taker.preferred_offer_type is OfferType.SW0_RELATIVE
+
+    @pytest.mark.parametrize("mode", ["managed", "manual"])
+    def test_lightning_requires_the_taproot_switch(self, mode: str) -> None:
+        """No channels or market integration without a P2TR wallet."""
+        assert JoinMarketSettings().lightning.mode == "off"
+        with pytest.raises(ValidationError, match="requires wallet.address_type"):
+            JoinMarketSettings(lightning={"mode": mode})
+
+        settings = JoinMarketSettings(wallet={"address_type": "p2tr"}, lightning={"mode": mode})
+        assert settings.lightning.mode == mode
+
+    def test_selling_podle_commitments_requires_lightning(self) -> None:
+        """A maker invoices PoDLE sales from its nodes, so selling needs [lightning]."""
+        assert JoinMarketSettings().maker.sell_podle is False
+        with pytest.raises(ValidationError, match="sell_podle requires lightning.mode"):
+            JoinMarketSettings(maker={"sell_podle": True})
+        selling = JoinMarketSettings(
+            wallet={"address_type": "p2tr"},
+            lightning={"mode": "managed"},
+            maker={"sell_podle": True, "podle_price_sats": 500},
+        )
+        assert selling.maker.sell_podle and selling.maker.podle_price_sats == 500
+
+    def test_lightning_makes_an_unset_podle_source_prefer_the_market(self) -> None:
+        """P2TR plus Lightning buys PoDLEs by default; explicit choices are kept."""
+        p2tr = {"address_type": "p2tr"}
+        assert JoinMarketSettings(wallet=p2tr).taker.external_podle_mode == "disabled"
+        managed = JoinMarketSettings(wallet=p2tr, lightning={"mode": "managed"})
+        assert managed.taker.external_podle_mode == "prefer"
+        explicit = JoinMarketSettings(
+            wallet=p2tr, lightning={"mode": "manual"}, taker={"external_podle_mode": "disabled"}
+        )
+        assert explicit.taker.external_podle_mode == "disabled"
+
+        with pytest.raises(ValidationError, match="'prefer' requires wallet.address_type"):
+            JoinMarketSettings(taker={"external_podle_mode": "prefer"})
+        # Existing segwit users of imported credentials keep working.
+        legacy = JoinMarketSettings(taker={"external_podle_mode": "only"})
+        assert legacy.taker.external_podle_mode == "only"
+
+    def test_lightning_reserve_range_must_be_ordered(self) -> None:
+        with pytest.raises(ValidationError, match="reserve_min_sats exceeds"):
+            JoinMarketSettings(lightning={"reserve_min_sats": 200_000, "reserve_max_sats": 100_000})
+
     def test_default_taker_settings(self) -> None:
         """Test default taker settings."""
         settings = JoinMarketSettings()
@@ -414,6 +485,7 @@ class TestSettingsDefaults:
         assert settings.taker.bondless_require_zero_fee is True
         assert settings.taker.initial_confirmation_timeout_sec == 300
         assert settings.taker.tx_broadcast == "random-peer"
+        assert settings.taker.external_podle_mode == "disabled"
 
 
 class TestSettingsFromEnv:
@@ -911,10 +983,16 @@ class TestTakerSettingsPodleFields:
             taker_utxo_age=10,
             taker_utxo_retries=7,
             taker_utxo_amtpercent=50,
+            external_podle_mode="only",
         )
         assert settings.taker_utxo_age == 10
         assert settings.taker_utxo_retries == 7
         assert settings.taker_utxo_amtpercent == 50
+        assert settings.external_podle_mode == "only"
+
+    def test_external_podle_mode_rejects_unsupported_values(self) -> None:
+        with pytest.raises(ValueError):
+            TakerSettings(external_podle_mode="fallback")  # type: ignore[arg-type]
 
     def test_taker_utxo_age_rejects_zero(self) -> None:
         """``taker_utxo_age`` must be >= 1; PoDLE commitments require

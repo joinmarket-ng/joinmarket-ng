@@ -36,14 +36,16 @@ Environment Variable Naming:
 
 from __future__ import annotations
 
+import copy
 import importlib.resources
 import json
 import os
 import re
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 from loguru import logger
 from pydantic import (
@@ -65,6 +67,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from jmcore.channel_ring import ChannelRingSettings, TakerChannelRingSettings
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.fee_policy import validate_min_fee_block_target
 from jmcore.models import (
@@ -72,6 +75,7 @@ from jmcore.models import (
     DIRECTORY_NODES_SIGNET,
     DIRECTORY_NODES_TESTNET,
     NetworkType,
+    OfferType,
 )
 from jmcore.nick_auth import NickAuthMode, validate_directory_endpoint, validate_directory_id
 from jmcore.paths import get_default_data_dir
@@ -293,6 +297,10 @@ class BitcoinSettings(BaseModel):
         ),
     )
 
+    # Internal validation policy, never a configurable field. Candidate-only
+    # models retain credential paths without consulting external file state.
+    _load_credential_files: ClassVar[bool] = True
+
     @model_validator(mode="after")
     def _load_rpc_cookie_from_file(self) -> Self:
         """Read rpc_user/rpc_password from Bitcoin Core .cookie file.
@@ -303,6 +311,8 @@ class BitcoinSettings(BaseModel):
         explicitly provided, the cookie file is parsed and the
         credentials are populated automatically.
         """
+        if not self._load_credential_files:
+            return self
         if self.rpc_cookie_file is not None:
             cookie_path = Path(self.rpc_cookie_file).expanduser()
             # Only override if user hasn't explicitly set credentials
@@ -336,6 +346,8 @@ class BitcoinSettings(BaseModel):
         CLI layer (``resolve_backend_settings``) which knows the resolved data
         directory and can join the path correctly.
         """
+        if not self._load_credential_files:
+            return self
         if self.neutrino_auth_token is None and self.neutrino_auth_token_file is not None:
             raw = self.neutrino_auth_token_file
             if raw.startswith("~") or Path(raw).is_absolute():
@@ -424,6 +436,14 @@ class WalletSettings(BaseModel):
             )
         return value
 
+    address_type: Literal["p2wpkh", "p2tr"] = Field(
+        default="p2wpkh",
+        description=(
+            "Wallet address type: 'p2wpkh' (BIP84 native segwit, the default) or "
+            "'p2tr' (BIP86 Taproot key-path). A p2tr wallet participates in tr0 "
+            "Taproot CoinJoins (JMP-0010)."
+        ),
+    )
     mixdepth_count: int = Field(
         default=5,
         ge=1,
@@ -787,7 +807,11 @@ class MakerSettings(BaseModel):
 
     offer_type: str = Field(
         default="sw0reloffer",
-        description="Offer type: sw0reloffer (relative) or sw0absoffer (absolute)",
+        description=(
+            "Offer type: sw0reloffer/sw0absoffer serve the native-segwit (P2WPKH) pit, "
+            "tr0reloffer/tr0absoffer the Taproot (P2TR) pit (JMP-0010). The family must "
+            "match wallet.address_type; 'rel' uses cj_fee_relative, 'abs' cj_fee_absolute."
+        ),
     )
     cj_fee_relative: str = Field(
         default="0.0001",
@@ -1049,6 +1073,65 @@ class MakerSettings(BaseModel):
             "The CLI flag --dual-offers overrides this setting."
         ),
     )
+    channel_ring: ChannelRingSettings = Field(default_factory=ChannelRingSettings)
+    sell_podle: bool = Field(
+        default=False,
+        description=(
+            "Sell PoDLE commitments of the current offer mixdepth's confirmed coins "
+            "over the credential market, invoiced from that mixdepth's Lightning node. "
+            "Requires [lightning] (and so P2TR), an owned fidelity bond and an "
+            "activated market ledger (jm-maker activate-market-ledger)."
+        ),
+    )
+    podle_price_sats: int | None = Field(
+        default=None,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "Price per sold PoDLE commitment. Unset: half the taker's default cap, "
+            "the fee of a one-input, one-output P2TR spend at the 3-block fee rate."
+        ),
+    )
+    rent_bonds: bool = Field(
+        default=False,
+        description=(
+            "Rent out owned fidelity bonds other than the advertised one, one retarget "
+            "period at a time, invoiced from mixdepth 0's Lightning node. Requires "
+            "[lightning] (and so P2TR) and an activated market ledger."
+        ),
+    )
+    bond_rent_rate: float = Field(
+        default=0.01,
+        gt=0,
+        le=1,
+        description=(
+            "Annual rent as a fraction of a bond's locked amount, charged for the rest "
+            "of the period a lease is sold in."
+        ),
+    )
+    lease_bond: bool = Field(
+        default=False,
+        description=(
+            "While the maker has no usable fidelity bond, lease one for the rest of each "
+            "retarget period over the credential market, paid from mixdepth 0's "
+            "Lightning node. Requires [lightning] (and so P2TR)."
+        ),
+    )
+    lease_bond_max_sats: int = Field(
+        default=50_000,
+        ge=1,
+        le=10_000_000,
+        description="Most one lease may cost, Lightning routing fees included.",
+    )
+    lease_bond_max_rate: float = Field(
+        default=0.02,
+        gt=0,
+        le=1,
+        description=(
+            "Most one lease may cost as an annual rate on the leased bond's locked "
+            "amount, for the rest of the period."
+        ),
+    )
 
     @field_validator("cj_fee_relative", mode="before")
     @classmethod
@@ -1085,6 +1168,17 @@ class MakerSettings(BaseModel):
 
 class TakerSettings(BaseModel):
     """Taker-specific settings."""
+
+    channel_ring: TakerChannelRingSettings = Field(default_factory=TakerChannelRingSettings)
+
+    @field_validator("channel_ring", mode="before")
+    @classmethod
+    def accept_common_channel_ring_settings(cls, value: Any) -> Any:
+        if isinstance(value, ChannelRingSettings) and not isinstance(
+            value, TakerChannelRingSettings
+        ):
+            return value.model_dump()
+        return value
 
     counterparty_count: int | None = Field(
         default=None,
@@ -1146,6 +1240,23 @@ class TakerSettings(BaseModel):
         description=(
             "Minimum UTXO value as a percentage of the CoinJoin amount for "
             "PoDLE commitments (reference default: 20)."
+        ),
+    )
+    external_podle_mode: Literal["disabled", "only", "prefer"] = Field(
+        default="disabled",
+        description=(
+            "Where the CoinJoin PoDLE commitment comes from. 'disabled': own UTXOs. "
+            "'only': imported external credentials only, without selecting their backing "
+            "UTXOs as CoinJoin funding inputs. 'prefer': an external credential, bought "
+            "automatically when none is usable, falling back to own UTXOs. Unset, it is "
+            "'prefer' with a P2TR wallet and Lightning enabled, else 'disabled'."
+        ),
+    )
+    market_fault_exclusion: bool = Field(
+        default=False,
+        description=(
+            "Opt in to experimental exclusion of makers with verified credential-market "
+            "fault evidence. Independent of buying or selling credentials."
         ),
     )
     max_cj_fee_rel: str = Field(
@@ -1286,6 +1397,15 @@ class TakerSettings(BaseModel):
         description=(
             "Maximum fill/auth replacement attempts to restore counterparty_count "
             "before proceeding at minimum_makers (0 = disabled)."
+        ),
+    )
+    preferred_offer_type: OfferType = Field(
+        default=OfferType.SW0_RELATIVE,
+        description=(
+            "Preferred offer family (rigid pit, JMP-0010). 'sw0reloffer'/'sw0absoffer' "
+            "select a native-segwit (P2WPKH) pit; 'tr0reloffer'/'tr0absoffer' a Taproot "
+            "(P2TR) pit. The taker only joins makers of this family and its own outputs "
+            "use this type, so it must match wallet.address_type."
         ),
     )
     rescan_interval_sec: int = Field(
@@ -1509,6 +1629,60 @@ class OrderbookWatcherSettings(BaseModel):
     )
 
 
+class MarketSettings(BaseModel):
+    """Credential-market seller settings."""
+
+    lnd_grpc_url: str | None = Field(
+        default=None,
+        description=(
+            "host:port of the seller LND gRPC that creates, settles, and cancels hold invoices"
+        ),
+    )
+    lnd_tls_cert_path: str | None = Field(
+        default=None, description="Path to that LND node's tls.cert"
+    )
+    lnd_macaroon_path: str | None = Field(
+        default=None,
+        description="Path to a macaroon limited to invoices (LND's invoice.macaroon)",
+    )
+
+
+class LightningSettings(BaseModel):
+    """Lightning nodes used by channel rings and the credential market."""
+
+    mode: Literal["off", "managed", "manual"] = Field(
+        default="off",
+        description=(
+            "'managed' runs one JoinMarket-owned LND per mixdepth (jm-lightning) and wires "
+            "rings and market payments to them; 'manual' does the same with the operator's "
+            "LND endpoints from the channel ring sections; 'off' adds no Lightning automation "
+            "(explicit channel ring settings still apply). Requires wallet.address_type = 'p2tr'."
+        ),
+    )
+    lnd_binary: str | None = Field(
+        default=None,
+        description="Managed mode: lnd executable (default: the one jm-lightning install-lnd fetched)",
+    )
+    reserve_min_sats: int = Field(
+        default=25_000,
+        ge=0,
+        le=10_000_000,
+        description="Managed mode: confirmed node wallet balance kept for force-close fee bumps",
+    )
+    reserve_max_sats: int = Field(
+        default=150_000,
+        ge=0,
+        le=10_000_000,
+        description="Managed mode: largest node wallet balance a reserve top-up may reach",
+    )
+
+    @model_validator(mode="after")
+    def _reserve_range(self) -> LightningSettings:
+        if self.reserve_min_sats > self.reserve_max_sats:
+            raise ValueError("lightning.reserve_min_sats exceeds lightning.reserve_max_sats")
+        return self
+
+
 class TuiSettings(BaseModel):
     """Menu settings, consumed by the shell TUI rather than Python components."""
 
@@ -1665,6 +1839,8 @@ class JoinMarketSettings(BaseSettings):
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     tui: TuiSettings = Field(default_factory=TuiSettings)
+    market: MarketSettings = Field(default_factory=MarketSettings)
+    lightning: LightningSettings = Field(default_factory=LightningSettings)
 
     # Component-specific settings
     maker: MakerSettings = Field(default_factory=MakerSettings)
@@ -1699,6 +1875,49 @@ class JoinMarketSettings(BaseSettings):
             toml_source,
         )
 
+    @model_validator(mode="after")
+    def _offer_families_follow_wallet(self) -> JoinMarketSettings:
+        """Make wallet.address_type the single pit switch (JMP-0010).
+
+        A P2TR wallet can only serve and join the Taproot pit, so unset maker and taker
+        offer types follow it. Explicit values are kept, and a mismatch still fails in the
+        component configuration with its existing error.
+        """
+        if self.wallet.address_type != "p2tr":
+            return self
+        if "offer_type" not in self.maker.model_fields_set:
+            self.maker.offer_type = OfferType.TR0_RELATIVE.value
+        if "preferred_offer_type" not in self.taker.model_fields_set:
+            self.taker.preferred_offer_type = OfferType.TR0_RELATIVE
+        return self
+
+    @model_validator(mode="after")
+    def _lightning_requires_taproot(self) -> JoinMarketSettings:
+        """No channels or market integration without the Taproot switch.
+
+        With it, an unset PoDLE source prefers market credentials (bought from the
+        source mixdepth's node) because they never reveal the taker's own UTXOs.
+        """
+        taproot = self.wallet.address_type == "p2tr"
+        if self.lightning.mode != "off" and not taproot:
+            raise ValueError(
+                f"lightning.mode = {self.lightning.mode!r} requires wallet.address_type = 'p2tr'"
+            )
+        if self.maker.sell_podle and self.lightning.mode == "off":
+            raise ValueError("maker.sell_podle requires lightning.mode = 'managed' or 'manual'")
+        if self.maker.rent_bonds and self.lightning.mode == "off":
+            raise ValueError("maker.rent_bonds requires lightning.mode = 'managed' or 'manual'")
+        if self.maker.lease_bond and self.lightning.mode == "off":
+            raise ValueError("maker.lease_bond requires lightning.mode = 'managed' or 'manual'")
+        if self.taker.external_podle_mode == "prefer" and not taproot:
+            raise ValueError(
+                "taker.external_podle_mode = 'prefer' requires wallet.address_type = 'p2tr'"
+            )
+        unset = "external_podle_mode" not in self.taker.model_fields_set
+        if unset and taproot and self.lightning.mode != "off":
+            self.taker.external_podle_mode = "prefer"
+        return self
+
     def get_data_dir(self) -> Path:
         """Get the data directory, using default if not set."""
         if self.data_dir is not None:
@@ -1715,6 +1934,46 @@ class JoinMarketSettings(BaseSettings):
     def get_neutrino_add_peers(self) -> list[str]:
         """Get the configured neutrino add peers."""
         return self.bitcoin.neutrino_add_peers
+
+
+class _ConfigDocumentBitcoinSettings(BitcoinSettings):
+    _load_credential_files: ClassVar[bool] = False
+
+
+class _ConfigDocumentSettings(JoinMarketSettings):
+    """The existing schema and defaults, with no ambient settings sources."""
+
+    bitcoin: _ConfigDocumentBitcoinSettings = Field(default_factory=_ConfigDocumentBitcoinSettings)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            InitSettingsSource(settings_cls, _normalize_wallet_preference_source(init_settings())),
+        )
+
+
+def validate_config_document(document: Mapping[str, Any]) -> JoinMarketSettings:
+    """Validate decoded TOML alone, without files, environment overrides, or writes.
+
+    Schema defaults apply only to the returned model, never to the document.
+    Unknown TOML names keep the normal forward-compatible ignore policy. In
+    particular they cannot become BaseSettings constructor controls such as
+    ``_env_file``. Use with ``update_config_values`` for safe displayed errors;
+    raw Pydantic errors may contain sensitive configuration inputs.
+    """
+    values = {
+        name: copy.deepcopy(value)
+        for name, value in document.items()
+        if name in JoinMarketSettings.model_fields
+    }
+    return _ConfigDocumentSettings(**values)
 
 
 def _warn_unknown_settings(
@@ -1991,7 +2250,7 @@ def _get_user_sections(user_text: str) -> set[str]:
         Set of section names found in the user config.
     """
     commented_sections = {
-        m.group(1) for m in re.finditer(r"^\s*#\s*\[(\w+)]\s*$", user_text, re.MULTILINE)
+        m.group(1) for m in re.finditer(r"^\s*#\s*\[([\w.]+)]\s*$", user_text, re.MULTILINE)
     }
 
     import tomlkit
@@ -2002,7 +2261,7 @@ def _get_user_sections(user_text: str) -> set[str]:
     except Exception:
         # If parsing fails, fall back to regex for uncommented headers.
         active_sections = {
-            m.group(1) for m in re.finditer(r"^\s*\[(\w+)]\s*$", user_text, re.MULTILINE)
+            m.group(1) for m in re.finditer(r"^\s*\[([\w.]+)]\s*$", user_text, re.MULTILINE)
         }
         return active_sections | commented_sections
 
@@ -2020,7 +2279,7 @@ def _get_template_section_keys(template_text: str) -> dict[str, set[str]]:
     Returns:
         Mapping of section name to set of key names defined in that section.
     """
-    section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    section_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     matches = list(section_re.finditer(template_text))
     result: dict[str, set[str]] = {}
     for idx, match in enumerate(matches):
@@ -2043,8 +2302,8 @@ def _get_user_section_keys(user_text: str) -> dict[str, set[str]]:
     Returns:
         Mapping of uncommented section name to set of key names found.
     """
-    boundary_re = re.compile(r"^(?:#\s*)?\[(\w+)]", re.MULTILINE)
-    uncommented_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    boundary_re = re.compile(r"^(?:#\s*)?\[([\w.]+)]", re.MULTILINE)
+    uncommented_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     all_boundaries = list(boundary_re.finditer(user_text))
     uncommented = list(uncommented_re.finditer(user_text))
 
@@ -2098,7 +2357,7 @@ def config_diff(
     user_sections = _get_user_sections(user_text)
 
     # Extract template section names.
-    template_section_re = re.compile(r"^\[(\w+)]", re.MULTILINE)
+    template_section_re = re.compile(r"^\[([\w.]+)]", re.MULTILINE)
     template_section_names = [m.group(1) for m in template_section_re.finditer(template_text)]
 
     diffs: list[str] = []

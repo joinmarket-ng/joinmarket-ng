@@ -140,12 +140,44 @@ python -m pip install --upgrade pip
 
 python -m pip install -e ./jmcore
 python -m pip install -e ./jmwallet
+python -m pip install -e ./jmswap
 python -m pip install -e ./maker
 python -m pip install -e ./taker
 python -m pip install -e ./tumbler
 # Optional: installs the jm-orderbook-watcher command
 python -m pip install -e ./orderbook_watcher
 ```
+
+### Native MuSig2 Support
+
+MuSig2 requires libsecp256k1 0.6.0 or newer with its MuSig module enabled, in
+addition to the pinned Python binding. Some Debian and Ubuntu packages provide
+0.5.0. Check the library loaded by the active Python environment:
+
+```bash
+python -c 'from bitcointx.core.secp256k1 import get_secp256k1; assert get_secp256k1().cap.has_musig, "Loaded libsecp256k1 lacks MuSig support"'
+```
+
+For Linux environments that need the newer library, run the pinned v0.8.0
+builder from the source checkout. It verifies the archive checksum before
+building. Compile as your normal user, then install the result system-wide:
+
+```bash
+sudo apt install -y cmake build-essential
+python3 scripts/build_secp256k1.py --prefix "$PWD/tmp/secp256k1-native" --build-dir "$PWD/tmp/secp256k1-build"
+sudo cmake --install tmp/secp256k1-build/build --prefix /usr/local
+sudo ldconfig
+```
+
+On macOS, update the Homebrew `secp256k1` formula and repeat the capability
+check. The maker, taker, and wallet-daemon Docker images include the pinned
+native library and check MuSig support during their builds. Existing source
+installations keep their current system library when updating; no native
+compilation or system-library replacement runs automatically at application
+startup. Enabling MuSig2 in such an installation requires the explicit native
+dependency setup above.
+
+### Shell Completions
 
 For shell completions in an editable installation, source the static scripts
 from the checkout:
@@ -197,6 +229,8 @@ cmake -S $secpSource -B $secpBuild `
   -DBUILD_SHARED_LIBS=ON `
   -DSECP256K1_ENABLE_MODULE_RECOVERY=ON `
   -DSECP256K1_ENABLE_MODULE_ECDH=ON `
+  -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON `
+  -DSECP256K1_ENABLE_MODULE_MUSIG=ON `
   -DSECP256K1_BUILD_TESTS=OFF `
   -DSECP256K1_BUILD_BENCHMARK=OFF `
   -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF
@@ -204,7 +238,7 @@ cmake --build $secpBuild --config Release
 $secpDll = Get-ChildItem $secpBuild -Recurse -Filter "*secp256k1*.dll" | Select-Object -First 1
 Copy-Item $secpDll.FullName .\.venv\Scripts\secp256k1.dll
 python -m pip install --upgrade pip
-pip install .\jmcore .\jmwallet .\taker
+pip install .\jmcore .\jmwallet .\jmswap .\taker
 ```
 
 When upgrading an existing Windows installation, rebuild and replace its

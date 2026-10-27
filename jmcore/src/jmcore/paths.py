@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from jmcore.secure_files import (
     atomic_write_sensitive_file,
@@ -16,20 +17,67 @@ from jmcore.secure_files import (
     read_sensitive_file,
 )
 
+NickRole = Literal["maker", "taker"]
 
-def get_default_data_dir() -> Path:
+# Filename suffix appended to a role for each non-default CoinJoin pit. The
+# default (SegWit v0) pit deliberately has no suffix so existing deployments
+# keep using ``state/maker.nick`` and ``state/taker.nick``.
+_NICK_STATE_SUFFIX_BY_ADDRESS_TYPE: dict[str, str] = {
+    "p2wpkh": "",
+    "p2tr": "_taproot",
+}
+
+
+def get_nick_state_component(role: NickRole, address_type: str) -> str:
+    """
+    Get the nick state filename component for a role in a CoinJoin pit.
+
+    JoinMarket peers of different address types trade in separate pits, and a
+    single wallet can run one maker and one taker per pit. The nick state
+    filename is therefore derived from the role plus the pit's address type:
+
+    - ``p2wpkh`` (SegWit v0, the default pit): ``maker`` / ``taker``
+    - ``p2tr`` (Taproot): ``maker_taproot`` / ``taker_taproot``
+
+    The SegWit v0 names are unsuffixed on purpose so that existing installations
+    and external tooling keep reading and writing the same files as before.
+
+    Args:
+        role: ``'maker'`` or ``'taker'``
+        address_type: Wallet/pit address type (e.g. ``'p2wpkh'``, ``'p2tr'``)
+
+    Returns:
+        Component name to pass to the ``*_nick_state`` helpers.
+
+    Raises:
+        ValueError: If ``address_type`` has no defined pit naming. Guessing a
+            filename would let two different pits share one nick file, so an
+            unknown type is rejected rather than defaulted.
+    """
+    try:
+        suffix = _NICK_STATE_SUFFIX_BY_ADDRESS_TYPE[address_type]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported address_type for nick state: {address_type!r} "
+            f"(expected one of {sorted(_NICK_STATE_SUFFIX_BY_ADDRESS_TYPE)})"
+        ) from None
+    return f"{role}{suffix}"
+
+
+def get_default_data_dir(*, create: bool = True) -> Path:
     """
     Get the default JoinMarket data directory.
 
     Returns ~/.joinmarket-ng or $JOINMARKET_DATA_DIR if set.
-    Creates the directory if it doesn't exist.
+    Creates the directory unless ``create=False`` requests read-only inspection.
 
     For compatibility with reference JoinMarket in Docker, users can
     set JOINMARKET_DATA_DIR=/home/jm/.joinmarket-ng to share the same volume.
     """
     env_path = os.getenv("JOINMARKET_DATA_DIR")
     data_dir = Path(env_path) if env_path else Path.home() / ".joinmarket-ng"
-    ensure_sensitive_directory(data_dir)
+    if create:
+        ensure_sensitive_directory(data_dir)
 
     return data_dir
 
@@ -54,9 +102,11 @@ def get_commitment_blacklist_path(data_dir: Path | None = None) -> Path:
     return cmtdata_dir / "commitmentlist"
 
 
-def get_used_commitments_path(data_dir: Path | None = None) -> Path:
+def get_used_commitments_path(data_dir: Path | None = None, *, create: bool = True) -> Path:
     """
     Get the path to the used commitments file (for takers).
+
+    Set ``create=False`` with an explicit data directory for read-only inspection.
 
     Args:
         data_dir: Optional data directory (defaults to get_default_data_dir())
@@ -65,13 +115,30 @@ def get_used_commitments_path(data_dir: Path | None = None) -> Path:
         Path to cmtdata/commitments.json (compatible with reference JoinMarket)
     """
     if data_dir is None:
+        if not create:
+            raise ValueError("Read-only commitments paths require an explicit data directory")
         data_dir = get_default_data_dir()
 
     # Use cmtdata/ subdirectory
     cmtdata_dir = data_dir / "cmtdata"
-    ensure_sensitive_directory(cmtdata_dir)
+    if create:
+        ensure_sensitive_directory(cmtdata_dir)
 
     return cmtdata_dir / "commitments.json"
+
+
+def get_market_store_path(data_dir: Path | None = None) -> Path:
+    """Locate the shared market store without creating or activating it."""
+    if data_dir is None:
+        data_dir = get_default_data_dir()
+    return data_dir / "market" / "seller.sqlite"
+
+
+def get_bond_purchases_path(data_dir: Path | None = None) -> Path:
+    """Locate bond-lease payment history without creating or changing it."""
+    if data_dir is None:
+        data_dir = get_default_data_dir(create=False)
+    return data_dir / "market" / "bond-purchases"
 
 
 def get_ignored_makers_path(data_dir: Path | None = None) -> Path:

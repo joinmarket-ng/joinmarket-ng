@@ -257,6 +257,44 @@ class TestBotInitialization:
 
         assert "Starting maker bot (version=0.37.1, commit=9a3b6dd, ref=main)" in messages
 
+    def test_tr0_maker_rejects_light_client_backend(self):
+        """A tr0 (Taproot) maker on a backend that cannot resolve foreign
+        prevouts (light client) must fail fast at startup rather than
+        advertise offers it can never sign."""
+        wallet = MagicMock()
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        wallet.address_type = "p2tr"
+        backend = MagicMock()
+        backend.can_resolve_foreign_prevouts.return_value = False
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.TR0_RELATIVE,
+            address_type="p2tr",
+        )
+        with pytest.raises(ValueError, match="resolve arbitrary prevouts"):
+            MakerBot(wallet=wallet, backend=backend, config=config)
+
+    def test_tr0_maker_accepts_core_backend(self):
+        """A tr0 maker on a Core/descriptor backend (resolves prevouts) starts."""
+        wallet = MagicMock()
+        wallet.mixdepth_count = 5
+        wallet.utxo_cache = {}
+        wallet.address_type = "p2tr"
+        backend = MagicMock()
+        backend.can_resolve_foreign_prevouts.return_value = True
+        config = MakerConfig(
+            mnemonic="test " * 12,
+            directory_servers=["localhost:5222"],
+            network=NetworkType.REGTEST,
+            offer_type=OfferType.TR0_RELATIVE,
+            address_type="p2tr",
+        )
+        bot = MakerBot(wallet=wallet, backend=backend, config=config)
+        assert bot.nick
+
     def test_bot_respects_no_fidelity_bond_config(self, mock_wallet, mock_backend):
         """Test that no_fidelity_bond=True is stored on the config.
 
@@ -503,7 +541,7 @@ class TestHiddenServiceListener:
             # At this point, the connection should be tracked
             connection_was_tracked = taker_nick in bot.direct_connections
             assert taker_nick == taker_identity.nick
-            assert "fill" in msg
+            assert msg == f"fill {signed_fill}"
             assert source == "direct"  # Should be called with source="direct"
             assert generation_id == 0
 
@@ -885,6 +923,71 @@ class TestHiddenServiceListener:
             await bot._handle_message(fill_message("cd" * 32), source="dir:second")
 
         assert handler.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_on_direct_connection_ring_command(
+        self, mock_wallet, mock_backend, config_with_onion
+    ):
+        """Authenticated direct ring envelopes reach the ring dispatcher."""
+        bot = MakerBot(
+            wallet=mock_wallet,
+            backend=mock_backend,
+            config=config_with_onion,
+        )
+        bot.running = True
+        received: list[tuple[str, str, str, int | None]] = []
+
+        async def mock_handle_ring(
+            taker_nick: str,
+            msg: str,
+            source: str = "unknown",
+            generation_id: int | None = None,
+        ) -> None:
+            received.append((taker_nick, msg, source, generation_id))
+
+        bot._handle_ring = mock_handle_ring
+        taker_identity = NickIdentity(JM_VERSION)
+        handshake = create_handshake_request(
+            nick=taker_identity.nick,
+            location="NOT-SERVING-ONION",
+            network=NetworkType.REGTEST.value,
+            directory=False,
+        )
+        handshake_msg = json.dumps(
+            {"type": MessageType.HANDSHAKE.value, "line": json.dumps(handshake)}
+        ).encode()
+        ciphertext = "ciphertext"
+        signed = taker_identity.sign_message(ciphertext, ONION_HOSTID)
+        ring_msg = json.dumps(
+            {
+                "type": MessageType.PRIVMSG.value,
+                "line": f"{taker_identity.nick}!{bot.nick}!ring {signed}",
+            }
+        ).encode()
+        received_messages = iter((handshake_msg, ring_msg))
+
+        async def mock_receive() -> bytes:
+            return next(received_messages)
+
+        async def mock_close() -> None:
+            pass
+
+        mock_conn = MagicMock(spec=TCPConnection)
+        mock_conn.is_connected.side_effect = [True, True, False]
+        mock_conn.receive = mock_receive
+        mock_conn.send = AsyncMock(return_value=True)
+        mock_conn.close = mock_close
+
+        await bot._on_direct_connection(mock_conn, "127.0.0.1:12345")
+
+        assert received == [
+            (
+                taker_identity.nick,
+                f"ring {signed}",
+                "direct",
+                0,
+            )
+        ]
 
     @pytest.mark.asyncio
     async def test_on_direct_connection_clean_eof_not_logged_as_error(
@@ -1437,6 +1540,83 @@ class TestWalletRescanAndOfferUpdate:
                 await maker_bot.start()
 
         maker_bot.offer_manager.create_offers.assert_not_awaited()
+
+    @staticmethod
+    def _leased_bond(test_private_key, test_pubkey, *, cert_expiry: int = 400) -> FidelityBondInfo:
+        return FidelityBondInfo(
+            txid="c" * 64,
+            vout=2,
+            value=50_000_000,
+            locktime=2_000_000_000,
+            confirmation_time=1_700_000_000,
+            bond_value=25_000,
+            pubkey=test_pubkey,
+            cert_pubkey=test_pubkey,
+            cert_privkey=test_private_key,
+            cert_signature=b"certificate-signature",
+            cert_expiry=cert_expiry,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resync_with_lease_bond_stops_advertising_an_expired_certificate(
+        self, maker_bot, test_private_key, test_pubkey
+    ):
+        maker_bot.config.lease_bond = True
+        maker_bot.fidelity_bond = self._leased_bond(test_private_key, test_pubkey)
+
+        await maker_bot._resync_wallet_and_update_offers()
+
+        assert maker_bot.fidelity_bond is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("all_expired", [False, True])
+    async def test_start_with_lease_bond_runs_without_an_expired_certificate(
+        self, maker_bot, mock_wallet, test_private_key, test_pubkey, tmp_path, all_expired
+    ):
+        from jmwallet.wallet.bond_registry import BondRegistry
+
+        maker_bot.config.data_dir = tmp_path
+        maker_bot.config.lease_bond = True
+        mock_wallet.data_dir = tmp_path
+        mock_wallet.wallet_fingerprint = "deadbeef"
+        expired = self._leased_bond(test_private_key, test_pubkey)
+        best = (
+            AsyncMock(side_effect=ExpiredFidelityBondCertificateError("expired"))
+            if all_expired
+            else AsyncMock(return_value=expired)
+        )
+        maker_bot.offer_manager.create_offers = AsyncMock(side_effect=RuntimeError("offers"))
+
+        with (
+            patch("jmwallet.wallet.bond_registry.load_registry", return_value=BondRegistry()),
+            patch("maker.bot.get_best_fidelity_bond", new=best),
+        ):
+            with pytest.raises(RuntimeError, match="offers"):
+                await maker_bot.start()
+
+        # Offers are created without a bond, for the lease buyer to fill in.
+        maker_bot.offer_manager.create_offers.assert_awaited()
+        assert maker_bot.fidelity_bond is None
+
+    @pytest.mark.asyncio
+    async def test_a_leased_bond_is_adopted_only_without_a_bond_and_recorded_first(
+        self, maker_bot, test_private_key, test_pubkey, tmp_path
+    ):
+        from maker.bond_leases import BondLeaseGuard, read_advertisements
+
+        guard = BondLeaseGuard(tmp_path / "market" / "seller.sqlite", "regtest")
+        (tmp_path / "market").mkdir()
+        maker_bot.bond_lease_guard = guard
+        bond = self._leased_bond(test_private_key, test_pubkey)
+
+        await maker_bot.adopt_leased_bond(bond, 4033)
+
+        assert maker_bot.fidelity_bond is bond
+        record = read_advertisements(guard.record_path)
+        assert record is not None and record.through((bond.txid, bond.vout)) == 3
+        assert maker_bot._advertised_bond() is bond
+        with pytest.raises(ValueError, match="already advertised"):
+            await maker_bot.adopt_leased_bond(bond, 4033)
 
     @pytest.mark.asyncio
     async def test_start_filters_registry_bonds_by_wallet_network(

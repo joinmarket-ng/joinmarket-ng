@@ -11,6 +11,10 @@ Mix your bitcoin for privacy via CoinJoin. Takers initiate transactions and pay 
 - **Transaction Monitoring**: Track transaction progress and confirmations
 - **Retry Logic**: Automatic retry on failure or maker timeout
 
+Before selecting makers, long-running takers can reconnect a failed directory transport
+using the same identity and authentication policy. This recovery does not replay a
+CoinJoin or Lightning payment.
+
 ## Documentation
 
 For full documentation, see [taker Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-taker/).
