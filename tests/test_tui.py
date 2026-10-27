@@ -337,19 +337,71 @@ def test_tui_menu_header_layout(
         ("short.mnemonic", "short.mnemonic"),
         ("x" * 24, "x" * 24),
         ("a-very-long-wallet-name.mnemonic", "a-very-long-wallet-name…"),
+        ("界" * 12, "界" * 12),
+        ("界" * 13, "界" * 11 + "…"),
+        ("界" * 11 + "abc", "界" * 11 + "a…"),
+        ("e\u0301" * 13, "e\u0301" * 13),
     ],
 )
 def test_tui_truncate_wallet_name(wallet_name: str, expected: str) -> None:
-    """Wallet names longer than 24 chars are end-truncated with an ellipsis."""
+    """Truncation budgets terminal columns, including wide and combining characters."""
     content = SCRIPT_PATH.read_text()
     script = (
         _extract_script_function(content, "truncate_wallet_name")
-        + f'\ntruncate_wallet_name "{wallet_name}"\n'
+        + '\ntruncate_wallet_name "$1"\n'
     )
     result = subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, check=True, timeout=5
+        ["bash", "-c", script, "bash", wallet_name],
+        env=os.environ | {"TUI_PYTHON": sys.executable, "LC_ALL": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
     )
     assert result.stdout.rstrip("\n") == expected
+
+
+@pytest.mark.parametrize("choice", ["DELPW", "DELPP"])
+def test_tui_delete_secret_dialog_fits_header(tmp_path: Path, choice: str) -> None:
+    """Both deletion dialogs fit the maximum-width header without wrapping it."""
+    content = SCRIPT_PATH.read_text()
+    flow = content.split(f"\n          {choice})\n", 1)[1]
+    flow = flow.split("\n            ;;", 1)[0]
+    functions = "\n".join(
+        _extract_script_function(content, name)
+        for name in ("truncate_wallet_name", "update_wallet_header", "menu_header")
+    )
+    args_file = tmp_path / "dialog.args"
+    script = (
+        functions
+        + """
+CURRENT_WALLET="$1"
+MAKER_STATUS=STOPPED
+wallet_identity_summary() { printf 0123456789abcdef; }
+ensure_active_wallet() { update_wallet_header; }
+get_stored_mnemonic_password() { printf stored; }
+get_stored_bip39_passphrase() { printf stored; }
+whiptail() { printf '%s\\0' "$@" > "$ARGS_FILE"; return 1; }
+while true; do
+"""
+        + flow
+        + "\nbreak\ndone\n"
+    )
+    subprocess.run(
+        ["bash", "-c", script, "bash", "/wallets/" + "a" * 15 + ".mnemonic"],
+        env=os.environ | {"TUI_PYTHON": sys.executable, "ARGS_FILE": str(args_file)},
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    args = args_file.read_bytes().decode().rstrip("\0").split("\0")
+    prompt_index = args.index("--yesno") + 1
+    prompt = args[prompt_index].replace("\\n", "\n")
+    header = prompt.lstrip("\n").split("\n\n", 1)[0]
+    width = int(args[prompt_index + 2])
+    assert len(header.splitlines()) == 2
+    assert all(len(line) <= width - 4 for line in header.splitlines())
 
 
 def test_tui_prefers_its_virtual_environment() -> None:

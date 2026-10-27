@@ -371,14 +371,29 @@ get_maker_env_password() {
     "$TUI_PYTHON" -m jmcore.maker_env "$MAKER_ENV" MNEMONIC_PASSWORD
 }
 
-# Helper: Truncate long wallet names for the menu header (max 24 chars).
+# Helper: Truncate wallet names to 24 terminal columns, including the ellipsis.
 truncate_wallet_name() {
-    local name="$1"
-    if [ "${#name}" -gt 24 ]; then
-        printf '%s…' "${name:0:23}"
-    else
-        printf '%s' "$name"
-    fi
+    "$TUI_PYTHON" - "$1" <<'PY'
+import ctypes
+import locale
+import sys
+
+# Measure native terminal columns, including wide and combining characters.
+locale.setlocale(locale.LC_CTYPE, "")
+cell_width = ctypes.CDLL(None).wcwidth
+cell_width.argtypes = [ctypes.c_wchar]
+cell_width.restype = ctypes.c_int
+name = sys.argv[1]
+widths = [max(0, cell_width(char)) for char in name]
+if sum(widths) > 24:
+    remaining = 23
+    for index, width in enumerate(widths):
+        if width > remaining:
+            name = name[:index] + "…"
+            break
+        remaining -= width
+print(name, end="")
+PY
 }
 
 # Helper: Refresh the two-line menu header globals from CURRENT_WALLET.
@@ -2895,7 +2910,7 @@ for item in json.load(sys.stdin):
 
             if whiptail --title " Delete Password " --yesno \
               "\n$(menu_header)\n\nDelete the stored password for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the password on next use." \
-              13 60 --defaultno 3>&1 1>&2 2>&3; then
+              13 64 --defaultno 3>&1 1>&2 2>&3; then
 
               if clear_config_value wallet mnemonic_password; then
                 whiptail --title " Password Deleted " --msgbox "Wallet password removed from config.toml." 8 50
@@ -2919,7 +2934,7 @@ for item in json.load(sys.stdin):
 
             if whiptail --title " Delete Passphrase " --yesno \
               "\n$(menu_header)\n\nDelete the stored BIP39 passphrase for wallet:\n$(basename "$CURRENT_WALLET")\n\nThis will require entering the passphrase on next use." \
-              13 60 --defaultno 3>&1 1>&2 2>&3; then
+              13 64 --defaultno 3>&1 1>&2 2>&3; then
 
               if clear_config_value wallet bip39_passphrase && rm -f "$MAKER_ENV" "$FINGERPRINT_CACHE"; then
                 unset BIP39_PASSPHRASE EXPECTED_FINGERPRINT
