@@ -8,6 +8,7 @@ rebuilds best-effort maker/taker/send/deposit rows from chain data (tagged
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -32,6 +33,7 @@ from jmwallet.cli.history_cmd import (
 )
 from jmwallet.history import (
     append_history_entry,
+    create_send_history_entry,
     create_taker_history_entry,
     format_yield_generator_report,
     purge_reconstructed_entries,
@@ -193,6 +195,62 @@ async def _run(backend: FakeBackend, data_dir: Path, **kwargs: int) -> Reconstru
         data_dir=data_dir,
         **kwargs,  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "existing_destination",
+    [
+        None,
+        "bcrt1pehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxs64gzl4",
+        "bcrt1pehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxs0fcw6h",
+    ],
+    ids=["missing-history", "legacy-checksum-history", "valid-history"],
+)
+async def test_taproot_history_uses_bech32m_without_rewriting_existing_rows(
+    tmp_path: Path, existing_destination: str | None
+) -> None:
+    fund_raw = _raw_tx([("aa" * 32, 0)], [(100_000, OUR_DEPOSIT)])
+    fund_txid = get_txid(fund_raw)
+    send_raw = serialize_transaction(
+        2,
+        [TxInput.from_hex(fund_txid, 0)],
+        [
+            TxOutput(value=50_000, script=b"\x51\x20" + b"\xcd" * 32),
+            TxOutput(value=49_847, script=_script(OUR_CHANGE)),
+        ],
+        0,
+    ).hex()
+    send_txid = get_txid(send_raw)
+    backend = FakeBackend(
+        [
+            WalletTxEntry(txid=fund_txid, confirmations=10, block_height=100),
+            WalletTxEntry(txid=send_txid, confirmations=5, block_height=105),
+        ],
+        {fund_txid: fund_raw, send_txid: send_raw},
+    )
+    if existing_destination is not None:
+        entry = create_send_history_entry(
+            destination=existing_destination,
+            change_address=_addr(OUR_CHANGE),
+            amount=50_000,
+            mining_fee=153,
+            source_mixdepth=0,
+            selected_utxos=[(fund_txid, 0)],
+            txid=send_txid,
+            network=NETWORK,
+            wallet_fingerprint=FINGERPRINT,
+        )
+        append_history_entry(replace(entry, source="onchain"), tmp_path)
+
+    result = await _run(backend, tmp_path)
+
+    sends = [entry for entry in read_history(tmp_path) if entry.txid == send_txid]
+    assert len(sends) == 1
+    assert sends[0].destination_address == (
+        existing_destination or "bcrt1pehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxs0fcw6h"
+    )
+    assert result.skipped_existing == (0 if existing_destination is None else 1)
 
 
 class TestClassifyWalletTransaction:

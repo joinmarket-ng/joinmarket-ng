@@ -8,7 +8,7 @@ This module provides consolidated Bitcoin operations:
 - Varint encoding/decoding
 
 Uses external libraries for security-critical operations:
-- bech32: BIP173 bech32 encoding
+- python-bitcointx: BIP173/BIP350 SegWit address encoding and decoding
 - base58: Base58Check encoding
 """
 
@@ -22,9 +22,9 @@ from enum import StrEnum
 from typing import Any
 
 import base58
-import bech32 as bech32_lib
 from bitcointx.core import Hash160
 from bitcointx.segwit_addr import decode as decode_segwit_address
+from bitcointx.segwit_addr import encode as encode_segwit_address
 from pydantic import validate_call
 from pydantic.dataclasses import dataclass
 
@@ -402,7 +402,7 @@ def pubkey_to_p2wpkh_address(pubkey: bytes | str, network: str | NetworkType = "
     pubkey_hash = hash160(pubkey)
     hrp = get_hrp(network)
 
-    result = bech32_lib.encode(hrp, 0, pubkey_hash)
+    result = encode_segwit_address(hrp, 0, pubkey_hash)
     if result is None:
         raise ValueError("Failed to encode bech32 address")
     return result
@@ -440,7 +440,7 @@ def script_to_p2wsh_address(script: bytes, network: str | NetworkType = "mainnet
     script_hash = sha256(script)
     hrp = get_hrp(network)
 
-    result = bech32_lib.encode(hrp, 0, script_hash)
+    result = encode_segwit_address(hrp, 0, script_hash)
     if result is None:
         raise ValueError("Failed to encode bech32 address")
     return result
@@ -490,10 +490,10 @@ def address_to_scriptpubkey(address: str) -> bytes:
     Returns:
         scriptPubKey bytes
     """
-    # Bech32 (SegWit) addresses
+    # Bech32/Bech32m (SegWit) addresses
     hrp = _segwit_hrp(address)
     if hrp is not None:
-        bech32_decoded = bech32_lib.decode(hrp, address)
+        bech32_decoded = decode_segwit_address(hrp, address)
         if bech32_decoded[0] is None or bech32_decoded[1] is None:
             raise ValueError(f"Invalid bech32 address: {address}")
 
@@ -576,21 +576,21 @@ def scriptpubkey_to_address(scriptpubkey: bytes, network: str | NetworkType = "m
 
     # P2WPKH
     if len(scriptpubkey) == 22 and scriptpubkey[0] == 0x00 and scriptpubkey[1] == 0x14:
-        result = bech32_lib.encode(hrp, 0, scriptpubkey[2:])
+        result = encode_segwit_address(hrp, 0, scriptpubkey[2:])
         if result is None:
             raise ValueError(f"Failed to encode P2WPKH address: {scriptpubkey.hex()}")
         return result
 
     # P2WSH
     if len(scriptpubkey) == 34 and scriptpubkey[0] == 0x00 and scriptpubkey[1] == 0x20:
-        result = bech32_lib.encode(hrp, 0, scriptpubkey[2:])
+        result = encode_segwit_address(hrp, 0, scriptpubkey[2:])
         if result is None:
             raise ValueError(f"Failed to encode P2WSH address: {scriptpubkey.hex()}")
         return result
 
     # P2TR
     if len(scriptpubkey) == 34 and scriptpubkey[0] == 0x51 and scriptpubkey[1] == 0x20:
-        result = bech32_lib.encode(hrp, 1, scriptpubkey[2:])
+        result = encode_segwit_address(hrp, 1, scriptpubkey[2:])
         if result is None:
             raise ValueError(f"Failed to encode P2TR address: {scriptpubkey.hex()}")
         return result
@@ -1212,7 +1212,7 @@ def get_address_type(address: str) -> str:
     Raises:
         ValueError: If address is invalid or unknown type
     """
-    # Witness v0 uses Bech32; Taproot uses Bech32m, unlike the legacy decoder.
+    # Witness v0 uses Bech32; Taproot uses Bech32m.
     hrp = _segwit_hrp(address)
     if hrp is not None:
         decoded = decode_segwit_address(hrp, address)

@@ -12,7 +12,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import base58 as b58
-import bech32 as bech32_lib
 import pytest
 from bitcointx.segwit_addr import encode as encode_segwit_address
 from loguru import logger
@@ -33,7 +32,7 @@ def captured_warnings() -> Iterator[list[str]]:
 
 
 def _make_p2wpkh() -> str:
-    addr = bech32_lib.encode("bcrt", 0, b"\xaa" * 20)
+    addr = encode_segwit_address("bcrt", 0, b"\xaa" * 20)
     assert addr is not None
     return addr
 

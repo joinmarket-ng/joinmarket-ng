@@ -48,6 +48,8 @@ from jmcore.bitcoin import (
     validate_satoshi_amount,
 )
 
+LEGACY_BECH32_P2TR_ADDRESS = "bcrt1pehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxs64gzl4"
+
 
 def create_synthetic_segwit_tx(num_inputs: int, num_outputs: int) -> bytes:
     """
@@ -1053,11 +1055,9 @@ class TestAddressToScriptpubkey:
 
     def test_p2tr_address(self) -> None:
         """P2TR address should produce OP_1 <32-byte> scriptpubkey."""
-        import bech32 as bech32_lib
-
         # Create a synthetic P2TR address (witness version 1, 32-byte program)
         pubkey_x = b"\xdd" * 32
-        addr = bech32_lib.encode("bcrt", 1, pubkey_x)
+        addr = encode_segwit_address("bcrt", 1, pubkey_x)
         assert addr is not None
 
         spk = address_to_scriptpubkey(addr)
@@ -1141,6 +1141,42 @@ class TestNetworkAwareAddressToScriptpubkey:
 
 class TestScriptpubkeyToAddress:
     """Tests for scriptpubkey_to_address."""
+
+    @pytest.mark.parametrize(
+        ("network", "script", "expected_address"),
+        [
+            ("testnet", "0014" + "ab" * 20, "tb1q4w46h2at4w46h2at4w46h2at4w46h2atqjldwr"),
+            (
+                "signet",
+                "0020" + "ab" * 32,
+                "tb1q4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w4sxks0pp",
+            ),
+            ("regtest", "0014" + "ab" * 20, "bcrt1q4w46h2at4w46h2at4w46h2at4w46h2atzmxqe2"),
+            (
+                "regtest",
+                "0020" + "ab" * 32,
+                "bcrt1q4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w4st06f5m",
+            ),
+        ],
+    )
+    def test_preserves_witness_v0_encoding(
+        self, network: str, script: str, expected_address: str
+    ) -> None:
+        """Existing wallet and bond addresses must not change encodings."""
+        script_bytes = bytes.fromhex(script)
+        assert scriptpubkey_to_address(script_bytes, network) == expected_address
+        assert address_to_scriptpubkey(expected_address) == script_bytes
+
+    def test_bip350_p2tr_roundtrip(self) -> None:
+        """Independent BIP350 vector protects both conversion directions."""
+        address = "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c"
+        script = bytes.fromhex(
+            "5120000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433"
+        )
+        assert address_to_scriptpubkey(address) == script
+        assert address_to_scriptpubkey(address.upper()) == script
+        assert scriptpubkey_to_address(script, "signet") == address
+        assert address_to_scriptpubkey_for_network(address, "signet") == script
 
     def test_p2wpkh_roundtrip(self) -> None:
         pubkey = b"\x02" + b"\xaa" * 32
@@ -1367,10 +1403,8 @@ class TestGetAddressType:
 
     def test_p2wsh(self) -> None:
         """P2WSH address should be detected."""
-        import bech32 as bech32_lib
-
         script_hash = b"\xab" * 32
-        addr = bech32_lib.encode("bcrt", 0, script_hash)
+        addr = encode_segwit_address("bcrt", 0, script_hash)
         assert addr is not None
         assert get_address_type(addr) == "p2wsh"
 
@@ -1391,18 +1425,19 @@ class TestGetAddressType:
         assert get_address_type(addr) == "p2tr"
 
     def test_rejects_legacy_checksum_for_p2tr(self) -> None:
-        import bech32 as bech32_lib
-
-        addr = bech32_lib.encode("bcrt", 1, b"\xcd" * 32)
-        assert addr is not None
+        # Witness v1 encoded with the pre-BIP350 Bech32 checksum is invalid.
         with pytest.raises(ValueError, match="Invalid bech32 address"):
-            get_address_type(addr)
+            get_address_type(LEGACY_BECH32_P2TR_ADDRESS)
+        with pytest.raises(ValueError, match="Invalid bech32 address"):
+            address_to_scriptpubkey(LEGACY_BECH32_P2TR_ADDRESS)
 
     def test_rejects_bech32m_checksum_for_witness_v0(self) -> None:
         # BIP350 invalid testnet vector: witness v0 must keep its Bech32 checksum.
         addr = "tb1q0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq24jc47"
         with pytest.raises(ValueError, match="Invalid bech32 address"):
             get_address_type(addr)
+        with pytest.raises(ValueError, match="Invalid bech32 address"):
+            address_to_scriptpubkey(addr)
 
     @pytest.mark.parametrize("mixed_case", [False, True])
     def test_rejects_malformed_p2tr(self, mixed_case: bool) -> None:
@@ -1414,6 +1449,8 @@ class TestGetAddressType:
             addr = addr[:-1] + ("q" if addr[-1] != "q" else "p")
         with pytest.raises(ValueError, match="Invalid bech32 address"):
             get_address_type(addr)
+        with pytest.raises(ValueError, match="Invalid bech32 address"):
+            address_to_scriptpubkey(addr)
 
     @pytest.mark.parametrize(("version", "program_length"), [(1, 20), (2, 32)])
     def test_rejects_unsupported_witness_types(self, version: int, program_length: int) -> None:
@@ -1421,6 +1458,8 @@ class TestGetAddressType:
         assert addr is not None
         with pytest.raises(ValueError, match="Unknown SegWit address type"):
             get_address_type(addr)
+        with pytest.raises(ValueError, match="Unsupported witness version"):
+            address_to_scriptpubkey(addr)
 
     def test_p2pkh(self) -> None:
         import base58 as b58
