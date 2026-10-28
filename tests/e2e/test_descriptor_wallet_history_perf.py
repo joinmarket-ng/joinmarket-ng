@@ -15,10 +15,9 @@ per-script ``IsMine`` check; this regularly timed out at 10 minutes for
 real-world wallets, and the ``listsinceblock`` fallback added several more
 minutes.
 
-The current implementation calls only ``listreceivedbyaddress 0 false true``,
-which iterates outputs once and groups by destination, with no input-side
-scan. On regtest benchmarks, this is 2.7x to 13x faster than
-``listaddressgroupings`` and >5x faster than ``listsinceblock``.
+The test checks wallet history enumeration without depending on a particular
+RPC implementation. The co-spend workload preserves the expensive case for
+the legacy grouping-based implementation.
 
 This test guards against regressions by:
 
@@ -40,13 +39,18 @@ Requires: docker compose up -d (the default ``jm-bitcoin`` regtest node).
 
 from __future__ import annotations
 
+import math
 import secrets
 import time
+from collections import deque
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
 from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
+from loguru import logger
 
 pytestmark = pytest.mark.e2e
 
@@ -75,51 +79,61 @@ HISTORY_RPC_BUDGET_SECONDS = 10.0
 _RPC_TIMEOUT = 120.0
 
 
+@pytest_asyncio.fixture
+async def setup_rpc_client(
+    bitcoin_rpc_config: dict[str, str],
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Reuse setup connections within this test's event loop, including cleanup."""
+    async with httpx.AsyncClient(
+        base_url=bitcoin_rpc_config["rpc_url"].rstrip("/") + "/",
+        auth=(bitcoin_rpc_config["rpc_user"], bitcoin_rpc_config["rpc_password"]),
+        timeout=_RPC_TIMEOUT,
+    ) as client:
+        yield client
+
+
 async def _rpc(
-    cfg: dict[str, str],
+    client: httpx.AsyncClient,
     method: str,
     params: list[Any] | None = None,
     wallet: str | None = None,
 ) -> Any:
-    url = cfg["rpc_url"].rstrip("/")
-    if wallet:
-        url = f"{url}/wallet/{wallet}"
+    url = f"wallet/{wallet}" if wallet else ""
     payload = {
         "jsonrpc": "1.0",
         "id": "jmng-perf",
         "method": method,
         "params": params or [],
     }
-    async with httpx.AsyncClient(timeout=_RPC_TIMEOUT) as client:
-        response = await client.post(
-            url, auth=(cfg["rpc_user"], cfg["rpc_password"]), json=payload
-        )
+    response = await client.post(url, json=payload)
     data = response.json()
     if data.get("error"):
         raise RuntimeError(f"{method} RPC error: {data['error']}")
     return data.get("result")
 
 
-async def _ensure_wallet(cfg: dict[str, str], name: str) -> None:
+async def _ensure_wallet(client: httpx.AsyncClient, name: str) -> None:
     """Create or load a regtest wallet, idempotently."""
-    wallets = await _rpc(cfg, "listwallets")
+    wallets = await _rpc(client, "listwallets")
     if name in wallets:
         return
-    listed = await _rpc(cfg, "listwalletdir")
+    listed = await _rpc(client, "listwalletdir")
     if any(w.get("name") == name for w in listed.get("wallets", [])):
-        await _rpc(cfg, "loadwallet", [name])
+        await _rpc(client, "loadwallet", [name])
         return
     # Core 30 only supports descriptor wallets; ``descriptors`` defaults
     # to True. Bare ``createwallet name`` is the only form that works.
-    await _rpc(cfg, "createwallet", [name])
+    await _rpc(client, "createwallet", [name])
 
 
-async def _mine(cfg: dict[str, str], addr: str, n: int, miner_wallet: str) -> None:
-    await _rpc(cfg, "generatetoaddress", [n, addr], wallet=miner_wallet)
+async def _mine(
+    client: httpx.AsyncClient, addr: str, n: int, miner_wallet: str
+) -> None:
+    await _rpc(client, "generatetoaddress", [n, addr], wallet=miner_wallet)
 
 
 async def _setup_funded_miner(
-    cfg: dict[str, str], miner_wallet: str, target_btc: float = 8.0
+    client: httpx.AsyncClient, miner_wallet: str, target_btc: float = 8.0
 ) -> str:
     """Return a freshly generated miner address with mature funds.
 
@@ -127,34 +141,112 @@ async def _setup_funded_miner(
     (mines only 1 confirmation block).  Falls back to coinbase mining in
     batches of 100 blocks when test-funder is not available.
     """
-    miner_addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet)
+    miner_addr = await _rpc(
+        client, "getnewaddress", ["", "bech32"], wallet=miner_wallet
+    )
 
     # Fast path: fund from test-funder (1 confirmation block).
     try:
         await _rpc(
-            cfg, "sendtoaddress", [miner_addr, target_btc + 1.0], wallet="test-funder"
+            client,
+            "sendtoaddress",
+            [miner_addr, target_btc + 1.0],
+            wallet="test-funder",
         )
-        await _mine(cfg, miner_addr, 1, miner_wallet)
-        return miner_addr
-    except Exception:
-        pass
+        await _mine(client, miner_addr, 1, miner_wallet)
+    except Exception as exc:
+        logger.warning("Performance setup could not use test-funder: {}", exc)
 
-    # Fallback: coinbase mining in 100-block batches.
-    for _ in range(50):
-        info = await _rpc(cfg, "getwalletinfo", wallet=miner_wallet)
-        if info.get("balance", 0) >= target_btc:
+    # Modern Core reports spendable balance through getbalance, not getwalletinfo.
+    # Check again after the final allowed mining round before reporting failure.
+    max_mining_rounds = 50
+    balance = 0.0
+    for mining_round in range(max_mining_rounds + 1):
+        result = await _rpc(client, "getbalance", wallet=miner_wallet)
+        if (
+            not isinstance(result, (int, float))
+            or isinstance(result, bool)
+            or not math.isfinite(result)
+            or result < 0
+        ):
+            raise RuntimeError("Bitcoin Core returned an invalid spendable balance")
+        balance = float(result)
+        if balance >= target_btc:
+            return miner_addr
+        if mining_round == max_mining_rounds:
             break
-        await _mine(cfg, miner_addr, 100, miner_wallet)
-    return miner_addr
+
+        chain = await _rpc(client, "getblockchaininfo")
+        stats = await _rpc(client, "getblockstats", [chain["blocks"], ["subsidy"]])
+        subsidy = stats.get("subsidy")
+        if not isinstance(subsidy, int) or isinstance(subsidy, bool) or subsidy < 0:
+            raise RuntimeError("Bitcoin Core returned an invalid block subsidy")
+        if subsidy == 0:
+            raise RuntimeError(
+                "Cannot fund performance-test wallet: regtest subsidy is exhausted. "
+                "Use a fresh isolated test chain or a funded test-funder wallet."
+            )
+        await _mine(client, miner_addr, 100, miner_wallet)
+
+    raise RuntimeError(
+        f"Performance-test miner has {balance:.8f} BTC, needs {target_btc:.8f} BTC "
+        f"after {max_mining_rounds} mining rounds"
+    )
+
+
+async def _derive_address_pool(
+    client: httpx.AsyncClient, wallet: str, count: int
+) -> deque[str]:
+    """Prederive owned addresses without one SQLite commit per address.
+
+    Only use this for these isolated test wallets. Derivation does not reserve
+    indexes in Core: consume each returned pool once, and do not mix it with
+    getnewaddress calls. Funding obtains the miner address before pools exist.
+    """
+    # Leave Core's normal lookahead available as receiving advances next_index.
+    await _rpc(client, "keypoolrefill", [count + 1000], wallet=wallet)
+    info = await _rpc(client, "listdescriptors", wallet=wallet)
+    descriptors = [
+        descriptor
+        for descriptor in info["descriptors"]
+        if descriptor.get("active")
+        and not descriptor.get("internal")
+        and descriptor["desc"].startswith("wpkh(")
+    ]
+    if len(descriptors) != 1:
+        raise RuntimeError(
+            "Performance setup needs one active external wpkh descriptor"
+        )
+    descriptor = descriptors[0]
+    start = descriptor.get("next_index", descriptor.get("next"))
+    if not isinstance(start, int) or isinstance(start, bool) or start < 0:
+        raise RuntimeError("Performance setup descriptor has an invalid next index")
+
+    addresses: list[str] = []
+    for first in range(start, start + count, 500):
+        last = min(first + 499, start + count - 1)
+        batch = await _rpc(
+            client, "deriveaddresses", [descriptor["desc"], [first, last]]
+        )
+        if (
+            not isinstance(batch, list)
+            or len(batch) != last - first + 1
+            or any(not isinstance(address, str) or not address for address in batch)
+        ):
+            raise RuntimeError("Performance setup derived an invalid address batch")
+        addresses.extend(batch)
+    if len(set(addresses)) != count:
+        raise RuntimeError("Performance setup derived duplicate addresses")
+    return deque(addresses)
 
 
 async def _send_many_receives(
-    cfg: dict[str, str],
+    client: httpx.AsyncClient,
     n: int,
     batch_size: int,
     miner_addr: str,
     miner_wallet: str,
-    test_wallet: str,
+    addresses: deque[str],
 ) -> None:
     """
     Generate ``n`` distinct history-bearing addresses on the test wallet,
@@ -163,32 +255,32 @@ async def _send_many_receives(
     Batching reduces tx count by ``batch_size`` versus a per-address
     ``sendtoaddress`` loop, which is the difference between a few seconds
     and many minutes when ``n`` is in the thousands. Each output still
-    lands at a distinct ``getnewaddress`` so the wallet ends up with ``n``
+    lands at a distinct wallet-owned address so the wallet ends up with ``n``
     addresses that have history; the legacy ``listaddressgroupings`` path
     would still have to walk every such output.
     """
     sent = 0
     while sent < n:
-        targets: dict[str, float] = {}
-        for _ in range(min(batch_size, n - sent)):
-            addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=test_wallet)
-            targets[addr] = 0.0001
-        await _rpc(cfg, "sendmany", ["", targets], wallet=miner_wallet)
+        targets = {
+            addresses.popleft(): 0.0001 for _ in range(min(batch_size, n - sent))
+        }
+        await _rpc(client, "sendmany", ["", targets], wallet=miner_wallet)
         sent += len(targets)
-        await _mine(cfg, miner_addr, 1, miner_wallet)
-    await _mine(cfg, miner_addr, 6, miner_wallet)
+        await _mine(client, miner_addr, 1, miner_wallet)
+    await _mine(client, miner_addr, 6, miner_wallet)
 
 
 async def _ensure_miner_utxos(
-    cfg: dict[str, str],
+    client: httpx.AsyncClient,
     miner_addr: str,
     miner_wallet: str,
     count: int,
+    addresses: deque[str],
     value: float = 0.01,
 ) -> None:
     """Pre-split miner coins so CoinJoin sims have enough small inputs."""
     have = await _rpc(
-        cfg,
+        client,
         "listunspent",
         [1, 9999999, [], True, {"minimumAmount": value, "maximumAmount": value * 2}],
         wallet=miner_wallet,
@@ -198,23 +290,22 @@ async def _ensure_miner_utxos(
     batch = 200
     sent = 0
     while sent < count:
-        targets: dict[str, float] = {}
-        for _ in range(min(batch, count - sent)):
-            addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet)
-            targets[addr] = value
-        await _rpc(cfg, "sendmany", ["", targets], wallet=miner_wallet)
+        targets = {addresses.popleft(): value for _ in range(min(batch, count - sent))}
+        await _rpc(client, "sendmany", ["", targets], wallet=miner_wallet)
         sent += len(targets)
-        await _mine(cfg, miner_addr, 1, miner_wallet)
-    await _mine(cfg, miner_addr, 6, miner_wallet)
+        await _mine(client, miner_addr, 1, miner_wallet)
+    await _mine(client, miner_addr, 6, miner_wallet)
 
 
 async def _make_coinjoin_like(
-    cfg: dict[str, str],
+    client: httpx.AsyncClient,
     n: int,
     participants: int,
     miner_addr: str,
     miner_wallet: str,
     test_wallet: str,
+    test_addresses: deque[str],
+    miner_addresses: deque[str],
 ) -> None:
     """
     Craft ``n`` CoinJoin-like txs with co-spends between miner and test wallet.
@@ -226,22 +317,19 @@ async def _make_coinjoin_like(
     immune to this.
     """
     # Pre-fund the test wallet with enough small UTXOs.
-    targets: dict[str, float] = {}
-    for _ in range(n + 10):
-        addr = await _rpc(cfg, "getnewaddress", ["", "bech32"], wallet=test_wallet)
-        targets[addr] = 0.01
-    await _rpc(cfg, "sendmany", ["", targets], wallet=miner_wallet)
-    await _mine(cfg, miner_addr, 6, miner_wallet)
+    targets = {test_addresses.popleft(): 0.01 for _ in range(n + 10)}
+    await _rpc(client, "sendmany", ["", targets], wallet=miner_wallet)
+    await _mine(client, miner_addr, 6, miner_wallet)
 
     test_utxos = await _rpc(
-        cfg,
+        client,
         "listunspent",
         [1, 9999999, [], True, {"minimumAmount": 0.009}],
         wallet=test_wallet,
     )
     test_utxos = [u for u in test_utxos if u["amount"] >= 0.009]
     miner_utxos = await _rpc(
-        cfg,
+        client,
         "listunspent",
         [1, 9999999, [], True, {"minimumAmount": 0.005, "maximumAmount": 0.02}],
         wallet=miner_wallet,
@@ -267,39 +355,37 @@ async def _make_coinjoin_like(
         cj_amount = 0.005
         outputs: dict[str, float] = {}
         for j in range(participants):
-            wallet_for_output = test_wallet if j % 2 == 0 else miner_wallet
-            addr = await _rpc(
-                cfg, "getnewaddress", ["", "bech32"], wallet=wallet_for_output
-            )
+            pool = test_addresses if j % 2 == 0 else miner_addresses
+            addr = pool.popleft()
             outputs[addr] = cj_amount
         change = in_value - cj_amount * participants - 0.00005
         if change > 0:
-            change_addr = await _rpc(
-                cfg, "getnewaddress", ["", "bech32"], wallet=miner_wallet
-            )
+            change_addr = miner_addresses.popleft()
             outputs[change_addr] = round(change, 8)
 
-        raw = await _rpc(cfg, "createrawtransaction", [inputs, outputs])
-        s1 = await _rpc(cfg, "signrawtransactionwithwallet", [raw], wallet=miner_wallet)
+        raw = await _rpc(client, "createrawtransaction", [inputs, outputs])
+        s1 = await _rpc(
+            client, "signrawtransactionwithwallet", [raw], wallet=miner_wallet
+        )
         s2 = await _rpc(
-            cfg, "signrawtransactionwithwallet", [s1["hex"]], wallet=test_wallet
+            client, "signrawtransactionwithwallet", [s1["hex"]], wallet=test_wallet
         )
         if not s2.get("complete"):
             continue
-        await _rpc(cfg, "sendrawtransaction", [s2["hex"]])
+        await _rpc(client, "sendrawtransaction", [s2["hex"]])
         if k % 20 == 0:
-            await _mine(cfg, miner_addr, 1, miner_wallet)
-    await _mine(cfg, miner_addr, 6, miner_wallet)
+            await _mine(client, miner_addr, 1, miner_wallet)
+    await _mine(client, miner_addr, 6, miner_wallet)
 
 
 @pytest.mark.asyncio
 @pytest.mark.slow
 async def test_get_addresses_with_history_scales_on_large_wallet(
     bitcoin_rpc_config: dict[str, str],
+    setup_rpc_client: httpx.AsyncClient,
 ) -> None:
     """
-    Regression test for the listaddressgroupings -> listreceivedbyaddress
-    migration in ``DescriptorWalletBackend.get_addresses_with_history``.
+    Regression test for wallet history enumeration without input-side grouping.
 
     This test fails if the call ever takes longer than
     ``HISTORY_RPC_BUDGET_SECONDS`` on a wallet with several hundred receive
@@ -307,6 +393,8 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
     is the workload that motivated the fix.
     """
     cfg = bitcoin_rpc_config
+    client = setup_rpc_client
+    setup_started = time.perf_counter()
     # Per-run wallet names so concurrent runs (e.g. parallel test workers)
     # do not collide. Bitcoin Core regtest will keep these wallets across
     # tests, but the test only cares about its own wallets.
@@ -314,35 +402,71 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
     test_wallet = f"jmng_perf_test_{suffix}"
     miner_wallet = f"jmng_perf_miner_{suffix}"
 
-    await _ensure_wallet(cfg, miner_wallet)
-    await _ensure_wallet(cfg, test_wallet)
+    await _ensure_wallet(client, miner_wallet)
+    await _ensure_wallet(client, test_wallet)
 
     try:
-        miner_addr = await _setup_funded_miner(cfg, miner_wallet)
+        miner_addr = await _setup_funded_miner(client, miner_wallet)
+        logger.info(
+            "History perf setup: funded miner after {:.2f}s",
+            time.perf_counter() - setup_started,
+        )
+        miner_input_count = NUM_COINJOINS * (COINJOIN_PARTICIPANTS - 1) + 50
+        test_addresses = await _derive_address_pool(
+            client,
+            test_wallet,
+            NUM_RECEIVE_ADDRESSES
+            + (NUM_COINJOINS + 10)  # Prefunding inputs.
+            + NUM_COINJOINS * ((COINJOIN_PARTICIPANTS + 1) // 2),
+        )
+        miner_addresses = await _derive_address_pool(
+            client,
+            miner_wallet,
+            miner_input_count + NUM_COINJOINS * (COINJOIN_PARTICIPANTS // 2 + 1),
+        )
+        logger.info(
+            "History perf setup: address pools after {:.2f}s",
+            time.perf_counter() - setup_started,
+        )
         await _send_many_receives(
-            cfg,
+            client,
             NUM_RECEIVE_ADDRESSES,
             RECEIVES_PER_BATCH,
             miner_addr,
             miner_wallet,
-            test_wallet,
+            test_addresses,
+        )
+        logger.info(
+            "History perf setup: receive workload after {:.2f}s",
+            time.perf_counter() - setup_started,
         )
         await _ensure_miner_utxos(
-            cfg,
+            client,
             miner_addr,
             miner_wallet,
-            NUM_COINJOINS * (COINJOIN_PARTICIPANTS - 1) + 50,
+            miner_input_count,
+            miner_addresses,
+        )
+        logger.info(
+            "History perf setup: miner inputs after {:.2f}s",
+            time.perf_counter() - setup_started,
         )
         await _make_coinjoin_like(
-            cfg,
+            client,
             NUM_COINJOINS,
             COINJOIN_PARTICIPANTS,
             miner_addr,
             miner_wallet,
             test_wallet,
+            test_addresses,
+            miner_addresses,
+        )
+        logger.info(
+            "History perf setup: CoinJoin workload after {:.2f}s",
+            time.perf_counter() - setup_started,
         )
 
-        info = await _rpc(cfg, "getwalletinfo", wallet=test_wallet)
+        info = await _rpc(client, "getwalletinfo", wallet=test_wallet)
         # Sanity: confirm the wallet was actually populated. ``txcount``
         # only counts txs that touch the test wallet (one per ``sendmany``
         # batch + per-CoinJoin tx), so the threshold is much smaller than
@@ -369,6 +493,9 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
             t0 = time.perf_counter()
             addresses = await backend.get_addresses_with_history()
             elapsed = time.perf_counter() - t0
+            logger.info(
+                "History perf query: {} addresses in {:.3f}s", len(addresses), elapsed
+            )
 
             # Correctness: the wallet generated many fresh receive
             # addresses; we should see at least the receive count back
@@ -379,7 +506,7 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
             )
 
             # Performance: hard budget. The current implementation is
-            # well under 1s for this dataset; 5s is the regression
+            # well under 1s for this dataset; 10s is the regression
             # tripwire.
             assert elapsed < HISTORY_RPC_BUDGET_SECONDS, (
                 f"get_addresses_with_history took {elapsed:.2f}s on "
@@ -395,6 +522,6 @@ async def test_get_addresses_with_history_scales_on_large_wallet(
         # large wallets across many test runs.
         for wallet in (test_wallet, miner_wallet):
             try:
-                await _rpc(cfg, "unloadwallet", [wallet])
+                await _rpc(client, "unloadwallet", [wallet])
             except Exception:
                 pass
