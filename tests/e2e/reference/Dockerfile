@@ -54,8 +54,11 @@ COPY --from=server-builder /src /src
 # Match the signed-by path in the pinned image's /etc/apt/sources.list.d/tor.list.
 COPY --from=server-builder /tmp/tor-archive-keyring.gpg /usr/share/keyrings/tor-archive-keyring.gpg
 
+# The archived runtime's Tor lacks protocols now required by the public network.
+# Upgrade it explicitly, preserving the runtime's custom Tor configuration.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::=--force-confold \
         autoconf \
         automake \
         build-essential \
@@ -71,6 +74,7 @@ RUN apt-get update \
         python3-pip \
         python3-setuptools \
         python3-venv \
+        tor \
     && pip3 config set global.break-system-packages true \
     && cd /src \
     && ./install.sh --docker-install --without-qt \
