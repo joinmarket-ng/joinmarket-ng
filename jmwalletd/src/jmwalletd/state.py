@@ -272,13 +272,16 @@ class DaemonState:
         # Stop any in-flight tumbler through the runner's bounded lifecycle so
         # the persisted plan reaches a truthful terminal state before the
         # wallet service is discarded.
-        if self.tumble_runner is not None and self.tumble_task is not None:
+        # The runner's finally block can clear the shared references while we await it.
+        tumble_runner = self.tumble_runner
+        tumble_task = self.tumble_task
+        if tumble_runner is not None and tumble_task is not None:
             try:
-                await self.tumble_runner.stop_and_wait(self.tumble_task)
+                await tumble_runner.stop_and_wait(tumble_task)
             except Exception:
                 logger.error("Error stopping tumbler during wallet lock")
                 logger.bind(sensitive=True).exception("Error stopping tumbler during wallet lock")
-                if not self.tumble_task.done():
+                if not tumble_task.done():
                     raise
 
         # Stop the taker if running.

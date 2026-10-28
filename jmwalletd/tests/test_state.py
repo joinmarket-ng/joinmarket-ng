@@ -333,6 +333,77 @@ class TestDaemonState:
         assert daemon_state.tumble_task is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("clear_references", [False, True])
+    async def test_lock_wallet_accepts_shutdown_error_after_tumbler_finishes(
+        self,
+        daemon_state: DaemonState,
+        mock_wallet_service: MagicMock,
+        clear_references: bool,
+    ) -> None:
+        daemon_state.wallet_service = mock_wallet_service
+        daemon_state.wallet_name = "w.jmdat"
+
+        async def finished() -> None:
+            pass
+
+        task = asyncio.create_task(finished())
+        await task
+
+        async def stop(original_task: asyncio.Task[None]) -> None:
+            assert original_task is task
+            if clear_references:
+                # The runner's finally block clears these before stop resumes.
+                daemon_state.tumble_runner = None
+                daemon_state.tumble_task = None
+            raise RuntimeError("shutdown failed after the task finished")
+
+        runner = MagicMock()
+        runner.stop_and_wait = AsyncMock(side_effect=stop)
+        daemon_state.tumble_runner = runner
+        daemon_state.tumble_task = task
+
+        assert await daemon_state.lock_wallet() is False
+
+        runner.stop_and_wait.assert_awaited_once_with(task)
+        assert daemon_state.wallet_service is None
+        assert daemon_state.wallet_name == ""
+        assert daemon_state.tumble_task is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("clear_references", [False, True])
+    async def test_lock_wallet_preserves_wallet_when_tumbler_has_not_stopped(
+        self,
+        daemon_state: DaemonState,
+        mock_wallet_service: MagicMock,
+        clear_references: bool,
+    ) -> None:
+        daemon_state.wallet_service = mock_wallet_service
+        daemon_state.wallet_name = "w.jmdat"
+        task = asyncio.create_task(asyncio.Event().wait())
+
+        async def stop(original_task: asyncio.Task[bool]) -> None:
+            assert original_task is task
+            if clear_references:
+                daemon_state.tumble_runner = None
+                daemon_state.tumble_task = None
+            raise RuntimeError("tumbler is still running")
+
+        runner = MagicMock()
+        runner.stop_and_wait = AsyncMock(side_effect=stop)
+        daemon_state.tumble_runner = runner
+        daemon_state.tumble_task = task
+        try:
+            with pytest.raises(RuntimeError, match="tumbler is still running"):
+                await daemon_state.lock_wallet()
+
+            assert not task.done()
+            assert daemon_state.wallet_service is mock_wallet_service
+            assert daemon_state.wallet_name == "w.jmdat"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
     async def test_lock_wallet_stops_wallet_sync_task(
         self, daemon_state: DaemonState, mock_wallet_service: MagicMock
     ) -> None:
