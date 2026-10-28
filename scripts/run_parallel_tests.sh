@@ -952,7 +952,7 @@ run_suite_e2e() {
         COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
         COVERAGE_FILE=".coverage.${suite}" \
         pytest -c pytest.ini -m "e2e and not tumbler_e2e" --fail-on-skip \
-            -lv --timeout=300 --reruns=1 --reruns-delay=10 \
+            -lv --timeout=300 --reruns=1 --reruns-delay=10 --rerun-show-tracebacks \
             --cov --cov-report=term-missing \
             tests/
 
@@ -1021,23 +1021,10 @@ run_suite_tumbler() {
     ) > "$log" 2>&1
     rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        # On failure, dump container logs for the most relevant services
-        # (walletd + makers + bitcoin) so we can diagnose tumbler stalls
-        # without re-running the whole suite.
-        {
-            echo
-            echo "=========================================================="
-            echo "Container logs for diagnostics (suite=${suite}, rc=${rc})"
-            echo "=========================================================="
-            for svc in jmwalletd maker1 maker2 maker3 maker4 maker5 bitcoin miner directory directory2; do
-                echo
-                echo "----- ${svc} -----"
-                COMPOSE_PROJECT_NAME="${PROJECT_PREFIX}-${suite}" \
-                    compose_cmd "$suite" logs --tail=200 "$svc" 2>&1 || true
-            done
-        } >> "$log" 2>&1 || true
-    fi
+    # Passing tests can still log cleanup errors. Preserve daemon evidence
+    # before teardown removes it, without changing the test exit status.
+    dump_suite_logs "$suite" "$rc" "$log" \
+        jmwalletd maker1 maker2 maker3 maker4 maker5 bitcoin miner directory directory2
     cleanup_suite "$suite"
     return $rc
 }
