@@ -7,6 +7,7 @@ from __future__ import annotations
 from enum import StrEnum
 
 from jmcore.config import WalletConfig
+from jmcore.fee_policy import DEFAULT_MAX_FEE_RATE_SAT_VB
 from jmcore.models import OfferType, normalize_relative_fee
 from jmcore.randomness import secure_random
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
@@ -117,7 +118,7 @@ class TakerConfig(WalletConfig):
         default=0.8,
         ge=0.0,
         allow_inf_nan=False,
-        description="Maximum relative amount a sweep fee estimate may exceed its selected budget",
+        description="Maximum relative deviation of a sweep fee estimate from its selected budget",
     )
     tx_fee_factor: float = Field(
         default=0.2,
@@ -137,14 +138,14 @@ class TakerConfig(WalletConfig):
         "Defaults to 3 when connected to full node.",
     )
     max_fee_rate_sat_vb: float = Field(
-        default=1_000.0,
+        default=DEFAULT_MAX_FEE_RATE_SAT_VB,
         gt=0.0,
         allow_inf_nan=False,
         description=(
             "Safety cap on the resolved fee rate (sat/vB) for the CoinJoin "
             "transaction. Manual rates and backend estimates above this cap "
-            "are rejected, and randomization is limited to this cap, protecting against "
-            "runaway-fee bugs and malicious fee oracles."
+            "are rejected, and the effective rate based on estimated transaction size must "
+            "also respect this cap, protecting against runaway-fee bugs and malicious fee oracles."
         ),
     )
     min_fee_rate_sat_vb: float = Field(

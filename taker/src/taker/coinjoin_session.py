@@ -1317,23 +1317,23 @@ class CoinJoinSession:
                         num_inputs, num_outputs, use_base_rate=True
                     )
                     fee_ratio = actual_base_fee / tx_fee
-                    if fee_ratio > 1 + tolerance:
+                    if fee_ratio < 1 - tolerance or fee_ratio > 1 + tolerance:
                         self.last_failure_reason = (
-                            "Sweep transaction fee estimate exceeds the selected fee budget: "
+                            "Sweep transaction fee estimate differs from the selected fee budget: "
                             f"estimated {actual_base_fee} sats for {num_inputs} inputs and "
                             f"{num_outputs} outputs, budget {tx_fee} sats, "
                             f"tolerance {tolerance:.2f}. "
                             "Retry the CoinJoin with different makers."
                         )
-                        logger.error("Sweep fee estimate exceeds the selected budget")
+                        logger.error("Sweep fee estimate differs from the selected budget")
                         logger.bind(sensitive=True).error(
                             "Sweep fee estimate detail: {}", self.last_failure_reason
                         )
                         return False
 
                 # Defensively verify the finalized shape against the relay floor.
-                # Sweep budgeting should cover every input allowed by policy, but
-                # fail before signing if that invariant is ever broken.
+                # A normal-case budget need not fund the selected target for
+                # unusually large input sets, but must still clear this floor.
                 fee_rate_floor = self._minimum_fee_rate_sat_vb or self.config.min_fee_rate_sat_vb
                 if not fee_rate_meets_minimum(actual_mining_fee, actual_tx_vsize, fee_rate_floor):
                     logger.error("Sweep fee rate is below the required minimum")
@@ -1524,13 +1524,12 @@ class CoinJoinSession:
                 f"Participating makers: {', '.join(self.maker_sessions.keys())}"
             )
 
-            if self._minimum_fee_rate_sat_vb is not None:
-                fee_error = self._verify_unsigned_minimum_miner_fee()
-                if fee_error is not None:
-                    self.last_failure_reason = fee_error
-                    logger.error("Unsigned transaction does not meet the minimum miner fee")
-                    logger.bind(sensitive=True).error("Minimum miner fee detail: {}", fee_error)
-                    return False
+            fee_error = self._verify_unsigned_miner_fee()
+            if fee_error is not None:
+                self.last_failure_reason = fee_error
+                logger.error("Unsigned transaction violates miner-fee policy")
+                logger.bind(sensitive=True).error("Miner fee detail: {}", fee_error)
+                return False
 
             return True
 
@@ -1684,10 +1683,8 @@ class CoinJoinSession:
         self._apply_fee_randomization()
         return self._fee_rate
 
-    def _verify_unsigned_minimum_miner_fee(self) -> str | None:
+    def _verify_unsigned_miner_fee(self) -> str | None:
         """Validate known prevout values before !tx exposes the signing request."""
-        if self._minimum_fee_rate_sat_vb is None:
-            return "Minimum CoinJoin miner fee rate was not resolved"
         try:
             tx = deserialize_transaction(self.unsigned_tx)
         except TransactionSigningError as exc:
@@ -1699,7 +1696,15 @@ class CoinJoinSession:
         vsize = estimate_p2wpkh_vsize(len(tx.inputs), len(tx.outputs))
         if fee < 0:
             return "CoinJoin has a negative miner fee"
-        if not fee_rate_meets_minimum(fee, vsize, self._minimum_fee_rate_sat_vb):
+        if fee > self.config.max_fee_rate_sat_vb * vsize:
+            return (
+                f"CoinJoin miner fee rate {fee / vsize:.2f} sat/vB exceeds safety cap "
+                f"{self.config.max_fee_rate_sat_vb:.2f} sat/vB before requesting signatures. "
+                "Raise wallet.max_fee_rate_sat_vb explicitly only if you intend to pay this much."
+            )
+        if self._minimum_fee_rate_sat_vb is not None and not fee_rate_meets_minimum(
+            fee, vsize, self._minimum_fee_rate_sat_vb
+        ):
             return (
                 f"CoinJoin miner fee rate {fee / vsize:.2f} sat/vB is below required "
                 f"{self._minimum_fee_rate_sat_vb:.2f} sat/vB before requesting signatures"
@@ -1837,13 +1842,12 @@ class CoinJoinSession:
         order UTXOs were originally provided. We must match signatures to transaction
         inputs by verifying which UTXO each signature is valid for, not by index.
         """
-        if self._minimum_fee_rate_sat_vb is not None:
-            fee_error = self._verify_unsigned_minimum_miner_fee()
-            if fee_error is not None:
-                self.last_failure_reason = fee_error
-                logger.error("Unsigned transaction does not meet the minimum miner fee")
-                logger.bind(sensitive=True).error("Minimum miner fee detail: {}", fee_error)
-                return False
+        fee_error = self._verify_unsigned_miner_fee()
+        if fee_error is not None:
+            self.last_failure_reason = fee_error
+            logger.error("Unsigned transaction violates miner-fee policy")
+            logger.bind(sensitive=True).error("Miner fee detail: {}", fee_error)
+            return False
 
         # Encode transaction as base64 (expected by maker after decryption)
         import base64

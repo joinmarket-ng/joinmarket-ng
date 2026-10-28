@@ -66,7 +66,7 @@ from pydantic_settings import (
 )
 
 from jmcore.constants import DUST_THRESHOLD
-from jmcore.fee_policy import validate_min_fee_block_target
+from jmcore.fee_policy import DEFAULT_MAX_FEE_RATE_SAT_VB, validate_min_fee_block_target
 from jmcore.models import (
     DIRECTORY_NODES_MAINNET,
     DIRECTORY_NODES_SIGNET,
@@ -520,7 +520,7 @@ class WalletSettings(BaseModel):
         description="Default block target for fee estimation in wallet transactions",
     )
     max_fee_rate_sat_vb: float = Field(
-        default=1_000.0,
+        default=DEFAULT_MAX_FEE_RATE_SAT_VB,
         gt=0.0,
         description=(
             "Safety cap on the fee rate (sat/vB) used for any wallet-driven "
@@ -1168,7 +1168,7 @@ class TakerSettings(BaseModel):
         default=0.8,
         ge=0.0,
         allow_inf_nan=False,
-        description=("Maximum relative amount a sweep fee estimate may exceed its selected budget"),
+        description="Maximum relative deviation of a sweep fee estimate from its selected budget",
     )
 
     @field_validator("max_cj_fee_rel", mode="before")

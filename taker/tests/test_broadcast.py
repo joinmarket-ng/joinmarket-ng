@@ -12,6 +12,8 @@ import base64
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from jmcore.bitcoin import TxInput, TxOutput, calculate_tx_vsize, serialize_transaction
+from jmcore.fee_policy import estimate_p2wpkh_vsize
 from jmwallet.backends.base import Transaction
 from jmwallet.history import create_taker_history_entry
 
@@ -617,6 +619,7 @@ class TestTakerBroadcast:
 
     @pytest.mark.asyncio
     async def test_final_confirmation_decline_retains_signed_input_lease(self, taker) -> None:
+        taker.config.max_fee_rate_sat_vb = 1_000.0
         taker.confirmation_callback = MagicMock(return_value=False)
         taker._session.signing_boundary_crossed = True
         taker._session.selected_utxos = [MagicMock(value=10_000)]
@@ -637,6 +640,7 @@ class TestTakerBroadcast:
 
     @pytest.mark.asyncio
     async def test_final_confirmation_accepts_awaitable_callback(self, taker) -> None:
+        taker.config.max_fee_rate_sat_vb = 1_000.0
         taker.confirmation_callback = AsyncMock(return_value=False)
         taker._session.signing_boundary_crossed = True
         taker._session.selected_utxos = [MagicMock(value=10_000)]
@@ -714,6 +718,7 @@ class TestTakerBroadcast:
 
         from taker.models import MakerSession
 
+        taker.config.max_fee_rate_sat_vb = 1_000.0
         bond_txid = "a" * 64
         offer = Offer(
             counterparty="J5finalmaker",
@@ -767,6 +772,53 @@ class TestTakerBroadcast:
         assert result is None
         assert taker.state.value == "failed"
         taker.confirmation_callback.assert_not_called()
+        taker.backend.broadcast_transaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cap", [100.0, 1_000.0])
+    async def test_signed_effective_rate_cap_precedes_confirmation_and_any_broadcast(
+        self, taker, cap: float
+    ) -> None:
+        taker.config.max_fee_rate_sat_vb = cap
+        session = taker._session
+        session._minimum_fee_rate_sat_vb = 1.0
+        # Recheck the complete fee against the same size model used pre-sign.
+        fee = estimate_p2wpkh_vsize(1, 1) * 100 + 1
+        session.selected_utxos = [MagicMock(value=fee)]
+        session.maker_sessions = {}
+        session._phase_broadcast = AsyncMock()
+        taker.confirmation_callback = MagicMock(return_value=False)
+
+        assert await taker._finalize_and_broadcast("bcrt1qdestination") is None
+
+        session._phase_broadcast.assert_not_awaited()
+        taker.backend.broadcast_transaction.assert_not_awaited()
+        if cap == 100.0:
+            taker.confirmation_callback.assert_not_called()
+            assert "exceeds safety cap" in session.last_failure_reason
+        else:
+            taker.confirmation_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rate_at_cap_survives_signed_witness_size_variation(self, taker) -> None:
+        session = taker._session
+        inputs = [TxInput.from_hex(f"{i + 1:064x}", 0) for i in range(4)]
+        outputs = [TxOutput(value=0, script=bytes.fromhex("0014" + "11" * 20))]
+        session.unsigned_tx = serialize_transaction(2, inputs, outputs, 0)
+        session.final_tx = serialize_transaction(
+            2, inputs, outputs, 0, witnesses=[[b"\x00" * 71, b"\x02" * 33] for _ in inputs]
+        )
+        policy_vsize = estimate_p2wpkh_vsize(len(inputs), len(outputs))
+        fee = policy_vsize * 100
+        session.selected_utxos = [MagicMock(value=fee)]
+        session.maker_sessions = {}
+        session._minimum_fee_rate_sat_vb = 1.0
+        taker.confirmation_callback = MagicMock(return_value=False)
+
+        assert fee / calculate_tx_vsize(session.final_tx) > 100.0
+        assert session._verify_unsigned_miner_fee() is None
+        assert await taker._finalize_and_broadcast("bcrt1qdestination") is None
+        taker.confirmation_callback.assert_called_once()
         taker.backend.broadcast_transaction.assert_not_awaited()
 
     @pytest.mark.asyncio

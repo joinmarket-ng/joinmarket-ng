@@ -4,6 +4,7 @@ Tests for taker CLI module.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
@@ -256,6 +257,20 @@ async def test_coinjoin_success_prints_txid_and_tags_log_details(
 
 class TestBuildTakerConfig:
     """Tests for build_taker_config function."""
+
+    @pytest.mark.parametrize("configured_cap", [None, 1_000.0])
+    def test_wallet_fee_cap_default_and_explicit_override_reach_runtime(
+        self, sample_mnemonic: str, configured_cap: float | None, tmp_path: Path
+    ) -> None:
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings(
+            data_dir=tmp_path,
+            wallet={} if configured_cap is None else {"max_fee_rate_sat_vb": configured_cap},
+        )
+        config = build_taker_config(settings=settings, mnemonic=sample_mnemonic, passphrase="")
+
+        assert config.max_fee_rate_sat_vb == (100.0 if configured_cap is None else configured_cap)
 
     @pytest.fixture
     def mock_settings(self, sample_mnemonic: str) -> MagicMock:

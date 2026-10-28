@@ -1033,6 +1033,27 @@ class TestDirectSendFeeRateCap:
     *before* signing or broadcasting."""
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("manual", [False, True])
+    async def test_default_cap_rejects_rates_above_100_before_coin_selection(
+        self, manual: bool
+    ) -> None:
+        wallet = _make_mock_wallet([_make_utxo(value=1_000_000)])
+        backend = _make_mock_backend(fee_rate=101.0)
+
+        with pytest.raises(ExcessiveFeeRateError, match="exceeds safety cap 100.00"):
+            await direct_send(
+                wallet=wallet,
+                backend=backend,
+                mixdepth=0,
+                amount_sats=50_000,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=101.0 if manual else None,
+            )
+
+        wallet.get_utxos.assert_not_called()
+        backend.broadcast_transaction.assert_not_awaited()
+
+    @pytest.mark.anyio
     async def test_manual_fee_rate_above_cap_rejected_before_broadcast(self) -> None:
         utxos = [_make_utxo(value=1_000_000)]
         wallet = _make_mock_wallet(utxos)

@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
 from jmcore.config import TorControlConfig, WalletConfig, create_tor_control_config_from_env
-from jmcore.fee_policy import validate_min_fee_block_target
+from jmcore.fee_policy import DEFAULT_MAX_FEE_RATE_SAT_VB, validate_min_fee_block_target
 from jmcore.models import OfferType
 from jmcore.tor_control import HiddenServiceDoSConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -208,7 +208,7 @@ class MakerConfig(WalletConfig):
 
     # Hidden service configuration for direct peer connections
     max_fee_rate_sat_vb: float = Field(
-        default=1_000.0,
+        default=DEFAULT_MAX_FEE_RATE_SAT_VB,
         gt=0.0,
         allow_inf_nan=False,
         description="Safety cap for the resolved CoinJoin miner fee floor in sat/vB",

@@ -21,6 +21,7 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 from jmcore.btc_script import mk_freeze_script
+from jmcore.fee_policy import DEFAULT_MAX_FEE_RATE_SAT_VB as DEFAULT_MAX_FEE_RATE_SAT_VB
 from jmcore.randomness import secure_random
 from jmcore.transaction_policy import (
     MAX_LOCKTIME,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 DUST_THRESHOLD = 546
 
+
 # Default safety cap on fee rate (sat/vB) used by direct-send transactions.
 # This is the fallback when callers don't override via the
 # ``max_fee_rate_sat_vb`` parameter (typically wired from
@@ -58,9 +60,6 @@ DUST_THRESHOLD = 546
 #
 # Above this cap a transaction is refused with :class:`ExcessiveFeeRateError`
 # rather than silently broadcasting.
-DEFAULT_MAX_FEE_RATE_SAT_VB: float = 1_000.0
-
-
 class ExcessiveFeeRateError(ValueError):
     """Raised when a resolved fee rate exceeds the configured safety cap.
 

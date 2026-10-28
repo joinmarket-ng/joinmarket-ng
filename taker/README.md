@@ -11,6 +11,11 @@ Mix your bitcoin for privacy via CoinJoin. Takers initiate transactions and pay 
 - **Transaction Monitoring**: Track transaction progress and confirmations
 - **Retry Logic**: Automatic retry on failure or maker timeout
 
+Sweeps, including tumbler sweeps, budget for a typical maker input count before negotiation.
+Their effective fee rate can differ from the requested target, especially for unusually large
+transactions. Rounds must still satisfy the minimum-fee policy, sweep tolerance, and wallet
+fee-rate cap. See `config.toml.template` for those settings and current defaults.
+
 ## Documentation
 
 For full documentation, see [taker Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-taker/).

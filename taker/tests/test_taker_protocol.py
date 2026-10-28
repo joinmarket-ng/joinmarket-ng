@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import replace
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -23,7 +24,7 @@ from _taker_test_helpers import (
     make_taker_config,
     make_utxo,
 )
-from jmcore.bitcoin import parse_transaction_bytes
+from jmcore.bitcoin import TxInput, TxOutput, parse_transaction_bytes, serialize_transaction
 from jmcore.constants import DUST_THRESHOLD
 from jmcore.crypto import NickIdentity
 from jmcore.directory_pool import DirectoryConnectionResult
@@ -45,6 +46,7 @@ from taker.taker import (
     _estimate_initial_tx_shape,
     _initial_fee_confirmation_values,
 )
+from taker.tx_builder import build_coinjoin_tx
 
 
 @pytest.fixture
@@ -135,13 +137,13 @@ def sample_offer2():
 
 def test_initial_tx_shape_matches_fee_budget_assumptions() -> None:
     """Initial confirmations use the same shapes as fee budgeting."""
-    assert _estimate_initial_tx_shape(3, 9, is_sweep=True, max_maker_utxos=15) == (138, 19)
+    assert _estimate_initial_tx_shape(3, 9, is_sweep=True, max_maker_utxos=15) == (30, 19)
     assert _estimate_initial_tx_shape(3, 9, is_sweep=False, max_maker_utxos=15) == (14, 20)
 
 
-def test_sweep_tx_shape_requires_bounded_maker_inputs() -> None:
-    with pytest.raises(ValueError, match="positive max_maker_utxos"):
-        _estimate_initial_tx_shape(3, 9, is_sweep=True, max_maker_utxos=0)
+@pytest.mark.parametrize(("cap", "inputs"), [(0, 30), (1, 12), (2, 21), (3, 30), (15, 30)])
+def test_sweep_tx_shape_budgets_normal_inputs_within_admission_cap(cap: int, inputs: int) -> None:
+    assert _estimate_initial_tx_shape(3, 9, is_sweep=True, max_maker_utxos=cap) == (inputs, 19)
 
 
 @pytest.mark.asyncio
@@ -198,7 +200,7 @@ def test_initial_fee_confirmation_uses_committed_sweep_budget(
     session._sweep_tx_fee_budget = 1_421
     session._fee_rate = 0.6
 
-    assert _initial_fee_confirmation_values(session, 3, 9, 15) == (138, 19, 1_421, 0.6)
+    assert _initial_fee_confirmation_values(session, 3, 9, 15) == (30, 19, 1_421, 0.6)
 
     session.is_sweep = False
     session._randomized_fee_rate = 0.63
@@ -1123,13 +1125,14 @@ class TestSweepCjAmountPreservation:
     @pytest.mark.parametrize(
         ("actual_base_fee", "expected_result"),
         [
-            (559, True),  # A conservative budget may exceed the final shape.
+            (559, False),  # Below 80% of the budget would overpay too much.
+            (560, True),  # At the lower boundary.
             (700, True),  # Exact budget match.
             (840, True),  # At the upper boundary.
             (841, False),  # Above 120% of the budget.
         ],
     )
-    async def test_sweep_fee_budget_tolerance_caps_only_underfunding(
+    async def test_sweep_fee_budget_tolerance_checks_both_directions(
         self,
         mock_wallet_for_sweep,
         mock_backend_for_sweep,
@@ -1162,19 +1165,21 @@ class TestSweepCjAmountPreservation:
             assert session.last_failure_reason is None
         else:
             assert session.last_failure_reason is not None
-            assert "fee estimate exceeds" in session.last_failure_reason
+            assert "fee estimate differs" in session.last_failure_reason
 
     @pytest.mark.asyncio
-    async def test_sweep_budget_for_maker_input_cap_meets_minimum_rate(
-        self, mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep
+    @pytest.mark.parametrize("maker_inputs", [1, 6])
+    async def test_normal_sweep_budget_allows_target_rate_variation_above_floor(
+        self, mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep, maker_inputs
     ) -> None:
-        """The pre-negotiation budget covers every maker input allowed by policy."""
+        """Typical sweeps do not fund the cap; larger shapes may fall below the target."""
         taker_config_for_sweep.max_maker_utxos = 15
         taker = Taker(mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep)
         session = taker._session
         session.is_sweep = True
         session.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
-        session._fee_rate = 1.0
+        session._fee_rate = 10.0
+        session._randomized_fee_rate = 12.0
         session._minimum_fee_rate_sat_vb = 1.0
 
         estimated_inputs, estimated_outputs = _estimate_initial_tx_shape(
@@ -1189,17 +1194,18 @@ class TestSweepCjAmountPreservation:
             use_base_rate=True,
         )
         total_input = sum(utxo.value for utxo in session.preselected_utxos)
-        session.cj_amount = total_input - session._sweep_tx_fee_budget
+        original_cj_amount = total_input - session._sweep_tx_fee_budget
+        session.cj_amount = original_cj_amount
 
         nick, maker_session = self._make_single_utxo_maker_session()
         maker_session.utxos = [
             {
                 "txid": f"{i:064x}",
                 "vout": 0,
-                "value": 30_000,
+                "value": 300_000,
                 "address": "bcrt1qmaker",
             }
-            for i in range(10, 25)
+            for i in range(10, 10 + maker_inputs)
         ]
         session.maker_sessions = {nick: maker_session}
 
@@ -1210,6 +1216,101 @@ class TestSweepCjAmountPreservation:
 
         assert result is True
         assert session.last_failure_reason is None
+        assert session.cj_amount == original_cj_amount
+        parsed = parse_transaction_bytes(session.unsigned_tx)
+        mining_fee = total_input + 300_000 * maker_inputs - sum(o.value for o in parsed.outputs)
+        actual_vsize = (2 + maker_inputs) * 68 + 3 * 31 + 11
+        assert mining_fee == session._sweep_tx_fee_budget + maker_session.offer.txfee
+        assert mining_fee / actual_vsize >= 1.0
+        if maker_inputs == 6:
+            assert mining_fee / actual_vsize < session._fee_rate
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("taker_inputs", "makers", "actual_inputs", "budget", "residual"),
+        [(3, 10, 22, 145_300, 1), (2, 9, 15, 128_600, 3)],
+    )
+    async def test_sweep_normal_case_budget_avoids_maximum_input_overpayment(
+        self,
+        mock_wallet_for_sweep,
+        mock_backend_for_sweep,
+        taker_config_for_sweep,
+        taker_inputs: int,
+        makers: int,
+        actual_inputs: int,
+        budget: int,
+        residual: int,
+    ) -> None:
+        """Synthetic shapes reproduce the two reported fee blowups without mainnet data."""
+        session = Taker(
+            mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep
+        )._session
+        session.is_sweep = True
+        template = mock_wallet_for_sweep.get_all_utxos()[0]
+        session.preselected_utxos = [
+            replace(template, txid=f"{i + 1:064x}", vout=0, value=1_000_000)
+            for i in range(taker_inputs)
+        ]
+        session._fee_rate = 50.0
+        session._minimum_fee_rate_sat_vb = 1.0
+        estimated_inputs, estimated_outputs = _estimate_initial_tx_shape(
+            taker_inputs, makers, is_sweep=True, max_maker_utxos=15
+        )
+        session._sweep_tx_fee_budget = session._estimate_tx_fee(
+            estimated_inputs, estimated_outputs, use_base_rate=True
+        )
+        assert session._sweep_tx_fee_budget == budget
+        total_input = taker_inputs * 1_000_000
+        session.cj_amount = total_input - budget - residual
+        for i in range(makers):
+            _, maker = self._make_single_utxo_maker_session()
+            maker.nick = f"J5Synthetic{i}"
+            maker.offer.counterparty = maker.nick
+            maker.offer.txfee = 0
+            count = 1 + (i < actual_inputs - taker_inputs - makers)
+            maker.utxos = [
+                {"txid": f"{100 + i * 10 + j:064x}", "vout": 0, "value": 3_000_000}
+                for j in range(count)
+            ]
+            session.maker_sessions[maker.nick] = maker
+
+        assert await session._phase_build_tx(
+            destination="bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu", mixdepth=3
+        )
+
+        parsed = parse_transaction_bytes(session.unsigned_tx)
+        assert len(parsed.inputs) == actual_inputs
+        assert len(parsed.outputs) == 1 + 2 * makers
+        total_maker_inputs = (actual_inputs - taker_inputs) * 3_000_000
+        mining_fee = total_input + total_maker_inputs - sum(o.value for o in parsed.outputs)
+        assert mining_fee == budget + residual
+        assert session.cj_amount == total_input - budget - residual
+        assert session._verify_unsigned_miner_fee() is None
+
+    @pytest.mark.asyncio
+    async def test_fixed_amount_uses_actual_shape_instead_of_sweep_budget(
+        self, mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep
+    ) -> None:
+        session = Taker(
+            mock_wallet_for_sweep, mock_backend_for_sweep, taker_config_for_sweep
+        )._session
+        session.preselected_utxos = mock_wallet_for_sweep.get_all_utxos()
+        session.cj_amount = 100_000
+        session._fee_rate = session._randomized_fee_rate = 2.0
+        session._sweep_tx_fee_budget = 50_000
+        nick, maker = self._make_single_utxo_maker_session()
+        session.maker_sessions = {nick: maker}
+        mock_wallet_for_sweep.get_new_internal_address.return_value = maker.change_address
+
+        assert await session._phase_build_tx(
+            destination="bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu", mixdepth=3
+        )
+
+        parsed = parse_transaction_bytes(session.unsigned_tx)
+        total_input = sum(u.value for u in session.preselected_utxos) + maker.utxos[0]["value"]
+        mining_fee = total_input - sum(o.value for o in parsed.outputs)
+        assert len(parsed.outputs) == 4
+        assert mining_fee == (3 * 68 + 4 * 31 + 11) * 2 + maker.offer.txfee
 
     @pytest.mark.asyncio
     async def test_sweep_accepts_dropped_maker_fee_as_residual(
@@ -1420,10 +1521,13 @@ async def test_build_tx_uses_equalized_fee_plan_and_logs_target(
 
     records: list[str] = []
     handler_id = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    mock_wallet.get_new_internal_address.return_value = (
+        "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa"
+    )
     try:
         with patch(
             "taker.coinjoin_session.build_coinjoin_tx",
-            return_value=(b"unsigned", {"output_owners": []}),
+            wraps=build_coinjoin_tx,
         ) as build_tx:
             result = await session._phase_build_tx(
                 destination="bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu",
@@ -2329,13 +2433,20 @@ class TestTakerHistoryHardening:
         nick = "J5maker1"
         session = MakerSession(nick=nick, offer=sample_offer)
         session.crypto = AsyncMock()
-        session.utxos = [{"txid": "a", "vout": 0, "value": 1_000_000}]
+        session.utxos = [{"txid": "a" * 64, "vout": 0, "value": 1_000_000}]
         taker._session.maker_sessions = {nick: session}
 
-        taker._session.unsigned_tx = b"dummy_tx_bytes"
+        taker._session.unsigned_tx = serialize_transaction(
+            2,
+            [TxInput.from_hex("a" * 64, 0), TxInput.from_hex("b" * 64, 0)],
+            [TxOutput(value=1_999_000, script=bytes.fromhex("0014" + "11" * 20))],
+            0,
+        )
         taker._session.cj_amount = 500_000
         taker._session.cj_destination = "bcrt1qdest"
-        taker._session.selected_utxos = [MagicMock(txid="b", vout=0, address="bcrt1qsrc")]
+        taker._session.selected_utxos = [
+            MagicMock(txid="b" * 64, vout=0, address="bcrt1qsrc", value=1_000_000)
+        ]
         taker._session.tx_metadata = {"source_mixdepth": 0}
 
         taker.directory_client = AsyncMock()

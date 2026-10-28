@@ -19,7 +19,7 @@
 
 [wallet]
 # Maximum miner fee rate for any wallet transaction, in sat/vB.
-# max_fee_rate_sat_vb = 1000
+# max_fee_rate_sat_vb = 100
 
 [maker]
 # Relative offers use cj_fee_relative; absolute offers use cj_fee_absolute.

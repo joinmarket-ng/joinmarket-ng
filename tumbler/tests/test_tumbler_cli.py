@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 from jmcore.paths import read_nick_state
+from jmcore.settings import JoinMarketSettings
+from jmwallet.wallet.spend import ExcessiveFeeRateError
 from loguru import logger
 from pydantic import SecretStr
 from typer.testing import CliRunner
@@ -30,7 +32,7 @@ from tumbler.cli import (
     resolve_runner_pacing,
 )
 from tumbler.persistence import save_plan
-from tumbler.plan import Plan, PlanStatus
+from tumbler.plan import Plan, PlanStatus, TakerCoinjoinPhase
 
 runner = CliRunner()
 
@@ -298,6 +300,68 @@ class TestRunCounterpartiesOption:
                 ],
             )
         assert result.exit_code != 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_cap", [None, 1_000.0])
+async def test_tumbler_taker_uses_wallet_fee_cap_and_preserves_override(
+    tmp_path: Path, configured_cap: float | None
+) -> None:
+    settings = JoinMarketSettings(
+        data_dir=tmp_path,
+        network_config={"network": "regtest", "directory_servers": ["localhost:5222"]},
+        wallet={} if configured_cap is None else {"max_fee_rate_sat_vb": configured_cap},
+    )
+    wallet = MagicMock()
+    wallet.sync_with_registered_bonds = AsyncMock()
+    backend = MagicMock()
+    backend.can_estimate_fee.return_value = False
+    backend.get_mempool_min_fee = AsyncMock(return_value=None)
+
+    class CapturingRunner:
+        def __init__(self, plan: Plan, context: Any) -> None:
+            self.plan = plan
+            self.context = context
+
+        async def run(self) -> Any:
+            phase = next(p for p in self.plan.phases if isinstance(p, TakerCoinjoinPhase))
+            taker = await self.context.taker_factory(phase)
+            assert taker.config.max_fee_rate_sat_vb == (
+                100.0 if configured_cap is None else configured_cap
+            )
+            if configured_cap is None:
+                with pytest.raises(ExcessiveFeeRateError, match="exceeds safety cap 100.00"):
+                    await taker._session._resolve_fee_rate()
+            else:
+                assert await taker._session._resolve_fee_rate() == 101.0
+            return SimpleNamespace(status=PlanStatus.COMPLETED, error=None)
+
+        def request_stop(self) -> None:
+            return None
+
+    with (
+        patch("taker.cli.create_backend", return_value=backend),
+        patch("tumbler.cli.WalletService", return_value=wallet),
+        patch("tumbler.cli.TumbleRunner", CapturingRunner),
+    ):
+        await _run_plan(
+            settings=settings,
+            plan=_build_plan("w"),
+            mnemonic="abandon " * 11 + "about",
+            passphrase="",
+            creation_height=None,
+            data_dir=tmp_path,
+            network=None,
+            backend_type=None,
+            rpc_url=None,
+            neutrino_url=None,
+            directory_servers=None,
+            tor_socks_host=None,
+            tor_socks_port=None,
+            fee_rate=101.0,
+            block_target=None,
+            min_confirmations_between_phases=None,
+        )
 
 
 @pytest.mark.asyncio

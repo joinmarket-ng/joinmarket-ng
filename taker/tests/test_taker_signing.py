@@ -834,9 +834,22 @@ class TestPhaseCollectSignaturesCompleteness:
             taker.config.max_maker_replacement_attempts = 3
             taker.config.broadcast_timeout_sec = 30
             taker.config.pending_tx_abandon_hours = 24
+            taker.config.max_fee_rate_sat_vb = 100.0
             taker._session.unsigned_tx = tx_bytes
             taker._session.tx_metadata = metadata
-            taker._session.selected_utxos = []
+            taker._session.selected_utxos = [
+                UTXOInfo(
+                    txid=tx_input.txid_le[::-1].hex(),
+                    vout=tx_input.vout,
+                    value=tx_input.value,
+                    address="bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+                    confirmations=1,
+                    scriptpubkey="0014" + "00" * 20,
+                    path="m/84'/1'/0'/0/0",
+                    mixdepth=0,
+                )
+                for tx_input in tx_data.taker_inputs
+            ]
             taker._session.cj_amount = tx_data.cj_amount
             taker._session.cj_destination = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
             taker._session.taker_change_address = ""
@@ -935,16 +948,21 @@ class TestPhaseCollectSignaturesCompleteness:
         maker_sessions = {
             "maker1": self._make_maker_session(
                 "maker1", offer, [{"txid": "b" * 64, "vout": 0, "value": 1_500_000}]
-            )
+            ),
+            "maker2": self._make_maker_session(
+                "maker2", offer, [{"txid": "c" * 64, "vout": 0, "value": 1_200_000}]
+            ),
         }
         taker = self._build_taker_with_tx(two_maker_tx_data, maker_sessions=maker_sessions)
         taker.wallet.renew_coinjoin_inputs.return_value = False
 
+        assert taker._session._verify_unsigned_miner_fee() is None
         result = await taker._session._phase_collect_signatures()
 
         assert result is False
         assert taker._session.signing_boundary_crossed is False
         taker.directory_client.send_privmsg.assert_not_awaited()
+        taker.wallet.renew_coinjoin_inputs.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_rejects_when_maker_provides_invalid_signature(

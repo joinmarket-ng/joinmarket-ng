@@ -26,7 +26,7 @@ from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
 from jmcore.crypto import NickIdentity
-from jmcore.fee_policy import fee_rate_meets_minimum
+from jmcore.fee_policy import estimate_p2wpkh_vsize, fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
 from jmcore.models import Offer
 from jmcore.notifications import get_notifier
@@ -103,9 +103,11 @@ def _estimate_initial_tx_shape(
 ) -> tuple[int, int]:
     """Estimate the pre-negotiation transaction shape shown to the user."""
     if is_sweep:
-        if max_maker_utxos <= 0:
-            raise ValueError("Sweep fee budgeting requires a positive max_maker_utxos limit")
-        maker_inputs = num_makers * max_maker_utxos
+        # Match the reference's ordinary-case estimate. The admission cap limits
+        # consolidation abuse, but budgeting for that extreme burns excess fees
+        # whenever makers contribute their usual smaller input sets.
+        inputs_per_maker = min(3, max_maker_utxos) if max_maker_utxos > 0 else 3
+        maker_inputs = num_makers * inputs_per_maker
         num_outputs = 1 + num_makers * 2
     else:
         maker_inputs = math.ceil(num_makers * 1.2)
@@ -1255,19 +1257,9 @@ class Taker(TakerMonitoringMixin):
                     f"total value: {total_input_value:,} sats"
                 )
 
-                if self.config.max_maker_utxos <= 0:
-                    reason = (
-                        "Sweep CoinJoins require max_maker_utxos to be greater than 0 so the "
-                        "minimum miner fee rate can be guaranteed before maker inputs are known."
-                    )
-                    logger.error(reason)
-                    self._session.last_failure_reason = reason
-                    self.state = TakerState.FAILED
-                    return None
-
-                # Budget for every maker input the authenticated session will
-                # accept. This keeps the fixed sweep amount relayable even when
-                # all makers contribute the configured maximum input count.
+                # Budget for the normal case before maker inputs are known.
+                # Larger transactions may achieve a lower target rate; the
+                # finalized shape must still pass fee tolerance and floor checks.
                 estimated_inputs, estimated_outputs = _estimate_initial_tx_shape(
                     len(self._session.preselected_utxos),
                     n_makers,
@@ -2211,6 +2203,23 @@ class Taker(TakerMonitoringMixin):
                 else "Final CoinJoin miner fee rate could not be verified"
             )
             logger.error("Final CoinJoin miner fee rate is below the required minimum")
+            logger.bind(sensitive=True).error("Final CoinJoin miner fee detail: {}", reason)
+            self._session.last_failure_reason = reason
+            self.state = TakerState.FAILED
+            return None
+
+        # Keep the ceiling on the same size model as the pre-sign check.
+        # Witness-size variation must not reject an otherwise approved round
+        # near the cap; exact signed size still governs the floor and reporting.
+        policy_vsize = estimate_p2wpkh_vsize(len(tx.inputs), total_outputs)
+        policy_fee_rate = actual_mining_fee / policy_vsize
+        if actual_mining_fee > self.config.max_fee_rate_sat_vb * policy_vsize:
+            reason = (
+                f"Final CoinJoin miner fee rate {policy_fee_rate:.2f} sat/vB exceeds safety cap "
+                f"{self.config.max_fee_rate_sat_vb:.2f} sat/vB. "
+                "Raise wallet.max_fee_rate_sat_vb explicitly only if you intend to pay this much."
+            )
+            logger.error("Final CoinJoin miner fee rate exceeds the safety cap")
             logger.bind(sensitive=True).error("Final CoinJoin miner fee detail: {}", reason)
             self._session.last_failure_reason = reason
             self.state = TakerState.FAILED

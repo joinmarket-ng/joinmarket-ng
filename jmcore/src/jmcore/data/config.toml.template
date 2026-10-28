@@ -150,7 +150,7 @@
 # is then required with neutrino). A comma-separated list supplies a custom
 # fallback order. Self-hosting a mempool/Esplora instance is the most private
 # option. Every resolved estimate is still subject to the hard
-# wallet.max_fee_rate_sat_vb safety cap above (default 1000 sat/vB).
+# wallet.max_fee_rate_sat_vb safety cap.
 # fee_estimate_url = "http://your-esplora.onion/api/fee-estimates,https://backup.example/fee-estimates"
 
 # ============================================================================
@@ -253,8 +253,12 @@
 # Safety cap on the fee rate (sat/vB) used for any wallet transaction.
 # Both manual fee rates and backend fee estimates above this cap are rejected
 # to protect against runaway-fee bugs and malicious/misconfigured fee oracles.
-# Increase only if you have a deliberate need to pay fees above 1000 sat/vB.
-# max_fee_rate_sat_vb = 1000
+# Increase only if you have a deliberate need to pay fees above 100 sat/vB.
+# CoinJoins also check the effective rate before requesting signatures and broadcasting.
+# Those ceilings use estimated size to avoid signature-size jitter; reporting uses signed size.
+# This cap also bounds makers' required minimum rate. A resolved minimum above the cap
+# makes makers refuse startup/fills; raise the cap explicitly if that minimum is intended.
+# max_fee_rate_sat_vb = 100
 
 # Show the fidelity bond branch in the extended wallet info views
 # (`jm-wallet info --extended`). Fidelity bonds are managed separately via
@@ -564,7 +568,10 @@
 # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
 # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
 # max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
-# max_sweep_fee_change = 0.8  # Max relative amount actual sweep fee needs may exceed its budget
+# Sweeps budget three inputs per maker (or the lower positive input cap).
+# Larger transactions can achieve a lower target rate, but must clear the minimum fee policy.
+# Abort if the actual-shape fee estimate / selected budget falls outside 1 +/- this tolerance.
+# max_sweep_fee_change = 0.8
 # Round each selected maker fee up to the closest same-type public quantum.
 # Requires makers that accept outputs paying at least their advertised fee, as
 # supported by joinmarket-clientserver v0.9.12 and newer implementations.

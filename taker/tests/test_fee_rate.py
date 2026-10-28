@@ -173,7 +173,7 @@ class TestUnsignedMinimumFeePolicy:
         session.maker_sessions = {}
         session.unsigned_tx = _unsigned_fee_policy_tx(9_700)
 
-        assert session._verify_unsigned_minimum_miner_fee() is None
+        assert session._verify_unsigned_miner_fee() is None
 
     @pytest.mark.asyncio
     async def test_rejects_low_unsigned_miner_fee_before_sending_tx(self) -> None:
@@ -189,6 +189,37 @@ class TestUnsignedMinimumFeePolicy:
         assert await session._phase_collect_signatures() is False
         assert "below required" in (session.last_failure_reason or "")
         taker.directory_client.send_privmsg.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("minimum", [None, 1.0])
+    async def test_rejects_excessive_effective_rate_before_signing_request(
+        self, minimum: float | None
+    ) -> None:
+        taker = _make_taker(fee_rate=50.0, max_fee_rate_sat_vb=100.0)
+        session = taker._session
+        session._minimum_fee_rate_sat_vb = minimum
+        session.selected_utxos = [MagicMock(value=100_000)]
+        session.maker_sessions = {}
+        # Selected 50 sat/vB does not protect against an inflated sweep budget.
+        session.unsigned_tx = _unsigned_fee_policy_tx(80_000)
+        taker.directory_client = MagicMock()
+        taker.directory_client.send_privmsg = AsyncMock()
+        session._sign_our_inputs = AsyncMock()
+
+        assert await session._phase_collect_signatures() is False
+        assert "exceeds safety cap" in (session.last_failure_reason or "")
+        taker.directory_client.send_privmsg.assert_not_awaited()
+        session._sign_our_inputs.assert_not_awaited()
+
+    def test_unsigned_effective_rate_respects_explicit_higher_cap(self) -> None:
+        taker = _make_taker(fee_rate=50.0, max_fee_rate_sat_vb=1_000.0)
+        session = taker._session
+        session._minimum_fee_rate_sat_vb = 1.0
+        session.selected_utxos = [MagicMock(value=100_000)]
+        session.maker_sessions = {}
+        session.unsigned_tx = _unsigned_fee_policy_tx(80_000)
+
+        assert session._verify_unsigned_miner_fee() is None
 
 
 # ---------------------------------------------------------------------------

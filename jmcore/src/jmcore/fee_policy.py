@@ -1,4 +1,4 @@
-"""Shared minimum miner-fee policy for CoinJoin participants."""
+"""Shared miner-fee policy for wallet transactions and CoinJoin participants."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from inspect import isawaitable
 from typing import Any
 
 from loguru import logger
+
+DEFAULT_MAX_FEE_RATE_SAT_VB = 100.0
 
 _LOW_FEE_ERROR = re.compile(
     r"CoinJoin miner fee rate ([0-9]{1,16}\.[0-9]{1,8}) sat/vB is below required "

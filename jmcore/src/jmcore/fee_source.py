@@ -24,7 +24,7 @@ default (third-party) sources are only auto-enabled when a proxy is available.
 Safety: estimates are advisory input from a third party. Entries above
 :data:`ABSURD_FEE_RATE_SAT_VB` are discarded at parse time, and every
 consumer additionally enforces the operator's hard cap
-(``wallet.max_fee_rate_sat_vb``, default 1000 sat/vB) on the resolved rate,
+(``wallet.max_fee_rate_sat_vb``) on the resolved rate,
 so a compromised or broken provider cannot make transactions spend more than
 the configured maximum.
 """
