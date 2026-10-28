@@ -7,6 +7,7 @@ import os
 import struct
 
 import pytest
+from bitcointx.segwit_addr import encode as encode_segwit_address
 
 from jmcore.bitcoin import (
     PSBT_MAGIC,
@@ -1373,14 +1374,53 @@ class TestGetAddressType:
         assert addr is not None
         assert get_address_type(addr) == "p2wsh"
 
-    def test_p2tr(self) -> None:
-        """P2TR address should be detected."""
+    @pytest.mark.parametrize("hrp", ["bc", "tb", "bcrt"])
+    @pytest.mark.parametrize("uppercase", [False, True])
+    def test_p2tr(self, hrp: str, uppercase: bool) -> None:
+        """P2TR addresses use Bech32m, including all-uppercase addresses."""
+        x_only = b"\xcd" * 32
+        addr = encode_segwit_address(hrp, 1, x_only)
+        assert addr is not None
+        if uppercase:
+            addr = addr.upper()
+        assert get_address_type(addr) == "p2tr"
+
+    def test_bip350_p2tr_vector(self) -> None:
+        """Use an independent BIP350 testnet vector, not our fixture encoder."""
+        addr = "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c"
+        assert get_address_type(addr) == "p2tr"
+
+    def test_rejects_legacy_checksum_for_p2tr(self) -> None:
         import bech32 as bech32_lib
 
-        x_only = b"\xcd" * 32
-        addr = bech32_lib.encode("bcrt", 1, x_only)
+        addr = bech32_lib.encode("bcrt", 1, b"\xcd" * 32)
         assert addr is not None
-        assert get_address_type(addr) == "p2tr"
+        with pytest.raises(ValueError, match="Invalid bech32 address"):
+            get_address_type(addr)
+
+    def test_rejects_bech32m_checksum_for_witness_v0(self) -> None:
+        # BIP350 invalid testnet vector: witness v0 must keep its Bech32 checksum.
+        addr = "tb1q0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq24jc47"
+        with pytest.raises(ValueError, match="Invalid bech32 address"):
+            get_address_type(addr)
+
+    @pytest.mark.parametrize("mixed_case", [False, True])
+    def test_rejects_malformed_p2tr(self, mixed_case: bool) -> None:
+        addr = encode_segwit_address("bcrt", 1, b"\xcd" * 32)
+        assert addr is not None
+        if mixed_case:
+            addr = addr[0].upper() + addr[1:]
+        else:
+            addr = addr[:-1] + ("q" if addr[-1] != "q" else "p")
+        with pytest.raises(ValueError, match="Invalid bech32 address"):
+            get_address_type(addr)
+
+    @pytest.mark.parametrize(("version", "program_length"), [(1, 20), (2, 32)])
+    def test_rejects_unsupported_witness_types(self, version: int, program_length: int) -> None:
+        addr = encode_segwit_address("bcrt", version, b"\xcd" * program_length)
+        assert addr is not None
+        with pytest.raises(ValueError, match="Unknown SegWit address type"):
+            get_address_type(addr)
 
     def test_p2pkh(self) -> None:
         import base58 as b58

@@ -24,6 +24,7 @@ from typing import Any
 import base58
 import bech32 as bech32_lib
 from bitcointx.core import Hash160
+from bitcointx.segwit_addr import decode as decode_segwit_address
 from pydantic import validate_call
 from pydantic.dataclasses import dataclass
 
@@ -1211,10 +1212,10 @@ def get_address_type(address: str) -> str:
     Raises:
         ValueError: If address is invalid or unknown type
     """
-    # Bech32 (SegWit)
+    # Witness v0 uses Bech32; Taproot uses Bech32m, unlike the legacy decoder.
     hrp = _segwit_hrp(address)
     if hrp is not None:
-        decoded = bech32_lib.decode(hrp, address)
+        decoded = decode_segwit_address(hrp, address)
         if decoded[0] is None or decoded[1] is None:
             raise ValueError(f"Invalid bech32 address: {address}")
 
