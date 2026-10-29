@@ -51,7 +51,15 @@ matches the fingerprint recorded by the previous release. Otherwise use
 fingerprint with your records; the first registered identity is selected. Use
 **Select Registered Wallet Identity** to switch between several passphrase
 wallets sharing a mnemonic file. The menu shows the selected fingerprint;
-neither registration nor selection stores a passphrase.
+neither registration nor selection stores a passphrase. Both identity entries
+appear once BIP39 onboarding is enabled or a passphrase identity is registered.
+
+If a passphrase wallet never prompts and shows an unexpected fingerprint or an
+unexpectedly empty balance, the wallet was derived without its passphrase:
+enable **Configure BIP39 Onboarding** in the Config Center, then **Register
+Derived Wallet Identity** with the intended passphrase and select it via
+**Select Registered Wallet Identity**. Registered passphrase identities keep
+prompting and stay visible after onboarding is disabled again.
 
 `jm-ng` runs the menu with the Python and `jm-*` commands installed next to it.
 Launching the menu script directly, as Raspiblitz does, still prefers the

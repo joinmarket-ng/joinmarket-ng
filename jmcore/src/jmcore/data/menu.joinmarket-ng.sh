@@ -331,6 +331,45 @@ print(str(get_settings().wallet.bip39_passphrase_enabled).lower())
 PY
 }
 
+# Helper: return 0 when the BIP39 identity menu entries (IDREG/IDSEL) should be
+# shown. They are BIP39-only: visible when the wallet_with_passphrase flag is
+# enabled, or when the active wallet already has registered passphrase identities
+# (so existing identities stay manageable after the flag is turned off).
+# Passphrase-free "none" entries - recorded automatically when an ordinary
+# wallet is created or first unlocked - do not count; "unknown" counts as
+# possibly passphrase-derived.
+bip39_identity_entries_visible() {
+    if [ "$(get_wallet_with_passphrase)" = "true" ]; then
+        return 0
+    fi
+    [ -n "${CURRENT_WALLET:-}" ] && [ -f "$CURRENT_WALLET" ] || return 1
+    # Silence stderr: a warning about unreadable metadata must not corrupt the menu.
+    local count
+    count=$("$TUI_PYTHON" - "$CURRENT_WALLET" <<'PY' 2>/dev/null
+import sys
+from pathlib import Path
+
+from jmcore.wallet_metadata import registered_identities
+
+try:
+    identities = registered_identities(Path(sys.argv[1]))
+    print(sum(1 for identity in identities.values() if identity.bip39 != "none"))
+except (OSError, ValueError):
+    print(0)
+PY
+) || return 1
+    [ "${count:-0}" -gt 0 ]
+}
+
+# Helper: return 0 when a BIP39 passphrase is stored in config.toml, i.e. when
+# DELPP (Delete Active Wallet Passphrase) has something to delete.
+has_stored_bip39_passphrase() {
+    local stored_pp
+    stored_pp=$(get_stored_bip39_passphrase && printf '.')
+    stored_pp=${stored_pp%.}
+    [ -n "$stored_pp" ]
+}
+
 wallet_identity_summary() {
     "$TUI_PYTHON" - "$1" <<'PY'
 import sys
@@ -1973,21 +2012,31 @@ No:  automatic coin selection from one mixdepth." 12 64
         # Refresh wallet info at the START of each W submenu iteration
         check_stale_wallet
 
+        WMENU_ITEMS=(
+          "VIEW"     "View Wallet Info / Balance"
+          "HIST"     "CoinJoin History"
+          "REFRESH"  "Refresh / Reconstruct Wallet History"
+        )
+        # BIP39-only entries: hidden unless the flag is on or identities exist
+        if bip39_identity_entries_visible; then
+          WMENU_ITEMS+=(
+            "IDREG"    "Register Derived Wallet Identity"
+            "IDSEL"    "Select Registered Wallet Identity"
+          )
+        fi
+        WMENU_ITEMS+=(
+          "FREEZE"   "UTXO Freeze Manager"
+          "NEW"      "Create New Wallet (12 or 24-word seed)"
+          "IMP"      "Import Existing Wallet (from seed)"
+          "SEL"      "Select Active Wallet"
+          "VAL"      "Validate a Seed Phrase"
+          "SEED"     "Show Seed Words"
+          "BACK"     "Back to Main Menu"
+        )
         WCHOICE=$(whiptail --title " Wallet Management " \
          --menu "\n$(menu_header)" \
-          23 78 12 \
-          "VIEW"     "View Wallet Info / Balance" \
-          "HIST"     "CoinJoin History" \
-          "REFRESH"  "Refresh / Reconstruct Wallet History" \
-          "IDREG"    "Register Derived Wallet Identity" \
-          "IDSEL"    "Select Registered Wallet Identity" \
-          "FREEZE"   "UTXO Freeze Manager" \
-          "NEW"      "Create New Wallet (12 or 24-word seed)" \
-          "IMP"      "Import Existing Wallet (from seed)" \
-          "SEL"      "Select Active Wallet" \
-          "VAL"      "Validate a Seed Phrase" \
-          "SEED"     "Show Seed Words" \
-          "BACK"     "Back to Main Menu" 3>&1 1>&2 2>&3)
+          $(( ${#WMENU_ITEMS[@]} / 2 + 11 )) 78 $(( ${#WMENU_ITEMS[@]} / 2 )) \
+          "${WMENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
 
         # Handle ESC/Cancel - exit W submenu
         [ $? -ne 0 ] && break
@@ -2818,19 +2867,27 @@ for item in json.load(sys.stdin):
       # Config Center submenu
       while true; do
         check_stale_wallet
+        CMENU_ITEMS=(
+          "LOG"    "Configure Log Level"
+          "PPFLAG" "Configure BIP39 Onboarding"
+          "DELPW"  "Delete Active Wallet Password"
+        )
+        # Only offered when a stored BIP39 passphrase exists to delete
+        if has_stored_bip39_passphrase; then
+          CMENU_ITEMS+=("DELPP" "Delete Active Wallet Passphrase")
+        fi
+        CMENU_ITEMS+=(
+          ""   ""
+          "EDIT"   "Edit config.toml manually (nano)"
+          "BACKUP" "Backup config.toml"
+          "REST"   "Restore config.toml"
+          ""   ""
+          "BACK"   "Back to Main Menu"
+        )
         CCHOICE=$(whiptail --title " Config Center " \
           --menu "\n$(menu_header)" \
-          22 64 10 \
-          "LOG"    "Configure Log Level" \
-          "PPFLAG" "Configure BIP39 Onboarding" \
-          "DELPW"  "Delete Active Wallet Password" \
-          "DELPP"  "Delete Active Wallet Passphrase" \
-          ""   "" \
-          "EDIT"   "Edit config.toml manually (nano)" \
-          "BACKUP" "Backup config.toml" \
-          "REST"   "Restore config.toml" \
-          ""   "" \
-          "BACK"   "Back to Main Menu" 3>&1 1>&2 2>&3)
+          $(( ${#CMENU_ITEMS[@]} / 2 + 12 )) 64 $(( ${#CMENU_ITEMS[@]} / 2 )) \
+          "${CMENU_ITEMS[@]}" 3>&1 1>&2 2>&3)
 
         [ $? -ne 0 ] && break
 

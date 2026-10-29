@@ -2831,6 +2831,156 @@ def test_tui_script_config_center_delpp_clears_passphrase() -> None:
     assert "--defaultno" in delpp_case, "DELPP must default to No"
 
 
+def test_tui_script_bip39_identity_entries_visible_helper() -> None:
+    """IDREG/IDSEL gate: the flag short-circuits before the identity metadata read."""
+    content = SCRIPT_PATH.read_text()
+    helper = content.split("bip39_identity_entries_visible() {", 1)[1].split("\n}", 1)[
+        0
+    ]
+    assert '[ -f "$CURRENT_WALLET" ] || return 1' in helper, (
+        "without an active wallet there are no identities to enumerate"
+    )
+    assert "registered_identities" in helper, (
+        "identities must stay visible after the flag is turned off"
+    )
+    assert 'identity.bip39 != "none"' in helper, (
+        "passphrase-free 'none' hints (auto-recorded for ordinary wallets) must not count"
+    )
+    assert helper.index("get_wallet_with_passphrase") < helper.index(
+        "registered_identities"
+    ), "flag check must short-circuit before the identity metadata read"
+
+
+@pytest.mark.parametrize(
+    ("flag", "bip39_kinds", "expect_visible"),
+    [
+        ("true", [], True),
+        ("false", [], False),
+        ("false", ["none"], False),
+        ("false", ["required"], True),
+        ("false", ["unknown"], True),
+        ("false", ["none", "required"], True),
+    ],
+)
+def test_tui_identity_gate_executed(
+    tmp_path: Path, flag: str, bip39_kinds: list[str], expect_visible: bool
+) -> None:
+    """The real gate opens on the flag or a non-"none" identity, nothing else."""
+    from jmcore.wallet_metadata import WalletIdentity, register_identity
+
+    wallet_file = tmp_path / "w.mnemonic"
+    wallet_file.write_text("seed words placeholder")
+    for index, kind in enumerate(bip39_kinds):
+        register_identity(
+            wallet_file, WalletIdentity(fingerprint=f"1122334{index}", bip39=kind)
+        )
+    script = (
+        f'TUI_PYTHON="{sys.executable}"\n'
+        f'CURRENT_WALLET="{wallet_file}"\n'
+        f'get_wallet_with_passphrase() {{ echo "{flag}"; }}\n'
+        + _extract_script_function(
+            SCRIPT_PATH.read_text(), "bip39_identity_entries_visible"
+        )
+        + "\nbip39_identity_entries_visible\n"
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=15)
+    assert (result.returncode == 0) == expect_visible, result.stderr.decode()
+
+
+def test_tui_identity_gate_corrupt_metadata_fails_closed(tmp_path: Path) -> None:
+    """Unreadable metadata hides the entries (fail closed) and stays off stderr."""
+    wallet_file = tmp_path / "w.mnemonic"
+    wallet_file.write_text("seed words placeholder")
+    (tmp_path / "w.mnemonic.meta").write_text("{ this is not valid json")
+    script = (
+        f'TUI_PYTHON="{sys.executable}"\n'
+        f'CURRENT_WALLET="{wallet_file}"\n'
+        'get_wallet_with_passphrase() { echo "false"; }\n'
+        + _extract_script_function(
+            SCRIPT_PATH.read_text(), "bip39_identity_entries_visible"
+        )
+        + "\nbip39_identity_entries_visible\n"
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=15)
+    assert result.returncode != 0
+    assert b"Failed to read mnemonic metadata" not in result.stderr
+
+
+def test_tui_script_has_stored_bip39_passphrase_helper() -> None:
+    """DELPP gate: visibility follows the stored passphrase, not the flag."""
+    content = SCRIPT_PATH.read_text()
+    helper = content.split("has_stored_bip39_passphrase() {", 1)[1].split("\n}", 1)[0]
+    assert "get_stored_bip39_passphrase" in helper
+    assert '[ -n "$stored_pp" ]' in helper
+
+
+def _menu_snippet(content: str, array_name: str) -> str:
+    """Extract a menu construction block (items array through the whiptail call)."""
+    block = content.split(f"\n        {array_name}=(", 1)[1]
+    return array_name + "=(" + block.split("2>&3)", 1)[0] + "2>&3)"
+
+
+@pytest.mark.parametrize(
+    ("gate_open", "expect_entries", "height", "listheight"),
+    [(0, True, "23", "12"), (1, False, "21", "10")],
+)
+def test_tui_wallet_menu_identity_entry_gating(
+    tmp_path: Path, gate_open: int, expect_entries: bool, height: str, listheight: str
+) -> None:
+    """IDREG/IDSEL appear only when the gate opens; menu height follows item count."""
+    args_file = tmp_path / "menu.args"
+    script = (
+        f"bip39_identity_entries_visible() {{ return {gate_open}; }}\n"
+        "menu_header() { printf 'H'; }\n"
+        'whiptail() { printf "%s\\0" "$@" > "$ARGS_FILE"; return 1; }\n'
+        + _menu_snippet(SCRIPT_PATH.read_text(), "WMENU_ITEMS")
+        + "\ntrue\n"
+    )
+    subprocess.run(
+        ["bash", "-c", script],
+        env=os.environ | {"ARGS_FILE": str(args_file)},
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    args = args_file.read_bytes().decode().rstrip("\0").split("\0")
+    assert ("IDREG" in args) == expect_entries
+    assert ("IDSEL" in args) == expect_entries
+    menu_index = args.index("--menu")
+    assert args[menu_index + 2 : menu_index + 5] == [height, "78", listheight]
+
+
+@pytest.mark.parametrize(
+    ("gate_open", "expect_entries", "height", "listheight"),
+    [(0, True, "22", "10"), (1, False, "21", "9")],
+)
+def test_tui_config_center_delpp_gating(
+    tmp_path: Path, gate_open: int, expect_entries: bool, height: str, listheight: str
+) -> None:
+    """DELPP appears only with a stored passphrase; menu height follows item count."""
+    args_file = tmp_path / "menu.args"
+    script = (
+        f"has_stored_bip39_passphrase() {{ return {gate_open}; }}\n"
+        "menu_header() { printf 'H'; }\n"
+        'whiptail() { printf "%s\\0" "$@" > "$ARGS_FILE"; return 1; }\n'
+        + _menu_snippet(SCRIPT_PATH.read_text(), "CMENU_ITEMS")
+        + "\ntrue\n"
+    )
+    subprocess.run(
+        ["bash", "-c", script],
+        env=os.environ | {"ARGS_FILE": str(args_file)},
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    args = args_file.read_bytes().decode().rstrip("\0").split("\0")
+    assert ("DELPP" in args) == expect_entries
+    menu_index = args.index("--menu")
+    assert args[menu_index + 2 : menu_index + 5] == [height, "64", listheight]
+
+
 # ---------------------------------------------------------------------------
 # Docker image tests
 # ---------------------------------------------------------------------------
@@ -3172,10 +3322,16 @@ def test_tui_script_passphrase_storage_offers_require_flag() -> None:
         "maker storage offer must bail out before checking stored state when flag is off"
     )
 
-    # Both wallet-change storage offers are wrapped in a flag check.
-    assert (
-        content.count('if [ "$(get_wallet_with_passphrase)" = "true" ]; then') == 2
-    ), "both wallet-change passphrase storage offers must be flag-gated"
+    # Both wallet-change storage offers are wrapped in a flag check. The check is
+    # scoped per offer because other code paths (e.g. the IDREG/IDSEL visibility
+    # gate) legitimately read the same flag.
+    offers = content.split("Offer passphrase storage as well")
+    assert len(offers) == 3, "expected two wallet-change passphrase storage offers"
+    gate = 'if [ "$(get_wallet_with_passphrase)" = "true" ]; then'
+    for offer in offers[1:]:
+        assert gate in offer[: offer.index('" Store Passphrase "')], (
+            "each wallet-change passphrase storage offer must be flag-gated"
+        )
 
 
 def test_tui_script_config_center_has_passphrase_mode_toggle() -> None:
