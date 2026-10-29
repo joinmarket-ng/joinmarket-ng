@@ -583,7 +583,8 @@ def _onboard_saved_identity(
             settings,
             output_file,
             password=password,
-            prompt_bip39_passphrase=prompted_on_import,
+            # A previous wallet's stored credential does not belong to this seed.
+            force_bip39_prompt=prompted_on_import,
             warn_if_passphrase_empty=prompted_on_import,
             confirm_bip39_passphrase=True,
             select=True,

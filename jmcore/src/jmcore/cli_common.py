@@ -818,6 +818,7 @@ def resolve_mnemonic(
     password: str | None = None,
     bip39_passphrase: str | None = None,
     prompt_bip39_passphrase: bool = False,
+    force_bip39_prompt: bool = False,
     required: bool = True,
     validate_identity: bool = True,
     expected_fingerprint: str | None = None,
@@ -833,7 +834,7 @@ def resolve_mnemonic(
     5. Config file wallet.mnemonic_file setting
     6. Default wallet path (~/.joinmarket-ng/wallets/default.mnemonic)
 
-    BIP39 passphrase priority:
+    BIP39 passphrase priority (unless force_bip39_prompt requests a fresh entry):
     1. --bip39-passphrase argument
     2. BIP39_PASSPHRASE environment variable
     3. Config file wallet.bip39_passphrase setting
@@ -852,6 +853,8 @@ def resolve_mnemonic(
         password: Password for encrypted mnemonic file (NOT BIP39 passphrase)
         bip39_passphrase: BIP39 passphrase (13th/25th word, NOT file encryption password)
         prompt_bip39_passphrase: Whether to prompt for BIP39 passphrase interactively
+        force_bip39_prompt: Prompt instead of reusing environment/config passphrases;
+            incompatible with an explicit bip39_passphrase argument
         required: Whether mnemonic is required (raises error if not found)
 
     Returns:
@@ -860,6 +863,8 @@ def resolve_mnemonic(
     Raises:
         ValueError: If required but not found, or if loading fails
     """
+    if force_bip39_prompt and bip39_passphrase is not None:
+        raise ValueError("Cannot force a BIP39 prompt with an explicitly supplied passphrase")
     selected_source = select_mnemonic_source(
         settings, mnemonic=mnemonic, mnemonic_file=mnemonic_file
     )
@@ -919,23 +924,26 @@ def resolve_mnemonic(
         else None
     )
     legacy_file = mnemonic_file_path if identity is None and validate_identity else None
-    should_prompt = bip39_prompt_required(
-        settings, identity, explicitly_requested=prompt_bip39_passphrase
-    )
+    explicit_prompt = prompt_bip39_passphrase or force_bip39_prompt
+    should_prompt = bip39_prompt_required(settings, identity, explicitly_requested=explicit_prompt)
 
     # Resolve BIP39 passphrase
     # Priority: CLI arg > env var > config > prompt > empty
     resolved_passphrase = ""
     if bip39_passphrase is not None:
         resolved_passphrase = bip39_passphrase
-    elif "BIP39_PASSPHRASE" in os.environ and settings.wallet.bip39_passphrase_enabled:
+    elif (
+        not force_bip39_prompt
+        and "BIP39_PASSPHRASE" in os.environ
+        and settings.wallet.bip39_passphrase_enabled
+    ):
         resolved_passphrase = os.environ["BIP39_PASSPHRASE"]
-    elif env_passphrase := os.environ.get("BIP39_PASSPHRASE"):
+    elif not force_bip39_prompt and (env_passphrase := os.environ.get("BIP39_PASSPHRASE")):
         resolved_passphrase = env_passphrase
-    elif settings.wallet.bip39_passphrase is not None:
+    elif not force_bip39_prompt and settings.wallet.bip39_passphrase is not None:
         resolved_passphrase = settings.wallet.bip39_passphrase.get_secret_value()
     elif should_prompt:
-        if settings.wallet.bip39_passphrase_enabled and not prompt_bip39_passphrase:
+        if settings.wallet.bip39_passphrase_enabled and not explicit_prompt:
             from jmcore.confirmation import is_interactive_mode
 
             if not is_interactive_mode():

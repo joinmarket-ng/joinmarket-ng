@@ -1036,6 +1036,59 @@ class TestResolveMnemonicPassphraseFlag:
 
     VALID_MNEMONIC = "abandon " * 11 + "about"
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    @pytest.mark.parametrize("inherited_passphrase", ["", "inherited test passphrase"])
+    def test_force_prompt_ignores_inherited_credentials(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        enabled: bool,
+        inherited_passphrase: str,
+    ) -> None:
+        from pydantic import SecretStr
+
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings, WalletSettings
+
+        monkeypatch.setenv("BIP39_PASSPHRASE", inherited_passphrase)
+        settings = JoinMarketSettings(
+            data_dir=tmp_path,
+            wallet=WalletSettings(
+                bip39_passphrase_enabled=enabled,
+                bip39_passphrase=SecretStr("configured test pass"),
+            ),
+        )
+        with (
+            patch("typer.prompt", return_value="") as prompt,
+            patch("jmcore.cli_common._confirm_prompted_wallet") as confirm,
+        ):
+            result = resolve_mnemonic(
+                settings, mnemonic=self.VALID_MNEMONIC, force_bip39_prompt=True
+            )
+
+        assert result is not None and result.bip39_passphrase == ""
+        prompt.assert_called_once()
+        confirm.assert_called_once_with(self.VALID_MNEMONIC, "")
+        assert os.environ["BIP39_PASSPHRASE"] == inherited_passphrase
+        assert settings.wallet.bip39_passphrase is not None
+        assert settings.wallet.bip39_passphrase.get_secret_value() == "configured test pass"
+
+    @pytest.mark.parametrize("passphrase", ["", "explicit test passphrase"])
+    def test_force_prompt_rejects_explicit_passphrase(
+        self, tmp_path: Path, passphrase: str
+    ) -> None:
+        from jmcore.cli_common import resolve_mnemonic
+        from jmcore.settings import JoinMarketSettings
+
+        settings = JoinMarketSettings(data_dir=tmp_path)
+        with pytest.raises(ValueError, match="explicitly supplied passphrase"):
+            resolve_mnemonic(
+                settings,
+                mnemonic=self.VALID_MNEMONIC,
+                bip39_passphrase=passphrase,
+                force_bip39_prompt=True,
+            )
+
     def test_flag_true_prompts_when_interactive(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

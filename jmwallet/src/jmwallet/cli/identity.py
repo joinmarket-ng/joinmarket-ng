@@ -33,6 +33,7 @@ def confirm_and_register(
     mnemonic_file: Path,
     *,
     prompt_bip39_passphrase: bool = False,
+    force_bip39_prompt: bool = False,
     no_bip39_passphrase: bool = False,
     confirm_bip39_passphrase: bool = False,
     warn_if_passphrase_empty: bool = False,
@@ -40,7 +41,7 @@ def confirm_and_register(
     yes: bool = False,
     password: str | None = None,
 ) -> None:
-    if no_bip39_passphrase and prompt_bip39_passphrase:
+    if no_bip39_passphrase and (prompt_bip39_passphrase or force_bip39_prompt):
         raise ValueError("Choose either no passphrase or an interactive passphrase")
     resolved = resolve_mnemonic(
         settings,
@@ -49,6 +50,7 @@ def confirm_and_register(
         prompt_bip39_passphrase=(
             prompt_bip39_passphrase or settings.wallet.bip39_passphrase_enabled
         ),
+        force_bip39_prompt=force_bip39_prompt,
         validate_identity=False,
         password=password,
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -410,6 +411,91 @@ def test_import_question_declined_records_passphrase_free_hint(
     assert "mnemonic extension" in result.output
     assert selected_identity(output) is None
     assert load_mnemonic_meta_fingerprint(output) == get_mnemonic_fingerprint(MNEMONIC)
+
+
+@pytest.mark.parametrize("credential_source", ["environment", "config"])
+@pytest.mark.parametrize("old_passphrase", ["", "old wallet test passphrase"])
+@pytest.mark.parametrize("entered_passphrase", ["", PASSPHRASE])
+def test_import_yes_prompts_for_fresh_passphrase_without_changing_active_wallet(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    credential_source: str,
+    old_passphrase: str,
+    entered_passphrase: str,
+) -> None:
+    from jmcore.cli_common import load_mnemonic_from_file
+
+    source, _ = wallet
+    _select(source, old_passphrase)
+    previous_metadata = meta_path(source).read_bytes()
+    output = source.parent / "imported.mnemonic"
+    config = source.parent / "config.toml"
+    config_text = (
+        '[network_config]\nnetwork = "regtest"\n[wallet]\nbip39_passphrase_enabled = false\n'
+        f'mnemonic_file = "{source}"\n'
+    )
+    if credential_source == "config":
+        config_text += f'bip39_passphrase = "{old_passphrase}"\n'
+    else:
+        monkeypatch.setenv("BIP39_PASSPHRASE", old_passphrase)
+    config.write_text(config_text)
+    password = "test imported file password"
+    monkeypatch.setenv("MNEMONIC", MNEMONIC)
+    monkeypatch.setenv("MNEMONIC_PASSWORD", password)
+    answers = f"y\n{entered_passphrase}\n\n"
+    if entered_passphrase:
+        answers += f"{entered_passphrase}\n"
+    with patch("jmcore.confirmation.is_interactive_mode", return_value=True):
+        result = CliRunner().invoke(
+            app,
+            ["import", "--no-prompt-password", "--output", str(output)],
+            input=answers + "y\n",
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Enter BIP39 passphrase" in result.output
+    if entered_passphrase:
+        assert result.output.index("Enter BIP39 passphrase") < result.output.index(
+            "Repeat BIP39 passphrase"
+        )
+    else:
+        assert "An empty passphrase derives the same wallet as no passphrase" in result.output
+    assert PASSPHRASE not in result.output
+    assert password not in result.output
+    if old_passphrase:
+        assert old_passphrase not in result.output
+    assert selected_identity(output) == WalletIdentity(
+        fingerprint=get_mnemonic_fingerprint(MNEMONIC, entered_passphrase),
+        bip39="required" if entered_passphrase else "none",
+    )
+    assert output.read_bytes() != MNEMONIC.encode()
+    assert load_mnemonic_from_file(output, password) == MNEMONIC
+    assert config.read_text() == config_text
+    assert meta_path(source).read_bytes() == previous_metadata
+    if credential_source == "environment":
+        assert os.environ["BIP39_PASSPHRASE"] == old_passphrase
+
+
+def test_import_explicit_registration_keeps_supplied_passphrase(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _ = wallet
+    output = source.parent / "imported.mnemonic"
+    monkeypatch.setenv("MNEMONIC", MNEMONIC)
+    monkeypatch.setenv("BIP39_PASSPHRASE", PASSPHRASE)
+    with patch("jmcore.confirmation.is_interactive_mode", return_value=True):
+        result = CliRunner().invoke(
+            app,
+            ["import", "--no-prompt-password", "--register-identity", "--output", str(output)],
+            input=f"{PASSPHRASE}\ny\n",
+        )
+    assert result.exit_code == 0, result.output
+    assert "Does the imported seed phrase use a BIP39 passphrase?" not in result.output
+    assert "Enter BIP39 passphrase" not in result.output
+    assert selected_identity(output) == WalletIdentity(
+        fingerprint=get_mnemonic_fingerprint(MNEMONIC, PASSPHRASE), bip39="required"
+    )
 
 
 def test_import_question_aborted_preserves_saved_seed(

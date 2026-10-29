@@ -48,6 +48,8 @@ that setting. Supplied credentials still support unattended services.
 Importing a seed asks once whether it uses a BIP39 passphrase — not the new
 file-encryption password, but the passphrase bound to the seed from the original
 wallet — so migrated wallets register the correct identity immediately.
+Answering Yes requests a fresh passphrase rather than reusing the active wallet's
+stored credential.
 Unattended imports cannot ask and keep recording the passphrase-free hint.
 
 After upgrading, the first unlock confirms the wallet automatically when it
