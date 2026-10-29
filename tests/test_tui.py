@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from unittest.mock import patch
 
 import pytest
@@ -2863,7 +2863,10 @@ def test_tui_script_bip39_identity_entries_visible_helper() -> None:
     ],
 )
 def test_tui_identity_gate_executed(
-    tmp_path: Path, flag: str, bip39_kinds: list[str], expect_visible: bool
+    tmp_path: Path,
+    flag: str,
+    bip39_kinds: list[Literal["none", "required", "unknown"]],
+    expect_visible: bool,
 ) -> None:
     """The real gate opens on the flag or a non-"none" identity, nothing else."""
     from jmcore.wallet_metadata import WalletIdentity, register_identity
