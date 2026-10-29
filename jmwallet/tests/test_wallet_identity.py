@@ -358,6 +358,155 @@ def test_import_onboarding_setting_roundtrip(
         assert identity is None
 
 
+def test_import_asks_bip39_question_and_registers_passphrase_identity(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive import asks about a BIP39 passphrase even with the setting off."""
+    source, _ = wallet
+    output = source.parent / "imported.mnemonic"
+    config = source.parent / "config.toml"
+    config.write_text(
+        '[bitcoin]\nnetwork = "regtest"\n[wallet]\nbip39_passphrase_enabled = false\n'
+    )
+    monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config))
+    monkeypatch.setenv("MNEMONIC", MNEMONIC)
+    with patch("jmcore.confirmation.is_interactive_mode", return_value=True):
+        result = CliRunner().invoke(
+            app,
+            ["import", "--no-prompt-password", "--output", str(output)],
+            # yes to the question, passphrase, empty = accept the derived
+            # fingerprint, repeat the passphrase, yes to register+select
+            input=f"y\n{PASSPHRASE}\n\n{PASSPHRASE}\ny\n",
+        )
+    assert result.exit_code == 0, result.output
+    assert "mnemonic extension" in result.output
+    assert PASSPHRASE not in result.output
+    identity = selected_identity(output)
+    assert identity is not None and identity.bip39 == "required"
+    assert identity.fingerprint == get_mnemonic_fingerprint(MNEMONIC, PASSPHRASE)
+
+
+def test_import_question_declined_records_passphrase_free_hint(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declining the import question keeps the passphrase-free hint behavior."""
+    source, _ = wallet
+    output = source.parent / "imported.mnemonic"
+    config = source.parent / "config.toml"
+    config.write_text(
+        '[bitcoin]\nnetwork = "regtest"\n[wallet]\nbip39_passphrase_enabled = false\n'
+    )
+    monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config))
+    monkeypatch.setenv("MNEMONIC", MNEMONIC)
+    with patch("jmcore.confirmation.is_interactive_mode", return_value=True):
+        result = CliRunner().invoke(
+            app,
+            ["import", "--no-prompt-password", "--output", str(output)],
+            input="n\n",
+        )
+    assert result.exit_code == 0, result.output
+    assert "mnemonic extension" in result.output
+    assert selected_identity(output) is None
+    assert load_mnemonic_meta_fingerprint(output) == get_mnemonic_fingerprint(MNEMONIC)
+
+
+def test_import_question_aborted_preserves_saved_seed(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupting the import question (EOF/Ctrl-C) exits with guidance, no hint."""
+    source, _ = wallet
+    output = source.parent / "imported.mnemonic"
+    config = source.parent / "config.toml"
+    config.write_text(
+        '[bitcoin]\nnetwork = "regtest"\n[wallet]\nbip39_passphrase_enabled = false\n'
+    )
+    monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config))
+    monkeypatch.setenv("MNEMONIC", MNEMONIC)
+    with patch("jmcore.confirmation.is_interactive_mode", return_value=True):
+        result = CliRunner().invoke(
+            app,
+            ["import", "--no-prompt-password", "--output", str(output)],
+            input="",
+        )
+    assert result.exit_code == 1
+    assert "identity registration did not complete" in result.output
+    assert "saved seed was not deleted" in result.output
+    assert output.read_text() == MNEMONIC
+    assert selected_identity(output) is None
+    assert load_mnemonic_meta_fingerprint(output) is None
+
+
+def test_import_empty_passphrase_after_yes_warns(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Answering yes but entering no passphrase warns instead of silently trapping."""
+    source, _ = wallet
+    output = source.parent / "imported.mnemonic"
+    config = source.parent / "config.toml"
+    config.write_text(
+        '[bitcoin]\nnetwork = "regtest"\n[wallet]\nbip39_passphrase_enabled = false\n'
+    )
+    monkeypatch.setenv("JOINMARKET_CONFIG_FILE", str(config))
+    monkeypatch.setenv("MNEMONIC", MNEMONIC)
+    with patch("jmcore.confirmation.is_interactive_mode", return_value=True):
+        result = CliRunner().invoke(
+            app,
+            ["import", "--no-prompt-password", "--output", str(output)],
+            # yes to the question, empty passphrase, empty = accept the derived
+            # fingerprint, yes to register+select
+            input="y\n\n\ny\n",
+        )
+    assert result.exit_code == 0, result.output
+    assert "An empty passphrase derives the same wallet as no passphrase" in result.output
+    identity = selected_identity(output)
+    assert identity is not None and identity.bip39 == "none"
+    assert identity.fingerprint == get_mnemonic_fingerprint(MNEMONIC)
+
+
+def test_import_explicit_no_register_skips_question(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--no-register-identity takes precedence over the import question."""
+    source, _ = wallet
+    output = source.parent / "imported.mnemonic"
+    monkeypatch.setenv("MNEMONIC", MNEMONIC)
+    with patch("jmcore.confirmation.is_interactive_mode", return_value=True):
+        result = CliRunner().invoke(
+            app,
+            ["import", "--no-prompt-password", "--no-register-identity", "--output", str(output)],
+        )
+    assert result.exit_code == 0, result.output
+    assert "mnemonic extension" not in result.output
+    assert selected_identity(output) is None
+
+
+def test_generate_does_not_ask_import_question(
+    wallet: tuple[Path, JoinMarketSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh mnemonic cannot have a passphrase yet: no question on generate."""
+    source, _ = wallet
+    output = source.parent / "generated.mnemonic"
+    monkeypatch.setenv("JOINMARKET_DATA_DIR", str(source.parent))
+    with (
+        patch(
+            "jmwallet.cli.wallet._fetch_current_block_height",
+            side_effect=ConnectionError("offline"),
+        ),
+        patch("jmcore.confirmation.is_interactive_mode", return_value=True),
+    ):
+        result = CliRunner().invoke(
+            app, ["generate", "--output", str(output), "--no-prompt-password"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "mnemonic extension" not in result.output
+
+
 def test_canceled_onboarding_preserves_saved_seed(
     wallet: tuple[Path, JoinMarketSettings],
     monkeypatch: pytest.MonkeyPatch,

@@ -507,7 +507,24 @@ def import_mnemonic(
         "A visible balance or an idle scan does not prove complete recovery. "
         "Historical recovery requires a backend with the necessary block and history data."
     )
-    _onboard_saved_identity(settings, output_file, password, register_identity, resolved_mnemonic)
+    _onboard_saved_identity(
+        settings,
+        output_file,
+        password,
+        register_identity,
+        resolved_mnemonic,
+        ask_bip39_on_import=True,
+    )
+
+
+_IMPORT_BIP39_QUESTION = "Does the imported seed phrase use a BIP39 passphrase?"
+
+
+def _echo_registration_interrupted() -> None:
+    typer.echo(
+        "Mnemonic was saved, but identity registration did not complete. "
+        "The saved seed was not deleted."
+    )
 
 
 def _onboard_saved_identity(
@@ -516,8 +533,41 @@ def _onboard_saved_identity(
     password: str | None,
     register: bool | None,
     mnemonic: str,
+    *,
+    ask_bip39_on_import: bool = False,
 ) -> None:
     enabled = settings.wallet.bip39_passphrase_enabled if register is None else register
+    prompted_on_import = False
+    if not enabled and ask_bip39_on_import and register is None:
+        # An imported seed may already belong to a wallet that uses a BIP39
+        # passphrase (e.g. legacy JoinMarket's mnemonic extension). Recording
+        # the passphrase-free hint without asking would confirm that wrong
+        # derivation on the first unlock and suppress the passphrase prompt
+        # even after the BIP39 setting is enabled. Headless imports keep the
+        # hint behavior; explicit --register-identity/--no-register-identity
+        # takes precedence over the question.
+        from jmcore.confirmation import is_interactive_mode
+
+        if is_interactive_mode():
+            try:
+                typer.echo("\n" + "=" * 80)
+                typer.echo("BIP39 PASSPHRASE")
+                typer.echo("=" * 80)
+                typer.echo(
+                    'Also called "mnemonic extension" or 13th/25th word. This is NOT '
+                    "the file-encryption password chosen above - that one is new and "
+                    "local to JoinMarket NG. The BIP39 passphrase belongs to the seed "
+                    "itself and must match the original wallet exactly; a wrong one "
+                    "derives a different, usually empty wallet."
+                )
+                typer.echo("=" * 80)
+                uses_passphrase = typer.confirm(_IMPORT_BIP39_QUESTION, default=False)
+            except typer.Abort:
+                _echo_registration_interrupted()
+                raise typer.Exit(1) from None
+            if uses_passphrase:
+                enabled = True
+                prompted_on_import = True
     if not enabled:
         # Record the passphrase-free wallet as an unconfirmed hint, as earlier
         # releases did. The first matching unlock confirms it automatically.
@@ -533,14 +583,13 @@ def _onboard_saved_identity(
             settings,
             output_file,
             password=password,
+            prompt_bip39_passphrase=prompted_on_import,
+            warn_if_passphrase_empty=prompted_on_import,
             confirm_bip39_passphrase=True,
             select=True,
         )
     except (ValueError, OSError, typer.Abort) as exc:
-        typer.echo(
-            "Mnemonic was saved, but identity registration did not complete. "
-            "The saved seed was not deleted."
-        )
+        _echo_registration_interrupted()
         if not isinstance(exc, typer.Abort):
             logger.error(str(exc))
         raise typer.Exit(1) from exc

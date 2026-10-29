@@ -35,6 +35,7 @@ def confirm_and_register(
     prompt_bip39_passphrase: bool = False,
     no_bip39_passphrase: bool = False,
     confirm_bip39_passphrase: bool = False,
+    warn_if_passphrase_empty: bool = False,
     select: bool = False,
     yes: bool = False,
     password: str | None = None,
@@ -53,6 +54,11 @@ def confirm_and_register(
     )
     assert resolved is not None
     passphrase = resolved.bip39_passphrase
+    if warn_if_passphrase_empty and not passphrase:
+        typer.echo(
+            "WARNING: You confirmed that this seed uses a BIP39 passphrase, but none was "
+            "entered. An empty passphrase derives the same wallet as no passphrase."
+        )
     if confirm_bip39_passphrase and passphrase:
         repeated = typer.prompt("Repeat BIP39 passphrase", hide_input=True)
         # BIP39 specifies NFKD, not trimming or case folding.

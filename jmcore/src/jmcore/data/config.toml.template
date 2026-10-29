@@ -270,6 +270,8 @@
 # Mnemonic file settings (optional defaults)
 # mnemonic_file = ""            # Path to mnemonic file
 # Enable BIP39 onboarding and prompting for unregistered wallets. Default: false.
+# Interactive mnemonic import asks about a BIP39 passphrase regardless of this
+# setting; this setting controls generation and unlock-time prompting.
 # Registered passphrase wallets still require their passphrase when this is false.
 # Recorded history uses the selected identity without unlocking either credential.
 # bip39_passphrase_enabled = false

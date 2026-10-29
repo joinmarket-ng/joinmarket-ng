@@ -37,9 +37,13 @@ Import the mnemonic interactively into a new file:
 jm-wallet import --output "$HOME/.joinmarket-ng/wallets/recovered.mnemonic"
 ```
 
-The command prompts for the mnemonic and for a local file-encryption password.
-It stores the words, not the BIP39 passphrase. Supply that passphrase only when
-using the recovered wallet, via the hidden prompt rather than on a command line:
+The command prompts for the mnemonic, for a local file-encryption password, and,
+when run interactively, whether the imported seed uses a BIP39 passphrase. That
+passphrase belongs to the seed and must match the original wallet exactly; it is
+not the freely chosen file-encryption password. It stores the words, not the
+BIP39 passphrase. Non-interactive imports cannot ask and record only the
+passphrase-free hint; then supply the passphrase when using the recovered
+wallet, via the hidden prompt rather than on a command line:
 
 ```bash
 jm-wallet info \
@@ -48,10 +52,11 @@ jm-wallet info \
 ```
 
 The default-disabled `[wallet] bip39_passphrase_enabled` setting opts into
-identity onboarding during import/generation, not storage of the passphrase.
-A wallet imported without a passphrase is confirmed automatically the first time
-it is unlocked without one. For a passphrase wallet, after verifying the intended
-wallet, remember its identity; the first registered identity is also selected:
+identity onboarding during generation, not storage of the passphrase; interactive
+imports ask about the passphrase regardless of that setting. A wallet imported
+without a passphrase is confirmed automatically the first time it is unlocked
+without one. For a passphrase wallet, after verifying the intended wallet,
+remember its identity; the first registered identity is also selected:
 
 ```bash
 jm-wallet identity register \
