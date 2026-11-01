@@ -3794,7 +3794,8 @@ class TestReplacementTargetRestoration:
         assert below_floor_taker._session.last_failure_reason is not None
 
     @pytest.mark.asyncio
-    async def test_auth_hard_excludes_unavailable_maker_without_ignoring(self):
+    @pytest.mark.parametrize("excluded_field", ["unavailable_makers", "over_budget_makers"])
+    async def test_auth_hard_excludes_unavailable_maker_without_ignoring(self, excluded_field):
         taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
         survivor = next(iter(taker._session.maker_sessions.values()))
         survivor.responded_auth = True
@@ -3806,8 +3807,8 @@ class TestReplacementTargetRestoration:
             side_effect=[
                 PhaseResult(
                     success=True,
-                    unavailable_makers=["J5unavailable"],
                     podle_revealed=True,
+                    **{excluded_field: ["J5unavailable"]},
                 ),
                 PhaseResult(success=True),
             ]
