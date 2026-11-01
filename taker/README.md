@@ -15,6 +15,8 @@ Sweeps, including tumbler sweeps, budget for a typical maker input count before 
 Their effective fee rate can differ from the requested target, especially for unusually large
 transactions. Rounds must still satisfy the minimum-fee policy, sweep tolerance, and wallet
 fee-rate cap. See `config.toml.template` for those settings and current defaults.
+Makers whose inputs would break the minimum-fee policy or sweep tolerance are dropped during
+authentication, heaviest input set first, and replaced for that round without being ignored.
 
 ## Documentation
 

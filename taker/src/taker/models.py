@@ -67,6 +67,9 @@ class PhaseResult:
     # Makers whose UTXOs could not be verified because the local backend was
     # unavailable. They are excluded for this round but must not be blacklisted.
     unavailable_makers: list[str] = Field(default_factory=list)
+    # Sweep makers whose inputs the fixed fee budget cannot fund in this round.
+    # They are excluded for this round but must not be blacklisted.
+    over_budget_makers: list[str] = Field(default_factory=list)
     blacklist_error: bool = False  # True if any maker rejected due to blacklisted commitment
     # Subset of failed_makers that specifically rejected with a "blacklist" error.
     # Used so the taker can tell "minority blacklist rejection" (probably a lying
@@ -80,4 +83,6 @@ class PhaseResult:
     @property
     def needs_replacement(self) -> bool:
         """True if phase failed due to makers that can be replaced."""
-        return not self.success and bool(self.failed_makers or self.unavailable_makers)
+        return not self.success and bool(
+            self.failed_makers or self.unavailable_makers or self.over_budget_makers
+        )

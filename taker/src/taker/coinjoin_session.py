@@ -1002,12 +1002,21 @@ class CoinJoinSession:
                 failed_makers.append(nick)
                 del self.maker_sessions[nick]
 
+        # The sweep fee budget was fixed at order selection for typical maker
+        # input counts. Drop the heaviest input sets while they can still be
+        # replaced, instead of failing the round in _phase_build_tx.
+        over_budget_makers = self._sweep_over_budget_makers() if self.is_sweep else []
+        for nick in over_budget_makers:
+            logger.warning(f"Dropping maker {nick}: its inputs exceed the sweep fee budget")
+            del self.maker_sessions[nick]
+
         if len(self.maker_sessions) < self.config.minimum_makers:
             logger.error(f"Not enough makers sent UTXOs: {len(self.maker_sessions)}")
             return PhaseResult(
                 success=False,
                 failed_makers=failed_makers,
                 unavailable_makers=unavailable_makers,
+                over_budget_makers=over_budget_makers,
                 podle_revealed=podle_revealed,
             )
 
@@ -1015,8 +1024,36 @@ class CoinJoinSession:
             success=True,
             failed_makers=failed_makers,
             unavailable_makers=unavailable_makers,
+            over_budget_makers=over_budget_makers,
             podle_revealed=podle_revealed,
         )
+
+    def _sweep_over_budget_makers(self) -> list[str]:
+        """Return makers to drop, heaviest input set first, so the sweep budget fits.
+
+        Mirrors the tolerance and minimum fee checks in ``_phase_build_tx``.
+        Unclaimed maker fees can only add to the final miner fee, so leaving
+        them out keeps this conservative.
+        """
+        budget = self._sweep_tx_fee_budget
+        if budget <= 0:
+            return []
+        fee_rate_floor = self._minimum_fee_rate_sat_vb or self.config.min_fee_rate_sat_vb
+        tolerance = self.config.max_sweep_fee_change
+        kept = sorted(self.maker_sessions, key=lambda nick: len(self.maker_sessions[nick].utxos))
+        dropped: list[str] = []
+        while kept:
+            sessions = [self.maker_sessions[nick] for nick in kept]
+            num_inputs = len(self.preselected_utxos) + sum(len(s.utxos) for s in sessions)
+            num_outputs = 1 + 2 * len(sessions)
+            mining_fee = budget + sum(s.offer.txfee for s in sessions)
+            base_fee = self._estimate_tx_fee(num_inputs, num_outputs, use_base_rate=True)
+            if (tolerance is None or base_fee / budget <= 1 + tolerance) and fee_rate_meets_minimum(
+                mining_fee, estimate_p2wpkh_vsize(num_inputs, num_outputs), fee_rate_floor
+            ):
+                break
+            dropped.append(kept.pop())
+        return dropped
 
     async def _verify_maker_utxos(
         self,
@@ -1336,6 +1373,11 @@ class CoinJoinSession:
                 # unusually large input sets, but must still clear this floor.
                 fee_rate_floor = self._minimum_fee_rate_sat_vb or self.config.min_fee_rate_sat_vb
                 if not fee_rate_meets_minimum(actual_mining_fee, actual_tx_vsize, fee_rate_floor):
+                    self.last_failure_reason = (
+                        f"Sweep fee rate {actual_fee_rate:.2f} sat/vB is below the required "
+                        f"minimum of {fee_rate_floor:.2f} sat/vB. "
+                        "Retry the CoinJoin with different makers."
+                    )
                     logger.error("Sweep fee rate is below the required minimum")
                     logger.bind(sensitive=True).error(
                         f"Sweep failed: effective fee rate {actual_fee_rate:.2f} sat/vB "

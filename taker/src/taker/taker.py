@@ -1755,6 +1755,12 @@ class Taker(TakerMonitoringMixin):
                     f"Hard-excluded {unavailable_nick} for this round "
                     "(UTXO verification unavailable)"
                 )
+            for over_budget_nick in auth_result.over_budget_makers:
+                failed_nicks.add(over_budget_nick)
+                logger.debug(
+                    f"Hard-excluded {over_budget_nick} for this round "
+                    "(inputs exceed the sweep fee budget)"
+                )
 
             # A successful floor-level auth still needs target restoration. A
             # failed auth can only be recovered when it identified makers to replace.
