@@ -24,7 +24,7 @@ Change outputs are also included, but they are of different amounts and can be e
 - **Test (frontend, orderbook watcher UI)**: `cd tests/playwright && npm run test:obwatcher` - Headless browser tests for the static web UI, no Docker needed
 - **Test (full suite)**: `./scripts/run_parallel_tests.sh` - Runs all suites (unit + Docker) in parallel via Compose project isolation; `--suite <name>` runs a single suite
 - **Test (specific marker)**: `pytest -m e2e --fail-on-skip` - Uses `--fail-on-skip` to catch missing setup
-- **Lint/Format**: `pre-commit run --all-files` (Recommended).
+- **Lint/Format**: `prek run --all-files` (Recommended; fallback: `pre-commit run --all-files`).
   - Manual: `ruff check .` / `ruff format .` / `mypy .`
 - **Docker**: `docker-compose up -d` (several profiles available).
 
