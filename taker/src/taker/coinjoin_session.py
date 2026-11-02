@@ -1031,15 +1031,16 @@ class CoinJoinSession:
     def _sweep_over_budget_makers(self) -> list[str]:
         """Return makers to drop, heaviest input set first, so the sweep budget fits.
 
-        Mirrors the tolerance and minimum fee checks in ``_phase_build_tx``.
-        Unclaimed maker fees can only add to the final miner fee, so leaving
-        them out keeps this conservative.
+        Uses the upper tolerance and minimum fee checks in ``_phase_build_tx``.
+        Count unclaimed maker fees only when the builder sends them to miners,
+        not when it returns them as taker change.
         """
         budget = self._sweep_tx_fee_budget
         if budget <= 0:
             return []
         fee_rate_floor = self._minimum_fee_rate_sat_vb or self.config.min_fee_rate_sat_vb
         tolerance = self.config.max_sweep_fee_change
+        reserved_maker_fees = sum(u.value for u in self.preselected_utxos) - self.cj_amount - budget
         kept = sorted(self.maker_sessions, key=lambda nick: len(self.maker_sessions[nick].utxos))
         dropped: list[str] = []
         while kept:
@@ -1047,6 +1048,17 @@ class CoinJoinSession:
             num_inputs = len(self.preselected_utxos) + sum(len(s.utxos) for s in sessions)
             num_outputs = 1 + 2 * len(sessions)
             mining_fee = budget + sum(s.offer.txfee for s in sessions)
+            fee_plan = calculate_cj_fee_plan(
+                (s.offer for s in sessions),
+                self.cj_amount,
+                round_up_cj_fees=self.config.round_up_cj_fees,
+                equalize_cj_fees=self.config.equalize_cj_fees,
+            )
+            residual = reserved_maker_fees - sum(fee_plan.values())
+            if residual > BITCOIN_DUST_THRESHOLD:
+                num_outputs += 1
+            elif residual > 0:
+                mining_fee += residual
             base_fee = self._estimate_tx_fee(num_inputs, num_outputs, use_base_rate=True)
             if (tolerance is None or base_fee / budget <= 1 + tolerance) and fee_rate_meets_minimum(
                 mining_fee, estimate_p2wpkh_vsize(num_inputs, num_outputs), fee_rate_floor

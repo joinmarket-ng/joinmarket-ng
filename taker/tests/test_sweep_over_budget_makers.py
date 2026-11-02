@@ -13,6 +13,7 @@ from jmcore.bitcoin import (
     pubkey_to_p2wpkh_script,
     scriptpubkey_to_address,
 )
+from jmcore.constants import BITCOIN_DUST_THRESHOLD
 from jmcore.crypto import ecdsa_sign
 from jmcore.fee_policy import estimate_p2wpkh_vsize
 from jmcore.models import Offer, OfferType
@@ -213,6 +214,95 @@ async def test_over_budget_drop_below_minimum_makers_is_replaceable() -> None:
     assert result.success is False
     assert result.over_budget_makers == ["J5makerD"]
     assert result.needs_replacement is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_counts", "dropped"),
+    [((5, 5, 5, 5), ["J5makerD"]), ((5, 5, 5), [])],
+)
+async def test_auth_keeps_makers_funded_by_unclaimed_sweep_fees(
+    input_counts: tuple[int, ...], dropped: list[str]
+) -> None:
+    taker = await _sweep_taker(0.6, 0.6)
+    session = taker._session
+    _add_ioauth_makers(taker, input_counts)
+    for maker in session.maker_sessions.values():
+        maker.offer.cjfee = 200
+    # Selection reserved four maker fees. A missing/dropped maker's fee becomes
+    # miner fee, so three five-input makers still fit without a second drop.
+    session.cj_amount -= 800
+
+    result = await session._phase_auth()
+
+    assert result.success is True
+    assert result.over_budget_makers == dropped
+    assert len(session.maker_sessions) == 3
+    assert await session._phase_build_tx(destination=DESTINATION, mixdepth=3) is True
+    assert len(parse_transaction_bytes(session.unsigned_tx).outputs) == 7
+    assert session.taker_change_address == ""
+    assert _mining_fee_rate(session) == pytest.approx(1442 / 1384)
+
+
+@pytest.mark.asyncio
+async def test_auth_does_not_count_returned_taker_change_as_miner_fee() -> None:
+    taker = await _sweep_taker(0.6, 0.6)
+    taker.config.equalize_cj_fees = True
+    session = taker._session
+    _add_ioauth_makers(taker, (5, 5, 5, 5))
+    equalized_fee = BITCOIN_DUST_THRESHOLD // 4 + 1
+    session.maker_sessions["J5makerD"].offer.cjfee = equalized_fee
+    # Dropping D removes the equalization target and releases enough fee
+    # reserve to cross the builder's threshold for returning taker change.
+    session.cj_amount -= 4 * equalized_fee
+    third_maker = session.maker_sessions["J5makerC"]
+
+    result = await session._phase_auth()
+
+    assert result.success is False
+    assert result.over_budget_makers == ["J5makerD", "J5makerC"]
+    assert result.needs_replacement is True
+    session.maker_sessions["J5makerC"] = third_maker
+    cast(MagicMock, taker.wallet).get_new_internal_address.return_value = _address(2)
+    assert await session._phase_build_tx(destination=DESTINATION, mixdepth=3) is False
+    assert session.last_failure_reason is not None
+    assert "below required" in session.last_failure_reason
+
+
+@pytest.mark.asyncio
+async def test_auth_budgets_for_a_returned_taker_change_output() -> None:
+    taker = await _sweep_taker(0.6, 0.6)
+    session = taker._session
+    _add_ioauth_makers(taker, (3, 3, 3, 3))
+    # Cheaper replacement fees can release a reserve large enough to create
+    # taker change. Its extra output must also clear the minimum fee rate.
+    session.cj_amount -= BITCOIN_DUST_THRESHOLD + 1
+    cast(MagicMock, taker.wallet).get_new_internal_address.return_value = _address(2)
+
+    result = await session._phase_auth()
+
+    assert result.success is True
+    assert result.over_budget_makers == ["J5makerD"]
+    assert await session._phase_build_tx(destination=DESTINATION, mixdepth=3) is True
+    assert len(parse_transaction_bytes(session.unsigned_tx).outputs) == 8
+    assert session.taker_change_address == _address(2)
+    assert _mining_fee_rate(session) >= 1
+
+
+@pytest.mark.asyncio
+async def test_auth_counts_maker_mining_fee_contributions() -> None:
+    taker = await _sweep_taker(0.6, 0.6)
+    session = taker._session
+    _add_ioauth_makers(taker, (5, 5, 5, 5))
+    for maker in session.maker_sessions.values():
+        maker.offer.txfee = 200
+
+    result = await session._phase_auth()
+
+    assert result.success is True
+    assert result.over_budget_makers == []
+    assert await session._phase_build_tx(destination=DESTINATION, mixdepth=3) is True
+    assert _mining_fee_rate(session) >= 1
 
 
 @pytest.mark.asyncio
