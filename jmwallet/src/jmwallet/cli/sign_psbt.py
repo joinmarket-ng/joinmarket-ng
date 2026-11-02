@@ -221,7 +221,8 @@ def sign_psbt(
 
     Supports regular P2WPKH wallet inputs and canonical JoinMarket fidelity bond
     P2WSH inputs, while leaving unrelated P2WSH inputs unsigned. Every input must
-    include witness_utxo data so the complete fee can be reviewed. Accepts PSBT
+    include witness_utxo and the full funding transaction (non_witness_utxo) so
+    every amount and script can be authenticated offline. Accepts PSBT
     v0 and v2. Broadcasting requires every input to be wallet-owned and fully signed.
     Use --no-broadcast for fully offline signing. --yes authorizes broadcasting too;
     existing offline scripts using --yes must add --no-broadcast.

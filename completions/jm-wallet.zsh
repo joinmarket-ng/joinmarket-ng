@@ -368,6 +368,8 @@ _jm_wallet() {
             '--output=[Save PSBT to file (default\: stdout only)]:file:_files' \
             '--test-unfunded[Allow generating a test PSBT even when the bond is unfunded, using a synthetic UTXO for signer compatibility testing.]' \
             '--test-utxo-value=[Synthetic UTXO value in sats when using --test-unfunded (default\: 100000).]: :' \
+            '--funding-tx-file=[File containing the full funding transaction in hex (offline)]:file:_files' \
+            '--fetch-funding-tx[Retrieve the funding transaction from the configured backend]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--wallet-fingerprint=[8-char hex master key fingerprint of the JoinMarket wallet that will operate this bond. Run '\''jm-wallet info --mnemonic-file <wallet>'\'' on the hot wallet to look it up. Required because each wallet has its own bond registry (fidelity_bonds_<fp>.json) under the shared data directory.]: :' \
             '--log-level=[]: :' \

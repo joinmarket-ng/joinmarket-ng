@@ -36,7 +36,7 @@ the normal `[bitcoin]` backend from `config.toml`, either `descriptor_wallet` or
 | Create an external bond address | Offline; pass `--network` explicitly outside mainnet |
 | Generate the hot certificate key | Offline |
 | Prepare or import a certificate | Configured backend, or `--current-block <height>` offline |
-| Build a redemption PSBT | Offline after funded UTXO data has been synced into the registry |
+| Build a redemption PSBT | Offline with synced UTXO data and `--funding-tx-file`, or opt-in backend retrieval |
 | `sync-bonds` / `recover-bonds` | Configured backend and the JoinMarket wallet |
 
 Two fingerprints appear in the external-key workflow:
@@ -351,16 +351,32 @@ Refresh the registry before moving it to an offline machine:
 jm-wallet sync-bonds --mnemonic-file <hot-wallet.mnemonic>
 ```
 
+Also save the full funding transaction as hex in `funding.hex` on the online
+machine and transfer it with the registry. For a Core wallet-tracked transaction,
+use `bitcoin-cli -rpcwallet=<wallet> gettransaction <funding-txid>` and save its
+`hex` field. Alternatively, `bitcoin-cli getrawtransaction <funding-txid>` requires
+the transaction to be available through the mempool or transaction index.
+
 Build the PSBT with a current fee rate:
 
 ```bash
 jm-wallet spend-bond <bond-address> <destination> \
+  --funding-tx-file funding.hex \
   --fee-rate <current-sat-vB> \
   --master-fingerprint <external-master-fingerprint> \
   --derivation-path "<external-key-path>" \
   --wallet-fingerprint <hot-wallet-fingerprint> \
   --output unsigned-bond.psbt
 ```
+
+For online export, replace `--funding-tx-file funding.hex` with
+`--fetch-funding-tx` to explicitly use the configured backend. If the backend
+cannot retrieve the transaction (for example, a confirmed transaction with
+Neutrino), supply the file instead. Export verifies its txid, output index,
+amount, and script against the registry. Existing registries are unchanged;
+older witness-only PSBTs need enrichment or regeneration before `jm-wallet`
+will sign them. Signing itself stays offline. Parent authentication does not
+prove confirmation or unspentness.
 
 Before using a blind signer such as BitBox01, decode `unsigned-bond.psbt` on a
 separate trusted system and verify the destination, amount, fee, and locktime.
@@ -493,14 +509,16 @@ The fixed date is intentionally retained for reproducibility; the synthetic
 input does not exist. Save this unsigned PSBT as `unsigned-bond-test.psbt`:
 
 ```text
-cHNidP8BAFICAAAAARERERERERERERERERERERERERERERERERERERERERERAAAAAAD+////ATCGAQAAAAAAFgAUwM681sPTyox13F7GLr5VMw75EOKAl35pAAEBK6CGAQAAAAAAIgAgG15M3/mFQhRrS/nVEhPu1StoJSuBCk8VquAtQsl/BK4BAwQBAAAAAQUqBICXfmmxdSEDMNVP0N1CCm5fjTYk9fNILK41D3nV8HU79b7vnC2RrzysIgYDMNVP0N1CCm5fjTYk9fNILK41D3nV8HU79b7vnC2RrzwYc8XaClQAAIAAAACAAAAAgAAAAAAAAAAAAAA=
+cHNidP8BAFICAAAAASRpf0Z0XPelNHEsL7ggf4NaYDa3X6GM8KjD5lTBheXbAAAAAAD+////ATCGAQAAAAAAFgAUwM681sPTyox13F7GLr5VMw75EOKAl35pAAEAXgIAAAABEREREREREREREREREREREREREREREREREREREREREREAAAAAAP////8BoIYBAAAAAAAiACAbXkzf+YVCFGtL+dUSE+7VK2glK4EKTxWq4C1CyX8ErgAAAAABASughgEAAAAAACIAIBteTN/5hUIUa0v51RIT7tUraCUrgQpPFargLULJfwSuAQMEAQAAAAEFKgSAl35psXUhAzDVT9DdQgpuX402JPXzSCyuNQ951fB1O/W+75wtka88rCIGAzDVT9DdQgpuX402JPXzSCyuNQ951fB1O/W+75wtka88GHPF2gpUAACAAAAAgAAAAIAAAAAAAAAAAAAA
 ```
 
 Sign and verify it with the HWI or QR flow above. For HWI use `--chain main`.
-The classic Jade has completed this exact HWI signing flow with HWI 3.2.0 and
-`cbor2` 5.9.0. With 5.8.0 the device completed its confirmation screens, but
-HWI lost the returned signed PSBT while decoding the chunked serial response.
-You can regenerate the exact vector with:
+The classic Jade completed the earlier witness-only form of this HWI signing
+flow with HWI 3.2.0 and `cbor2` 5.9.0. With 5.8.0 the device completed its
+confirmation screens, but HWI lost the returned signed PSBT while decoding the
+chunked serial response. The current vector includes a consistent synthetic
+funding transaction; repeat compatibility testing on your exact device.
+You can regenerate the current vector with:
 
 ```bash
 jm-wallet create-bond-address 0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c \
@@ -515,4 +533,10 @@ jm-wallet spend-bond bc1qrd0yehles4ppg66tl823yylw654ksfftsy9y79d2uqk59jtlqjhqd7z
   --derivation-path "m/84'/0'/0'/0/0" \
   --wallet-fingerprint 73c5da0a \
   --output unsigned-bond-test.psbt
+```
+
+For comparison, the historical witness-only vector tested on Jade was:
+
+```text
+cHNidP8BAFICAAAAARERERERERERERERERERERERERERERERERERERERERERAAAAAAD+////ATCGAQAAAAAAFgAUwM681sPTyox13F7GLr5VMw75EOKAl35pAAEBK6CGAQAAAAAAIgAgG15M3/mFQhRrS/nVEhPu1StoJSuBCk8VquAtQsl/BK4BAwQBAAAAAQUqBICXfmmxdSEDMNVP0N1CCm5fjTYk9fNILK41D3nV8HU79b7vnC2RrzysIgYDMNVP0N1CCm5fjTYk9fNILK41D3nV8HU79b7vnC2RrzwYc8XaClQAAIAAAACAAAAAgAAAAAAAAAAAAAA=
 ```

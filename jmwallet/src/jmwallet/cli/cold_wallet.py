@@ -1265,6 +1265,20 @@ def spend_bond(
             help=("Synthetic UTXO value in sats when using --test-unfunded (default: 100000)."),
         ),
     ] = 100_000,
+    funding_tx_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--funding-tx-file",
+            help="File containing the full funding transaction in hex (offline)",
+        ),
+    ] = None,
+    fetch_funding_tx: Annotated[
+        bool,
+        typer.Option(
+            "--fetch-funding-tx",
+            help="Retrieve the funding transaction from the configured backend",
+        ),
+    ] = False,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -1285,7 +1299,9 @@ def spend_bond(
     This creates a Partially Signed Bitcoin Transaction (PSBT) that can be signed
     using HWI (hardware wallet) or the mnemonic signing script (software wallet).
 
-    The PSBT includes the witness script (CLTV timelock) needed to spend the bond.
+    The PSBT includes the witness script (CLTV timelock) and full funding transaction.
+    Use --funding-tx-file for offline export, or explicitly request backend retrieval
+    with --fetch-funding-tx. Signing never needs network access.
 
     HOT WALLETS: If the bond was created with 'generate-bond-address' (key derived
     from this wallet's seed), you do NOT need a PSBT. After it expires, spend it
@@ -1332,9 +1348,11 @@ def spend_bond(
         estimate_vsize,
         format_amount,
         get_address_type,
+        get_txid,
         parse_derivation_path,
         psbt_to_base64,
         script_to_p2wsh_scriptpubkey,
+        serialize_transaction,
     )
     from jmcore.paths import get_default_data_dir
 
@@ -1385,8 +1403,20 @@ def spend_bond(
             logger.error("--test-utxo-value must be positive")
             raise typer.Exit(1)
 
-        # Deterministic synthetic outpoint for dry-run signer testing.
-        txid = "11" * 32
+        # A consistent synthetic parent exercises the same authentication as a
+        # real export. It is deliberately not an on-chain transaction.
+        synthetic_parent = serialize_transaction(
+            2,
+            [TxInput.from_hex("11" * 32, 0)],
+            [
+                TxOutput(
+                    test_utxo_value,
+                    script_to_p2wsh_scriptpubkey(bytes.fromhex(bond.witness_script_hex)),
+                )
+            ],
+            0,
+        )
+        txid = get_txid(synthetic_parent.hex())
         vout = 0
         input_value = test_utxo_value
         is_test_unfunded_mode = True
@@ -1525,12 +1555,53 @@ def spend_bond(
     tx_output = TxOutput(value=send_amount, script=dest_scriptpubkey)
 
     # Create PSBT input metadata
+    try:
+        if funding_tx_file is not None and fetch_funding_tx:
+            raise ValueError("Choose --funding-tx-file or --fetch-funding-tx, not both")
+        if is_test_unfunded_mode:
+            if funding_tx_file is not None or fetch_funding_tx:
+                raise ValueError("Synthetic testing does not accept a funding transaction source")
+            funding_tx = synthetic_parent
+        elif funding_tx_file is not None:
+            funding_tx = bytes.fromhex(funding_tx_file.read_text().strip())
+        elif fetch_funding_tx:
+            import asyncio
+
+            from jmcore.cli_common import create_backend
+
+            async def fetch_parent() -> bytes:
+                backend_settings = resolve_backend_settings(settings, network=bond.network)
+                backend = create_backend(
+                    backend_settings, wallet_name=f"jm-{resolved_fingerprint}-{bond.network}"
+                )
+                try:
+                    transaction = await backend.get_transaction(txid)
+                    if transaction is None or not transaction.raw:
+                        raise ValueError(
+                            "Funding transaction unavailable; provide --funding-tx-file"
+                        )
+                    return bytes.fromhex(transaction.raw)
+                finally:
+                    await backend.close()
+
+            funding_tx = asyncio.run(fetch_parent())
+        else:
+            raise ValueError("Provide --funding-tx-file (offline) or --fetch-funding-tx")
+
+        from jmcore.bitcoin import verify_prevout
+
+        verify_prevout(funding_tx, tx_input, input_value, p2wsh_scriptpubkey)
+    except (OSError, ValueError) as exc:
+        logger.error(f"Cannot authenticate bond funding transaction: {exc}")
+        raise typer.Exit(1) from exc
+
     psbt_input = PSBTInput(
         witness_utxo_value=input_value,
         witness_utxo_script=p2wsh_scriptpubkey,
         witness_script=witness_script,
         sighash_type=1,  # SIGHASH_ALL
         bip32_derivations=bip32_derivations,
+        non_witness_utxo=funding_tx,
     )
 
     # Create the PSBT

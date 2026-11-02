@@ -6,7 +6,11 @@ import base64
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+import pytest
+from jmcore.bitcoin import TxInput, TxOutput, get_txid, serialize_transaction
 from typer.testing import CliRunner
 
 from jmwallet.cli import app
@@ -23,6 +27,19 @@ TEST_PUBKEY_HEX = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f
 # Locktime in the past so the bond is spendable
 TEST_LOCKTIME = 1672531200  # 2023-01-01 00:00:00 UTC
 TEST_NETWORK = "regtest"
+
+
+def _write_funding_transaction(data_dir: Path, witness_script: bytes) -> str:
+    from jmcore.bitcoin import script_to_p2wsh_scriptpubkey
+
+    raw = serialize_transaction(
+        2,
+        [TxInput.from_hex("aa" * 32, 0)],
+        [TxOutput(100_000, script_to_p2wsh_scriptpubkey(witness_script))],
+        0,
+    )
+    (data_dir / "funding.hex").write_text(raw.hex())
+    return get_txid(raw.hex())
 
 
 def _create_funded_bond(
@@ -49,7 +66,7 @@ def _create_funded_bond(
         witness_script_hex=witness_script.hex(),
         network=TEST_NETWORK,
         created_at="2025-01-01T00:00:00",
-        txid="aa" * 32,
+        txid=_write_funding_transaction(data_dir, witness_script),
         vout=0,
         value=100_000,
         confirmations=1000,
@@ -92,6 +109,57 @@ def _create_unfunded_bond(data_dir: Path) -> str:
 DEST_ADDRESS = "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m"
 
 
+@pytest.mark.parametrize("source", ["file", "fetch", "missing", "malformed", "wrong-parent"])
+def test_export_authenticates_funding_without_implicit_network_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    from jmwallet.wallet.psbt import parse_psbt
+
+    address = _create_funded_bond(tmp_path)
+    funding_file = tmp_path / "funding.hex"
+    parent = bytes.fromhex(funding_file.read_text())
+    backend = SimpleNamespace(
+        get_transaction=AsyncMock(return_value=SimpleNamespace(raw=parent.hex())),
+        close=AsyncMock(),
+    )
+    factory = Mock(return_value=backend)
+    monkeypatch.setattr("jmcore.cli_common.create_backend", factory)
+    args = [
+        "spend-bond",
+        address,
+        DEST_ADDRESS,
+        "--data-dir",
+        str(tmp_path),
+        "--wallet-fingerprint",
+        "deadbeef",
+    ]
+    if source == "fetch":
+        args.append("--fetch-funding-tx")
+    elif source != "missing":
+        args += ["--funding-tx-file", str(funding_file)]
+        if source == "malformed":
+            funding_file.write_text("not transaction hex")
+        elif source == "wrong-parent":
+            funding_file.write_text((parent[:-4] + b"\x01\x00\x00\x00").hex())
+    result = runner.invoke(app, args)
+    if source in ("file", "fetch"):
+        assert result.exit_code == 0, result.output
+        exported = _extract_psbt_from_output(result.stdout.splitlines())
+        assert exported is not None
+        parsed = parse_psbt(base64.b64decode(exported))
+        assert next(r.value for r in parsed.input_maps[0].records if r.key == b"\x00") == parent
+        assert parsed.transaction.inputs[0].txid == get_txid(parent.hex())
+    else:
+        assert result.exit_code == 1, result.output
+        assert _extract_psbt_from_output(result.stdout.splitlines()) is None
+    if source == "fetch":
+        factory.assert_called_once()
+        backend.get_transaction.assert_awaited_once_with(get_txid(parent.hex()))
+        backend.close.assert_awaited_once()
+    else:
+        factory.assert_not_called()
+
+
 class TestSpendBondCommand:
     """Tests for the spend-bond CLI command."""
 
@@ -111,6 +179,8 @@ class TestSpendBondCommand:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                     "--fee-rate",
                     "1.0",
                 ],
@@ -145,6 +215,8 @@ class TestSpendBondCommand:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                     "--output",
                     str(output_file),
                 ],
@@ -335,6 +407,8 @@ class TestSpendBondCommand:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                     "--fee-rate",
                     "10.0",
                 ],
@@ -384,7 +458,7 @@ class TestSpendBondCommand:
                 witness_script_hex=witness_script.hex(),
                 network=TEST_NETWORK,
                 created_at="2025-01-01T00:00:00",
-                txid="aa" * 32,
+                txid=_write_funding_transaction(data_dir, witness_script),
                 vout=0,
                 value=100_000,
                 confirmations=100,
@@ -402,6 +476,8 @@ class TestSpendBondCommand:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                 ],
             )
             # Should still succeed (creates the PSBT even if locktime not expired)
@@ -426,6 +502,8 @@ class TestSpendBondCommand:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                 ],
             )
             assert result.exit_code == 0
@@ -460,6 +538,8 @@ class TestSpendBondCommand:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                 ],
             )
             assert result.exit_code == 0
@@ -501,6 +581,8 @@ class TestSpendBondBIP32Derivation:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                     "--master-fingerprint",
                     fingerprint,
                     "--derivation-path",
@@ -556,6 +638,8 @@ class TestSpendBondBIP32Derivation:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                 ],
             )
 
@@ -739,6 +823,8 @@ class TestSpendBondBIP32Derivation:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                     "--master-fingerprint",
                     "aabbccdd",
                     "--derivation-path",
@@ -770,6 +856,8 @@ class TestSpendBondBIP32Derivation:
                     str(data_dir),
                     "--wallet-fingerprint",
                     "deadbeef",
+                    "--funding-tx-file",
+                    str(data_dir / "funding.hex"),
                 ],
             )
 
@@ -828,7 +916,9 @@ class TestDeviceCompatibilityDocVector:
         witness_script = mk_freeze_script(self.PUBKEY, self.LOCKTIME)
         assert script_to_p2wsh_address(witness_script, "mainnet") == self.BOND_ADDRESS
 
-    def test_documented_psbt_regenerates_from_cli_flow(self) -> None:
+    def test_documented_psbt_regenerates_from_cli_flow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
 
@@ -878,6 +968,40 @@ class TestDeviceCompatibilityDocVector:
                 "The unsigned test PSBT in docs/fidelity-bond-operations.md no longer "
                 "matches the output of the documented CLI flow. Regenerate the "
                 "documented vector or fix the regression."
+            )
+            # The intentionally minimal standalone signer accepts parent-bearing
+            # exports without acquiring project dependencies or network access.
+            monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+            from jmcore.bitcoin import parse_transaction
+            from sign_bond_mnemonic import (
+                derive_key_from_mnemonic,
+                sign_bond_transaction,
+            )
+            from sign_bond_mnemonic import (
+                parse_psbt as parse_standalone_psbt,
+            )
+
+            from jmwallet.wallet.signing import verify_p2wsh_signature
+
+            parsed = parse_standalone_psbt(generated)
+            private_key, pubkey = derive_key_from_mnemonic(
+                "abandon " * 11 + "about", "m/84'/0'/0'/0/0"
+            )
+            signed = parse_transaction(
+                sign_bond_transaction(
+                    parsed["unsigned_tx_bytes"],
+                    parsed["witness_script"],
+                    parsed["witness_utxo_value"],
+                    private_key,
+                )
+            )
+            assert verify_p2wsh_signature(
+                signed,
+                0,
+                parsed["witness_script"],
+                parsed["witness_utxo_value"],
+                signed.witnesses[0][0],
+                pubkey,
             )
 
 

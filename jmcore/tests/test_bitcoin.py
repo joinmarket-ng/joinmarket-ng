@@ -46,6 +46,7 @@ from jmcore.bitcoin import (
     serialize_outpoint,
     serialize_transaction,
     validate_satoshi_amount,
+    verify_prevout,
 )
 
 LEGACY_BECH32_P2TR_ADDRESS = "bcrt1pehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxumnwdehxs64gzl4"
@@ -297,6 +298,39 @@ def _make_witness_script() -> bytes:
 def _make_p2wsh_scriptpubkey(witness_script: bytes) -> bytes:
     """Derive P2WSH scriptPubKey from witness script."""
     return script_to_p2wsh_scriptpubkey(witness_script)
+
+
+@pytest.mark.parametrize("has_witness", [False, True])
+def test_prevout_authentication_uses_stripped_parent_hash(has_witness: bool) -> None:
+    script = b"\x00\x14" + b"\x22" * 20
+    inputs = [TxInput.from_hex("aa" * 32, 0)]
+    parent = serialize_transaction(
+        2,
+        inputs,
+        [TxOutput(100_000, script)],
+        0,
+        [[b"signature", b"pubkey"]] if has_witness else None,
+    )
+    outpoint = TxInput.from_hex(get_txid(parent.hex()), 0)
+    verify_prevout(parent, outpoint, 100_000, script)
+    raw = create_psbt(
+        2,
+        [outpoint],
+        [TxOutput(99_000, script)],
+        0,
+        [PSBTInput(100_000, script, b"", non_witness_utxo=parent)],
+    )
+    assert parent in raw
+    if has_witness:
+        assert hash256(parent) != outpoint.txid_le
+    with pytest.raises(ValueError, match="amount does not match"):
+        create_psbt(
+            2,
+            [outpoint],
+            [TxOutput(99_000, script)],
+            0,
+            [PSBTInput(100_001, script, b"", non_witness_utxo=parent)],
+        )
 
 
 class TestPSBTMagic:

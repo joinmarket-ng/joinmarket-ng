@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _jmwallet_test_helpers import TEST_MNEMONIC
+from _jmwallet_test_helpers import TEST_MNEMONIC, psbt_input_with_parent
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
@@ -69,6 +69,7 @@ def _psbt(
     *,
     locktime: int = 0,
 ) -> bytes:
+    tx_input, input_records = psbt_input_with_parent(tx_input, input_records)
     unsigned_tx = serialize_transaction(2, [tx_input], [tx_output], locktime)
     return PSBT_MAGIC + _map((b"\x00", unsigned_tx)) + _map(*input_records) + _map()
 
@@ -274,17 +275,24 @@ def _foreign_p2wsh_psbt(*, value: int, output_value: int) -> bytes:
     """Build a PSBT with one owned P2WPKH input and one unowned P2WSH input."""
     wallet = _wallet()
     foreign_script = b"\x00\x20" + sha256(b"foreign witness script").digest()
+    owned_input, owned_records = psbt_input_with_parent(
+        TxInput.from_hex("cc" * 32, 0), _owned_input_records(wallet, value)
+    )
+    foreign_input, foreign_records = psbt_input_with_parent(
+        TxInput.from_hex("dd" * 32, 1),
+        [(bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(value, foreign_script))],
+    )
     unsigned_tx = serialize_transaction(
         2,
-        [TxInput.from_hex("cc" * 32, 0), TxInput.from_hex("dd" * 32, 1)],
+        [owned_input, foreign_input],
         [TxOutput(output_value, b"\x00\x14" + b"\x44" * 20)],
         0,
     )
     return (
         PSBT_MAGIC
         + _map((b"\x00", unsigned_tx))
-        + _map(*_owned_input_records(wallet, value))
-        + _map((bytes([PSBT_IN_WITNESS_UTXO]), _witness_utxo(value, foreign_script)))
+        + _map(*owned_records)
+        + _map(*foreign_records)
         + _map()
     )
 

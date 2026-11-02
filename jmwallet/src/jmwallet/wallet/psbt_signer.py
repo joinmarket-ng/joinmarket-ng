@@ -12,6 +12,7 @@ from jmcore.bitcoin import (
     estimate_vsize,
     pubkey_to_p2wpkh_script,
     serialize_transaction,
+    verify_prevout,
 )
 from jmcore.btc_script import parse_freeze_script
 from jmcore.timenumber import timestamp_to_timenumber
@@ -22,6 +23,7 @@ from jmwallet.wallet.psbt import (
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTSIG,
     PSBT_IN_FINAL_SCRIPTWITNESS,
+    PSBT_IN_NON_WITNESS_UTXO,
     PSBT_IN_PARTIAL_SIG,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_SCRIPT,
@@ -163,6 +165,21 @@ class WalletPSBTSigningMixin:
             witness_utxo = parse_witness_utxo(witness_record.value)
             if witness_utxo.value > MAX_MONEY:
                 raise PSBTError(f"PSBT input {index} amount exceeds Bitcoin MAX_MONEY")
+            parent_record = _record_for_type(input_map, PSBT_IN_NON_WITNESS_UTXO)
+            if parent_record is None:
+                raise PSBTError(
+                    f"PSBT input {index} is missing non_witness_utxo; enrich or regenerate "
+                    "the PSBT with full funding transactions for every input"
+                )
+            try:
+                verify_prevout(
+                    parent_record.value,
+                    transaction.inputs[index],
+                    witness_utxo.value,
+                    witness_utxo.script_pubkey,
+                )
+            except ValueError as exc:
+                raise PSBTError(f"PSBT input {index}: {exc}") from exc
             input_type = _classify_input_script(witness_utxo.script_pubkey)
             if input_type == "unsupported":
                 raise PSBTError(

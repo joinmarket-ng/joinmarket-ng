@@ -1168,6 +1168,25 @@ def get_txid(tx_hex: str) -> str:
     return hash256(data)[::-1].hex()
 
 
+def verify_prevout(previous_tx: bytes, tx_input: TxInput, value: int, script_pubkey: bytes) -> None:
+    """Authenticate an input's amount and script against its hash-verified parent.
+
+    This verifies the outpoint, not chain inclusion or unspentness. Hash the
+    stripped serialization, since funding transactions can contain witnesses.
+    """
+    parent = parse_transaction_bytes(previous_tx)
+    stripped = serialize_transaction(parent.version, parent.inputs, parent.outputs, parent.locktime)
+    if hash256(stripped) != tx_input.txid_le:
+        raise ValueError("Previous transaction txid does not match input outpoint")
+    if not 0 <= tx_input.vout < len(parent.outputs):
+        raise ValueError("Previous transaction output index is out of range")
+    output = parent.outputs[tx_input.vout]
+    if output.value != value:
+        raise ValueError("Previous transaction amount does not match witness_utxo")
+    if output.script != script_pubkey:
+        raise ValueError("Previous transaction script does not match witness_utxo")
+
+
 # =============================================================================
 # Script Code (for signing)
 # =============================================================================
@@ -1496,6 +1515,7 @@ class PSBTInput:
             no script is supplied (e.g. P2WPKH) and omit PSBT_IN_WITNESS_SCRIPT.
         sighash_type: Sighash type (default SIGHASH_ALL = 0x01).
         bip32_derivations: Optional BIP32 key origin info for signing devices.
+        non_witness_utxo: Full funding transaction, required by the wallet signer.
     """
 
     witness_utxo_value: int
@@ -1503,6 +1523,7 @@ class PSBTInput:
     witness_script: bytes
     sighash_type: int = 1
     bip32_derivations: list[BIP32Derivation] | None = None
+    non_witness_utxo: bytes | None = None
 
 
 def create_psbt(
@@ -1555,7 +1576,13 @@ def create_psbt(
     result.extend(PSBT_SEPARATOR)
 
     # 3. Build per-input maps
-    for pi in psbt_inputs:
+    for tx_input, pi in zip(inputs, psbt_inputs, strict=True):
+        if pi.non_witness_utxo is not None:
+            verify_prevout(
+                pi.non_witness_utxo, tx_input, pi.witness_utxo_value, pi.witness_utxo_script
+            )
+            # PSBT_IN_NON_WITNESS_UTXO (0x00), including SegWit funding transactions.
+            result.extend(_serialize_psbt_pair(0x00, pi.non_witness_utxo))
         # PSBT_IN_WITNESS_UTXO: serialized as <value 8-byte LE> + <varint scriptlen> + <script>
         witness_utxo = (
             struct.pack("<Q", pi.witness_utxo_value)

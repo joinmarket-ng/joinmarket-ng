@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from unittest.mock import Mock
 
 import pytest
+from _jmwallet_test_helpers import psbt_input_with_parent
 from bitcointx.core.key import CKey
 from bitcointx.core.script import OP_2, OP_CHECKMULTISIG, CScript
 from jmcore.bitcoin import (
@@ -32,6 +34,7 @@ from jmwallet.wallet.psbt import (
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTSIG,
     PSBT_IN_FINAL_SCRIPTWITNESS,
+    PSBT_IN_NON_WITNESS_UTXO,
     PSBT_IN_OUTPUT_INDEX,
     PSBT_IN_PARTIAL_SIG,
     PSBT_IN_PREVIOUS_TXID,
@@ -216,6 +219,12 @@ def _build_psbt(
     global_unknown: tuple[bytes, bytes] | None = None,
     output_records: list[list[tuple[bytes, bytes]]] | None = None,
 ) -> bytes:
+    prepared = [
+        psbt_input_with_parent(tx_input, records)
+        for tx_input, records in zip(inputs, input_records, strict=True)
+    ]
+    inputs = [tx_input for tx_input, _ in prepared]
+    input_records = [records for _, records in prepared]
     unsigned_tx = serialize_transaction(2, inputs, outputs, locktime)
     global_records = [(b"\x00", unsigned_tx)]
     if global_unknown is not None:
@@ -300,9 +309,10 @@ def test_signs_jmcore_psbt_preserving_input_records(
 ) -> None:
     """New exports omit empty scripts; signing still preserves older imported records."""
     records, pubkey, script_pubkey = _regular_input_records(wallet_service, 1, 1, 3, 100_000)
+    tx_input, records = psbt_input_with_parent(TxInput.from_hex("aa" * 32, 2), records)
     raw = create_psbt(
         version=2,
-        inputs=[TxInput.from_hex("aa" * 32, 2)],
+        inputs=[tx_input],
         outputs=[TxOutput(value=98_000, script=b"\x00\x14" + b"\x33" * 20)],
         locktime=0,
         psbt_inputs=[
@@ -310,6 +320,7 @@ def test_signs_jmcore_psbt_preserving_input_records(
                 witness_utxo_value=100_000,
                 witness_utxo_script=script_pubkey,
                 witness_script=b"",
+                non_witness_utxo=records[0][1],
                 bip32_derivations=[
                     BIP32Derivation(
                         pubkey=pubkey,
@@ -429,6 +440,106 @@ def test_valid_existing_wallet_signature_is_preserved(wallet_service) -> None:
     assert second.signed_indices == ()
     assert second.already_signed_indices == (0,)
     assert second.psbt == first.psbt
+
+
+@pytest.mark.parametrize("version", [PSBT_VERSION_0, PSBT_VERSION_2])
+def test_swapped_amount_attack_releases_no_signatures(wallet_service, version: int) -> None:
+    records_a, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 100_000)
+    records_b, _, _ = _regular_input_records(wallet_service, 0, 0, 1, 100_000)
+    raw = _build_psbt(
+        [TxInput.from_hex("aa" * 32, 0), TxInput.from_hex("bb" * 32, 0)],
+        [TxOutput(100_000, b"\x00\x14" + b"\x22" * 20)],
+        [records_a, records_b],
+    )
+    if version == PSBT_VERSION_2:
+        raw = _to_v2(raw)
+    wallet_service.sign_input = Mock(side_effect=AssertionError("Must not release a signature"))
+    for underreported_input in (0, 1):
+        attack = parse_psbt(raw)
+        records = attack.input_maps[underreported_input].records
+        for index, record in enumerate(records):
+            if record.key == bytes([PSBT_IN_WITNESS_UTXO]):
+                records[index] = PSBTKeyValue(
+                    record.key, (1_000).to_bytes(8, "little") + record.value[8:]
+                )
+        with pytest.raises(PSBTError, match="amount does not match"):
+            wallet_service.sign_psbt(wallet_service.prepare_psbt_signing(attack.serialize(), 0))
+    wallet_service.sign_input.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [PSBT_VERSION_0, PSBT_VERSION_2])
+@pytest.mark.parametrize("state", ["unsigned", "foreign", "signed", "finalized"])
+@pytest.mark.parametrize("mutation", ["missing", "malformed", "txid", "vout", "amount", "script"])
+def test_authenticates_every_input_before_signing(
+    wallet_service, version: int, state: str, mutation: str
+) -> None:
+    owned, _, _ = _regular_input_records(wallet_service, 0, 0, 0, 60_000)
+    other, _, _ = _regular_input_records(wallet_service, 0, 0, 1, 40_000)
+    if state == "foreign":
+        other = [(b"\x01", _witness_utxo(40_000, b"\x00\x14" + b"\x33" * 20))]
+    raw = _build_psbt(
+        [TxInput.from_hex("aa" * 32, 0), TxInput.from_hex("bb" * 32, 0)],
+        [TxOutput(99_000, b"\x00\x14" + b"\x22" * 20)],
+        [owned, other],
+    )
+    if version == PSBT_VERSION_2:
+        raw = _to_v2(raw)
+    if state in ("signed", "finalized"):
+        raw = wallet_service.sign_psbt(wallet_service.prepare_psbt_signing(raw, 0)).psbt
+    psbt = parse_psbt(raw)
+    # Leave the first input signable, so a late validation could leak its signature.
+    psbt.input_maps[0].records[:] = [
+        r for r in psbt.input_maps[0].records if r.key[0] != PSBT_IN_PARTIAL_SIG
+    ]
+    if state == "finalized":
+        psbt.append_input_key_value(1, bytes([PSBT_IN_FINAL_SCRIPTWITNESS]), b"\x00")
+    records = psbt.input_maps[1].records
+    if mutation == "vout":
+        if version == PSBT_VERSION_2:
+            for index, record in enumerate(records):
+                if record.key == bytes([PSBT_IN_OUTPUT_INDEX]):
+                    records[index] = PSBTKeyValue(record.key, (1).to_bytes(4, "little"))
+        else:
+            psbt.transaction.inputs[1].vout = 1
+            psbt.global_map.records[0] = PSBTKeyValue(
+                b"\x00",
+                serialize_transaction(2, psbt.transaction.inputs, psbt.transaction.outputs, 0),
+            )
+    elif mutation in ("missing", "malformed", "txid"):
+        for index, record in enumerate(records):
+            if record.key == bytes([PSBT_IN_NON_WITNESS_UTXO]):
+                if mutation == "missing":
+                    records.pop(index)
+                else:
+                    value = (
+                        b"bad"
+                        if mutation == "malformed"
+                        else record.value[:-4] + b"\x01\x00\x00\x00"
+                    )
+                    records[index] = PSBTKeyValue(record.key, value)
+                break
+    else:
+        for index, record in enumerate(records):
+            if record.key == bytes([PSBT_IN_WITNESS_UTXO]):
+                value = (
+                    (40_001).to_bytes(8, "little") + record.value[8:]
+                    if mutation == "amount"
+                    else record.value[:-1] + b"\x01"
+                )
+                records[index] = PSBTKeyValue(record.key, value)
+                break
+    wallet_service.sign_input = Mock(side_effect=AssertionError("Must not release a signature"))
+    expected_error = {
+        "missing": "input 1 is missing non_witness_utxo",
+        "malformed": "input 1: Truncated transaction",
+        "txid": "input 1: Previous transaction txid",
+        "vout": "input 1: Previous transaction output index",
+        "amount": "input 1: Previous transaction amount",
+        "script": "input 1: Previous transaction script",
+    }
+    with pytest.raises(PSBTError, match=expected_error[mutation]):
+        wallet_service.sign_psbt(wallet_service.prepare_psbt_signing(psbt.serialize(), 0))
+    wallet_service.sign_input.assert_not_called()
 
 
 @pytest.mark.parametrize("psbt_version", [PSBT_VERSION_0, PSBT_VERSION_2])

@@ -160,6 +160,7 @@ async def test_sign_psbt_local_finalize_and_broadcast(
                 witness_utxo_value=_BOND_AMOUNT_SATS,
                 witness_utxo_script=bytes.fromhex(prevout["scriptPubKey"]["hex"]),
                 witness_script=wallet.get_fidelity_bond_script(0, locktime) if bond else b"",
+                non_witness_utxo=bytes.fromhex(funding["hex"]),
             )
         ],
     )

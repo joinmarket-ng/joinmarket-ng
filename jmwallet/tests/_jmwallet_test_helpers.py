@@ -9,7 +9,12 @@ tests from the monorepo root.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import Any
+
+from jmcore.bitcoin import TxInput, TxOutput, get_txid, serialize_transaction
+
+from jmwallet.wallet.psbt import parse_witness_utxo
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -33,6 +38,25 @@ TEST_FAKE_TXID = "abc123" * 10 + "ab"
 # ---------------------------------------------------------------------------
 # Factory helpers
 # ---------------------------------------------------------------------------
+
+
+def psbt_input_with_parent(
+    tx_input: TxInput, records: list[tuple[bytes, bytes]]
+) -> tuple[TxInput, list[tuple[bytes, bytes]]]:
+    """Replace a fixture outpoint with a consistent synthetic funding transaction.
+
+    The original outpoint seeds the parent to keep distinct fixture inputs
+    distinct. Callers can mutate the resulting records to test authentication.
+    """
+    witness = next((value for key, value in records if key == b"\x01"), None)
+    if witness is None:
+        return tx_input, list(records)
+    utxo = parse_witness_utxo(witness)
+    outputs = [TxOutput(0, b"\x6a") for _ in range(tx_input.vout)]
+    outputs.append(TxOutput(utxo.value, utxo.script_pubkey))
+    parent = serialize_transaction(2, [TxInput.from_hex(tx_input.txid, 0)], outputs, 0)
+    authenticated = replace(tx_input, txid_le=bytes.fromhex(get_txid(parent.hex()))[::-1])
+    return authenticated, [(b"\x00", parent), *records]
 
 
 def make_mock_rpc(
