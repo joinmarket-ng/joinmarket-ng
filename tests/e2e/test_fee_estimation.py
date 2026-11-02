@@ -68,9 +68,9 @@ class TestBitcoinCoreFeeEstimation:
         """Test that fee estimation returns a positive value (or fallback)."""
         fee = await bitcoin_backend.estimate_fee(target_blocks=6)
 
-        # On regtest with no transactions, estimation may fail and return fallback (1.0)
+        # Successful estimates may be fractional. The 1.0 sat/vB fallback is
+        # tested separately with deterministic RPC failures below.
         assert fee > 0, "Fee should be positive"
-        assert fee >= 1.0, "Fee should be at least 1.0 sat/vB (minimum relay fee)"
         logger.info(f"6-block fee estimate: {fee} sat/vB")
 
     async def test_estimate_fee_different_targets(self, bitcoin_backend):

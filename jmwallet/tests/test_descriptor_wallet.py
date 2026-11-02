@@ -151,6 +151,24 @@ class TestDescriptorWalletBackendUnit:
             await backend.get_block_height()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("btc_per_kb", "expected_sat_per_vbyte"),
+        [(0.000001, 0.1), (0.000005, 0.5)],
+    )
+    async def test_estimate_fee_preserves_fractional_rpc_estimates(
+        self, btc_per_kb: float, expected_sat_per_vbyte: float
+    ) -> None:
+        backend = DescriptorWalletBackend()
+        backend._rpc_call = AsyncMock(return_value={"feerate": btc_per_kb})
+
+        try:
+            assert await backend.estimate_fee(target_blocks=6) == pytest.approx(
+                expected_sat_per_vbyte
+            )
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
     async def test_get_mempool_spender_uses_core_request_shape(self) -> None:
         backend = DescriptorWalletBackend()
         txid = "ab" * 32
