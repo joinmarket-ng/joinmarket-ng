@@ -7,6 +7,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-11-03
+
+New features, bug fixes, and security hardening.
+
+### Added
+
+- Add --view compact 80-column wallet info layout ([f1ffa32a](../../commit/f1ffa32a22a37fd60a7a7b4f629ed93afb271a16))
+- PSBT signing now offers confirmed broadcasting by default. Use --no-broadcast for offline signing; --yes skips signing and broadcast confirmations. ([2d92cf5a](../../commit/2d92cf5a39828f39d9a48736f6e4f271a4894789))
+- Makers cap concurrent connections per Tor rendezvous circuit, so floods multiplexed over a few circuits no longer bypass proof of work ([c5cd4ca8](../../commit/c5cd4ca8b3c7d8d88b0d6ca008a6e1ba991f8942))
+- The bundled directory torrc caps concurrent connections per Tor rendezvous circuit to blunt multiplexed sybil floods ([595f8a5e](../../commit/595f8a5e499f94a3712c61595fc8264307ccb5b6))
+- TUI wallet info submenu offers the new full and compact extended views; Wallet Management entry renamed BAL -> VIEW ([e7aba2a1](../../commit/e7aba2a1e129efd3e6e8d9f0e7c490ad53c0d59c))
+- Hide BIP39 identity menu entries for wallets without passphrase identities ([173425f9](../../commit/173425f95d1af09737a7b6732f4b7590fbc96b39))
+
+### Fixed
+
+- Fix compact wallet info wrapping and unfunded bond legends ([6306a32e](../../commit/6306a32ea7ddf4d5d1f9cb7dbf01b079710cc193))
+- Maker and taker now shut down gracefully on SIGTERM (docker stop, systemd, TUI stop) instead of being killed ([9456d080](../../commit/9456d080d6d97790271439de2aa4eb02925612d7))
+- Docker images now stop promptly on docker stop because every command runs under tini ([1f8937af](../../commit/1f8937af07605f2fe315e05ef804331b9da603f3))
+- Stop repeating the same directory disconnection warning every 10 minutes ([1358f5bb](../../commit/1358f5bbce468a026cdd9031915d2e9a04c1b831))
+- Report spam as bounded episodes (start, hourly reminder, end) instead of per-ban warnings and hourly statistics ([eea2fd9d](../../commit/eea2fd9d0e074adbd0d3acaee0247cec53c5b942))
+- Create the commitment and hot key directories with owner-only permissions ([4de1d3e7](../../commit/4de1d3e7bc06040f7db8c1db4e013b97a632c3a3))
+- Reject spend-bond fee rates above the configured safety maximum ([56001432](../../commit/56001432a12dafdfee0bbdd3a31489f58c7b127d))
+- Stop printing the hot certificate private key in bond JSON output ([6e1981ff](../../commit/6e1981fff1b91b22cb4327071b8591026eca4d85))
+- Find older fidelity bonds when recovering an imported wallet on neutrino ([fc9f29ed](../../commit/fc9f29edcaa32008a29b083a4f5fd835f850c4d6))
+- The orderbook watcher now sends Content-Security-Policy and X-Content-Type-Options headers. ([4d1896e1](../../commit/4d1896e14d13e3e86ceb7eec443bfb987598bbd3))
+- Updating an installed tumbler now also installs its hash-pinned dependencies. ([0ee89756](../../commit/0ee8975686e3d8db107c37f5aedb844d86d0299e))
+- jm-tumbler now disables core dumps and ptrace like the other components. ([d8c87099](../../commit/d8c870992dd48e73da9f88f9faf5d60217aab2a4))
+- The wallet daemon now rejects request bodies larger than 1 MiB with HTTP 413. ([a1f78cb8](../../commit/a1f78cb8b9a23553ae4155a24e068773c93a2732))
+- The wallet daemon no longer serves the CDN-backed /docs and /redoc pages when it also serves the Jam web UI. ([c170c18f](../../commit/c170c18f3257cdcfb5559f4170492cee27a34176))
+- The taker now aborts before requesting signatures when a maker declares one of the taker's own inputs and ignores that maker afterwards. ([1d35f54c](../../commit/1d35f54c77eeb4e7cf7534970a1ff5d52d86bbe7))
+- The taker now caps how many messages a direct maker connection can queue, so a misbehaving maker can no longer exhaust taker memory. ([6c409a97](../../commit/6c409a97f4bab0ea321275e32b9677afa3195030))
+- Reject directory handshakes that advertise oversized feature sets ([3dc220d3](../../commit/3dc220d302de11fb62253b89ab6199fa7ee2df23))
+- Stop directory peer churn from growing maker memory without bound ([fa37d6e2](../../commit/fa37d6e2ebcc2aadd1fc646c0372b6eaffe20bf1))
+- Stop a slow !auth verification from stalling a maker's directory connections ([02a18a56](../../commit/02a18a563a963ec41b80f582d9b3b5aab2f23810))
+- Prevent one fidelity bond from filling several maker slots in a CoinJoin ([6af8778a](../../commit/6af8778a1cd8e3329f6e1e6dd239dd51820f1886))
+- Prevent public message floods from saturating maker CPU in message deduplication ([5b1a24a4](../../commit/5b1a24a4f059a3b874d84bc274a98f4aca620072))
+- Notifications no longer leak the destination address, txids or amounts in failure reasons when the matching privacy settings are off. ([51689502](../../commit/51689502a2d63105f653ac4ccd3b515032a54c0c))
+- Hide unitless amounts in rejection and failure notifications when include_amounts is disabled ([2cdcece6](../../commit/2cdcece64ed0c84537cebba163338922152b7dc4))
+- The wallet daemon no longer reveals backend tokens through configget requests for internal attribute names. ([f3db1ac2](../../commit/f3db1ac2ca8a1434a82934788f19a1a00f30a175))
+- Keep the wallet_with_passphrase compatibility setting readable through configget ([c4e9c02b](../../commit/c4e9c02baf08e807f2120c064fd45cc70e0f069c))
+- The wallet daemon now refuses to switch wallets while a maker, taker or tumbler is running unless the request carries the active session's token. ([3fc8b452](../../commit/3fc8b452bd060cadb70770c129ef39ce51ceaafb))
+- Prevent an unauthenticated wallet switch from stopping a service started during its password check ([13b69890](../../commit/13b69890ab60fc881af1f785988058b85156d94c))
+- The taker no longer loses its record of used PoDLE commitments when a write is interrupted, and keeps a copy of an unreadable commitments file for recovery. ([63d622dd](../../commit/63d622dd76108b004c87f943a38d7b73f4737e83))
+- Keep every quarantined copy of a corrupt used-commitments file ([05dbef4b](../../commit/05dbef4bc7b6e209907030172d261c6dd1ba8435))
+- Makers that send an invalid CoinJoin or change address are now dropped and ignored before the transaction is built. ([5e60745b](../../commit/5e60745b7aa90e0cf69aa93d6112387a90127164))
+- Accept makers that send valid all-uppercase bech32 addresses ([e6d74b9d](../../commit/e6d74b9d477108b364f28371918f59f2faaa19f1))
+- Keep fetching the orderbook when a directory relays a flood of public messages ([bcfb9e67](../../commit/bcfb9e679f415a32223267b17a5be22d7640a249))
+- Keep fetching the orderbook when a directory relays a very fast message flood ([38d5da0d](../../commit/38d5da0dd5b42e9b1b58115f92f8ef50d1102eab))
+- Stop free !fill floods from locking takers out of a maker's session slots ([d3d048c3](../../commit/d3d048c3ecba857711bfe0ea18338e0c44be9fae))
+- Stop malformed !fill messages from expiring other takers' pending maker sessions ([3c09177b](../../commit/3c09177b7883314b8c2b6e9531fc0ff2a20fcaf4))
+- Accept all-uppercase bech32 destination addresses for direct sends ([68e2ca22](../../commit/68e2ca227de84489beafb815090b9830855c447e))
+- Stop maker, taker, tumbler and rescan requests that race a wallet lock from starting services on the locked wallet ([c0ddf5f8](../../commit/c0ddf5f8e7d81ec2b45f960279d362e2c385aaba))
+- Fix TUI menu header overflowing the menu width ([e09e58ef](../../commit/e09e58eff676ffeabcad510ca42bb18ad129eae6))
+- Keep TUI wallet headers within menu bounds for Unicode names ([853029e5](../../commit/853029e52f6036e2cfea49dcd32645929aba26de))
+- Correct miner fee estimates when sending to Taproot addresses ([db787ece](../../commit/db787eced750736754a123c9dad543224df738ab))
+- Correct Taproot address encoding and decoding ([fed798ae](../../commit/fed798aed6a7038ea7ec8734539d6dcc9430eabd))
+- Avoid wallet-lock errors when tumbler shutdown clears its task ([77af69e1](../../commit/77af69e125ed2fde6d85c449e1e7a42bf695afe4))
+- Reduce excessive sweep fees in taker and tumbler CoinJoins ([d8c3a473](../../commit/d8c3a473117a514f2c57825f2c4ffb8385946246))
+- Lower the default wallet fee-rate safety cap to 100 sat/vB ([d8c3a473](../../commit/d8c3a473117a514f2c57825f2c4ffb8385946246))
+- Interactive seed import asks whether the seed uses a BIP39 passphrase ([eb1e8d4f](../../commit/eb1e8d4f528fc78486e6ac961df484882932569e))
+- Use a fresh BIP39 passphrase when importing a wallet interactively ([44723a52](../../commit/44723a52a02dd536576cc495968035c1c96088c7))
+- Sweeps replace makers whose inputs the fee budget cannot fund instead of failing the round ([f57981c6](../../commit/f57981c6346b156486752e75432b3f602388c35d))
+- Avoid unnecessary sweep maker replacements and fee-floor failures after maker fees decrease ([5f5384a5](../../commit/5f5384a5a8d73f65292c1fbbf39c555b4dd123e1))
+- Authenticate PSBT prevouts offline and include funding transactions in bond exports ([f1d4e8b5](../../commit/f1d4e8b5ef3a55db6e5ebd696a44f28d5518167a))
+- Prevent revoked daemon requests from accessing or changing a replacement wallet ([027dbe4b](../../commit/027dbe4baf6d7ff3c3fcccc58b6f65a6fc9337f7))
+- Make PSBT signing offline by default and require --broadcast for submission ([1a6f8287](../../commit/1a6f8287c5b422a306bb6aea87f3b31c9a395a65))
+- Bound feature metadata without letting individual peer updates disconnect healthy directory clients ([cc0c68f9](../../commit/cc0c68f91766a1cce676f563a0f36d25fd9d5e76))
+- Bound directory discovery while retaining partial offers and protecting peers from incomplete refreshes ([07f27edf](../../commit/07f27edf7d4fb481aefb916cbe91e0cf336e9b2b))
+- Sync atomic file replacements to their parent directories on supported platforms ([a88553be](../../commit/a88553bed31aa91509bfd71f174035f53050bb05))
+- Require explicit commitment history initialization and stop CoinJoins on history read or write failures ([e02be25f](../../commit/e02be25fb129a2863e0f8a532e320651348d2415))
+- Reject excessive CoinJoin mining fees before consuming or exposing fresh commitments ([199fc108](../../commit/199fc10873a98f05a2da2b3b626494ee94d1dc88))
+- Hide RPC and notification credentials from wallet config responses ([c9ee5b5d](../../commit/c9ee5b5d68d4ba14cfba626d6db09b91963659bd))
+- Prevent one direct peer from exhausting another peer's response queue capacity ([0afd8352](../../commit/0afd835203347baa06667f6b6d7d54da2521b7df))
+- Preserve queued authentication and maker session limits during concurrent fills ([b716cc23](../../commit/b716cc23cf75b45fbd5733aff68507eb1dd51a73))
+- Creating the first wallet in an unused data directory now initializes its commitment history, so new users can make CoinJoins without running jm-taker init-commitment-history ([0524fea2](../../commit/0524fea2c01fc89fda261c393b5e7f4ec5be6ded))
+- Restrict automatic commitment history to generated wallets and preserve safe recovery behavior ([0169bd1b](../../commit/0169bd1b184ec5e81b322211bee06b87e13a5648))
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.42.1)
++++ config.toml.template (0.43.0)
+@@ -150,7 +150,7 @@ [bitcoin]
+ # is then required with neutrino). A comma-separated list supplies a custom
+ # fallback order. Self-hosting a mempool/Esplora instance is the most private
+ # option. Every resolved estimate is still subject to the hard
+-# wallet.max_fee_rate_sat_vb safety cap above (default 1000 sat/vB).
++# wallet.max_fee_rate_sat_vb safety cap.
+ # fee_estimate_url = "http://your-esplora.onion/api/fee-estimates,https://backup.example/fee-estimates"
+
+ # ============================================================================
+@@ -253,8 +253,12 @@ [wallet]
+ # Safety cap on the fee rate (sat/vB) used for any wallet transaction.
+ # Both manual fee rates and backend fee estimates above this cap are rejected
+ # to protect against runaway-fee bugs and malicious/misconfigured fee oracles.
+-# Increase only if you have a deliberate need to pay fees above 1000 sat/vB.
+-# max_fee_rate_sat_vb = 1000
++# Increase only if you have a deliberate need to pay fees above 100 sat/vB.
++# CoinJoins also check the effective rate before requesting signatures and broadcasting.
++# Those ceilings use estimated size to avoid signature-size jitter; reporting uses signed size.
++# This cap also bounds makers' required minimum rate. A resolved minimum above the cap
++# makes makers refuse startup/fills; raise the cap explicitly if that minimum is intended.
++# max_fee_rate_sat_vb = 100
+
+ # Show the fidelity bond branch in the extended wallet info views
+ # (`jm-wallet info --extended`). Fidelity bonds are managed separately via
+@@ -266,6 +270,8 @@ [wallet]
+ # Mnemonic file settings (optional defaults)
+ # mnemonic_file = ""            # Path to mnemonic file
+ # Enable BIP39 onboarding and prompting for unregistered wallets. Default: false.
++# Interactive mnemonic import asks about a BIP39 passphrase regardless of this
++# setting; this setting controls generation and unlock-time prompting.
+ # Registered passphrase wallets still require their passphrase when this is false.
+ # Recorded history uses the selected identity without unlocking either credential.
+ # bip39_passphrase_enabled = false
+@@ -564,7 +570,10 @@ [taker]
+ # Maximum acceptable coinjoin fees (paid to makers, not network/miner fees)
+ # max_cj_fee_abs = 500        # Absolute fee in satoshis per maker
+ # max_cj_fee_rel = "0.001"    # Relative fee (0.001 = 0.1%)
+-# max_sweep_fee_change = 0.8  # Max relative amount actual sweep fee needs may exceed its budget
++# Sweeps budget three inputs per maker (or the lower positive input cap).
++# Larger transactions can achieve a lower target rate, but must clear the minimum fee policy.
++# Abort if the actual-shape fee estimate / selected budget falls outside 1 +/- this tolerance.
++# max_sweep_fee_change = 0.8
+ # Round each selected maker fee up to the closest same-type public quantum.
+ # Requires makers that accept outputs paying at least their advertised fee, as
+ # supported by joinmarket-clientserver v0.9.12 and newer implementations.
+````
+
 ## [0.42.1] - 2026-10-19
 
 Small fix in directory traffic stats and in flatpak build CI.
@@ -4531,7 +4662,8 @@ This release did not change the bundled `config.toml.template`.
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.42.1...HEAD
+[Unreleased]: ../../compare/0.43.0...HEAD
+[0.43.0]: ../../compare/0.42.1...0.43.0
 [0.42.1]: ../../compare/0.42.0...0.42.1
 [0.42.0]: ../../compare/0.41.0...0.42.0
 [0.41.0]: ../../compare/0.40.0...0.41.0
