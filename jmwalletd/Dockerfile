@@ -4,7 +4,7 @@
 # Update with: ./scripts/update-base-images.sh
 # =============================================================================
 ARG PYTHON_VERSION=3.14
-ARG PYTHON_SLIM_DIGEST=sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
+ARG PYTHON_SLIM_DIGEST=sha256:930e1abba7c4e8f96ed93e8012c35d174d7732752731bbd5e8e757d7ec6f3966
 
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
@@ -17,7 +17,7 @@ ARG WHEEL_VERSION=0.48.0
 # Pins the whole transitive package closure so the build keeps reproducing
 # after the live archive rotates. See scripts/docker-apt-install.sh.
 # Update with: ./scripts/update-base-images.sh
-ARG DEBIAN_SNAPSHOT=20261030T082514Z
+ARG DEBIAN_SNAPSHOT=20261103T144352Z
 
 # =============================================================================
 # Stage 1: Build Python environment

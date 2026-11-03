@@ -312,7 +312,6 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 
 </details>
 
-
 <details>
 <summary><code>jm-taker init-commitment-history --help</code></summary>
 
@@ -323,14 +322,15 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
  Explicitly create a missing, empty commitment history for a new taker.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --config-file          PATH  Config file path (decoupled from data dir)      │
-│                              [env var: JOINMARKET_CONFIG_FILE]               │
-│ --data-dir     -d      PATH  Data directory for JoinMarket files             │
-│                              [env var: JOINMARKET_DATA_DIR]                  │
-│ --help                       Show this message and exit.                     │
+│ --config-file          <path>  Config file path (decoupled from data dir)    │
+│                                [env var: JOINMARKET_CONFIG_FILE]             │
+│ --data-dir     -d      <path>  Data directory for JoinMarket files           │
+│                                [env var: JOINMARKET_DATA_DIR]                │
+│ --help                         Show this message and exit.                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
 </details>
+
 
 <!-- AUTO-GENERATED HELP END: jm-taker -->
