@@ -124,7 +124,8 @@ changing private transaction message sizes or signed-input lock policy:
 | Tracked directory offers | 256 per connection generation; order IDs at most 64 characters |
 | Maker direct sockets | 256 across all identity generations; 60-second receive-idle and initial authentication deadlines |
 | Maker active sessions | 128; at the cap, a valid new `!fill` expires the oldest session still waiting for `!auth` |
-| Client buffered messages | 1,024 messages and 8 MiB serialized data |
+| Directory client buffered messages | 1,024 messages and 8 MiB serialized data |
+| Taker direct-peer queue | 1,024 messages and 8 MiB per assigned peer identity; 2,048 messages and 16 MiB total |
 | Client message collection | 10,000 messages and 32 MiB per collection/fetch |
 | Client retained state | 10,000 offers and 20,000 peers per directory; 64 features per peer |
 | Feature metadata | 128 UTF-8 bytes per identifier; directory admission also retains 32 keys and 64 characters per identifier |
@@ -161,6 +162,15 @@ Deadline expiry retains offers from the final collection chunk; a stalled
 request send reports a directory failure. Slow endpoints cannot indefinitely
 delay healthy directories' results. Resource-limit failures abort the transport
 without awaiting a blocked writer, while ordinary shutdown remains graceful.
+
+Direct-response quotas are charged to the connection identity assigned by the
+taker, never to sender claims inside a message. Each peer retains the old full
+queue capacity, and the aggregate budget permits another peer's full burst beside
+one flooder. Queued early replies and their charges survive disconnects, so idle
+socket closure does not lose signatures and reconnecting cannot refresh a quota.
+Dequeue releases each stored charge, including invalid or unwanted replies;
+shutdown drains all queued messages and resets accounting. Multiple flooding
+peers can still exhaust the bounded aggregate budget.
 
 ### Flood Behavior and Log Volume
 

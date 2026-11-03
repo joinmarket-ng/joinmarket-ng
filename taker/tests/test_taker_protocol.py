@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,7 @@ from _taker_test_helpers import (
     make_directory_client,
     make_taker_config,
     make_utxo,
+    register_direct_peer,
 )
 from jmcore.bitcoin import TxInput, TxOutput, parse_transaction_bytes, serialize_transaction
 from jmcore.constants import DUST_THRESHOLD
@@ -755,8 +757,9 @@ class TestMultiDirectoryClientDirectConnections:
 
         # Pre-load both messages into the direct queue so wait_for_responses
         # drains them without actually opening network connections.
-        await client._direct_message_queue.put(msg_dir1)
-        await client._direct_message_queue.put(msg_dir2)
+        register_direct_peer(client, maker_nick)
+        await client._on_peer_message(maker_nick, json.dumps(msg_dir1).encode())
+        await client._on_peer_message(maker_nick, json.dumps(msg_dir2).encode())
 
         # Stub out directory clients so no real listening happens.
         client.clients = {}

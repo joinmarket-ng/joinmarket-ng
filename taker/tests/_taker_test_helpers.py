@@ -13,6 +13,7 @@ from pathlib import Path
 from jmcore.crypto import NickIdentity
 from jmcore.encryption import CryptoSession
 from jmcore.models import NetworkType
+from jmcore.network import OnionPeer
 from jmcore.paths import get_used_commitments_path
 from jmwallet.wallet.models import UTXOInfo
 
@@ -41,6 +42,12 @@ def initialize_test_commitment_history(data_dir: Path) -> None:
     """Prepare successful fixtures without resetting any already recorded proofs."""
     if not get_used_commitments_path(data_dir).exists():
         initialize_commitment_history(data_dir)
+
+
+def register_direct_peer(client: MultiDirectoryClient, nick: str) -> None:
+    """Register a locally assigned connection identity without opening a socket."""
+    if nick not in client._peer_connections:
+        client._peer_connections[nick] = OnionPeer(nick, "test.onion:5222")
 
 
 def make_utxo(

@@ -8,9 +8,10 @@ without its signing key.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
-from _taker_test_helpers import make_directory_client
+from _taker_test_helpers import make_directory_client, register_direct_peer
 from jmcore.crypto import NickIdentity
 from jmcore.network import ONION_HOSTID
 from jmcore.protocol import MessageType
@@ -22,9 +23,13 @@ def signed_line(identity: NickIdentity, recipient: str, command: str, data: str)
 
 
 async def run(client, expected_nicks, command, lines, counts=None):
+    register_direct_peer(client, "assigned-test-connection")
     for line in lines:
-        await client._direct_message_queue.put(
-            {"type": MessageType.PRIVMSG.value, "line": line, "source": "dir1"}
+        await client._on_peer_message(
+            "assigned-test-connection",
+            json.dumps(
+                {"type": MessageType.PRIVMSG.value, "line": line, "source": "dir1"}
+            ).encode(),
         )
     client.clients = {}
     return await client.wait_for_responses(
@@ -100,8 +105,10 @@ async def test_public_message_from_expected_maker_ignored():
     client = make_directory_client()
     maker = NickIdentity(5)
     line = f"{maker.nick}!PUBLIC!sw0reloffer 0 100000 1000000 0 0.001"
-    await client._direct_message_queue.put(
-        {"type": MessageType.PUBMSG.value, "line": line, "source": "dir1"}
+    register_direct_peer(client, maker.nick)
+    await client._on_peer_message(
+        maker.nick,
+        json.dumps({"type": MessageType.PUBMSG.value, "line": line, "source": "dir1"}).encode(),
     )
     client.clients = {}
 

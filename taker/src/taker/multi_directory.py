@@ -35,6 +35,20 @@ from jmcore.protocol import (
 from jmcore.randomness import secure_random
 from loguru import logger
 
+DIRECT_PEER_MAX_MESSAGES = MAX_BUFFERED_MESSAGES
+DIRECT_PEER_MAX_BYTES = MAX_BUFFERED_MESSAGE_BYTES
+# Preserve the full previously supported burst beside one flooding peer.
+# Directory queues keep their existing limits.
+DIRECT_QUEUE_MAX_MESSAGES = 2 * DIRECT_PEER_MAX_MESSAGES
+DIRECT_QUEUE_MAX_BYTES = 2 * DIRECT_PEER_MAX_BYTES
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedDirectMessage:
+    peer_nick: str
+    message: dict[str, Any]
+    charged_bytes: int
+
 
 @dataclass(frozen=True)
 class ChannelBinding:
@@ -144,10 +158,11 @@ class MultiDirectoryClient(DirectoryClientPool):
 
         # Unified message queue for direct peer messages
         # Messages from direct peers are queued here and consumed by wait_for_responses
-        self._direct_message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
-            maxsize=MAX_BUFFERED_MESSAGES
+        self._direct_message_queue: asyncio.Queue[_QueuedDirectMessage] = asyncio.Queue(
+            maxsize=DIRECT_QUEUE_MAX_MESSAGES
         )
         self._direct_message_queue_bytes = 0
+        self._direct_message_usage: dict[str, tuple[int, int]] = {}
 
         # Multi-directory nick tracking
         # Format: active_nicks[nick] = {server1: True, server2: True, ...}
@@ -423,6 +438,11 @@ class MultiDirectoryClient(DirectoryClientPool):
         by wait_for_responses(). The message is enriched with the sender's nick
         to match the format expected by the response processing logic.
         """
+        # OnionPeer supplies the nick assigned when we dialed it, not a sender
+        # claimed inside the message. Its identity survives reconnects, so a
+        # disconnect cannot refresh a flooder's quota or discard early replies.
+        if nick not in self._peer_connections:
+            return
         try:
             msg = json.loads(data.decode("utf-8"))
             logger.debug(f"Received direct message from {nick}: type={msg.get('type')}")
@@ -433,14 +453,19 @@ class MultiDirectoryClient(DirectoryClientPool):
 
             # Queue for processing by wait_for_responses
             size = self._direct_message_size(msg)
+            peer_count, peer_bytes = self._direct_message_usage.get(nick, (0, 0))
+            if peer_count >= DIRECT_PEER_MAX_MESSAGES or peer_bytes + size > DIRECT_PEER_MAX_BYTES:
+                logger.debug(f"Direct peer queue quota reached, dropping message from {nick}")
+                return
             if (
                 self._direct_message_queue.full()
-                or self._direct_message_queue_bytes + size > MAX_BUFFERED_MESSAGE_BYTES
+                or self._direct_message_queue_bytes + size > DIRECT_QUEUE_MAX_BYTES
             ):
                 logger.debug(f"Direct message queue full, dropping message from {nick}")
                 return
-            self._direct_message_queue.put_nowait(msg)
+            self._direct_message_queue.put_nowait(_QueuedDirectMessage(nick, msg, size))
             self._direct_message_queue_bytes += size
+            self._direct_message_usage[nick] = (peer_count + 1, peer_bytes + size)
         except Exception as e:
             logger.warning("Error processing direct peer message")
             logger.bind(sensitive=True).warning(f"Error processing peer message from {nick}: {e}")
@@ -449,9 +474,23 @@ class MultiDirectoryClient(DirectoryClientPool):
     def _direct_message_size(msg: dict[str, Any]) -> int:
         return len(json.dumps(msg).encode("utf-8"))
 
+    def _dequeue_direct_message(self) -> dict[str, Any]:
+        """Release the immutable admission charge even for rejected responses."""
+        entry = self._direct_message_queue.get_nowait()
+        self._direct_message_queue_bytes -= entry.charged_bytes
+        count, size = self._direct_message_usage[entry.peer_nick]
+        if count == 1:
+            del self._direct_message_usage[entry.peer_nick]
+        else:
+            self._direct_message_usage[entry.peer_nick] = (count - 1, size - entry.charged_bytes)
+        return entry.message
+
     async def _on_peer_disconnect(self, nick: str) -> None:
         """Handle peer disconnection."""
         logger.debug(f"Peer {nick} disconnected")
+        # Retain queued replies and their charges: a maker may disconnect after
+        # sending valid signatures, before the taker starts waiting. Reconnects
+        # reuse the same assigned identity and must not obtain a fresh quota.
         # Clean up but don't remove from _peer_connections immediately
         # in case we want to reconnect
 
@@ -523,6 +562,10 @@ class MultiDirectoryClient(DirectoryClientPool):
                 logger.debug("Error disconnecting from peer")
                 logger.bind(sensitive=True).debug(f"Error disconnecting from peer {nick}: {e}")
         self._peer_connections.clear()
+        while not self._direct_message_queue.empty():
+            self._dequeue_direct_message()
+        self._direct_message_queue_bytes = 0
+        self._direct_message_usage.clear()
 
     async def connect_all(self) -> int:
         """Connect to all directory servers in parallel.
@@ -920,10 +963,7 @@ class MultiDirectoryClient(DirectoryClientPool):
             # First, drain any pending direct peer messages (non-blocking)
             while True:
                 try:
-                    msg = self._direct_message_queue.get_nowait()
-                    self._direct_message_queue_bytes = max(
-                        0, self._direct_message_queue_bytes - self._direct_message_size(msg)
-                    )
+                    msg = self._dequeue_direct_message()
                     process_message(msg, "direct")
                 except asyncio.QueueEmpty:
                     break

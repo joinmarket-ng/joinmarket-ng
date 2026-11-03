@@ -9,15 +9,18 @@ until the timeout expires.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
-from _taker_test_helpers import make_directory_client
+from _taker_test_helpers import make_directory_client, register_direct_peer
 from jmcore.crypto import NickIdentity
 from jmcore.directory_client import DirectoryClientError
 from jmcore.network import ONION_HOSTID
 from jmcore.protocol import MessageType
 from loguru import logger
+
+from taker.multi_directory import MultiDirectoryClient
 
 
 class DeadClient:
@@ -65,14 +68,15 @@ class ReplacingDeadClient(DeadClient):
 class DirectMessageDeadClient(DeadClient):
     """Queues a direct response before its terminal listener failure."""
 
-    def __init__(self, queue: asyncio.Queue[dict[str, Any]], message: dict[str, Any]) -> None:
+    def __init__(self, client: MultiDirectoryClient, nick: str, message: dict[str, Any]) -> None:
         super().__init__()
-        self.queue = queue
+        self.client = client
+        self.nick = nick
         self.message = message
 
     async def listen_for_messages(self, duration: float) -> list[dict[str, Any]]:
         self.calls += 1
-        await self.queue.put(self.message)
+        await self.client._on_peer_message(self.nick, json.dumps(self.message).encode())
         raise DirectoryClientError("Connection closed")
 
 
@@ -191,7 +195,8 @@ async def test_direct_response_arriving_after_eviction_is_processed() -> None:
         "type": MessageType.PRIVMSG.value,
         "line": signed_line(maker, client.nick_identity.nick, "pubkey", "MAKER_NACL"),
     }
-    dead = DirectMessageDeadClient(client._direct_message_queue, direct_message)
+    register_direct_peer(client, maker.nick)
+    dead = DirectMessageDeadClient(client, maker.nick, direct_message)
     client.clients = {"dead.onion:5222": dead}
 
     responses = await client.wait_for_responses(
