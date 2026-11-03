@@ -29,7 +29,7 @@ _jm_wallet() {
     'rescan:Rescan the blockchain to repair a descriptor wallet'\''s coverage.'
     'send:Send a simple transaction from wallet to an address.'
     'showseed:Display the BIP39 seed words (mnemonic) of an existing wallet.'
-    'sign-psbt:Review and sign a PSBT, then confirm broadcasting the transaction.'
+    'sign-psbt:Review and sign a PSBT offline. Submit only with --broadcast.'
     'spend-bond:Generate a PSBT to spend a cold storage fidelity bond after locktime expires.'
     'sync-bonds:Refresh funded status of bonds already in the registry (fast).'
     'validate:Validate a mnemonic phrase.'
@@ -353,8 +353,9 @@ _jm_wallet() {
             '--prompt-bip39-passphrase[Prompt for BIP39 passphrase]' \
             '--network=[Bitcoin network]: :' \
             '--scan-range=[Fallback addresses per branch to derive when PSBT key origins are absent]: :' \
-            '--yes[Skip signing AND broadcast confirmations]' \
-            '--no-broadcast[Disable broadcasting and backend access (offline signing)]' \
+            '--yes[Skip confirmations (broadcast still needs --broadcast)]' \
+            '--broadcast[Submit the fully signed transaction (default\: sign only)]' \
+            '--no-broadcast[Disable submission and backend access, even with --broadcast]' \
             '--data-dir=[Data directory (default\: ~/.joinmarket-ng or $JOINMARKET_DATA_DIR)]:file:_files' \
             '--config-file=[Config file path (default\: <data-dir>/config.toml)]:file:_files' \
             '--log-level=[Log level]: :' \

@@ -186,6 +186,7 @@ async def test_sign_psbt_local_finalize_and_broadcast(
             "--config-file",
             str(config_file),
             "--yes",
+            "--broadcast",
         ],
         env={"MNEMONIC": _MNEMONIC},
     )

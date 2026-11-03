@@ -191,12 +191,20 @@ def sign_psbt(
         ),
     ] = None,
     yes: Annotated[
-        bool, typer.Option("--yes", "-y", help="Skip signing AND broadcast confirmations")
+        bool,
+        typer.Option("--yes", "-y", help="Skip confirmations (broadcast still needs --broadcast)"),
+    ] = False,
+    broadcast: Annotated[
+        bool,
+        typer.Option(
+            "--broadcast",
+            help="Submit the fully signed transaction (default: sign only)",
+        ),
     ] = False,
     no_broadcast: Annotated[
         bool,
         typer.Option(
-            "--no-broadcast", help="Disable broadcasting and backend access (offline signing)"
+            "--no-broadcast", help="Disable submission and backend access, even with --broadcast"
         ),
     ] = False,
     data_dir: Annotated[
@@ -217,15 +225,15 @@ def sign_psbt(
     ] = None,
     log_level: Annotated[str | None, typer.Option("--log-level", "-l", help="Log level")] = None,
 ) -> None:
-    """Review and sign a PSBT, then confirm broadcasting the transaction.
+    """Review and sign a PSBT offline. Submit only with --broadcast.
 
     Supports regular P2WPKH wallet inputs and canonical JoinMarket fidelity bond
     P2WSH inputs, while leaving unrelated P2WSH inputs unsigned. Every input must
     include witness_utxo and the full funding transaction (non_witness_utxo) so
     every amount and script can be authenticated offline. Accepts PSBT
     v0 and v2. Broadcasting requires every input to be wallet-owned and fully signed.
-    Use --no-broadcast for fully offline signing. --yes authorizes broadcasting too;
-    existing offline scripts using --yes must add --no-broadcast.
+    Signing-only is the default, including with --yes. Submission requires
+    --broadcast and a separate confirmation unless --yes is also supplied.
     """
     settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
     try:
@@ -277,7 +285,7 @@ def sign_psbt(
             f"Signed {len(result.signed_indices)} input(s); "
             f"{len(result.already_signed_indices)} already had valid wallet signatures."
         )
-        if no_broadcast:
+        if not broadcast or no_broadcast:
             return
         tx_bytes = wallet.finalize_psbt(
             result.psbt,

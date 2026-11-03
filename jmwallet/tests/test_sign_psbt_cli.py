@@ -97,7 +97,10 @@ def _regular_psbt(*, value: int = 100_000, output_value: int = 99_000) -> bytes:
     )
 
 
-def _invoke_args(raw: bytes, data_dir: Path, *, broadcast: bool = False) -> list[str]:
+def _invoke_args(raw: bytes, data_dir: Path, *, broadcast: bool | None = False) -> list[str]:
+    broadcast_flags = (
+        [] if broadcast is None else ["--broadcast" if broadcast else "--no-broadcast"]
+    )
     return [
         "sign-psbt",
         base64.b64encode(raw).decode("ascii"),
@@ -107,7 +110,7 @@ def _invoke_args(raw: bytes, data_dir: Path, *, broadcast: bool = False) -> list
         "0",
         "--data-dir",
         str(data_dir),
-        *([] if broadcast else ["--no-broadcast"]),
+        *broadcast_flags,
     ]
 
 
@@ -368,7 +371,28 @@ def test_broadcast_decline_or_eof_never_connects(
 
 @pytest.mark.parametrize("yes", [False, True])
 @pytest.mark.parametrize("version", [0, 2])
-def test_default_broadcast_submits_verified_transaction(
+@pytest.mark.parametrize("foreign", [False, True])
+def test_default_signing_never_creates_backend(
+    tmp_path: Path, broadcast_backend: SimpleNamespace, yes: bool, version: int, foreign: bool
+) -> None:
+    raw = _foreign_p2wsh_psbt(value=100_000, output_value=198_000) if foreign else _regular_psbt()
+    if version == 2:
+        raw = _to_v2(raw)
+    args = _invoke_args(raw, tmp_path, broadcast=None) + (["--yes"] if yes else [])
+    result = CliRunner().invoke(app, args, input="y\n", env={"MNEMONIC": TEST_MNEMONIC})
+    assert result.exit_code == 0, result.output
+    signed = parse_psbt(_extract_signed_psbt(result.stdout))
+    assert any(r.key[0] == PSBT_IN_PARTIAL_SIG for r in signed.input_maps[0].records)
+    if foreign:
+        assert not any(r.key[0] == PSBT_IN_PARTIAL_SIG for r in signed.input_maps[1].records)
+    assert "Broadcast this transaction?" not in result.output
+    assert "Transaction submitted:" not in result.output
+    broadcast_backend.factory.assert_not_called()
+
+
+@pytest.mark.parametrize("yes", [False, True])
+@pytest.mark.parametrize("version", [0, 2])
+def test_explicit_broadcast_submits_verified_transaction(
     tmp_path: Path, broadcast_backend: SimpleNamespace, yes: bool, version: int
 ) -> None:
     raw = _regular_psbt()
@@ -392,10 +416,15 @@ def test_default_broadcast_submits_verified_transaction(
     broadcast_backend.close.assert_awaited_once()
 
 
-def test_no_broadcast_wins_over_yes(tmp_path: Path, broadcast_backend: SimpleNamespace) -> None:
+@pytest.mark.parametrize("also_broadcast", [False, True])
+def test_no_broadcast_wins_over_yes(
+    tmp_path: Path, broadcast_backend: SimpleNamespace, also_broadcast: bool
+) -> None:
     result = CliRunner().invoke(
         app,
-        _invoke_args(_regular_psbt(), tmp_path) + ["--yes"],
+        _invoke_args(_regular_psbt(), tmp_path)
+        + ["--yes"]
+        + (["--broadcast"] if also_broadcast else []),
         env={"MNEMONIC": TEST_MNEMONIC},
     )
     assert result.exit_code == 0, result.output

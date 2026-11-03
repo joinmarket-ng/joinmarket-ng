@@ -62,10 +62,17 @@ jm-wallet sign-psbt '<base64-PSBT>'
 Omit the argument to paste at a prompt instead of putting transaction details in
 shell history. The command prompts for the wallet password when needed, displays
 inputs, outputs, and fees, and asks before signing. It prints the signed PSBT,
-then asks separately before broadcasting through your configured Bitcoin backend.
-Broadcasting requires every input to be wallet-owned and fully signed. Foreign
-inputs must be completed in another wallet. The signed PSBT remains available if
-you decline broadcasting or submission fails. Submission is not confirmation.
+then exits without creating a backend. To submit through your configured Bitcoin
+backend, explicitly request broadcasting:
+
+```bash
+jm-wallet sign-psbt '<base64-PSBT>' --broadcast
+```
+
+Broadcasting requires every input to be wallet-owned and fully signed, with a
+separate confirmation. Foreign inputs must be completed in another wallet. The
+signed PSBT remains available if you decline broadcasting or submission fails.
+Submission is not confirmation.
 
 For fully offline signing, or to return a collaborative PSBT to another signer:
 
@@ -74,9 +81,11 @@ jm-wallet sign-psbt '<base64-PSBT>' --no-broadcast
 jm-wallet sign-psbt --input unsigned.psbt --output signed.psbt --no-broadcast
 ```
 
-**Upgrading scripts:** `--yes` now skips both signing and broadcast confirmations.
-Existing offline scripts using `--yes` must add `--no-broadcast`, which prevents
-backend access even with `--yes`.
+**Automation:** `--yes` skips confirmation prompts but never independently
+authorizes submission. Use `--broadcast --yes` only when submission is intended.
+`--no-broadcast` remains supported for existing offline scripts. Successful
+partial signing returns success unless an explicitly requested broadcast cannot
+be completed.
 
 The signer supports native P2WPKH wallet inputs and canonical JoinMarket
 fidelity bond P2WSH inputs. Every input must include both `witness_utxo` and its
@@ -176,8 +185,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                              address.                                        │
 │ showseed                     Display the BIP39 seed words (mnemonic) of an   │
 │                              existing wallet.                                │
-│ sign-psbt                    Review and sign a PSBT, then confirm            │
-│                              broadcasting the transaction.                   │
+│ sign-psbt                    Review and sign a PSBT offline. Submit only     │
+│                              with --broadcast.                               │
 │ spend-bond                   Generate a PSBT to spend a cold storage         │
 │                              fidelity bond after locktime expires.           │
 │ sync-bonds                   Refresh funded status of bonds already in the   │
@@ -1441,7 +1450,7 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 
  Usage: jm-wallet sign-psbt [OPTIONS] [psbt_base64]
 
- Review and sign a PSBT, then confirm broadcasting the transaction.
+ Review and sign a PSBT offline. Submit only with --broadcast.
 
  Supports regular P2WPKH wallet inputs and canonical JoinMarket fidelity bond
  P2WSH inputs, while leaving unrelated P2WSH inputs unsigned. Every input must
@@ -1449,14 +1458,16 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
  every amount and script can be authenticated offline. Accepts PSBT
  v0 and v2. Broadcasting requires every input to be wallet-owned and fully
  signed.
- Use --no-broadcast for fully offline signing. --yes authorizes broadcasting
- too;
- existing offline scripts using --yes must add --no-broadcast.
+ Signing-only is the default, including with --yes. Submission requires
+ --broadcast and a separate confirmation unless --yes is also supplied.
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────╮
 │   psbt_base64      <str>  Base64-encoded PSBT v0 or v2                       │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --broadcast                                           Submit the fully       │
+│                                                       signed transaction     │
+│                                                       (default: sign only)   │
 │ --config-file                   <path>                Config file path       │
 │                                                       (default:              │
 │                                                       <data-dir>/config.tom… │
@@ -1477,9 +1488,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │ --mnemonic-file         -f      <path>                [env var:              │
 │                                                       MNEMONIC_FILE]         │
 │ --network               -n      <str>                 Bitcoin network        │
-│ --no-broadcast                                        Disable broadcasting   │
-│                                                       and backend access     │
-│                                                       (offline signing)      │
+│ --no-broadcast                                        Disable submission and │
+│                                                       backend access, even   │
+│                                                       with --broadcast       │
 │ --output                -o      <path>                Write the signed       │
 │                                                       base64 PSBT to a file  │
 │ --prompt-bip39-passph…                                Prompt for BIP39       │
@@ -1488,9 +1499,9 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 │                                 [0<=x<=1000000]       branch to derive when  │
 │                                                       PSBT key origins are   │
 │                                                       absent                 │
-│ --yes                   -y                            Skip signing AND       │
-│                                                       broadcast              │
-│                                                       confirmations          │
+│ --yes                   -y                            Skip confirmations     │
+│                                                       (broadcast still needs │
+│                                                       --broadcast)           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
