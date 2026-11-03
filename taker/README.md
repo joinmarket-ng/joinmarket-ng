@@ -18,6 +18,14 @@ fee-rate cap. See `config.toml.template` for those settings and current defaults
 Makers whose inputs would break the minimum-fee policy or sweep tolerance are dropped during
 authentication, heaviest input set first, and replaced for that round without being ignored.
 
+Before generating or exposing a commitment, the taker checks complete mining-fee
+headroom for the proposed maker set, including maker contributions and unreturned
+change. The same check applies to replacements. It assumes each maker could use
+one input, so it can reject a set that larger actual input counts would make
+acceptable, particularly sweeps and rates near the wallet fee cap. Lower the
+requested rate or explicitly change the cap only if the higher fee is intended.
+Unsigned and final transaction fee checks still apply.
+
 ## Commitment History and Recovery
 
 Before a new taker first uses its data directory, explicitly initialize its history:

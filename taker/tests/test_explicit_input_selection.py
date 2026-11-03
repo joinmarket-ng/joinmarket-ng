@@ -7,11 +7,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from _taker_test_helpers import initialize_test_commitment_history, make_taker_config, make_utxo
+from jmcore.bitcoin import parse_transaction_bytes, scriptpubkey_to_address
+from jmcore.fee_policy import estimate_p2wpkh_vsize
 from jmcore.models import Offer, OfferType
 
 from taker.coinjoin_session import CoinJoinSession
 from taker.podle_manager import CommitmentHistoryError
 from taker.taker import Taker, TakerState
+from taker.tx_builder import build_coinjoin_tx
 
 
 def _wallet(utxos: list) -> AsyncMock:
@@ -165,6 +168,114 @@ async def test_coinjoin_preselects_exact_explicit_set(tmp_path: Path, amount: in
     assert taker._session.strict_input_selection is True
     wallet.select_utxos.assert_not_called()
     wallet.get_all_utxos.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contribution, rejected", [(20_000, True), (5_000, False)])
+async def test_funded_high_contribution_offers_reject_before_commitment(
+    tmp_path: Path,
+    contribution: int,
+    rejected: bool,
+) -> None:
+    script = "0014" + "11" * 20
+    address = scriptpubkey_to_address(bytes.fromhex(script), "regtest")
+    selected = make_utxo(value=25_000_000, scriptpubkey=script, address=address)
+    taker = Taker(
+        _wallet([selected]),
+        _backend(),
+        _config(tmp_path, counterparty_count=2, minimum_makers=2, fee_rate=10, tx_fee_factor=0),
+    )
+    offers = {
+        nick: _offer().model_copy(update={"counterparty": nick, "txfee": contribution})
+        for nick in ("maker1", "maker2")
+    }
+    # These offers are fully fundable, including the fixed maker change floor.
+    # Demonstrate the complete fee that the later unsigned guard would see.
+    maker_data = {
+        nick: {
+            "utxos": [
+                {"txid": f"{index:064x}", "vout": 0, "value": 2_000_000, "scriptpubkey": script}
+            ],
+            "cj_addr": address,
+            "change_addr": address,
+            "cjfee": 0,
+            "txfee": contribution,
+        }
+        for index, nick in enumerate(offers, start=1)
+    }
+    transaction, _ = build_coinjoin_tx(
+        taker_utxos=[
+            {"txid": selected.txid, "vout": 0, "value": selected.value, "scriptpubkey": script}
+        ],
+        taker_cj_address=address,
+        taker_change_address=address,
+        taker_total_input=selected.value,
+        maker_data=maker_data,
+        cj_amount=1_000_000,
+        tx_fee=10 * estimate_p2wpkh_vsize(3, 6),
+        network="regtest",
+    )
+    parsed = parse_transaction_bytes(transaction)
+    mining_fee = selected.value + 4_000_000 - sum(output.value for output in parsed.outputs)
+    assert (mining_fee > 100 * estimate_p2wpkh_vsize(3, 6)) is rejected
+    taker.directory_client.fetch_orderbook = AsyncMock(return_value=list(offers.values()))
+    taker._update_offers_with_bond_values = AsyncMock()  # type: ignore[method-assign]
+    taker.orderbook_manager.select_makers = Mock(return_value=(offers, 0))
+    taker.podle_manager.generate_fresh_commitment = Mock(return_value=None)
+
+    assert (
+        await taker.do_coinjoin(
+            amount=1_000_000,
+            destination="INTERNAL",
+            mixdepth=0,
+            input_utxos=[f"{selected.txid}:0"],
+        )
+        is None
+    )
+    if rejected:
+        taker.podle_manager.generate_fresh_commitment.assert_not_called()
+        assert "before commitment exposure" in (taker.last_failure_reason or "")
+    else:
+        taker.podle_manager.generate_fresh_commitment.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rate, rejected", [(60, True), (40, False)])
+async def test_sweep_fee_headroom_is_checked_before_commitment(
+    tmp_path: Path,
+    rate: float,
+    rejected: bool,
+) -> None:
+    selected = make_utxo(value=25_000_000)
+    taker = Taker(
+        _wallet([selected]),
+        _backend(),
+        _config(tmp_path, counterparty_count=8, minimum_makers=8, fee_rate=rate, tx_fee_factor=0),
+    )
+    offers = {
+        f"maker{i}": _offer().model_copy(update={"counterparty": f"maker{i}"}) for i in range(8)
+    }
+    taker.directory_client.fetch_orderbook = AsyncMock(return_value=list(offers.values()))
+    taker._update_offers_with_bond_values = AsyncMock()  # type: ignore[method-assign]
+
+    def select_sweep(total_input_value: int, my_txfee: int, **_kwargs: object) -> tuple:
+        return offers, total_input_value - my_txfee, 0
+
+    taker.orderbook_manager.select_makers_for_sweep = Mock(side_effect=select_sweep)
+    taker.podle_manager.generate_fresh_commitment = Mock(return_value=None)
+    assert (
+        await taker.do_coinjoin(
+            amount=0,
+            destination="INTERNAL",
+            mixdepth=0,
+            input_utxos=[f"{selected.txid}:0"],
+        )
+        is None
+    )
+    if rejected:
+        taker.podle_manager.generate_fresh_commitment.assert_not_called()
+    else:
+        taker.podle_manager.generate_fresh_commitment.assert_called_once()
 
 
 @pytest.mark.asyncio

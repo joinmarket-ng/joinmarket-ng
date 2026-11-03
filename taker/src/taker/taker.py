@@ -25,6 +25,7 @@ from jmcore.bitcoin import calculate_tx_vsize, get_address_type
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.commitment_blacklist import set_blacklist_path
+from jmcore.constants import BITCOIN_DUST_THRESHOLD
 from jmcore.crypto import NickIdentity
 from jmcore.fee_policy import estimate_p2wpkh_vsize, fee_rate_meets_minimum
 from jmcore.logging_context import coinjoin_id_from_commitment, coinjoin_log_context
@@ -59,6 +60,7 @@ from taker.multi_directory import MultiDirectoryClient
 from taker.orderbook import (
     OrderbookManager,
     calculate_cj_fee,
+    calculate_cj_fee_plan,
     maker_selection_keys,
 )
 from taker.podle_manager import CommitmentHistoryError, PoDLEManager
@@ -956,6 +958,71 @@ class Taker(TakerMonitoringMixin):
 
         logger.info(f"Updated {updated_count} offers with verified fidelity bond values")
 
+    def _preflight_fee_headroom(self, offers: dict[str, Offer]) -> bool:
+        """Bound complete mining fees before exposing a commitment to a maker set.
+
+        Unknown makers can each use just one input. More actual inputs can make
+        a rejected set affordable, but cannot invalidate an accepted upper bound.
+        Reuse this conservative shape even when an earlier ioauth is available:
+        a fresh fill can replace those inputs.
+        """
+        session = self._session
+        if not session.preselected_utxos or not offers:
+            reason = "Cannot check CoinJoin fee headroom without taker inputs and makers"
+        else:
+            minimum_inputs = len(session.preselected_utxos) + len(offers)
+            minimum_outputs = 1 + 2 * len(offers)
+            minimum_vsize = estimate_p2wpkh_vsize(minimum_inputs, minimum_outputs)
+            maker_contributions = sum(offer.txfee for offer in offers.values())
+            if session.is_sweep:
+                fee_plan = calculate_cj_fee_plan(
+                    offers.values(),
+                    session.cj_amount,
+                    round_up_cj_fees=self.config.round_up_cj_fees,
+                    equalize_cj_fees=self.config.equalize_cj_fees,
+                )
+                residual = (
+                    sum(utxo.value for utxo in session.preselected_utxos)
+                    - session.cj_amount
+                    - sum(fee_plan.values())
+                    - session._sweep_tx_fee_budget
+                )
+                if residual < 0:
+                    reason = "Sweep maker fees exceed selected funding before commitment exposure"
+                    session.last_failure_reason = reason
+                    logger.error(reason)
+                    self.state = TakerState.FAILED
+                    return False
+                complete_fee = session._sweep_tx_fee_budget + maker_contributions
+                if residual > BITCOIN_DUST_THRESHOLD:
+                    minimum_vsize = estimate_p2wpkh_vsize(minimum_inputs, minimum_outputs + 1)
+                else:
+                    complete_fee += residual
+            else:
+                # Allocation assumes change even when dust removes that output.
+                # Reserve all possible unreturned change and one satoshi of ceil
+                # slack. This remains an upper rate bound if more inputs are added.
+                complete_fee = (
+                    session._estimate_tx_fee(minimum_inputs, minimum_outputs + 1)
+                    + maker_contributions
+                    + BITCOIN_DUST_THRESHOLD
+                    + 1
+                )
+            cap = self.config.max_fee_rate_sat_vb
+            if complete_fee <= cap * minimum_vsize:
+                return True
+            reason = (
+                f"Conservative CoinJoin miner fee rate {complete_fee / minimum_vsize:.2f} sat/vB "
+                f"exceeds safety cap {cap:.2f} sat/vB before commitment exposure. "
+                "Lower the requested fee rate or maker contributions, or explicitly raise "
+                "wallet.max_fee_rate_sat_vb only if you intend to pay this much."
+            )
+        session.last_failure_reason = reason
+        logger.error("CoinJoin fee headroom is insufficient")
+        logger.bind(sensitive=True).error("Fee headroom detail: {}", reason)
+        self.state = TakerState.FAILED
+        return False
+
     def _log_initial_maker_fee_plan(self, fee_plan: dict[str, int]) -> None:
         """Explain the opt-in fee equalization policy before makers are contacted."""
         if not self.config.equalize_cj_fees or not fee_plan:
@@ -1431,6 +1498,9 @@ class Taker(TakerMonitoringMixin):
             )
             self._log_initial_maker_fee_plan(initial_fee_plan)
 
+            if not self._preflight_fee_headroom(selected_offers):
+                return None
+
             # Log the same estimate used by the transaction calculations. Sweep
             # amounts commit to the deterministic budget before !fill, while
             # normal CoinJoins use the session's randomized fee rate.
@@ -1800,6 +1870,13 @@ class Taker(TakerMonitoringMixin):
                 if not replacement_offers:
                     break
 
+                prospective_offers = {
+                    nick: maker_session.offer
+                    for nick, maker_session in self._session.maker_sessions.items()
+                } | replacement_offers
+                if not self._preflight_fee_headroom(prospective_offers):
+                    return False
+
                 if len(replacement_offers) < needed:
                     logger.info(
                         f"Auth replacement selection is partial: found {len(replacement_offers)}, "
@@ -2048,6 +2125,14 @@ class Taker(TakerMonitoringMixin):
                         f"(attempt {podle_retry + 2}/{max_podle_retries})..."
                     )
                     podle_retry += 1
+                    prospective_offers = {
+                        nick: offer
+                        for nick, offer in selected_offers.items()
+                        if nick not in self.orderbook_manager.ignored_makers
+                        and nick not in failed_nicks
+                    }
+                    if not self._preflight_fee_headroom(prospective_offers):
+                        return False
                     new_commitment = self.podle_manager.generate_fresh_commitment(
                         wallet_utxos=self._session.preselected_utxos,
                         cj_amount=self._session.cj_amount,
@@ -2059,6 +2144,8 @@ class Taker(TakerMonitoringMixin):
                     if new_commitment is None:
                         added = self._session._expand_preselected_utxos_same_mixdepth(mixdepth)
                         if added > 0:
+                            if not self._preflight_fee_headroom(prospective_offers):
+                                return False
                             logger.info(
                                 f"Preselected UTXOs exhausted for PoDLE; added {added} "
                                 f"additional UTXO(s) from mixdepth {mixdepth}, which will "
@@ -2168,6 +2255,13 @@ class Taker(TakerMonitoringMixin):
                     f"Fill replacement selection is partial: found {len(replacement_offers)}, "
                     f"need {needed}; retrying the remaining deficit"
                 )
+
+            prospective_offers = {
+                nick: maker_session.offer
+                for nick, maker_session in self._session.maker_sessions.items()
+            } | replacement_offers
+            if not self._preflight_fee_headroom(prospective_offers):
+                return False
 
             for nick, offer in replacement_offers.items():
                 self._session.maker_sessions[nick] = MakerSession(

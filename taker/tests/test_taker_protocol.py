@@ -3164,12 +3164,15 @@ class TestNeutrinoIncompatibleMakerReplacement:
             taker = Taker.__new__(Taker)
         taker._session = CoinJoinSession()
         taker._session.attach(taker)
+        taker._session.preselected_utxos = [make_utxo(txid_char="e", value=25_000_000)]
+        taker._session._fee_rate = taker._session._randomized_fee_rate = 1.0
         taker.wallet = MagicMock()
         taker.backend = AsyncMock()
         taker.backend.requires_neutrino_metadata = MagicMock(return_value=True)
         taker.config = MagicMock()
         taker.config.minimum_makers = minimum_makers
         taker.config.maker_timeout_sec = 1
+        taker.config.max_fee_rate_sat_vb = 100.0
 
         dc = MagicMock()
         dc.send_privmsg = AsyncMock(return_value="direct")
@@ -3566,6 +3569,8 @@ class TestReplacementTargetRestoration:
         taker._session.attach(taker)
         taker._session.cj_amount = 1_000_000
         taker._session.maker_target_count = target_makers
+        taker._session.preselected_utxos = [make_utxo(value=25_000_000)]
+        taker._session._fee_rate = taker._session._randomized_fee_rate = 1.0
         taker._session.maker_sessions = {
             f"J5maker{index}": MakerSession(
                 nick=f"J5maker{index}", offer=_simple_offer(f"J5maker{index}")
@@ -3577,6 +3582,7 @@ class TestReplacementTargetRestoration:
         taker.config.taker_utxo_retries = 3
         taker.config.taker_utxo_age = 1
         taker.config.taker_utxo_amtpercent = 20
+        taker.config.max_fee_rate_sat_vb = 100.0
         taker.directory_client = MagicMock()
         taker.directory_client.clients = {}
         taker.directory_client.prefer_direct_connections = False
@@ -3846,6 +3852,50 @@ class TestReplacementTargetRestoration:
             in taker.orderbook_manager.select_makers.call_args.kwargs["hard_exclude_nicks"]
         )
         assert "J5replacement" in taker._session.maker_sessions
+
+    @pytest.mark.asyncio
+    async def test_auth_replacement_rejects_fee_over_cap_before_rotating_commitment(self):
+        taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
+        next(iter(taker._session.maker_sessions.values())).responded_auth = True
+        taker._session.podle_commitment = MagicMock()
+        taker._session._phase_auth = AsyncMock(
+            return_value=PhaseResult(success=True, podle_revealed=True)
+        )
+        expensive = _simple_offer("J5expensive").model_copy(update={"txfee": 200_000})
+        taker.orderbook_manager.select_makers.return_value = ({"J5expensive": expensive}, 0)
+        taker.podle_manager = MagicMock()
+        taker._fill_replacement_makers = AsyncMock()
+
+        assert not await taker._run_auth_with_replacements(
+            required_features=None,
+            get_private_key=MagicMock(),
+            max_replacement_attempts=2,
+        )
+        taker.podle_manager.generate_fresh_commitment.assert_not_called()
+        taker._fill_replacement_makers.assert_not_awaited()
+        taker.orderbook_manager.add_ignored_maker.assert_not_called()
+        assert "wallet.max_fee_rate_sat_vb" in (taker.last_failure_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_fill_replacement_rejects_fee_over_cap_before_installation(self):
+        taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
+        taker._session._phase_fill = AsyncMock(
+            return_value=PhaseResult(success=True, failed_makers=["J5gone"])
+        )
+        selected = {nick: session.offer for nick, session in taker._session.maker_sessions.items()}
+        expensive = _simple_offer("J5expensive").model_copy(update={"txfee": 200_000})
+        taker.orderbook_manager.select_makers.return_value = ({"J5expensive": expensive}, 0)
+        assert not await taker._run_fill_with_replacements(
+            destination="bcrt1qdest",
+            selected_offers=selected,
+            required_features=None,
+            mixdepth=0,
+            get_private_key=MagicMock(),
+            max_replacement_attempts=2,
+        )
+        assert "J5expensive" not in taker._session.maker_sessions
+        assert "J5expensive" not in selected
+        taker._session._phase_fill.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_auth_replacement_history_failure_never_sends_mini_fill(self):
