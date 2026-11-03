@@ -11,6 +11,7 @@ from jmcore.protocol import (
     FEATURE_NICK_AUTH,
     JM_VERSION,
     JM_VERSION_MIN,
+    FeatureSet,
     create_peerlist_entry,
     parse_peerlist_entry,
 )
@@ -297,6 +298,8 @@ def test_handshake_rejects_unsafe_feature_identifiers(handler, features):
     [
         {"f" * 65: True},
         {"f" * 60_000: True},
+        {"€" * 43: True},
+        {"€" * 43: False},
         {f"future-feature-{i}": True for i in range(33)},
     ],
 )
@@ -322,6 +325,16 @@ def test_handshake_accepts_safe_unknown_feature_identifier(handler):
 
     assert peer_info.features == {"future-feature.v1": True}
     assert response["accepted"] is True
+
+
+def test_handshake_preserves_character_limit_with_shared_utf8_bound(handler):
+    feature = "€" * 42 + "aa"
+    peer, response = handler.process_handshake(
+        _valid_handshake(features={feature: True}), "127.0.0.1:12345"
+    )
+    assert response["accepted"] is True
+    # Every admitted peer's metadata must also survive directory peerlist generation.
+    assert FeatureSet(features=set(peer.features)).to_dict() == {feature: True}
 
 
 def test_create_rejection_response(handler):

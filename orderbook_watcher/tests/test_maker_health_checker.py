@@ -99,6 +99,34 @@ def create_dn_handshake_response(
     return json.dumps(response).encode("utf-8")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "features, valid",
+    [
+        ({"€" * 43: True}, False),
+        ({f"f{i}": True for i in range(65)}, False),
+        ({f"f{i}": False for i in range(65)}, False),
+        ({"future+invalid": True}, False),
+        ({"€" * 42 + "aa": True, "future.v1": True}, True),
+    ],
+)
+async def test_probe_feature_metadata_is_bounded_before_caching(
+    health_checker: MakerHealthChecker,
+    mock_connection: MagicMock,
+    features: dict[str, bool],
+    valid: bool,
+) -> None:
+    mock_connection.receive.return_value = create_peer_handshake_response(features)
+    with patch("orderbook_watcher.health_checker.connect_via_tor", return_value=mock_connection):
+        status = await health_checker.check_maker(
+            "J5maker", "test123456789012345678901234567890123456789012345678.onion:5222"
+        )
+    assert status.reachable is valid
+    assert status.features.to_dict() == (features if valid else {})
+    assert health_checker.health_status[status.location] is status
+    mock_connection.close.assert_awaited_once()
+
+
 class TestMakerHealthChecker:
     """Test MakerHealthChecker functionality."""
 

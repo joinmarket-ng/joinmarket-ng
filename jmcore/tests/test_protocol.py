@@ -26,12 +26,59 @@ from jmcore.protocol import (
     format_utxo_list,
     get_nick_version,
     is_valid_nick,
+    merge_positive_features,
     parse_jm_message,
     parse_peer_location,
     parse_peerlist_entry,
     parse_utxo_list,
     peer_supports_neutrino_compat,
 )
+
+
+@pytest.mark.parametrize("source", ["constructor", "handshake", "list", "peerlist"])
+@pytest.mark.parametrize("names", [["€" * 43], ["f" * 129], [f"f{i}" for i in range(65)]])
+def test_feature_bounds_apply_to_every_ingress(source: str, names: list[str]) -> None:
+    with pytest.raises(ValueError, match="exceeds|limit"):
+        if source == "constructor":
+            FeatureSet(features=set(names))
+        elif source == "handshake":
+            FeatureSet.from_handshake({"features": dict.fromkeys(names, True)})
+        elif source == "list":
+            FeatureSet.from_list(names)
+        else:
+            FeatureSet.from_comma_string("+".join(names))
+
+
+def test_handshake_bounds_include_disabled_feature_metadata() -> None:
+    with pytest.raises(ValueError, match="feature limit"):
+        FeatureSet.from_handshake({"features": {f"f{i}": False for i in range(65)}})
+
+
+@pytest.mark.parametrize("serializer", ["to_dict", "to_comma_string"])
+def test_feature_serialization_rechecks_mutated_cached_values(serializer: str) -> None:
+    features = FeatureSet.from_list([f"f{i}" for i in range(64)])
+    features.features.add("overflow")
+    with pytest.raises(ValueError, match="feature limit"):
+        getattr(features, serializer)()
+
+
+def test_positive_feature_merge_validates_prospective_union_without_mutation() -> None:
+    existing = {f"f{i}": True for i in range(64)}
+    incoming = {"future-extension.v1": True}
+    with pytest.raises(ValueError, match="feature limit"):
+        merge_positive_features(existing, incoming)
+    assert len(existing) == 64
+    assert incoming == {"future-extension.v1": True}
+    assert merge_positive_features({"known": True}, {"known": False, "future": True}) == {
+        "known": True,
+        "future": True,
+    }
+    boundary = "€" * 42 + "aa"
+    features = FeatureSet.from_list([boundary, "future-extension.v1"])
+    assert FeatureSet.from_comma_string(features.to_comma_string()).to_dict() == {
+        boundary: True,
+        "future-extension.v1": True,
+    }
 
 
 @pytest.mark.parametrize("nick", ["J57wPBk1VfjSP5Te", "J5" + "O" * 14])

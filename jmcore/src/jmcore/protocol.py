@@ -53,6 +53,7 @@ import binascii
 import ipaddress
 import json
 import re
+from collections.abc import Collection, Mapping
 from enum import IntEnum, StrEnum
 from typing import Any
 
@@ -129,6 +130,40 @@ def is_safe_peerlist_feature(feature: object) -> bool:
     return _is_safe_peerlist_value(feature, _FEATURE_IDENTIFIER_DELIMITERS)
 
 
+MAX_FEATURES = 64
+MAX_FEATURE_UTF8_BYTES = 128
+
+
+def validate_feature_names(
+    features: Collection[str], *, max_count: int = MAX_FEATURES, max_chars: int | None = None
+) -> None:
+    """Bound feature metadata without restricting valid unknown extensions.
+
+    Validate raw collections before filtering disabled flags or deduplicating.
+    Directories can retain their stricter admission count and character limits.
+    """
+    if len(features) > max_count:
+        raise ValueError(f"peer feature limit exceeded: maximum {max_count} features")
+    for feature in features:
+        if not is_safe_peerlist_feature(feature):
+            raise ValueError("Invalid feature identifier")
+        if len(feature.encode("utf-8")) > MAX_FEATURE_UTF8_BYTES:
+            raise ValueError(f"feature identifier exceeds {MAX_FEATURE_UTF8_BYTES} UTF-8 bytes")
+        if max_chars is not None and len(feature) > max_chars:
+            raise ValueError(f"feature identifier exceeds {max_chars} characters")
+
+
+def merge_positive_features(
+    existing: Mapping[str, bool], incoming: Mapping[str, bool], *, max_count: int = MAX_FEATURES
+) -> dict[str, bool]:
+    """Validate both sources and their prospective positive union before mutation."""
+    validate_feature_names(existing, max_count=max_count)
+    validate_feature_names(incoming, max_count=max_count)
+    merged = {**existing, **{name: True for name, enabled in incoming.items() if enabled is True}}
+    validate_feature_names(merged, max_count=max_count)
+    return merged
+
+
 class MakerError(StrEnum):
     """Fixed maker error messages that are safe to expose to counterparties."""
 
@@ -146,14 +181,16 @@ class FeatureSet:
 
     features: set[str] = Field(default_factory=set)
 
+    def __post_init__(self) -> None:
+        validate_feature_names(self.features)
+
     @classmethod
     def from_handshake(cls, handshake_data: dict[str, Any]) -> FeatureSet:
         """Extract features from a handshake payload."""
         features_dict = handshake_data.get("features", {})
-        if not isinstance(features_dict, dict) or not all(
-            is_safe_peerlist_feature(feature) for feature in features_dict
-        ):
+        if not isinstance(features_dict, dict):
             raise ValueError("Invalid feature identifier")
+        validate_feature_names(features_dict)
         # Only include features that are set to True
         features = {k for k, v in features_dict.items() if v is True}
         return cls(features=features)
@@ -161,8 +198,7 @@ class FeatureSet:
     @classmethod
     def from_list(cls, feature_list: list[str]) -> FeatureSet:
         """Create from a list of feature names."""
-        if not all(is_safe_peerlist_feature(feature) for feature in feature_list):
-            raise ValueError("Invalid feature identifier")
+        validate_feature_names(feature_list)
         return cls(features=set(feature_list))
 
     @classmethod
@@ -177,15 +213,15 @@ class FeatureSet:
             return cls(features=set())
         # Support both + (peerlist) and , (legacy/handshake) separators
         if "+" in s:
-            features = {feature for feature in s.split("+") if feature}
+            features = [feature for feature in s.split("+") if feature]
         else:
-            features = {feature for feature in s.split(",") if feature}
-        if not all(is_safe_peerlist_feature(feature) for feature in features):
-            raise ValueError("Invalid feature identifier")
-        return cls(features=features)
+            features = [feature for feature in s.split(",") if feature]
+        validate_feature_names(features)
+        return cls(features=set(features))
 
     def to_dict(self) -> dict[str, bool]:
         """Convert to dict for JSON serialization."""
+        validate_feature_names(self.features)
         return dict.fromkeys(sorted(self.features), True)
 
     def to_comma_string(self) -> str:
@@ -195,8 +231,7 @@ class FeatureSet:
         itself uses ',' to separate entries. Using ',' for features would
         cause parsing ambiguity.
         """
-        if not all(is_safe_peerlist_feature(feature) for feature in self.features):
-            raise ValueError("Invalid feature identifier")
+        validate_feature_names(self.features)
         return "+".join(sorted(self.features))
 
     def supports(self, feature: str) -> bool:

@@ -121,15 +121,24 @@ changing private transaction message sizes or signed-input lock policy:
 | Client buffered messages | 1,024 messages and 8 MiB serialized data |
 | Client message collection | 10,000 messages and 32 MiB per collection/fetch |
 | Client retained state | 10,000 offers and 20,000 peers per directory; 64 features per peer |
+| Feature metadata | 128 UTF-8 bytes per identifier; directory admission also retains 32 keys and 64 characters per identifier |
 | Watcher bond caches | 4,096 positive entries and 4,096 short-lived retry entries |
 | Watcher mempool verification | At most 256 claims per update, five concurrent lookups, 60-second retry cooldown |
 
 Excess public broadcasts are dropped. While fetching a peerlist or orderbook, a
 client also drops relayed traffic beyond its buffer and collection limits, so any
-peer's flood cannot disconnect it; the orderbook may then be partial. Other
+peer's flood cannot disconnect it; the orderbook may then be partial.
+
+Individual feature violations do not close healthy directory connections.
+Malformed peerlist entries make a snapshot non-authoritative; a well-formed
+peer whose cumulative feature union exceeds the cap retains its presence while
+the feature update is skipped. Probe enrichment validates cached metadata and
+prospective unions before mutation, so one invalid probe cannot amplify responses
+or prevent other probes from enriching valid offers. Other aggregate
 client collection/state exhaustion closes the connection and reports failure
-rather than accepting a partial authoritative peerlist. Maker deadlines do not impose a 60-second limit on verified CoinJoin
-work. These bounds reduce resource exhaustion; they do not prevent Sybil attacks
+rather than accepting a partial authoritative peerlist. Maker deadlines do not
+impose a 60-second limit on verified CoinJoin work. These bounds reduce resource
+exhaustion; they do not prevent Sybil attacks
 or guarantee admission while an adversary continuously occupies available slots.
 
 ### Flood Behavior and Log Volume

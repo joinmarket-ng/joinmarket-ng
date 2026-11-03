@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING, Any
 from jmcore.bond_calc import calculate_timelocked_fidelity_bond_value
 from jmcore.btc_script import derive_bond_address
 from jmcore.crypto import NickIdentity
+from jmcore.directory_client import DirectoryClientFeatureError
 from jmcore.mempool_api import MempoolAPI, TxOut
 from jmcore.models import FidelityBond, Offer, OrderBook
 from jmcore.nick_auth import NickAuthMode
-from jmcore.protocol import JM_VERSION
+from jmcore.protocol import JM_VERSION, merge_positive_features, validate_feature_names
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -652,15 +653,22 @@ class OrderbookAggregator:
         features_discovered = 0
         for _location, status in health_statuses.items():
             if status.reachable and status.features.features:
-                features_dict = status.features.to_dict()
+                try:
+                    features_dict = status.features.to_dict()
+                except ValueError as exc:
+                    logger.bind(sensitive=True).debug(f"Skipping invalid probe features: {exc}")
+                    continue
                 features_discovered += 1
                 # Update all clients with this peer's features using merge
                 # (never overwrite/downgrade existing features)
                 for client in self.clients.values():
                     if status.nick in client._active_peers:
-                        client._merge_peer_features(status.nick, features_dict)
-                        # Also update cached offers
-                        client._update_offer_features(status.nick, features_dict)
+                        try:
+                            client._merge_peer_features(status.nick, features_dict)
+                        except DirectoryClientFeatureError as exc:
+                            logger.bind(sensitive=True).debug(
+                                f"Skipping invalid probe feature merge: {exc}"
+                            )
 
         if features_discovered > 0:
             logger.info(f"Feature discovery: Discovered features for {features_discovered} makers")
@@ -1085,6 +1093,13 @@ class OrderbookAggregator:
     ) -> None:
         offer_key_to_offer: dict[tuple[str, int], Offer] = {}
         for offer in deduplicated_offers:
+            try:
+                validate_feature_names(offer.features)
+            except ValueError as exc:
+                logger.bind(sensitive=True).debug(f"Ignoring invalid cached offer features: {exc}")
+                # Retain the offer, but do not serve untrusted cached metadata or
+                # mutate the source cache while constructing a response.
+                offer = offer.model_copy(update={"features": {}})
             key = (offer.counterparty, offer.oid)
             if key not in offer_key_to_offer:
                 if not offer.directory_nodes and offer.directory_node:
@@ -1095,9 +1110,14 @@ class OrderbookAggregator:
             existing_offer = offer_key_to_offer[key]
             if offer.directory_node and offer.directory_node not in existing_offer.directory_nodes:
                 existing_offer.directory_nodes.append(offer.directory_node)
-            for feature, value in offer.features.items():
-                if value and not existing_offer.features.get(feature):
-                    existing_offer.features[feature] = value
+            try:
+                merged_features = merge_positive_features(existing_offer.features, offer.features)
+            except ValueError as exc:
+                logger.bind(sensitive=True).debug(
+                    f"Skipping invalid cross-directory feature merge: {exc}"
+                )
+            else:
+                existing_offer.features.update(merged_features)
 
         for offer in offer_key_to_offer.values():
             orderbook.offers.append(offer)
@@ -1295,14 +1315,14 @@ class OrderbookAggregator:
             if health_status is None:
                 continue
 
-            offer.directly_reachable = health_status.reachable
-            if not health_status.features:
+            try:
+                health_features = health_status.features.to_dict()
+                merged_features = merge_positive_features(offer.features, health_features)
+            except ValueError as exc:
+                logger.bind(sensitive=True).debug(f"Skipping invalid cached probe features: {exc}")
                 continue
-
-            health_features = health_status.features.to_dict()
-            for feature, value in health_features.items():
-                if value:
-                    offer.features[feature] = value
+            offer.directly_reachable = health_status.reachable
+            offer.features.update(merged_features)
 
     async def _is_valid_mempool_bond_output(self, bond: FidelityBond, utxo: TxOut) -> bool:
         assert self.mempool_api is not None

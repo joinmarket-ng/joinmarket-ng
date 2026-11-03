@@ -121,6 +121,7 @@ class MakerHealthChecker:
 
     def _store_status(self, status: MakerHealthStatus) -> None:
         """Store a status while bounding attacker-controlled location state."""
+        status.features.to_dict()
         self.health_status.pop(status.location, None)
         self.health_status[status.location] = status
         while len(self.health_status) > self.max_status_entries:
@@ -294,6 +295,11 @@ class MakerHealthChecker:
         old_status = self.health_status.get(location)
         consecutive_failures = (old_status.consecutive_failures + 1) if old_status else 1
         last_success = old_status.last_success_time if old_status else None
+        previous_features = old_status.features if old_status else FeatureSet()
+        try:
+            previous_features.to_dict()
+        except ValueError:
+            previous_features = FeatureSet()
 
         status = MakerHealthStatus(
             location=location,
@@ -302,7 +308,7 @@ class MakerHealthChecker:
             last_check_time=current_time,
             last_success_time=last_success,
             consecutive_failures=consecutive_failures,
-            features=old_status.features if old_status else FeatureSet(),
+            features=previous_features,
             error=error,
         )
         self._store_status(status)

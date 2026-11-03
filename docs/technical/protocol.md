@@ -315,6 +315,13 @@ nick;location;F:feature1+feature2
 
 The `+` separator (not `,`) avoids ambiguity since peerlist entries are comma-separated.
 
+Feature metadata is limited to 64 identifiers, each at most 128 UTF-8 bytes.
+Identifiers cannot contain wire delimiters, whitespace, or control characters;
+valid unknown extensions remain supported. Directory admission retains its
+stricter limits of 32 keys and 64 characters per identifier, in addition to the
+shared byte bound. These limits cover probe handshakes, caches, serialization,
+and prospective feature unions, not just individual messages.
+
 **Neutrino Compatibility:**
 
 Extended UTXO format includes scriptPubKey + block height for verification:

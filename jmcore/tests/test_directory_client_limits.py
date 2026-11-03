@@ -298,6 +298,93 @@ def test_storage_field_byte_limits_reject_untrusted_values() -> None:
         client._merge_peer_features(VALID_MAKER_NICKS[0], {"f" * 129: True})
 
 
+def test_feature_merge_preflights_all_caches_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("jmcore.directory_client.MAX_PEER_FEATURES", 1)
+    client = DirectoryClient("host", 1234, "regtest")
+    maker = VALID_MAKER_NICKS[0]
+    first, second = _offer(maker, 0), _offer(maker, 1)
+    second.features = {"existing": True}
+    client._store_offer((maker, 0), first)
+    client._store_offer((maker, 1), second)
+    client.peer_features[maker] = {}
+    with pytest.raises(DirectoryClientError, match="feature limit"):
+        client._merge_peer_features(maker, {"new": True})
+    assert client.peer_features[maker] == {}
+    assert first.features == {}
+    assert second.features == {"existing": True}
+
+
+def test_invalid_offer_metadata_does_not_abort_other_peer_announcements() -> None:
+    client = DirectoryClient("host", 1234, "regtest")
+    bad, good = VALID_MAKER_NICKS
+    invalid = _offer(bad, 0)
+    invalid.features = {"€" * 43: True}
+    assert not client._cache_offer_announcement(bad, invalid, None)
+    assert client.peer_features == {}
+    valid = _offer(good, 0)
+    valid.features = {"future.v1": True}
+    assert client._cache_offer_announcement(good, valid, None)
+    assert set(client.offers) == {(good, 0)}
+    assert valid.features == {"future.v1": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("features", [["€" * 43], ["f" * 129], [f"f{i}" for i in range(65)]])
+async def test_invalid_individual_features_do_not_disconnect_or_prune(features: list[str]) -> None:
+    good, bad = VALID_MAKER_NICKS
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        json.dumps(
+            {
+                "type": MessageType.PEERLIST.value,
+                "line": f"{good};good.onion:5222;F:future.v1,{bad};bad.onion:5222;F:{'+'.join(features)}",
+            }
+        ).encode(),
+        TimeoutError(),
+    ]
+    client = DirectoryClient("host", 1234, "regtest")
+    client.connection = connection
+    client._active_peers[bad] = "original.onion:5222"
+    client._store_offer((bad, 0), _offer(bad, 0))
+    snapshot = await client.get_authoritative_peerlist_snapshot()
+    assert snapshot is None
+    assert client._active_peers == {bad: "original.onion:5222", good: "good.onion:5222"}
+    assert client.peer_features == {good: {"future.v1": True}}
+    assert (bad, 0) in client.offers
+    connection.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cumulative_feature_overflow_keeps_valid_peer_presence_authoritative() -> None:
+    maker, good = VALID_MAKER_NICKS
+    connection = AsyncMock()
+    connection.receive.side_effect = [
+        json.dumps(
+            {
+                "type": MessageType.PEERLIST.value,
+                "line": f"{maker};maker.onion:5222;F:new,{good};good.onion:5222;F:future.v1",
+            }
+        ).encode(),
+        TimeoutError(),
+    ]
+    client = DirectoryClient("host", 1234, "regtest")
+    client.connection = connection
+    existing = {f"f{i}": True for i in range(64)}
+    client._merge_peer_features(maker, existing)
+    offer = _offer(maker, 0)
+    offer.features = dict(existing)
+    client._store_offer((maker, 0), offer)
+    snapshot = await client.get_authoritative_peerlist_snapshot()
+    assert snapshot is not None
+    assert snapshot.nicks == {maker, good}
+    assert client.peer_features[maker] == existing
+    assert offer.features == existing
+    assert client.peer_features[good] == {"future.v1": True}
+    connection.close.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_authoritative_peerlist_limit_never_returns_partial_snapshot(
     monkeypatch: pytest.MonkeyPatch,

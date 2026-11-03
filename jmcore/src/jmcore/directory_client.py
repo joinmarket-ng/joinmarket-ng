@@ -56,8 +56,12 @@ from jmcore.protocol import (
     MessageType,
     create_handshake_request,
     is_valid_nick,
+    merge_positive_features,
     parse_peerlist_entry,
     peer_supports_neutrino_compat,
+)
+from jmcore.protocol import (
+    MAX_FEATURES as MAX_PEER_FEATURES,
 )
 from jmcore.tasks import spawn_task
 
@@ -80,6 +84,10 @@ class DirectoryClientError(Exception):
 
 class _DirectoryClientLimitError(DirectoryClientError):
     """Internal error for directory-controlled resource limit exhaustion."""
+
+
+class DirectoryClientFeatureError(DirectoryClientError):
+    """Invalid individual feature metadata, not a connection resource failure."""
 
 
 @dataclass(frozen=True)
@@ -122,10 +130,8 @@ MAX_INFLIGHT_PEERLIST_CHUNKS = 1_024
 MAX_INFLIGHT_PEERLIST_BYTES = 8 * 1024 * 1024
 MAX_RETAINED_OFFERS = 10_000
 MAX_RETAINED_PEERS = 20_000
-MAX_PEER_FEATURES = 64
 MAX_NICK_UTF8_BYTES = 64
 MAX_LOCATION_UTF8_BYTES = 300
-MAX_FEATURE_UTF8_BYTES = 128
 
 
 def _fidelity_bond_claim_key(bond_data: dict[str, Any]) -> str:
@@ -410,11 +416,14 @@ class DirectoryClient:
                 f"Directory peer location exceeds {MAX_LOCATION_UTF8_BYTES} UTF-8 bytes"
             )
 
-    def _validate_feature_storage(self, feature: str) -> None:
-        if self._utf8_size(feature, "feature identifier") > MAX_FEATURE_UTF8_BYTES:
-            raise _DirectoryClientLimitError(
-                f"Directory feature identifier exceeds {MAX_FEATURE_UTF8_BYTES} UTF-8 bytes"
-            )
+    @staticmethod
+    def _validated_feature_merge(
+        existing: dict[str, bool], incoming: dict[str, bool]
+    ) -> dict[str, bool]:
+        try:
+            return merge_positive_features(existing, incoming, max_count=MAX_PEER_FEATURES)
+        except ValueError as exc:
+            raise DirectoryClientFeatureError(f"Directory {exc}") from exc
 
     def _buffer_message(self, message: dict[str, Any]) -> None:
         """Buffer one unexpected message without allowing queue growth or blocking."""
@@ -1172,10 +1181,15 @@ class DirectoryClient:
                             "Directory active peer limit exceeded: "
                             f"maximum {MAX_RETAINED_PEERS} peers"
                         )
-                    # Merge features before active-peer mutation so a feature cache
-                    # limit cannot leave a partially added peer behind.
                     features_dict = features.to_dict()
-                    self._merge_peer_features(nick, features_dict)
+                    try:
+                        self._merge_peer_features(nick, features_dict)
+                    except DirectoryClientFeatureError as exc:
+                        # The entry still proves peer presence. A cumulative feature
+                        # overflow must not let one peer disable snapshot pruning.
+                        logger.bind(sensitive=True).warning(
+                            f"Skipping feature update for {nick}: {exc}"
+                        )
                     peers.append((nick, location, features))
                     # Update/add this nick to active peers
                     self._active_peers[nick] = location
@@ -1183,10 +1197,6 @@ class DirectoryClient:
                     # This prevents losing features when receiving peerlist from directories
                     # that don't support peerlist_features
 
-                    # Update features on any cached offers for this peer
-                    # This fixes the race condition where offers are stored before
-                    # peerlist response arrives with features
-                    self._update_offer_features(nick, features_dict)
             except ValueError as e:
                 logger.bind(sensitive=True).warning(
                     f"Failed to parse peerlist entry '{entry}': {e}"
@@ -1835,7 +1845,12 @@ class DirectoryClient:
                                     # Track new peer - merge empty features (will be a no-op
                                     # if we already know their features from another source)
                                     # Features will be populated from offer messages or peerlist
-                                    self._merge_peer_features(from_nick, {})
+                                    try:
+                                        self._merge_peer_features(from_nick, {})
+                                    except DirectoryClientFeatureError as exc:
+                                        logger.bind(sensitive=True).debug(
+                                            f"Skipping feature update for {from_nick}: {exc}"
+                                        )
                                     logger.bind(sensitive=True).debug(
                                         f"Discovered new peer: {from_nick}"
                                     )
@@ -1914,7 +1929,14 @@ class DirectoryClient:
         """Store one parsed offer while preserving monotonic bond renewals."""
         # Offers can arrive before a peerlist update. Retain their empty feature
         # entry only after applying the same peer cap as peerlist processing.
-        self._merge_peer_features(from_nick, {})
+        try:
+            self._validated_feature_merge(offer.features, {})
+            self._merge_peer_features(from_nick, {})
+        except DirectoryClientFeatureError as exc:
+            logger.bind(sensitive=True).warning(
+                f"Skipping invalid offer features for {from_nick}: {exc}"
+            )
+            return False
         bond_claim_key = _fidelity_bond_claim_key(bond_data) if bond_data else None
         if not self._store_offer((from_nick, offer.oid), offer, bond_claim_key):
             return False
@@ -2086,6 +2108,7 @@ class DirectoryClient:
         current_time = time.time()
         old_offer_data = self.offers.get(offer_key)
         self._validate_nick_storage(offer_key[0])
+        self._validated_feature_merge(offer.features, {})
         new_expiry = (offer.fidelity_bond_data or {}).get("cert_expiry", -1)
 
         if bond_utxo_key:
@@ -2193,26 +2216,14 @@ class DirectoryClient:
             Number of offers updated
         """
         self._validate_nick_storage(nick)
-        positive_features = {feature for feature, value in features.items() if value}
-        for feature in positive_features:
-            self._validate_feature_storage(feature)
-
+        self._validated_feature_merge({}, features)
         matching_offers = [offer_ts for key, offer_ts in self.offers.items() if key[0] == nick]
-        for offer_ts in matching_offers:
-            merged_feature_count = len(
-                {feature for feature, value in offer_ts.offer.features.items() if value}
-                | positive_features
-            )
-            if merged_feature_count > MAX_PEER_FEATURES:
-                raise _DirectoryClientLimitError(
-                    "Directory offer feature limit exceeded: "
-                    f"maximum {MAX_PEER_FEATURES} features per peer"
-                )
-
-        for offer_ts in matching_offers:
-            # Merge new features with any existing ones (new features take precedence).
-            for feature in positive_features:
-                offer_ts.offer.features[feature] = True
+        prospective = [
+            self._validated_feature_merge(offer_ts.offer.features, features)
+            for offer_ts in matching_offers
+        ]
+        for offer_ts, merged in zip(matching_offers, prospective, strict=True):
+            offer_ts.offer.features.update(merged)
 
         updated = len(matching_offers)
 
@@ -2227,9 +2238,14 @@ class DirectoryClient:
     def _enrich_returned_offers_with_peer_features(self, offers: list[Offer]) -> None:
         """Merge final positive peer feature evidence into returned offers."""
         for offer in offers:
-            for feature, value in self.peer_features.get(offer.counterparty, {}).items():
-                if value:
-                    offer.features[feature] = True
+            try:
+                merged = self._validated_feature_merge(
+                    offer.features, self.peer_features.get(offer.counterparty, {})
+                )
+            except DirectoryClientFeatureError as exc:
+                logger.bind(sensitive=True).debug(f"Skipping invalid feature enrichment: {exc}")
+                continue
+            offer.features.update(merged)
 
     def _merge_peer_features(self, nick: str, new_features: dict[str, bool]) -> None:
         """
@@ -2245,9 +2261,7 @@ class DirectoryClient:
         """
         self._validate_nick_storage(nick)
         existing = self.peer_features.get(nick)
-        positive_features = {feature for feature, value in new_features.items() if value}
-        for feature in positive_features:
-            self._validate_feature_storage(feature)
+        merged = self._validated_feature_merge(existing or {}, new_features)
 
         if existing is None:
             if len(self.peer_features) >= MAX_RETAINED_PEERS:
@@ -2257,16 +2271,11 @@ class DirectoryClient:
                 )
             existing = {}
 
-        added_features = positive_features.difference(existing)
-        if len(existing) + len(added_features) > MAX_PEER_FEATURES:
-            raise _DirectoryClientLimitError(
-                "Directory peer feature limit exceeded: "
-                f"maximum {MAX_PEER_FEATURES} features per peer"
-            )
-
-        for feature in added_features:
-            # Only set true features, never downgrade an existing positive value.
-            existing[feature] = True
+        # Empty/disabled updates are also used on every offer announcement;
+        # they must not scan the full offer cache when no flag can change.
+        if any(value is True for value in new_features.values()):
+            self._update_offer_features(nick, new_features)
+        existing.update(merged)
         self.peer_features[nick] = existing
 
     def remove_offers_for_nick(self, nick: str) -> int:
