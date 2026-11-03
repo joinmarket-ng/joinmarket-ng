@@ -80,6 +80,12 @@ Readable administrator-owned or read-only files remain usable if permissions
 cannot be tightened; a warning asks the operator to address the exposure.
 Wallet key and TLS files retain their stricter no-follow rules.
 
+Atomic writes sync file contents before replacement, then sync the parent
+directory on supported platforms. Unsupported directory sync emits a warning;
+Windows retains its existing behavior. Other sync failures are reported even
+if replacement already installed the new bytes, so a reported failure does not
+mean the previous contents remain. Existing files need no format migration.
+
 An upgrade preserves existing file contents, metadata records, and directory
 permissions. Missing default data and state directories are created with mode
 `0700`; existing shared or symlinked directories are not changed. This permission

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 from pathlib import Path
 
 import pytest
 
 from jmcore.secure_files import (
+    _sync_directory,
     atomic_write_private,
     atomic_write_sensitive_file,
+    create_private_file_exclusive,
     ensure_private_directory,
     ensure_private_file,
     ensure_sensitive_directory,
@@ -22,6 +25,170 @@ from jmcore.secure_files import (
 
 def _mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
+
+
+def test_atomic_write_syncs_file_then_replacement_then_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "history.json"
+    events: list[str] = []
+    fsync = os.fsync
+    replace = os.replace
+
+    def record_fsync(fd: int) -> None:
+        events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        fsync(fd)
+
+    def record_replace(source: Path, target: Path) -> None:
+        events.append("replace")
+        replace(source, target)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
+    atomic_write_private(path, b"new")
+
+    assert events == ["file", "replace", "directory"]
+    assert path.read_bytes() == b"new"
+
+
+@pytest.mark.parametrize("error", [errno.EIO, errno.ENOSPC, errno.EACCES, errno.EROFS])
+def test_directory_sync_failure_propagates_after_replacement_and_closes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: int,
+) -> None:
+    path = tmp_path / "history.json"
+    path.write_bytes(b"old")
+    directory_fds: list[int] = []
+    fsync = os.fsync
+
+    def fail_directory_sync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_fds.append(fd)
+            raise OSError(error, "directory sync failed")
+        fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_sync)
+    with pytest.raises(OSError) as exc:
+        atomic_write_private(path, b"new")
+
+    assert exc.value.errno == error
+    assert path.read_bytes() == b"new"
+    assert list(tmp_path.iterdir()) == [path]
+    assert len(directory_fds) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(directory_fds[0])
+    assert closed.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("error", sorted({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}))
+def test_unsupported_directory_sync_warns_without_rejecting_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: int,
+) -> None:
+    fsync = os.fsync
+
+    def unsupported_directory_sync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(error, "unsupported directory sync")
+        fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", unsupported_directory_sync)
+    path = tmp_path / "history.json"
+    atomic_write_private(path, b"new")
+
+    assert path.read_bytes() == b"new"
+    assert "durability is unconfirmed" in caplog.text
+
+
+def test_file_sync_failure_preserves_previous_bytes_and_cleans_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "history.json"
+    path.write_bytes(b"old")
+
+    def fail_sync(_fd: int) -> None:
+        raise OSError(errno.EIO, "file sync failed")
+
+    monkeypatch.setattr(os, "fsync", fail_sync)
+    with pytest.raises(OSError, match="file sync failed"):
+        atomic_write_private(path, b"new")
+    assert path.read_bytes() == b"old"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_directory_open_failure_is_not_treated_as_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_open(_path: Path, _flags: int) -> int:
+        raise OSError(errno.EINVAL, "directory open failed")
+
+    monkeypatch.setattr(os, "open", fail_open)
+    with pytest.raises(OSError, match="directory open failed"):
+        _sync_directory(tmp_path)
+
+
+def test_windows_directory_sync_does_not_open_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_open(_path: Path, _flags: int) -> int:
+        raise AssertionError("directory descriptor is not portable on Windows")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(os, "open", unexpected_open)
+        _sync_directory(tmp_path)
+
+
+def test_exclusive_private_creation_is_owner_only_and_never_replaces(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "history.json"
+    create_private_file_exclusive(path, b"original")
+    assert _mode(path) == 0o600
+    assert _mode(path.parent) == 0o700
+    with pytest.raises(FileExistsError):
+        create_private_file_exclusive(path, b"replacement")
+    assert path.read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_exclusive_private_creation_refuses_existing_aliases(
+    tmp_path: Path, dangling: bool
+) -> None:
+    target = tmp_path / "target"
+    if not dangling:
+        target.write_bytes(b"original")
+    link = tmp_path / "history.json"
+    link.symlink_to(target)
+    with pytest.raises(FileExistsError):
+        create_private_file_exclusive(link, b"replacement")
+    assert link.is_symlink()
+    if not dangling:
+        assert target.read_bytes() == b"original"
+    else:
+        assert not target.exists()
+
+
+def test_exclusive_private_creation_failure_preserves_bytes_for_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "history.json"
+
+    def fail_sync(_fd: int) -> None:
+        raise OSError(errno.EIO, "sync failed")
+
+    monkeypatch.setattr(os, "fsync", fail_sync)
+    with pytest.raises(OSError, match="sync failed"):
+        create_private_file_exclusive(path, b"unconfirmed")
+    assert path.read_bytes() == b"unconfirmed"
+    with pytest.raises(FileExistsError):
+        create_private_file_exclusive(path, b"replacement")
 
 
 def test_ensure_private_directory_ignores_permissive_umask(tmp_path: Path) -> None:

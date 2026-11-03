@@ -137,8 +137,29 @@ def read_sensitive_file(path: Path) -> bytes:
         return sensitive_file.read()
 
 
+def _sync_directory(path: Path) -> None:
+    """Persist a replacement's directory entry where directory fsync is supported."""
+    if os.name == "nt":
+        return
+
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise
+            logger.warning("Directory fsync is unsupported; replacement durability is unconfirmed")
+    finally:
+        os.close(fd)
+
+
 def atomic_write_private(path: Path, data: bytes) -> None:
-    """Atomically write bytes without exposing a permissively-mode temporary file."""
+    """Atomically replace private bytes, syncing the file and supported parent directory.
+
+    A directory-sync failure propagates after replacement: new bytes may already
+    be present, but their crash durability has not been confirmed.
+    """
     _reject_parent_traversal(path)
     parent = path.parent
     if parent.is_symlink():
@@ -160,6 +181,7 @@ def atomic_write_private(path: Path, data: bytes) -> None:
             temp_file.flush()
             os.fsync(temp_file.fileno())
         os.replace(temp_path, path)
+        _sync_directory(parent)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -170,3 +192,29 @@ def atomic_write_private(path: Path, data: bytes) -> None:
 def atomic_write_sensitive_file(path: Path, data: bytes) -> None:
     """Atomically update a sensitive file while preserving configured aliases."""
     atomic_write_private(path.resolve(strict=False), data)
+
+
+def create_private_file_exclusive(path: Path, data: bytes) -> None:
+    """Create and sync a missing private file without replacing any existing path.
+
+    Failed initialization leaves its bytes in place for explicit recovery rather
+    than allowing another attempt to mistake partial state for a missing file.
+    """
+    _reject_parent_traversal(path)
+    parent = path.parent
+    if parent.is_symlink():
+        raise OSError(f"refusing to use symlink as private directory: {parent}")
+    if not parent.exists():
+        ensure_private_directory(parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as new_file:
+            fd = -1
+            new_file.write(data)
+            new_file.flush()
+            os.fsync(new_file.fileno())
+        _sync_directory(parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
