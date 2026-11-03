@@ -111,6 +111,33 @@ async def _run_one_refresh_iteration(agg: OrderbookAggregator) -> None:
 
 class TestPerDirectoryPeerlistCleanup:
     @pytest.mark.asyncio
+    async def test_total_timeout_partial_snapshot_does_not_prune_healthy_peers(self) -> None:
+        client = _make_client(
+            nicks_with_offers=["alice", "bob"],
+            peerlist_chunks=None,
+            announces_peerlist_features=True,
+        )
+        first = True
+
+        async def receive() -> bytes:
+            nonlocal first
+            line = "alice;alice.onion:5222" if first else "peerlist_features"
+            first = False
+            return json.dumps({"type": MessageType.PEERLIST.value, "line": line}).encode()
+
+        client.connection.receive.side_effect = receive
+        remove = MagicMock(wraps=client.remove_offers_for_nick)
+        client.remove_offers_for_nick = remove  # type: ignore[method-assign]
+        agg = _build_aggregator()
+        agg.clients = {"node1:5222": client}
+
+        async with asyncio.timeout(0.8):
+            await _run_one_refresh_iteration(agg)
+
+        remove.assert_not_called()
+        assert set(client.offers) == {("alice", 0), ("bob", 0)}
+
+    @pytest.mark.asyncio
     async def test_removes_offers_for_nicks_not_in_directory_peerlist(self) -> None:
         """Offers from nicks the directory no longer reports must be dropped."""
         client = _make_client(

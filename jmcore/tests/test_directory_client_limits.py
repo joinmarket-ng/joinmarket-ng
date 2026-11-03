@@ -133,6 +133,7 @@ async def test_listen_message_byte_limit_closes_without_returning_partial_messag
         len(json.dumps(message).encode("utf-8")) - 1,
     )
     connection = AsyncMock()
+    connection.abort = Mock()
     connection.is_connected = Mock(return_value=True)
     connection.receive.return_value = json.dumps(message).encode("utf-8")
     client = DirectoryClient("host", 1234, "mainnet")
@@ -141,7 +142,8 @@ async def test_listen_message_byte_limit_closes_without_returning_partial_messag
     with pytest.raises(DirectoryClientError, match="listen byte limit"):
         await client.listen_for_messages(duration=1.0)
 
-    connection.close.assert_awaited_once()
+    connection.abort.assert_called_once_with()
+    connection.close.assert_not_awaited()
     assert client.connection is None
 
 
@@ -229,6 +231,7 @@ async def test_listener_peerlist_sink_limit_wakes_stalled_fetcher(
     on_disconnect = Mock()
     client = DirectoryClient("host", 1234, "mainnet", on_disconnect=on_disconnect)
     connection = AsyncMock()
+    connection.abort = Mock()
     connection.receive.side_effect = [
         json.dumps({"type": MessageType.PEERLIST.value, "line": "peer1;loc1.onion:5222"}).encode(
             "utf-8"
@@ -248,7 +251,8 @@ async def test_listener_peerlist_sink_limit_wakes_stalled_fetcher(
     assert client.running is False
     assert client._peerlist_inflight is not None
     assert client._peerlist_inflight.get_nowait() is None
-    connection.close.assert_awaited_once()
+    connection.abort.assert_called_once_with()
+    connection.close.assert_not_awaited()
     assert client.connection is None
     on_disconnect.assert_called_once_with()
     client._notify_disconnect()
@@ -392,6 +396,7 @@ async def test_authoritative_peerlist_limit_never_returns_partial_snapshot(
     """A peerlist that exceeds its retained peer limit is not authoritative."""
     monkeypatch.setattr("jmcore.directory_client.MAX_RETAINED_PEERS", 1)
     connection = AsyncMock()
+    connection.abort = Mock()
     connection.receive.side_effect = [
         json.dumps({"type": MessageType.PEERLIST.value, "line": "peer1;loc1.onion:5222"}).encode(
             "utf-8"
@@ -406,6 +411,7 @@ async def test_authoritative_peerlist_limit_never_returns_partial_snapshot(
     with pytest.raises(DirectoryClientError, match="active peer limit"):
         await client.get_authoritative_peerlist_snapshot()
 
-    connection.close.assert_awaited_once()
+    connection.abort.assert_called_once_with()
+    connection.close.assert_not_awaited()
     assert client.connection is None
     assert client.get_active_nicks() == {"peer1"}

@@ -511,8 +511,9 @@ class DirectoryClient:
         self.running = False
         self._listen_loop_active = False
         self._wake_peerlist_sink()
-        with contextlib.suppress(Exception):
-            await self.close()
+        # A resource failure must not wait for a blocked writer to drain or
+        # let cancellation turn a fatal limit into a partial discovery result.
+        self.abort()
         self._notify_disconnect()
         raise error
 
@@ -902,7 +903,6 @@ class DirectoryClient:
 
         getpeerlist_msg = {"type": MessageType.GETPEERLIST.value, "line": ""}
         logger.debug("Sending GETPEERLIST request")
-        await self.connection.send(json.dumps(getpeerlist_msg).encode("utf-8"))
 
         start_time = asyncio.get_event_loop().time()
 
@@ -915,6 +915,7 @@ class DirectoryClient:
         # Timeout between chunks - when this expires after receiving at least one
         # PEERLIST message, we know the directory has finished sending all chunks
         inter_chunk_timeout = self._peerlist_chunk_timeout
+        deadline = start_time + first_response_timeout + inter_chunk_timeout
 
         # Accumulate peers from multiple PEERLIST chunks
         all_peers: list[tuple[str, str, FeatureSet]] = []
@@ -931,139 +932,139 @@ class DirectoryClient:
         max_consecutive_errors = 5
 
         try:
-            while True:
-                elapsed = asyncio.get_event_loop().time() - start_time
-
-                # Determine timeout for this receive
-                if not got_first_response:
-                    # Waiting for first PEERLIST - use full timeout
-                    remaining = first_response_timeout - elapsed
-                    if remaining <= 0:
-                        self._handle_peerlist_timeout()
-                        return _PeerlistFetchResult(peers=(), snapshot=None)
-                    receive_timeout = remaining
-                else:
-                    # Already received at least one chunk - use shorter inter-chunk
-                    # timeout, measured from the last chunk so that other relayed
-                    # traffic cannot keep the fetch open.
-                    receive_timeout = max(0.0, inter_chunk_timeout - (elapsed - last_chunk_at))
-
-                try:
-                    if use_inflight_sink:
-                        assert self._peerlist_inflight is not None
-                        # The listen loop feeds PEERLIST payloads (the "line"
-                        # field) into this queue. Non-PEERLIST messages stay
-                        # in the listen loop and are handled there.
-                        peerlist_str = await asyncio.wait_for(
-                            self._peerlist_inflight.get(), timeout=receive_timeout
-                        )
-                        if peerlist_str is None:
-                            raise DirectoryClientError("Connection lost while waiting for PEERLIST")
-                        self._discard_peerlist_chunk(peerlist_str)
-                        consecutive_errors = 0
-                        got_first_response = True
-                        last_chunk_at = asyncio.get_event_loop().time() - start_time
-                        chunks_received += 1
-                        chunk_peers, chunk_malformed = self._process_peerlist_response(peerlist_str)
-                        response_incomplete = response_incomplete or chunk_malformed
-                        self._extend_peerlist_peers(all_peers, chunk_peers)
-                        logger.debug(
-                            f"Received PEERLIST chunk {chunks_received} with "
-                            f"{len(chunk_peers)} peers (total: {len(all_peers)})"
-                        )
-                        continue
-
-                    response_data = await asyncio.wait_for(
-                        self.connection.receive(), timeout=receive_timeout
-                    )
-                    response = json.loads(response_data.decode("utf-8"))
-                    msg_type = response.get("type")
-                    await self._reject_out_of_order_nick_auth(msg_type)
-                    consecutive_errors = 0
-
-                    if msg_type == MessageType.PEERLIST.value:
-                        got_first_response = True
-                        last_chunk_at = asyncio.get_event_loop().time() - start_time
-                        chunks_received += 1
-                        peerlist_str = response.get("line", "")
-                        chunk_peers, chunk_malformed = self._process_peerlist_response(peerlist_str)
-                        response_incomplete = response_incomplete or chunk_malformed
-                        self._extend_peerlist_peers(all_peers, chunk_peers)
-                        logger.debug(
-                            f"Received PEERLIST chunk {chunks_received} with "
-                            f"{len(chunk_peers)} peers (total: {len(all_peers)})"
-                        )
-                        # Continue to check for more chunks
-                        continue
-
-                    # Buffer unexpected messages (like PUBMSG offers) for later processing
-                    # Handle PING immediately instead of buffering
-                    if msg_type == MessageType.PING.value:
-                        await self._send_pong()
-                        continue
-
-                    logger.trace(
-                        f"Buffering unexpected message type {msg_type} while waiting for PEERLIST"
-                    )
-                    try:
-                        self._buffer_message(response)
-                    except _DirectoryClientLimitError:
-                        # Relayed traffic from any peer lands here; dropping it
-                        # keeps the bound without disconnecting from the directory.
-                        logger.trace("Dropping message while waiting for PEERLIST: buffer full")
-
-                except TimeoutError:
-                    if not got_first_response:
-                        # Never received any PEERLIST - this is a real timeout
-                        self._handle_peerlist_timeout()
-                        return _PeerlistFetchResult(peers=(), snapshot=None)
-                    # Received at least one chunk, inter-chunk timeout means we're done
-                    logger.debug(
-                        f"Peerlist complete: received {len(all_peers)} peers "
-                        f"in {chunks_received} chunks"
-                    )
-                    break
-
-                except NetworkConnectionError as e:
-                    # Connection-level error from our network layer (e.g. the
-                    # connection was closed under us by a concurrent stop()).
-                    # ``receive()`` then raises synchronously with no I/O wait,
-                    # so retrying would busy-loop until first_response_timeout
-                    # (issue #557). Abort immediately, matching
-                    # ``listen_for_messages``.
-                    raise DirectoryClientError(
-                        f"Connection lost while waiting for PEERLIST: {e}"
-                    ) from e
-                except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                    # System-level connection errors that bypassed our network layer.
-                    raise DirectoryClientError(
-                        f"Connection lost while waiting for PEERLIST: {e}"
-                    ) from e
-                except _DirectoryClientLimitError as e:
-                    await self._abort_for_resource_limit(e)
-                except DirectoryClientError:
-                    raise
-
-                except Exception as e:
-                    consecutive_errors += 1
-                    logger.bind(sensitive=True).warning(
-                        f"Error receiving/parsing message while waiting for PEERLIST: {e}"
-                    )
-                    if consecutive_errors >= max_consecutive_errors:
-                        # Defense in depth: never let a repeatedly-failing,
-                        # non-connection error (e.g. malformed payloads) spin.
-                        raise DirectoryClientError(
-                            f"Too many consecutive errors while waiting for PEERLIST "
-                            f"({consecutive_errors}), last error: {e}"
-                        ) from e
+            async with asyncio.timeout_at(deadline):
+                await self.connection.send(json.dumps(getpeerlist_msg).encode("utf-8"))
+                while True:
                     elapsed = asyncio.get_event_loop().time() - start_time
-                    if not got_first_response and elapsed > first_response_timeout:
-                        self._handle_peerlist_timeout()
-                        return _PeerlistFetchResult(peers=(), snapshot=None)
-                    # If we already have some data, return what we have
-                    if got_first_response:
-                        response_incomplete = True
+                    # Preserve first-response and quiet timers within the absolute deadline.
+                    if not got_first_response:
+                        remaining = first_response_timeout - elapsed
+                        if remaining <= 0:
+                            self._handle_peerlist_timeout()
+                            return _PeerlistFetchResult(peers=(), snapshot=None)
+                        receive_timeout = remaining
+                    else:
+                        # Buffered reads and queue.get() can finish without yielding,
+                        # so timer callbacks alone cannot stop a metadata drip.
+                        if asyncio.get_event_loop().time() >= deadline:
+                            response_incomplete = True
+                            break
+                        receive_timeout = max(0.0, inter_chunk_timeout - (elapsed - last_chunk_at))
+
+                    try:
+                        if use_inflight_sink:
+                            assert self._peerlist_inflight is not None
+                            # The listener remains the sole connection reader.
+                            peerlist_str = await asyncio.wait_for(
+                                self._peerlist_inflight.get(), timeout=receive_timeout
+                            )
+                            if peerlist_str is None:
+                                raise DirectoryClientError(
+                                    "Connection lost while waiting for PEERLIST"
+                                )
+                            self._discard_peerlist_chunk(peerlist_str)
+                            consecutive_errors = 0
+                            got_first_response = True
+                            last_chunk_at = asyncio.get_event_loop().time() - start_time
+                            chunks_received += 1
+                            chunk_peers, chunk_malformed = self._process_peerlist_response(
+                                peerlist_str
+                            )
+                            response_incomplete = response_incomplete or chunk_malformed
+                            self._extend_peerlist_peers(all_peers, chunk_peers)
+                            logger.debug(
+                                f"Received PEERLIST chunk {chunks_received} with "
+                                f"{len(chunk_peers)} peers (total: {len(all_peers)})"
+                            )
+                            continue
+
+                        response_data = await asyncio.wait_for(
+                            self.connection.receive(), timeout=receive_timeout
+                        )
+                        response = json.loads(response_data.decode("utf-8"))
+                        msg_type = response.get("type")
+                        await self._reject_out_of_order_nick_auth(msg_type)
+                        consecutive_errors = 0
+
+                        if msg_type == MessageType.PEERLIST.value:
+                            got_first_response = True
+                            last_chunk_at = asyncio.get_event_loop().time() - start_time
+                            chunks_received += 1
+                            peerlist_str = response.get("line", "")
+                            chunk_peers, chunk_malformed = self._process_peerlist_response(
+                                peerlist_str
+                            )
+                            response_incomplete = response_incomplete or chunk_malformed
+                            self._extend_peerlist_peers(all_peers, chunk_peers)
+                            logger.debug(
+                                f"Received PEERLIST chunk {chunks_received} with "
+                                f"{len(chunk_peers)} peers (total: {len(all_peers)})"
+                            )
+                            continue
+
+                        if msg_type == MessageType.PING.value:
+                            await self._send_pong()
+                            continue
+
+                        logger.trace(
+                            f"Buffering unexpected message type {msg_type} while waiting for PEERLIST"
+                        )
+                        try:
+                            self._buffer_message(response)
+                        except _DirectoryClientLimitError:
+                            # Relayed traffic must not disconnect the directory.
+                            logger.trace("Dropping message while waiting for PEERLIST: buffer full")
+
+                    except TimeoutError:
+                        if not got_first_response:
+                            self._handle_peerlist_timeout()
+                            return _PeerlistFetchResult(peers=(), snapshot=None)
+                        # Only a receive quiet timeout proves successful completion.
+                        logger.debug(
+                            f"Peerlist complete: received {len(all_peers)} peers "
+                            f"in {chunks_received} chunks"
+                        )
                         break
+
+                    except NetworkConnectionError as e:
+                        # Closed transports may raise without yielding: never retry them.
+                        raise DirectoryClientError(
+                            f"Connection lost while waiting for PEERLIST: {e}"
+                        ) from e
+                    except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                        raise DirectoryClientError(
+                            f"Connection lost while waiting for PEERLIST: {e}"
+                        ) from e
+                    except _DirectoryClientLimitError as e:
+                        await self._abort_for_resource_limit(e)
+                    except DirectoryClientError:
+                        raise
+
+                    except Exception as e:
+                        consecutive_errors += 1
+                        logger.bind(sensitive=True).warning(
+                            f"Error receiving/parsing message while waiting for PEERLIST: {e}"
+                        )
+                        if consecutive_errors >= max_consecutive_errors:
+                            raise DirectoryClientError(
+                                f"Too many consecutive errors while waiting for PEERLIST "
+                                f"({consecutive_errors}), last error: {e}"
+                            ) from e
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        if not got_first_response and elapsed > first_response_timeout:
+                            self._handle_peerlist_timeout()
+                            return _PeerlistFetchResult(peers=(), snapshot=None)
+                        if got_first_response:
+                            response_incomplete = True
+                            break
+        except TimeoutError:
+            if not got_first_response:
+                self._handle_peerlist_timeout()
+            else:
+                self._peerlist_timeout_count = 0
+                self._peerlist_supported = True
+            logger.debug("Peerlist absolute deadline reached; response is non-authoritative")
+            return _PeerlistFetchResult(peers=tuple(all_peers), snapshot=None)
         finally:
             if use_inflight_sink:
                 self._peerlist_inflight = None
@@ -1077,7 +1078,7 @@ class DirectoryClient:
             f"Received {len(all_peers)} active peers from {self.host}:{self.port}"
         )
         peers = tuple(all_peers)
-        if response_incomplete:
+        if response_incomplete or asyncio.get_event_loop().time() >= deadline:
             return _PeerlistFetchResult(peers=peers, snapshot=None)
 
         snapshot = PeerlistSnapshot(peers=peers)
@@ -1237,6 +1238,9 @@ class DirectoryClient:
                 dropped instead of closing the connection, so relayed traffic from
                 other peers cannot end the caller's collection.
 
+        The duration also bounds buffered-message processing and PONG sends.
+        Deadline expiry returns collected messages; caller cancellation propagates.
+
         Returns:
             List of received messages
 
@@ -1267,75 +1271,74 @@ class DirectoryClient:
                     raise
                 logger.trace("Dropping message: listen collection limit reached")
 
-        # First, drain any buffered messages into our result list
-        # These are messages that were received while waiting for other responses
-        while not self._message_buffer.empty():
-            try:
-                buffered_msg = self._message_buffer.get_nowait()
-                self._discard_buffered_message(buffered_msg)
-                await self._reject_out_of_order_nick_auth(buffered_msg.get("type"))
-                logger.bind(sensitive=True).trace(
-                    f"Processing buffered message type {buffered_msg.get('type')}: "
-                    f"{buffered_msg.get('line', '')[:80]}..."
-                )
-                collect(buffered_msg)
-            except asyncio.QueueEmpty:
-                break
-            except _DirectoryClientLimitError as e:
-                await self._abort_for_resource_limit(e)
+        try:
+            # Keep the partial list in this scope: cancelling a caller's chunk
+            # await would otherwise discard offers received before a blocked PONG.
+            async with asyncio.timeout_at(start_time + duration):
+                # Drain traffic received while waiting for other responses.
+                while not self._message_buffer.empty():
+                    try:
+                        buffered_msg = self._message_buffer.get_nowait()
+                        self._discard_buffered_message(buffered_msg)
+                        await self._reject_out_of_order_nick_auth(buffered_msg.get("type"))
+                        logger.bind(sensitive=True).trace(
+                            f"Processing buffered message type {buffered_msg.get('type')}: "
+                            f"{buffered_msg.get('line', '')[:80]}..."
+                        )
+                        collect(buffered_msg)
+                    except asyncio.QueueEmpty:
+                        break
+                    except _DirectoryClientLimitError as e:
+                        await self._abort_for_resource_limit(e)
 
-        # Track consecutive errors to prevent tight loops on persistent failures
-        consecutive_errors = 0
-        max_consecutive_errors = 5
-
-        while asyncio.get_event_loop().time() - start_time < duration:
-            try:
-                remaining_time = duration - (asyncio.get_event_loop().time() - start_time)
-                if remaining_time <= 0:
-                    break
-
-                response_data = await asyncio.wait_for(
-                    self.connection.receive(), timeout=remaining_time
-                )
-                response = json.loads(response_data.decode("utf-8"))
-                await self._reject_out_of_order_nick_auth(response.get("type"))
-                logger.bind(sensitive=True).trace(
-                    f"Received message type {response.get('type')}: "
-                    f"{response.get('line', '')[:80]}..."
-                )
-
-                # Handle PING immediately by sending PONG back -- don't buffer
-                if response.get("type") == MessageType.PING.value:
-                    await self._send_pong()
-                    consecutive_errors = 0
-                    continue
-
-                collect(response)
                 consecutive_errors = 0
+                max_consecutive_errors = 5
 
-            except TimeoutError:
-                # Normal timeout - no more messages within duration
-                break
-            except NetworkConnectionError as e:
-                # Connection-level errors from our network layer - always propagate
-                raise DirectoryClientError(f"Connection lost: {e}") from e
-            except _DirectoryClientLimitError as e:
-                await self._abort_for_resource_limit(e)
-            except DirectoryClientError:
-                raise
-            except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                # System-level connection errors that bypassed our network layer
-                raise DirectoryClientError(f"Connection lost: {e}") from e
-            except Exception as e:
-                # Other errors (JSON parse, etc) - log and continue, but with a limit
-                consecutive_errors += 1
-                logger.warning("Error processing directory message")
-                logger.bind(sensitive=True).warning(f"Error processing message: {e}")
-                if consecutive_errors >= max_consecutive_errors:
-                    raise DirectoryClientError(
-                        f"Too many consecutive errors ({consecutive_errors}), last error: {e}"
-                    ) from e
-                continue
+                while asyncio.get_event_loop().time() - start_time < duration:
+                    try:
+                        remaining_time = duration - (asyncio.get_event_loop().time() - start_time)
+                        if remaining_time <= 0:
+                            break
+
+                        response_data = await asyncio.wait_for(
+                            self.connection.receive(), timeout=remaining_time
+                        )
+                        response = json.loads(response_data.decode("utf-8"))
+                        await self._reject_out_of_order_nick_auth(response.get("type"))
+                        logger.bind(sensitive=True).trace(
+                            f"Received message type {response.get('type')}: "
+                            f"{response.get('line', '')[:80]}..."
+                        )
+
+                        if response.get("type") == MessageType.PING.value:
+                            await self._send_pong()
+                            consecutive_errors = 0
+                            continue
+
+                        collect(response)
+                        consecutive_errors = 0
+
+                    except TimeoutError:
+                        break
+                    except NetworkConnectionError as e:
+                        raise DirectoryClientError(f"Connection lost: {e}") from e
+                    except _DirectoryClientLimitError as e:
+                        await self._abort_for_resource_limit(e)
+                    except DirectoryClientError:
+                        raise
+                    except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                        raise DirectoryClientError(f"Connection lost: {e}") from e
+                    except Exception as e:
+                        consecutive_errors += 1
+                        logger.warning("Error processing directory message")
+                        logger.bind(sensitive=True).warning(f"Error processing message: {e}")
+                        if consecutive_errors >= max_consecutive_errors:
+                            raise DirectoryClientError(
+                                f"Too many consecutive errors ({consecutive_errors}), last error: {e}"
+                            ) from e
+                        continue
+        except TimeoutError:
+            logger.trace("Message collection deadline reached; retaining partial messages")
 
         logger.trace(f"Collected {len(messages)} messages in {duration}s")
         return messages
@@ -1359,7 +1362,8 @@ class DirectoryClient:
         the connection state and removes offers when makers disconnect.
 
         Args:
-            max_wait: Hard ceiling in seconds (default 120). Based on empirical Tor
+            max_wait: Hard ceiling for the broadcast send and offer collection, after
+                the independently bounded peerlist request. Based on empirical Tor
                 testing: 95th percentile ~101s, 99th percentile ~115s.
             min_wait: Minimum seconds before early exit is allowed (default 30).
                 Prevents cutting off slow Tor responses during the initial burst.
@@ -1390,8 +1394,6 @@ class DirectoryClient:
             "type": MessageType.PUBMSG.value,
             "line": f"{self.nick}!PUBLIC!orderbook",
         }
-        await self.connection.send(json.dumps(pubmsg).encode("utf-8"))
-        logger.debug("Sent !orderbook broadcast to PUBLIC")
 
         # Adaptive orderbook listening: instead of waiting a fixed duration, we listen
         # in small chunks and exit early once offers stop arriving. This dramatically
@@ -1432,6 +1434,13 @@ class DirectoryClient:
         start_time = asyncio.get_event_loop().time()
         last_offer_time = start_time
         chunk_duration = 1.0  # Listen in 1s chunks for responsiveness
+
+        try:
+            async with asyncio.timeout_at(start_time + max_wait):
+                await self.connection.send(json.dumps(pubmsg).encode("utf-8"))
+            logger.debug("Sent !orderbook broadcast to PUBLIC")
+        except TimeoutError as exc:
+            raise DirectoryClientError("Timed out sending orderbook request") from exc
 
         while True:
             elapsed = asyncio.get_event_loop().time() - start_time

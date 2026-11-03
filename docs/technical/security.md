@@ -141,6 +141,21 @@ impose a 60-second limit on verified CoinJoin work. These bounds reduce resource
 exhaustion; they do not prevent Sybil attacks
 or guarantee admission while an adversary continuously occupies available slots.
 
+Directory discovery also has absolute deadlines. A peerlist request's total
+budget begins before GETPEERLIST is sent and combines its first-response and
+inter-chunk quiet allowances. Sending, processing chunks, and replying to PING
+cannot reset that budget. Total expiry retains partial discoveries but never
+produces an authoritative snapshot, so watcher refreshes cannot prune peers
+based on the incomplete response. A normally completed empty snapshot still
+permits cleanup.
+
+After the independently bounded peerlist request, the orderbook wait budget
+covers sending the public request and collecting replies, including PONG sends.
+Deadline expiry retains offers from the final collection chunk; a stalled
+request send reports a directory failure. Slow endpoints cannot indefinitely
+delay healthy directories' results. Resource-limit failures abort the transport
+without awaiting a blocked writer, while ordinary shutdown remains graceful.
+
 ### Flood Behavior and Log Volume
 
 Under a message flood the limits above hold CPU and memory flat; the first

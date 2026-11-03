@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from jmcore.crypto import NickIdentity
+from jmcore.directory_client import DirectoryClient
 from jmcore.models import Offer, OfferType
+from jmcore.protocol import MessageType
 
 from taker.multi_directory import ChannelBinding, MultiDirectoryClient
 
@@ -54,6 +58,49 @@ def _offer(
         features=features or {},
         neutrino_compat=neutrino_compat,
     )
+
+
+@pytest.mark.asyncio
+async def test_stalled_directory_does_not_block_healthy_offers() -> None:
+    stalled = DirectoryClient("stalled", 1234, "regtest")
+    stalled.connection = AsyncMock()
+    stalled.directory_peerlist_features = True
+    stalled._peerlist_timeout = 0.03
+    stalled._peerlist_chunk_timeout = 0.02
+
+    async def stalled_send(_data: bytes) -> None:
+        await asyncio.Event().wait()
+
+    stalled.connection.send.side_effect = stalled_send
+    healthy = DirectoryClient("healthy", 1234, "regtest")
+    healthy.connection = AsyncMock()
+    healthy.connection.is_connected = MagicMock(return_value=True)
+    healthy.get_peerlist_with_features = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    frame = json.dumps(
+        {
+            "type": MessageType.PUBMSG.value,
+            "line": "J57wPBk1VfjSP5Te!PUBLIC!sw0reloffer 0 100000 1000000 500 0.001",
+        }
+    ).encode()
+    sent = False
+
+    async def healthy_receive() -> bytes:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return frame
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    healthy.connection.receive.side_effect = healthy_receive
+    mdc = _make_client()
+    mdc.clients = {"stalled": stalled, "healthy": healthy}
+    async with asyncio.timeout(0.8):
+        offers = await mdc.fetch_orderbook(max_wait=0.03, min_wait=0, quiet_period=0)
+
+    assert [(offer.counterparty, offer.oid) for offer in offers] == [("J57wPBk1VfjSP5Te", 0)]
+    assert stalled._peerlist_inflight is None
+    assert stalled._peerlist_timeout_count == 1
 
 
 @pytest.mark.asyncio
