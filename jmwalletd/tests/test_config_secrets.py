@@ -8,7 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 from loguru import logger
 
-from jmcore.settings import BitcoinSettings, JoinMarketSettings, WalletSettings
+from jmcore.settings import (
+    BitcoinSettings,
+    JoinMarketSettings,
+    NotificationSettings,
+    WalletSettings,
+)
 from jmwalletd.deps import get_daemon_state
 
 
@@ -42,6 +47,7 @@ def test_neutrino_token_from_settings_is_masked(
         "password",
         "rpc_password",
         "rpcpassword",
+        "rpc_url",
         "mnemonic_password",
         "bip39_passphrase",
         "neutrino_auth_token",
@@ -90,6 +96,113 @@ def test_nonsecret_override_still_round_trips(authed_client: tuple[TestClient, s
         headers=headers,
     )
     assert response.json()["configvalue"] == "7000"
+
+
+@pytest.mark.parametrize("section", ["BITCOIN", "BLOCKCHAIN", "bitcoin"])
+def test_credential_bearing_rpc_url_from_settings_is_masked(
+    authed_client: tuple[TestClient, str],
+    section: str,
+) -> None:
+    client, token = authed_client
+    settings = JoinMarketSettings.model_construct(
+        bitcoin=BitcoinSettings(rpc_url="http://rpc-user:synthetic-rpc-secret@127.0.0.1:18443")
+    )
+    with patch("jmcore.settings.get_settings", return_value=settings):
+        response = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/configget",
+            json={"section": section, "field": "RPC_URL"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 200
+    assert response.json()["configvalue"] == "**********"
+    assert "rpc-user" not in response.text
+    assert "synthetic-rpc-secret" not in response.text
+
+
+@pytest.mark.parametrize("section", ["NOTIFICATIONS", "notifications"])
+def test_notification_urls_from_settings_are_fully_masked(
+    authed_client: tuple[TestClient, str],
+    section: str,
+) -> None:
+    client, token = authed_client
+    settings = JoinMarketSettings.model_construct(
+        notifications=NotificationSettings(
+            urls=[
+                "tgram://synthetic-bot-secret/123",
+                "gotify://example.invalid/synthetic-path-secret",
+            ]
+        )
+    )
+    with patch("jmcore.settings.get_settings", return_value=settings):
+        response = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/configget",
+            json={"section": section, "field": "URLS"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 200
+    assert response.json()["configvalue"] == "**********"
+    assert "synthetic-bot-secret" not in response.text
+    assert "synthetic-path-secret" not in response.text
+
+
+@pytest.mark.parametrize(
+    "section, expected",
+    [("NOTIFICATIONS", "**********"), ("POLICY", "gotify://example.invalid/synthetic-token")],
+)
+def test_url_override_masking_is_scoped_and_preserves_stored_value(
+    authed_client: tuple[TestClient, str],
+    section: str,
+    expected: str,
+) -> None:
+    client, token = authed_client
+    headers = {"Authorization": f"Bearer {token}"}
+    value = "gotify://example.invalid/synthetic-token"
+    assert (
+        client.post(
+            "/api/v1/wallet/test_wallet.jmdat/configset",
+            json={"section": section.lower(), "field": "URLS", "value": value},
+            headers=headers,
+        ).status_code
+        == 200
+    )
+    response = client.post(
+        "/api/v1/wallet/test_wallet.jmdat/configget",
+        json={"section": section, "field": "urls"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["configvalue"] == expected
+    assert get_daemon_state().config_overrides[section]["urls"] == value
+
+
+@pytest.mark.parametrize(
+    "section, field, expected",
+    [
+        ("NOTIFICATIONS", "urls", "[]"),
+        ("NOTIFICATIONS", "enabled", "False"),
+        ("BITCOIN", "rpc_url", ""),
+        ("BITCOIN", "neutrino_url", "http://public.example.invalid"),
+    ],
+)
+def test_empty_secret_values_and_nonsecret_settings_keep_string_responses(
+    authed_client: tuple[TestClient, str],
+    section: str,
+    field: str,
+    expected: str,
+) -> None:
+    client, token = authed_client
+    settings = JoinMarketSettings.model_construct(
+        bitcoin=BitcoinSettings(rpc_url="", neutrino_url="http://public.example.invalid"),
+        notifications=NotificationSettings(),
+    )
+    with patch("jmcore.settings.get_settings", return_value=settings):
+        response = client.post(
+            "/api/v1/wallet/test_wallet.jmdat/configget",
+            json={"section": section, "field": field},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 200
+    assert response.json()["configvalue"] == expected
 
 
 @pytest.mark.parametrize(

@@ -62,6 +62,7 @@ _CONFIG_SECRET_FIELDS = frozenset(
         "password",
         "rpc_password",
         "rpcpassword",
+        "rpc_url",
         "mnemonic_password",
         "bip39_passphrase",
         "neutrino_auth_token",
@@ -69,9 +70,11 @@ _CONFIG_SECRET_FIELDS = frozenset(
 )
 
 
-def _config_response_value(field: str, value: Any) -> str:
+def _config_response_value(field: str, value: Any, *, section: str) -> str:
     """Mask secret fields even when overrides bypass typed settings values."""
-    if field in _CONFIG_SECRET_FIELDS and value:
+    if (
+        field in _CONFIG_SECRET_FIELDS or (section == "NOTIFICATIONS" and field == "urls")
+    ) and value:
         return "**********"
     return str(value)
 
@@ -579,7 +582,7 @@ async def config_get(
     if section in state.config_overrides and field_name in state.config_overrides[section]:
         return ConfigGetResponse(
             configvalue=_config_response_value(
-                field_name, state.config_overrides[section][field_name]
+                field_name, state.config_overrides[section][field_name], section=section
             )
         )
 
@@ -601,7 +604,9 @@ async def config_get(
                 return ConfigGetResponse(configvalue=str(value))
 
         declared_field, value = _get_setting_value(settings, section, field_name)
-        return ConfigGetResponse(configvalue=_config_response_value(declared_field, value))
+        return ConfigGetResponse(
+            configvalue=_config_response_value(declared_field, value, section=section)
+        )
     except (AttributeError, KeyError) as exc:
         raise ConfigNotPresent(f"Config not found: [{section}] {field_name}") from exc
 

@@ -74,6 +74,10 @@ before retrying. Completion notifications are not forwarded to a later wallet se
 
 ## Configuration
 
+Config responses mask notification URLs and Bitcoin RPC URLs, including runtime
+overrides, because credentials may appear anywhere in those URLs. Stored values
+remain unchanged; masked responses are not configuration backups.
+
 ### BIP39 Wallet Identity
 
 Create, recover, and unlock accept an optional `bip39_passphrase`, separate from
