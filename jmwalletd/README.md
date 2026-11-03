@@ -51,12 +51,14 @@ jmwalletd --host 0.0.0.0
 jmwalletd --data-dir /path/to/data
 ```
 
-Before the first CoinJoin in a new, unused data directory, run
+Creating the first wallet in a data directory with no other wallet, transaction
+history or `cmtdata` files also creates an empty commitment history. Otherwise,
+before the first CoinJoin in a new, unused data directory, run
 `jm-taker init-commitment-history --data-dir /path/to/data` in the daemon's
 environment, using the same data directory or container volume. For the supplied
 Docker service, run `docker compose exec jmwalletd jm-taker init-commitment-history
---data-dir /root/.joinmarket-ng` and explicitly confirm. Startup does not create
-history automatically. Previously used wallets require trusted history recovery,
+--data-dir /root/.joinmarket-ng` and explicitly confirm. Startup and wallet recovery
+do not create history automatically. Previously used wallets require trusted history recovery,
 not empty initialization; see [taker recovery guidance](../taker/README.md#commitment-history-and-recovery).
 History failures stop CoinJoins and tumbles without maker retries; status endpoints
 report the operator-action error. Wallet reads and direct sends do not require this history.

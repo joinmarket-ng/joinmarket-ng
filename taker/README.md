@@ -28,7 +28,12 @@ Unsigned and final transaction fee checks still apply.
 
 ## Commitment History and Recovery
 
-Before a new taker first uses its data directory, explicitly initialize its history:
+Generating a wallet (`jm-wallet generate`, the TUI or the daemon's wallet creation)
+creates an empty history when the new wallet is saved under `<data-dir>/wallets`
+and the data directory has no other wallet, transaction history or `cmtdata`
+files. A fresh seed has no commitments to reuse. In every other case, including
+imported or recovered seeds, explicitly initialize the history before a new taker
+first uses its data directory:
 
 ```bash
 jm-taker init-commitment-history --data-dir /path/to/data
