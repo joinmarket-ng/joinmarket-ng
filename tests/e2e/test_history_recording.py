@@ -53,9 +53,6 @@ async def test_history_recording_mechanism(bitcoin_core_backend):
 
     with tempfile.TemporaryDirectory() as temp_dir:
         data_dir = Path(temp_dir)
-        from taker.podle_manager import initialize_commitment_history
-
-        initialize_commitment_history(data_dir)
 
         # Create a wallet
         wallet = WalletService(
@@ -146,6 +143,7 @@ async def test_coinjoin_creates_history_entry(
 
     from jmcore.models import NetworkType
     from taker.config import TakerConfig
+    from taker.podle_manager import initialize_commitment_history
     from taker.taker import Taker
 
     # Check if Docker makers are running
@@ -165,6 +163,7 @@ async def test_coinjoin_creates_history_entry(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         data_dir = Path(temp_dir)
+        initialize_commitment_history(data_dir)
 
         # Create taker config with temp data dir
         config = TakerConfig(
