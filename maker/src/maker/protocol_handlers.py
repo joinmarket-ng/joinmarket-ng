@@ -688,13 +688,13 @@ class ProtocolHandlersMixin:
                 )
                 return
 
-            # At the cap, only a fill that passed every check above and carries a
-            # usable encryption key may shed another taker's pending session.
+            # Reject impossible admissions cheaply, but do not evict anything
+            # before the candidate has finished all awaited preparation.
             if (
                 (generation_id, taker_nick) not in self.active_sessions
                 and len(self.active_sessions) >= MAX_ACTIVE_MAKER_SESSIONS
                 and not (
-                    _is_usable_taker_pubkey(taker_pk) and await self._shed_oldest_preauth_session()
+                    _is_usable_taker_pubkey(taker_pk) and self._oldest_preauth_session() is not None
                 )
             ):
                 self._release_commitment_reservation(commitment)
@@ -738,6 +738,18 @@ class ProtocolHandlersMixin:
             success, response = await session.handle_fill(amount, commitment, taker_pk)
 
             if success:
+                # Preparation can suspend while fees or the candidate are
+                # initialized. Revalidate generation and admission against the
+                # current table, not the state observed before those awaits.
+                generation = self._generation(generation_id)
+                if (
+                    generation is None
+                    or generation_id != self.current_generation_id
+                    or generation.state is not GenerationState.ACCEPTING
+                ):
+                    self._release_commitment_reservation(commitment)
+                    reservation_owned = False
+                    return
                 session_key = (generation_id, taker_nick)
                 previous_session = self.active_sessions.get(session_key)
                 if previous_session is not None:
@@ -746,8 +758,10 @@ class ProtocolHandlersMixin:
                     # only before auth starts; replacing a running or advanced
                     # session could race its commitment and input cleanup.
                     if (
-                        previous_session.lock.locked()
-                        or previous_session.state != CoinJoinState.PUBKEY_SENT
+                        previous_session.state != CoinJoinState.PUBKEY_SENT
+                        or previous_session.pending_handlers > 0
+                        or previous_session.handler_task is not None
+                        or previous_session.lock.locked()
                     ):
                         self._release_commitment_reservation(commitment)
                         reservation_owned = False
@@ -759,6 +773,24 @@ class ProtocolHandlersMixin:
                     previous_session.release_input_locks()
                     self._release_podle_outpoint(previous_session)
                     self._release_commitment_reservation(previous_session.commitment.hex())
+                elif len(self.active_sessions) >= MAX_ACTIVE_MAKER_SESSIONS:
+                    # Shedding a handler-free PUBKEY_SENT session cannot suspend
+                    # in expiration cleanup. Keep the following install atomic,
+                    # with a backstop if that invariant ever changes.
+                    shed = await self._shed_oldest_preauth_session()
+                    if (
+                        not shed
+                        or len(self.active_sessions) >= MAX_ACTIVE_MAKER_SESSIONS
+                        or session_key in self.active_sessions
+                    ):
+                        self._release_commitment_reservation(commitment)
+                        reservation_owned = False
+                        self._log_rate_limited(
+                            "maker-active-session-cap",
+                            f"Rejecting new maker session at cap ({MAX_ACTIVE_MAKER_SESSIONS})",
+                            interval=10.0,
+                        )
+                        return
 
                 self.active_sessions[session_key] = session
                 logger.info(
@@ -797,22 +829,33 @@ class ProtocolHandlersMixin:
             if log_context is not None:
                 log_context.__exit__(None, None, None)
 
-    async def _shed_oldest_preauth_session(self: MakerBotProtocol) -> bool:
-        """Expire the oldest session still waiting for !auth to make room.
-
-        A !fill costs the sender nothing, so a full table of sessions that never
-        authenticate must not lock out new takers until their deadlines pass.
-        """
+    def _oldest_preauth_session(
+        self: MakerBotProtocol,
+    ) -> tuple[tuple[int, str], MakerSession] | None:
+        """Select a session with no admitted handler, including queued work."""
         candidates = [
             (session.created_at, key, session)
             for key, session in self.active_sessions.items()
             if session.state == CoinJoinState.PUBKEY_SENT
+            and session.pending_handlers == 0
             and session.handler_task is None
             and not session.lock.locked()
         ]
         if not candidates:
-            return False
+            return None
         _, key, session = min(candidates, key=lambda candidate: candidate[0])
+        return key, session
+
+    async def _shed_oldest_preauth_session(self: MakerBotProtocol) -> bool:
+        """Expire one idle preauth session without yielding before installation.
+
+        A !fill costs the sender nothing, so a full table of sessions that never
+        authenticate must not lock out new takers until their deadlines pass.
+        """
+        candidate = self._oldest_preauth_session()
+        if candidate is None:
+            return False
+        key, session = candidate
         return await self._expire_timed_out_session(key, session)
 
     async def _handle_auth(

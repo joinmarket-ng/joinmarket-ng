@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -762,6 +763,194 @@ class TestMakerBotMultiOfferFill:
 
         assert maker_bot.active_sessions == before
         assert "cd" * 32 not in maker_bot._reserved_commitments
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("same_nick", [False, True])
+    async def test_queued_auth_is_protected_before_its_task_starts(
+        self,
+        maker_bot,
+        monkeypatch: pytest.MonkeyPatch,
+        same_nick: bool,
+    ) -> None:
+        from jmcore.encryption import CryptoSession
+
+        monkeypatch.setattr("maker.protocol_handlers.MAX_ACTIVE_MAKER_SESSIONS", 1)
+        session = self._session("J5Queued", "11" * 32)
+        session.on_auth = AsyncMock()
+        maker_bot.active_sessions[_session_key("J5Queued")] = session
+        maker_bot._reserved_commitments.add("11" * 32)
+        maker_bot._initialize_minimum_fee_policy = AsyncMock()
+        maker_bot._send_response = AsyncMock()
+        await maker_bot._handle_auth("J5Queued", "auth payload")
+        handlers = set(maker_bot._detached_handler_tasks)
+        assert session.pending_handlers == 1
+        assert session.handler_task is None
+        assert not session.lock.locked()
+        try:
+            with patch("maker.protocol_handlers.check_commitment", return_value=True):
+                await maker_bot._handle_fill(
+                    "J5Queued" if same_nick else "J5New",
+                    f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{'22' * 32}",
+                )
+            assert maker_bot.active_sessions[_session_key("J5Queued")] is session
+            assert "11" * 32 in maker_bot._reserved_commitments
+            assert "22" * 32 not in maker_bot._reserved_commitments
+            assert not session.expired
+        finally:
+            await asyncio.gather(*handlers)
+        session.on_auth.assert_awaited_once()
+        assert session.pending_handlers == 0
+        assert maker_bot._session_handler_task_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raises", [False, True])
+    async def test_candidate_preparation_failure_at_cap_evicts_nobody(
+        self,
+        maker_bot,
+        monkeypatch: pytest.MonkeyPatch,
+        raises: bool,
+    ) -> None:
+        from jmcore.encryption import CryptoSession
+
+        monkeypatch.setattr("maker.protocol_handlers.MAX_ACTIVE_MAKER_SESSIONS", 1)
+        original = self._session("J5Existing", "11" * 32)
+        original.release_input_locks = MagicMock()
+        maker_bot.active_sessions[_session_key("J5Existing")] = original
+        maker_bot._reserved_commitments.add("11" * 32)
+        with (
+            patch("maker.protocol_handlers.check_commitment", return_value=True),
+            patch("maker.protocol_handlers.CoinJoinSession") as candidate_class,
+        ):
+            candidate_class.return_value.handle_fill = AsyncMock(
+                side_effect=RuntimeError("preparation failed") if raises else None,
+                return_value=(False, {"error": "candidate rejected"}),
+            )
+            await maker_bot._handle_fill(
+                "J5Rejected",
+                f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{'22' * 32}",
+            )
+        assert maker_bot.active_sessions == {_session_key("J5Existing"): original}
+        assert maker_bot._reserved_commitments == {"11" * 32}
+        original.release_input_locks.assert_not_called()
+        assert not original.expired
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fill_preparations_recheck_capacity_before_install(
+        self,
+        maker_bot,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from jmcore.encryption import CryptoSession
+
+        monkeypatch.setattr("maker.protocol_handlers.MAX_ACTIVE_MAKER_SESSIONS", 1)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        preparing = 0
+        observed_sizes: list[int] = []
+
+        async def prepare(*_args: object, **_kwargs: object) -> None:
+            nonlocal preparing
+            preparing += 1
+            if preparing == 2:
+                entered.set()
+            await release.wait()
+
+        async def send_response(*_args: object, **_kwargs: object) -> None:
+            observed_sizes.append(len(maker_bot.active_sessions))
+
+        maker_bot._initialize_minimum_fee_policy = AsyncMock(side_effect=prepare)
+        maker_bot._send_response = AsyncMock(side_effect=send_response)
+        with patch("maker.protocol_handlers.check_commitment", return_value=True):
+            tasks = [
+                asyncio.create_task(
+                    maker_bot._handle_fill(
+                        f"J5Concurrent{i}",
+                        f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{i + 1:064x}",
+                    )
+                )
+                for i in range(2)
+            ]
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+            finally:
+                release.set()
+                await asyncio.gather(*tasks)
+        assert observed_sizes == [1, 1]
+        assert len(maker_bot.active_sessions) == 1
+        assert len(maker_bot._reserved_commitments) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pause_at", ["fees", "candidate"])
+    async def test_prepared_fill_cannot_install_into_a_retired_generation(
+        self,
+        maker_bot,
+        pause_at: str,
+    ) -> None:
+        from jmcore.encryption import CryptoSession
+
+        from maker.coinjoin import CoinJoinSession
+        from maker.generation import GenerationState
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def prepare(*_args: object, **_kwargs: object) -> None:
+            entered.set()
+            await release.wait()
+
+        original_fill = CoinJoinSession.handle_fill
+
+        async def paused_fill(
+            inner: CoinJoinSession,
+            amount: int,
+            commitment: str,
+            taker_pk: str | None = None,
+        ) -> tuple[bool, dict[str, Any]]:
+            if pause_at == "candidate":
+                await prepare()
+            return await original_fill(inner, amount, commitment, taker_pk)
+
+        maker_bot._initialize_minimum_fee_policy = AsyncMock(
+            side_effect=prepare if pause_at == "fees" else None,
+        )
+        maker_bot._send_response = AsyncMock()
+        with (
+            patch("maker.protocol_handlers.check_commitment", return_value=True),
+            patch.object(CoinJoinSession, "handle_fill", new=paused_fill),
+        ):
+            task = asyncio.create_task(
+                maker_bot._handle_fill(
+                    "J5Retired",
+                    f"fill 0 500000 {CryptoSession().get_pubkey_hex()} P{'22' * 32}",
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                generation = maker_bot._generation(maker_bot.current_generation_id)
+                assert generation is not None
+                generation.state = GenerationState.GRACE
+            finally:
+                release.set()
+                await task
+        assert maker_bot.active_sessions == {}
+        assert "22" * 32 not in maker_bot._reserved_commitments
+        maker_bot._send_response.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_preauth_shedding_does_not_suspend_before_installation(self, maker_bot) -> None:
+        """The admission critical section relies on this no-suspension boundary."""
+        original = self._session("J5Idle", "11" * 32)
+        maker_bot.active_sessions[_session_key("J5Idle")] = original
+        maker_bot._reserved_commitments.add("11" * 32)
+        coroutine = maker_bot._shed_oldest_preauth_session()
+        try:
+            with pytest.raises(StopIteration) as result:
+                coroutine.send(None)
+        finally:
+            coroutine.close()
+        assert result.value.value is True
+        assert maker_bot.active_sessions == {}
+        assert maker_bot._reserved_commitments == set()
 
     @pytest.mark.asyncio
     async def test_fill_failure_releases_commitment_reservation(self, maker_bot):

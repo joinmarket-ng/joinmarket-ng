@@ -123,7 +123,7 @@ changing private transaction message sizes or signed-input lock policy:
 | Public broadcast forwarding | 16 MiB/s across recipients, 64 MiB burst |
 | Tracked directory offers | 256 per connection generation; order IDs at most 64 characters |
 | Maker direct sockets | 256 across all identity generations; 60-second receive-idle and initial authentication deadlines |
-| Maker active sessions | 128; at the cap, a valid new `!fill` expires the oldest session still waiting for `!auth` |
+| Maker active sessions | 128; at the cap, an accepted new `!fill` may expire the oldest idle preauth session, never one with admitted handlers |
 | Directory client buffered messages | 1,024 messages and 8 MiB serialized data |
 | Taker direct-peer queue | 1,024 messages and 8 MiB per assigned peer identity; 2,048 messages and 16 MiB total |
 | Client message collection | 10,000 messages and 32 MiB per collection/fetch |
@@ -171,6 +171,12 @@ socket closure does not lose signatures and reconnecting cannot refresh a quota.
 Dequeue releases each stored charge, including invalid or unwanted replies;
 shutdown drains all queued messages and resets accounting. Multiple flooding
 peers can still exhaust the bounded aggregate budget.
+
+Maker candidates finish preparation before eviction. Admission rechecks the
+current generation and capacity at installation, and protects both running and
+queued session handlers, including against same-nick replacement. Rejected
+candidates leave existing sessions intact; the handler and session limits do
+not change.
 
 ### Flood Behavior and Log Volume
 
