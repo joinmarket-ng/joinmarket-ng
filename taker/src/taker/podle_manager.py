@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from jmcore.commitment_blacklist import get_blacklist
-from jmcore.paths import get_used_commitments_path
+from jmcore.paths import create_commitment_history, get_used_commitments_path
 from jmcore.podle import PoDLECommitment, generate_podle
-from jmcore.secure_files import atomic_write_sensitive_file, create_private_file_exclusive
+from jmcore.secure_files import atomic_write_sensitive_file
 from loguru import logger
 
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
@@ -29,13 +29,7 @@ class CommitmentHistoryError(Exception):
 def initialize_commitment_history(data_dir: Path | None = None) -> Path:
     """Explicitly initialize only a missing history, never replace existing state."""
     try:
-        path = get_used_commitments_path(data_dir)
-        # Follow configured directory aliases, but never resolve the final name:
-        # O_EXCL must refuse even a dangling history-file symlink.
-        create_private_file_exclusive(
-            path.parent.resolve(strict=False) / path.name,
-            b'{"used": [], "external": {}}\n',
-        )
+        path = create_commitment_history(data_dir)
     except FileExistsError as exc:
         raise CommitmentHistoryError(
             "Commitment history already exists; it was not replaced."

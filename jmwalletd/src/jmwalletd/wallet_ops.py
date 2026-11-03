@@ -139,10 +139,15 @@ async def create_wallet(
         msg = f"Invalid wallet type: {wallet_type}. Must be one of {valid_types}"
         raise ValueError(msg)
 
+    from jmwallet.commitment_history import (
+        initialize_commitment_history_for_new_wallet,
+        is_first_wallet_in_data_dir,
+    )
     from jmwallet.mnemonic import generate_wallet_mnemonic
     from jmwallet.wallet.service import WalletService
     from jmwalletd._backend import get_backend
 
+    first_wallet = is_first_wallet_in_data_dir(data_dir, wallet_path)
     with _reserve_wallet_path(wallet_path):
         seedphrase = generate_wallet_mnemonic(strength=128)
 
@@ -193,6 +198,8 @@ async def create_wallet(
             creation_height=creation_height,
             bip39_passphrase=bip39_passphrase,
         )
+        if first_wallet:
+            initialize_commitment_history_for_new_wallet(data_dir)
 
     logger.info("Created wallet")
     logger.bind(sensitive=True).info("Created wallet: {}", wallet_path.name)

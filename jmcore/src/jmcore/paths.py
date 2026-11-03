@@ -12,6 +12,7 @@ from pathlib import Path
 
 from jmcore.secure_files import (
     atomic_write_sensitive_file,
+    create_private_file_exclusive,
     ensure_sensitive_directory,
     read_sensitive_file,
 )
@@ -72,6 +73,21 @@ def get_used_commitments_path(data_dir: Path | None = None) -> Path:
     ensure_sensitive_directory(cmtdata_dir)
 
     return cmtdata_dir / "commitments.json"
+
+
+def create_commitment_history(data_dir: Path | None = None) -> Path:
+    """Create a missing, empty used-commitments file without replacing any path.
+
+    Raises FileExistsError for an existing file or symlink, and OSError on failure.
+    """
+    path = get_used_commitments_path(data_dir)
+    # Follow configured directory aliases, but never resolve the final name:
+    # O_EXCL must refuse even a dangling history-file symlink.
+    create_private_file_exclusive(
+        path.parent.resolve(strict=False) / path.name,
+        b'{"used": [], "external": {}}\n',
+    )
+    return path
 
 
 def get_ignored_makers_path(data_dir: Path | None = None) -> Path:

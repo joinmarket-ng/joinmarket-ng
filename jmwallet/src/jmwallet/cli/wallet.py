@@ -738,6 +738,14 @@ def generate(
                     typer.echo("Wallet generation cancelled")
                     raise typer.Exit(1)
 
+        from jmwallet.commitment_history import (
+            initialize_commitment_history_for_new_wallet,
+            is_first_wallet_in_data_dir,
+        )
+
+        first_wallet = output_file is not None and is_first_wallet_in_data_dir(
+            get_default_data_dir(), output_file
+        )
         mnemonic = generate_mnemonic_secure(word_count)
 
         # Validate the generated mnemonic
@@ -793,6 +801,8 @@ def generate(
             # Record the wallet's birthday so the first sync does not rescan
             # a year of history for a brand-new (empty) wallet (issue #472).
             _record_wallet_creation_height(output_file)
+            if first_wallet:
+                initialize_commitment_history_for_new_wallet(get_default_data_dir())
 
             typer.echo(f"\nMnemonic saved to: {output_file}")
             if password:
