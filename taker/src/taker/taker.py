@@ -243,7 +243,9 @@ class Taker(TakerMonitoringMixin):
         )
 
         # PoDLE manager for commitment tracking
-        self.podle_manager = PoDLEManager(config.data_dir)
+        self.podle_manager = PoDLEManager(
+            config.data_dir, mnemonic=config.mnemonic.get_secret_value()
+        )
 
         # Per-CoinJoin state and protocol phases live in a dedicated
         # ``CoinJoinSession``. ``Taker`` owns persistent infrastructure

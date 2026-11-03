@@ -11,9 +11,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from jmcore.commitment_blacklist import get_blacklist
-from jmcore.paths import create_commitment_history, get_used_commitments_path
+from jmcore.paths import (
+    GENERATED_WALLETS_ONLY,
+    create_commitment_history,
+    get_used_commitments_path,
+)
 from jmcore.podle import PoDLECommitment, generate_podle
 from jmcore.secure_files import atomic_write_sensitive_file
+from jmwallet.commitment_history import (
+    generated_wallet_is_authorized,
+    history_requires_generation_authorization,
+)
 from loguru import logger
 
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
@@ -64,6 +72,8 @@ def _validate_history(data: object) -> dict[str, Any]:
         raise ValueError("Commitment history must contain a used list")
     if not isinstance(data.get("external"), dict):
         raise ValueError("Commitment history must contain an external object")
+    if GENERATED_WALLETS_ONLY in data and data[GENERATED_WALLETS_ONLY] is not True:
+        raise ValueError("Unknown automatic commitment-history restriction")
     for commitment in data["used"]:
         _validate_hex(commitment)
     for outpoint, entry in data["external"].items():
@@ -88,7 +98,7 @@ def _validate_history(data: object) -> dict[str, Any]:
 class PoDLEManager:
     """Manages tracking of used PoDLE commitments."""
 
-    def __init__(self, data_dir: Path | None = None) -> None:
+    def __init__(self, data_dir: Path | None = None, *, mnemonic: str | None = None) -> None:
         try:
             self.filepath = get_used_commitments_path(data_dir)
         except OSError as exc:
@@ -98,9 +108,9 @@ class PoDLEManager:
         self.used_commitments: set[str] = set()
         self.external_commitments: dict[str, Any] = {}
         self._history_data: dict[str, Any] = {}
-        self._load()
+        self._load(mnemonic=mnemonic)
 
-    def _load(self) -> None:
+    def _load(self, *, mnemonic: str | None = None) -> None:
         """Load used commitments from file."""
         try:
             with open(self.filepath, encoding="utf-8") as history:
@@ -116,6 +126,14 @@ class PoDLEManager:
                 f"Could not load commitment history at {self.filepath}; bytes were left untouched. "
                 "Restore trusted history or resolve the read failure before retrying."
             ) from exc
+        if history_requires_generation_authorization(self.filepath.parent.parent, data) and (
+            mnemonic is None
+            or not generated_wallet_is_authorized(self.filepath.parent.parent, mnemonic)
+        ):
+            raise CommitmentHistoryError(
+                "Automatically initialized commitment history does not authorize this wallet. "
+                "Restore trusted commitment history before using a recovered or imported wallet."
+            )
         self._history_data = data
         self.used_commitments = {value.lower() for value in data["used"]}
         self.external_commitments = data["external"]

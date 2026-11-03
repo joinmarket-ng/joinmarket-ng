@@ -91,6 +91,17 @@ permissions. Missing default data and state directories are created with mode
 `0700`; existing shared or symlinked directories are not changed. This permission
 hardening does not trigger rescans, metadata reconstruction, or new migrations.
 
+Newly generated wallets can initialize an unused commitment history, but that
+history carries an automatic-use restriction. Durable, owner-only records in
+`cmtdata/generated-wallets/` authorize only the freshly generated mnemonic
+families (including BIP39 passphrase identities), using full domain-separated
+hashes rather than short wallet fingerprints. Imports and recovery cannot create
+these records. Missing, partial, or unknown authorization state stops the taker;
+startup never repairs it. Additional generated wallets do not rewrite shared
+commitments. Existing history formats remain usable without migration.
+Other clients sharing the history may not enforce this JoinMarket NG
+authorization check and still require a complete, trusted commitment record.
+
 PoDLE proof nonces use a domain-separated RFC 6979-style HMAC-SHA256 derivation
 keyed by the UTXO private key and bound to the proof transcript. Proof generation
 therefore does not depend on runtime randomness, avoiding private-key exposure

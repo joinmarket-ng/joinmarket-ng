@@ -63,6 +63,11 @@ not empty initialization; see [taker recovery guidance](../taker/README.md#commi
 History failures stop CoinJoins and tumbles without maker retries; status endpoints
 report the operator-action error. Wallet reads and direct sends do not require this history.
 
+Automatic history authorizes only mnemonics generated locally, not a different
+wallet recovered afterward. Its private `cmtdata/generated-wallets/` records
+must accompany history backups. Missing records fail closed; valid histories
+from earlier releases do not require them.
+
 The wallet API accepts passwords and returns bearer tokens. Never expose it over
 plain HTTP to an untrusted network. `--no-tls` should be used only on loopback,
 or on an isolated container network behind an access-controlled, TLS-terminating

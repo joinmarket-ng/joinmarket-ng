@@ -39,6 +39,14 @@ first uses its data directory:
 jm-taker init-commitment-history --data-dir /path/to/data
 ```
 
+Automatically created history is restricted to mnemonics freshly generated in
+that data directory, including their BIP39 passphrase identities. Another
+generated wallet receives its own authorization without resetting shared history.
+An imported or recovered wallet cannot inherit that authorization. Back up
+`cmtdata/generated-wallets/` together with `commitments.json`; missing or damaged
+authorization records stop the taker rather than being recreated at startup.
+Existing histories from earlier releases are unchanged and need no new records.
+
 Confirm only for a new, unused history. The command never overwrites an existing
 file, including a corrupt file or symlink. Takers, including daemon CoinJoins and
 tumbler phases, stop on missing, unreadable, invalid, or unsavable history rather
@@ -52,6 +60,14 @@ cannot be reconstructed from the seed or blockchain; an empty replacement can
 reuse commitments and expose links between rounds. Failed writes can leave new
 bytes installed even when durability was not confirmed, so preserve and inspect
 the file instead of assuming the previous version remains.
+
+If a recovered wallet is blocked by another wallet's automatically created
+history, restore its complete trusted `cmtdata` backup in a separate data
+directory rather than overlaying only the JSON file. Generation records keep
+the restriction even if another client rewrites unknown JSON fields.
+For an imported seed that has
+never been used, explicitly initialize history in a new data directory before
+using it; the initialization command does not overwrite an existing history.
 
 ## Documentation
 

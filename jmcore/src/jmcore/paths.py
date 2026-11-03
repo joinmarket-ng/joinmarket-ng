@@ -75,17 +75,28 @@ def get_used_commitments_path(data_dir: Path | None = None) -> Path:
     return cmtdata_dir / "commitments.json"
 
 
-def create_commitment_history(data_dir: Path | None = None) -> Path:
+GENERATED_WALLETS_ONLY = "generated_wallets_only"
+
+
+def create_commitment_history(
+    data_dir: Path | None = None, *, generated_wallets_only: bool = False
+) -> Path:
     """Create a missing, empty used-commitments file without replacing any path.
 
     Raises FileExistsError for an existing file or symlink, and OSError on failure.
+    Automatic creation must restrict use to durably authorized generated wallets.
     """
     path = get_used_commitments_path(data_dir)
     # Follow configured directory aliases, but never resolve the final name:
     # O_EXCL must refuse even a dangling history-file symlink.
+    contents = (
+        b'{"used": [], "external": {}, "generated_wallets_only": true}\n'
+        if generated_wallets_only
+        else b'{"used": [], "external": {}}\n'
+    )
     create_private_file_exclusive(
         path.parent.resolve(strict=False) / path.name,
-        b'{"used": [], "external": {}}\n',
+        contents,
     )
     return path
 

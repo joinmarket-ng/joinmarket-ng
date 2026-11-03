@@ -801,8 +801,12 @@ def generate(
             # Record the wallet's birthday so the first sync does not rescan
             # a year of history for a brand-new (empty) wallet (issue #472).
             _record_wallet_creation_height(output_file)
-            if first_wallet:
-                initialize_commitment_history_for_new_wallet(get_default_data_dir())
+            initialize_commitment_history_for_new_wallet(
+                get_default_data_dir(),
+                mnemonic=mnemonic,
+                wallet_file=output_file,
+                first_wallet=first_wallet,
+            )
 
             typer.echo(f"\nMnemonic saved to: {output_file}")
             if password:
