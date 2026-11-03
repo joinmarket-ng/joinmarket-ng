@@ -77,6 +77,43 @@ def _make_utxo(
 
 REGTEST_P2WPKH_ADDR = "bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m"
 
+
+@pytest.mark.asyncio
+async def test_preparation_rechecks_authorization_after_final_await() -> None:
+    revoked = False
+
+    def authorize() -> None:
+        if revoked:
+            raise PermissionError("session revoked")
+
+    async def final_locktime(**kwargs: object) -> int:
+        nonlocal revoked
+        revoked = True
+        return 100
+
+    wallet = MagicMock(network="regtest")
+    utxo = _make_utxo()
+    wallet.get_utxos = AsyncMock(return_value=[utxo])
+    with (
+        patch(
+            "jmwallet.wallet.spend.select_sweep_input_utxos", AsyncMock(return_value=([utxo], None))
+        ),
+        patch("jmwallet.wallet.spend.resolve_direct_send_locktime", side_effect=final_locktime),
+        patch("jmwallet.wallet.spend.build_and_sign_direct_tx") as sign,
+    ):
+        with pytest.raises(PermissionError, match="session revoked"):
+            await prepare_direct_send(
+                wallet=wallet,
+                backend=MagicMock(),
+                mixdepth=0,
+                amount_sats=0,
+                destination=REGTEST_P2WPKH_ADDR,
+                fee_rate=1.0,
+                authorization_check=authorize,
+            )
+    sign.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # BlockchainBackend.get_median_time_past
 # ---------------------------------------------------------------------------

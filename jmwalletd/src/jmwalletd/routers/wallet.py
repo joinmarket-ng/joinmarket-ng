@@ -19,7 +19,9 @@ from jmwalletd.deps import (
     get_optional_token,
     require_auth,
     require_auth_allow_expired,
+    require_current_session,
     require_wallet_match,
+    require_wallet_session,
 )
 from jmwalletd.errors import (
     BackendNotReady,
@@ -200,6 +202,8 @@ async def get_session(
     """
     token = get_optional_token(request)
     token_valid = False
+    ws = state.wallet_service
+    walletname = state.wallet_name
 
     if token is not None:
         try:
@@ -211,6 +215,10 @@ async def get_session(
     # Bitcoin Core is the source of truth for rescan state: the in-memory
     # flag can go stale while Core keeps scanning server-side (issue #551).
     rescanning, _progress = await state.live_rescan_status()
+    if token_valid:
+        require_current_session(state, token)
+        if ws is not None:
+            require_wallet_session(state, token, walletname)
 
     resp = SessionResponse(
         session=state.wallet_loaded,
@@ -221,7 +229,7 @@ async def get_session(
     )
 
     # Populate extra fields only when authenticated.
-    if state.wallet_loaded and token_valid:
+    if ws is not None and token_valid:
         resp.schedule = _get_running_tumble_schedule(state)
         resp.nickname = _get_nickname_from_maker(state)
         taker = state._taker_ref
@@ -245,17 +253,18 @@ async def get_session(
         resp.offer_list = offer_list if offer_list else state.offer_list
 
         try:
-            backend = state.wallet_service.backend
+            backend = ws.backend
             resp.block_height = await backend.get_block_height()
         except Exception:
             resp.block_height = None
+        require_wallet_session(state, token, walletname)
 
         # Expose the underlying bitcoind descriptor wallet name for clients
         # (e.g. test setup / debugging tools) that need to query Bitcoin Core
         # directly. Only present when the active backend is a descriptor
         # wallet — other backends (Neutrino) leave this unset.
         try:
-            backend = state.wallet_service.backend
+            backend = ws.backend
             wallet_name_attr = getattr(backend, "wallet_name", None)
             if isinstance(wallet_name_attr, str) and wallet_name_attr:
                 resp.descriptor_wallet_name = wallet_name_attr
@@ -535,9 +544,11 @@ async def wallet_lock(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> LockWalletResponse:
     """Lock the current wallet and stop all services."""
     async with state.wallet_lifecycle_lock:
+        require_wallet_session(state, token, walletname)
         already_locked = await state._lock_wallet()
     return LockWalletResponse(walletname=walletname, already_locked=already_locked)
 

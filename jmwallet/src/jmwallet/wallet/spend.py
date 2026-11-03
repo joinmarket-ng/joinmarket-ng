@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import TYPE_CHECKING
@@ -760,6 +760,7 @@ async def prepare_direct_send(
     max_fee_rate_sat_vb: float = DEFAULT_MAX_FEE_RATE_SAT_VB,
     input_utxos: list[str] | None = None,
     rbf: bool = True,
+    authorization_check: Callable[[], None] | None = None,
 ) -> SignedDirectTx:
     """Build and sign a direct-send transaction WITHOUT broadcasting.
 
@@ -768,11 +769,16 @@ async def prepare_direct_send(
     anything unusable raises :class:`ValueError` rather than falling back. An
     empty list is an error — omit the argument for automatic selection.
     ``rbf`` controls BIP125 signaling and defaults to enabled.
+    ``authorization_check`` lets a caller revoke preparation without coupling
+    the wallet to its authorization system. It must be synchronous and raise
+    on denial, including at the final pre-signing check.
 
     Returns a :class:`SignedDirectTx` containing the signed hex and all
     metadata needed to broadcast and record a history entry. Callers that want
     the full build+sign+broadcast flow should use :func:`direct_send` instead.
     """
+    if authorization_check is not None:
+        authorization_check()
     # BIP173 allows all-uppercase bech32 (common in QR codes); the decoder
     # below still rejects mixed case.
     if not destination.lower().startswith(("bc1", "tb1", "bcrt1")):
@@ -791,6 +797,8 @@ async def prepare_direct_send(
     fee_source = "manual"
     if fee_rate is None:
         fee_rate = await backend.estimate_fee(target_blocks=fee_target_blocks)
+        if authorization_check is not None:
+            authorization_check()
         logger.debug("Estimated fee rate: {:.2f} sat/vB ({} blocks)", fee_rate, fee_target_blocks)
         fee_source = "backend estimate"
 
@@ -818,6 +826,8 @@ async def prepare_direct_send(
         )
     elif amount_sats == 0:
         raw_utxos = await wallet.get_utxos(mixdepth)
+        if authorization_check is not None:
+            authorization_check()
         utxos, locktime_cutoff = await select_sweep_input_utxos(wallet, backend, raw_utxos)
     else:
         selection, _selected_mixdepth = await select_automatic_direct_send_inputs(
@@ -829,6 +839,8 @@ async def prepare_direct_send(
         )
         utxos = selection.utxos
 
+    if authorization_check is not None:
+        authorization_check()
     if not utxos:
         msg = f"No spendable UTXOs in mixdepth {mixdepth}"
         raise ValueError(msg)
@@ -899,6 +911,8 @@ async def prepare_direct_send(
         utxos=utxos,
         locktime_cutoff=locktime_cutoff,
     )
+    if authorization_check is not None:
+        authorization_check()
     built = build_and_sign_direct_tx(
         wallet=wallet,
         utxos=utxos,

@@ -16,17 +16,19 @@ from jmwalletd.deps import (
     get_daemon_state,
     get_optional_token,
     require_auth,
-    require_current_session,
     require_wallet_match,
+    require_wallet_session,
 )
 from jmwalletd.errors import (
     ActionNotAllowed,
     BackendNotReady,
     InvalidRequestFormat,
+    InvalidToken,
     NoWalletFound,
     ServiceAlreadyStarted,
     ServiceNotStarted,
     TransactionFailed,
+    WalletNotFound,
 )
 from jmwalletd.models import (
     DirectSendRequest,
@@ -104,12 +106,17 @@ async def direct_send(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> DirectSendResponse:
     """Send bitcoin directly (without coinjoin)."""
+    ws, generation = require_wallet_session(state, token, walletname)
     if state.taker_running:
         raise ActionNotAllowed("A coinjoin is already in progress.")
 
-    ws = state.wallet_service
+    def authorization_check() -> None:
+        current_ws, current_generation = require_wallet_session(state, token, walletname)
+        if current_ws is not ws or current_generation != generation:
+            raise InvalidToken("The wallet session has ended.")
 
     try:
         from jmwalletd.fee_policy import resolve_policy_fee_overrides
@@ -142,7 +149,10 @@ async def direct_send(
             max_fee_rate_sat_vb=settings.wallet.max_fee_rate_sat_vb,
             input_utxos=body.input_utxos,
             rbf=body.rbf,
+            authorization_check=authorization_check,
         )
+    except (InvalidToken, WalletNotFound, NoWalletFound):
+        raise
     except ValueError as exc:
         raise InvalidRequestFormat(str(exc)) from exc
     except Exception as exc:
@@ -156,8 +166,9 @@ async def direct_send(
     # Notify WebSocket clients about the transaction immediately, and mark it
     # so the background transaction monitor does not emit a duplicate
     # first-seen notification for the same txid (it still reports confirmation).
-    state.mark_tx_broadcast(txinfo.txid)
-    state.broadcast_ws({"txid": txinfo.txid, "txdetails": txinfo.model_dump()})
+    if state.wallet_generation == generation:
+        state.mark_tx_broadcast(txinfo.txid)
+        state.broadcast_ws({"txid": txinfo.txid, "txdetails": txinfo.model_dump()})
 
     return DirectSendResponse(txinfo=txinfo)
 
@@ -175,14 +186,16 @@ async def do_coinjoin(
     token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Initiate a coinjoin transaction (asynchronous)."""
+    ws, generation = require_wallet_session(state, token, walletname)
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
         raise ServiceAlreadyStarted("A coinjoin or maker service is already running.")
     if not state.wallet_mnemonic:
         raise NoWalletFound("Wallet mnemonic not available in daemon state.")
+    mnemonic = state.wallet_mnemonic
+    passphrase = state.wallet_bip39_passphrase
 
     # No await from here until the task exists, so a wallet lock either sees it
     # or has already invalidated this request's token.
-    require_current_session(state, token)
     try:
         from jmwalletd._backend import get_backend
         from taker.config import TakerConfig
@@ -209,17 +222,20 @@ async def do_coinjoin(
                 backend = await get_backend(
                     state.data_dir,
                     force_new=True,
-                    mnemonic=state.wallet_mnemonic,
+                    mnemonic=mnemonic,
                     network=bitcoin_network.value,
-                    passphrase=state.wallet_bip39_passphrase,
+                    passphrase=passphrase,
                 )
+                if state.wallet_generation != generation:
+                    await backend.close()
+                    raise InvalidToken("The wallet session has ended.")
                 config = build_coinjoin_taker_config(
                     body=body,
-                    mnemonic=state.wallet_mnemonic,
+                    mnemonic=mnemonic,
                     jm_settings=jm_settings,
                     taker_config_cls=TakerConfig,
                     config_overrides=state.config_overrides,
-                    passphrase=state.wallet_bip39_passphrase,
+                    passphrase=passphrase,
                 )
                 taker = Taker(
                     wallet=ws,
@@ -228,6 +244,8 @@ async def do_coinjoin(
                 )
                 state._taker_ref = taker
                 await taker.start()
+                if state.wallet_generation != generation:
+                    raise InvalidToken("The wallet session has ended.")
                 await taker.do_coinjoin(
                     amount=body.amount_sats,
                     destination=body.destination,
@@ -251,11 +269,12 @@ async def do_coinjoin(
                 # background tasks do not leak. Keep the shared wallet open
                 # for any subsequent operation on the daemon.
                 if taker is not None:
-                    state.last_broadcast_policy = taker.last_broadcast_policy or None
-                    state.last_broadcast_method = taker.last_broadcast_method or None
-                    state.last_broadcast_fallback_reason = (
-                        taker.last_broadcast_fallback_reason or None
-                    )
+                    if state.wallet_generation == generation:
+                        state.last_broadcast_policy = taker.last_broadcast_policy or None
+                        state.last_broadcast_method = taker.last_broadcast_method or None
+                        state.last_broadcast_fallback_reason = (
+                            taker.last_broadcast_fallback_reason or None
+                        )
                     status = taker.state.value if taker.state else None
                     # A raw TakerState like "fetching_orderbook" is only a real
                     # terminal outcome when the taker reached it on its own
@@ -269,32 +288,33 @@ async def do_coinjoin(
                             status = TakerState.CANCELLED.value
                         elif run_exception is not None:
                             status = TakerState.FAILED.value
-                    state.last_taker_status = status
-                    state.last_taker_txid = taker.txid or None
                     # ``last_failure_reason`` covers the specific failure paths the
                     # taker itself recognizes (e.g. a declined confirmation); fall
                     # back to the exception that unwound this task for anything
                     # else, so a caller polling /taker/status is never left with
                     # a "failed" status and no reason.
-                    state.last_taker_error = taker.last_failure_reason or (
-                        str(run_exception) if run_exception is not None else None
-                    )
+                    if state.wallet_generation == generation:
+                        state.last_taker_status = status
+                        state.last_taker_txid = taker.txid or None
+                        state.last_taker_error = taker.last_failure_reason or (
+                            str(run_exception) if run_exception is not None else None
+                        )
                     try:
                         await taker.stop(close_wallet=False)
                     except Exception:
                         logger.error("Taker teardown failed")
                         logger.bind(sensitive=True).exception("Taker teardown failed")
-                elif run_exception is not None:
+                elif run_exception is not None and state.wallet_generation == generation:
                     # The Taker never got constructed (e.g. config/backend setup
                     # failed) -- still record something explaining why.
                     state.last_taker_status = TakerState.FAILED.value
                     state.last_taker_error = str(run_exception)
-                elif cancelled:
+                elif cancelled and state.wallet_generation == generation:
                     state.last_taker_status = TakerState.CANCELLED.value
-                state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
-                state._taker_ref = None
+                if state.wallet_generation == generation:
+                    state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+                    state._taker_ref = None
 
-        ws = state.wallet_service
         state._taker_task = asyncio.create_task(_run_coinjoin())
 
     except ImportError:
@@ -316,27 +336,34 @@ async def stop_coinjoin(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Stop a running coinjoin/tumbler."""
+    require_wallet_session(state, token, walletname)
     if not state.taker_running:
         raise ServiceNotStarted()
 
-    # Signal the taker to stop if a reference is held.
-    if state._taker_ref is not None:
+    taker = state._taker_ref
+    task = state._taker_task
+    # Only stop the captured operation, never one installed during an await.
+    if taker is not None:
         try:
-            await state._taker_ref.stop()
+            await taker.stop()
         except Exception:
             logger.error("Error stopping taker")
             logger.bind(sensitive=True).exception("Error stopping taker")
+        require_wallet_session(state, token, walletname)
 
-    if state._taker_task is not None and not state._taker_task.done():
-        state._taker_task.cancel()
+    if task is not None and not task.done():
+        task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await state._taker_task
+            await task
+        require_wallet_session(state, token, walletname)
 
-    state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
-    state._taker_ref = None
-    state._taker_task = None
+    if state._taker_task is task:
+        state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+        state._taker_ref = None
+        state._taker_task = None
     return JSONResponse(content={}, status_code=202)
 
 
@@ -349,6 +376,7 @@ async def taker_status(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> TakerStatusResponse:
     """Report the outcome of the most recent single-shot taker/coinjoin call.
 
@@ -364,6 +392,7 @@ async def taker_status(
     reported as "running" here while showing a stale snapshot from a previous
     single-shot call underneath it.
     """
+    require_wallet_session(state, token, walletname)
     running = state.coinjoin_state == CoinjoinState.TAKER_RUNNING
     taker = state._taker_ref
     if taker is not None:
@@ -397,6 +426,7 @@ async def start_maker(
     token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Start the yield generator (maker) service."""
+    ws, generation = require_wallet_session(state, token, walletname)
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
         raise ServiceAlreadyStarted("A coinjoin or maker service is already running.")
     if not state.wallet_mnemonic:
@@ -411,9 +441,10 @@ async def start_maker(
     except ValueError as exc:
         raise InvalidRequestFormat(f"Invalid maker parameter: {exc}") from exc
 
+    mnemonic = state.wallet_mnemonic
+    passphrase = state.wallet_bip39_passphrase
     # No await from here until the task exists, so a wallet lock either sees it
     # or has already invalidated this request's token.
-    require_current_session(state, token)
     try:
         from jmwalletd._backend import get_backend
         from jmwalletd.maker_config import build_daemon_maker_config
@@ -425,28 +456,30 @@ async def start_maker(
             maker: MakerBot | None = None
             backend: Any | None = None
             try:
-                ws = state.wallet_service
                 backend = await get_backend(
                     state.data_dir,
                     force_new=True,
                     wallet_service=ws,
                 )
+                if state.wallet_generation != generation:
+                    raise InvalidToken("The wallet session has ended.")
                 jm_settings = get_settings()
                 config = build_daemon_maker_config(
                     jm_settings,
-                    state.wallet_mnemonic,
+                    mnemonic,
                     state.data_dir,
                     offer_type=body.ordertype,
                     min_size=minsize,
                     cj_fee_relative=cjfee_r,
                     cj_fee_absolute=cjfee_a,
                     tx_fee_contribution=txfee,
-                    passphrase=state.wallet_bip39_passphrase,
+                    passphrase=passphrase,
                 )
 
                 def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
-                    state.nickname = new_nick
-                    write_nick_state(state.data_dir, "maker", new_nick)
+                    if state.wallet_generation == generation:
+                        state.nickname = new_nick
+                        write_nick_state(state.data_dir, "maker", new_nick)
 
                 maker = MakerBot(
                     wallet=ws,
@@ -483,12 +516,13 @@ async def start_maker(
                         logger.bind(sensitive=True).exception(
                             "Error closing maker blockchain backend"
                         )
-                state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
-                state.offer_list = None
-                state.nickname = None
-                state._maker_ref = None
-                state._maker_task = None
-                remove_nick_state(state.data_dir, "maker")
+                if state.wallet_generation == generation:
+                    state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+                    state.offer_list = None
+                    state.nickname = None
+                    state._maker_ref = None
+                    state._maker_task = None
+                    remove_nick_state(state.data_dir, "maker")
 
         state._maker_task = asyncio.create_task(_run_maker())
     except ImportError:
@@ -510,29 +544,35 @@ async def stop_maker(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Stop the yield generator (maker) service."""
+    require_wallet_session(state, token, walletname)
     if not state.maker_running:
         raise ServiceNotStarted()
 
-    # Signal the maker to stop if a reference is held.
-    if state._maker_ref is not None:
+    maker = state._maker_ref
+    task = state._maker_task
+    if maker is not None:
         try:
-            await state._maker_ref.stop()
+            await maker.stop()
         except Exception:
             logger.error("Error stopping maker")
             logger.bind(sensitive=True).exception("Error stopping maker")
+        require_wallet_session(state, token, walletname)
 
-    if state._maker_task is not None and not state._maker_task.done():
-        state._maker_task.cancel()
+    if task is not None and not task.done():
+        task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await state._maker_task
+            await task
+        require_wallet_session(state, token, walletname)
 
-    state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
-    state.offer_list = None
-    state.nickname = None
-    state._maker_ref = None
-    state._maker_task = None
+    if state._maker_task is task:
+        state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+        state.offer_list = None
+        state.nickname = None
+        state._maker_ref = None
+        state._maker_task = None
     return JSONResponse(content={}, status_code=202)
 
 

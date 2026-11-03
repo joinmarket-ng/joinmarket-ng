@@ -59,13 +59,14 @@ from jmwalletd.deps import (
     get_daemon_state,
     get_optional_token,
     require_auth,
-    require_current_session,
     require_wallet_match,
+    require_wallet_session,
 )
 from jmwalletd.errors import (
     ActionNotAllowed,
     BackendNotReady,
     InvalidRequestFormat,
+    InvalidToken,
     NoWalletFound,
     ServiceAlreadyStarted,
     ServiceNotStarted,
@@ -309,6 +310,7 @@ async def create_plan(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> TumblerPlanResponse:
     """Build and persist a fresh tumble plan for the active wallet.
 
@@ -318,22 +320,26 @@ async def create_plan(
     ``force=true`` is only required for a pending plan, to make the
     destructive intent explicit.
     """
-    if _runner_alive_for(state, state.wallet_name):
-        raise ServiceAlreadyStarted("A tumbler is already running; stop it first.")
+    ws, _generation = require_wallet_session(state, token, walletname)
 
-    existing = _reconcile_on_request(state, state.wallet_name)
-    if existing is not None and existing.status == PlanStatus.PENDING and not body.force:
-        raise ActionNotAllowed("A pending plan already exists; pass force=true to overwrite it.")
+    def check_replacement() -> None:
+        if _runner_alive_for(state, walletname):
+            raise ServiceAlreadyStarted("A tumbler is already running; stop it first.")
+        existing = _reconcile_on_request(state, walletname)
+        if existing is not None and existing.status == PlanStatus.PENDING and not body.force:
+            raise ActionNotAllowed(
+                "A pending plan already exists; pass force=true to overwrite it."
+            )
 
-    ws = state.wallet_service
-    if ws is None:
-        raise NoWalletFound()
+    check_replacement()
 
     balances = await _mixdepth_balances(
         ws,
         num_mixdepths=getattr(ws, "mixdepth_count", 5),
         min_confirmations=get_settings().taker.taker_utxo_age,
     )
+    require_wallet_session(state, token, walletname)
+    check_replacement()
     if not any(v > 0 for v in balances.values()):
         raise ActionNotAllowed("Wallet has no confirmed coins to tumble.")
 
@@ -355,7 +361,7 @@ async def create_plan(
         raise InvalidRequestFormat(f"Invalid tumbler parameters: {exc}") from exc
 
     try:
-        plan = PlanBuilder(wallet_name=state.wallet_name, params=params).build()
+        plan = PlanBuilder(wallet_name=walletname, params=params).build()
     except ValueError as exc:
         raise InvalidRequestFormat(str(exc)) from exc
 
@@ -379,6 +385,7 @@ async def get_status(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> TumblerPlanResponse:
     """Return the live plan if the runner is active, otherwise the on-disk plan.
 
@@ -386,12 +393,13 @@ async def get_status(
     ``stale`` flag is set. A persisted confirmation wait is reset to pending;
     all other stale plans are marked failed.
     """
-    if _runner_alive_for(state, state.wallet_name):
+    require_wallet_session(state, token, walletname)
+    if _runner_alive_for(state, walletname):
         # ``tumble_runner`` is the authoritative state while running.
         return _plan_to_response(state.tumble_runner.plan)
 
     try:
-        plan = load_plan(state.wallet_name, state.data_dir)
+        plan = load_plan(walletname, state.data_dir)
     except PlanNotFoundError as exc:
         raise NoWalletFound("No tumbler plan exists for this wallet.") from exc
     except PlanCorruptError as exc:
@@ -421,6 +429,7 @@ async def start_plan(
     token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Load the pending plan and run it in the background."""
+    ws, generation = require_wallet_session(state, token, walletname)
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
         raise ServiceAlreadyStarted("A coinjoin or maker service is already running.")
     if not state.wallet_mnemonic:
@@ -429,8 +438,7 @@ async def start_plan(
     # Reconciliation may save the plan, so recheck first. No await from here
     # until the task exists, so a wallet lock either sees it or has already
     # invalidated this request's token.
-    require_current_session(state, token)
-    plan = _reconcile_on_request(state, state.wallet_name)
+    plan = _reconcile_on_request(state, walletname)
     if plan is None:
         raise NoWalletFound("No tumbler plan exists for this wallet; create one first.")
     if plan.status in (PlanStatus.COMPLETED, PlanStatus.FAILED, PlanStatus.CANCELLED):
@@ -438,12 +446,10 @@ async def start_plan(
     if plan.status == PlanStatus.RUNNING:
         raise ServiceAlreadyStarted("Plan is already running.")
 
-    ws = state.wallet_service
-    if ws is None:
-        raise NoWalletFound()
-
     # Factories are closed over the current wallet/settings at start time.
     jm_settings = get_settings()
+    mnemonic = state.wallet_mnemonic
+    passphrase = state.wallet_bip39_passphrase
 
     from jmwalletd._backend import get_backend
     from jmwalletd.maker_config import build_daemon_maker_config
@@ -457,13 +463,16 @@ async def start_plan(
             force_new=True,
             wallet_service=ws,
         )
+        if state.wallet_generation != generation:
+            await backend.close()
+            raise InvalidToken("The wallet session has ended.")
         config = build_tumbler_taker_config(
             phase=phase,
-            mnemonic=state.wallet_mnemonic,
+            mnemonic=mnemonic,
             jm_settings=jm_settings,
             taker_config_cls=TakerConfig,
             config_overrides=state.config_overrides,
-            passphrase=state.wallet_bip39_passphrase,
+            passphrase=passphrase,
         )
         return Taker(wallet=ws, backend=backend, config=config)
 
@@ -473,11 +482,14 @@ async def start_plan(
             force_new=True,
             wallet_service=ws,
         )
+        if state.wallet_generation != generation:
+            await backend.close()
+            raise InvalidToken("The wallet session has ended.")
         config = build_daemon_maker_config(
             jm_settings,
-            state.wallet_mnemonic,
+            mnemonic,
             state.data_dir,
-            passphrase=state.wallet_bip39_passphrase,
+            passphrase=passphrase,
         )
         # Tumbler maker sessions must run as 0-fee sw0absoffer with no
         # fidelity bond. See ``tumbler.maker_policy`` for the rationale.
@@ -486,7 +498,8 @@ async def start_plan(
         apply_tumbler_maker_policy(config)
 
         def _publish_maker_nick(_old_nick: str, new_nick: str) -> None:
-            write_nick_state(state.data_dir, "maker", new_nick)
+            if state.wallet_generation == generation:
+                write_nick_state(state.data_dir, "maker", new_nick)
 
         return MakerBot(
             wallet=ws,
@@ -496,6 +509,8 @@ async def start_plan(
         )
 
     def _on_state_changed(p: Plan) -> None:
+        if state.wallet_generation != generation:
+            return
         state.broadcast_ws(
             {
                 "tumbler": {
@@ -532,7 +547,7 @@ async def start_plan(
 
     ctx = RunnerContext(
         wallet_service=ws,
-        wallet_name=state.wallet_name,
+        wallet_name=walletname,
         data_dir=state.data_dir,
         taker_factory=_taker_factory,
         maker_factory=_maker_factory,
@@ -545,7 +560,7 @@ async def start_plan(
     runner = TumbleRunner(plan, ctx)
 
     state.tumble_runner = runner
-    state.tumble_plan_wallet = state.wallet_name
+    state.tumble_plan_wallet = walletname
     state.activate_coinjoin_state(CoinjoinState.TUMBLER_RUNNING)
 
     async def _run() -> Plan:
@@ -556,10 +571,11 @@ async def start_plan(
             logger.bind(sensitive=True).exception("Tumbler runner crashed")
             raise
         finally:
-            state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
-            state.tumble_runner = None
-            state.tumble_plan_wallet = None
-            state.tumble_task = None
+            if state.wallet_generation == generation:
+                state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+                state.tumble_runner = None
+                state.tumble_plan_wallet = None
+                state.tumble_task = None
 
     state.tumble_task = asyncio.create_task(_run())
     return JSONResponse(content={}, status_code=202)
@@ -574,9 +590,11 @@ async def stop_plan(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> JSONResponse:
     """Cooperatively stop the running plan; transition it to ``CANCELLED``."""
-    if not _runner_alive_for(state, state.wallet_name):
+    require_wallet_session(state, token, walletname)
+    if not _runner_alive_for(state, walletname):
         raise ServiceNotStarted("No tumbler is running for this wallet.")
 
     runner = state.tumble_runner
@@ -616,19 +634,21 @@ async def delete_plan_endpoint(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> Response:
     """Remove a non-running plan from disk."""
-    if _runner_alive_for(state, state.wallet_name):
+    require_wallet_session(state, token, walletname)
+    if _runner_alive_for(state, walletname):
         raise ActionNotAllowed("A tumbler is running; stop it before deleting the plan.")
 
     # Reconcile first so a stale ``RUNNING`` plan on disk is flipped to FAILED
     # before deletion; keeps the observable event stream consistent.
-    _reconcile_on_request(state, state.wallet_name)
+    _reconcile_on_request(state, walletname)
 
-    removed = delete_plan(state.wallet_name, state.data_dir)
+    removed = delete_plan(walletname, state.data_dir)
     if not removed:
         raise NoWalletFound("No tumbler plan exists for this wallet.")
-    state.broadcast_ws({"tumbler": {"event": "plan_deleted", "wallet_name": state.wallet_name}})
+    state.broadcast_ws({"tumbler": {"event": "plan_deleted", "wallet_name": walletname}})
     # A 204 must have an empty body: returning ``JSONResponse(None)`` would
     # render ``b"null"`` while starlette omits Content-Length for 204, which
     # makes uvicorn raise "Response content longer than Content-Length".

@@ -1032,7 +1032,7 @@ class TestRunRescan:
     """Unit tests for the background rescan driver coroutine."""
 
     async def test_duplicate_request_reuses_active_tracking_task(
-        self, daemon_state_with_wallet: DaemonState
+        self, daemon_state_with_wallet: DaemonState, auth_token: str
     ) -> None:
         from jmwalletd.routers.wallet_data import rescan_blockchain
 
@@ -1047,6 +1047,7 @@ class TestRunRescan:
             _auth={},
             _wallet=None,
             state=state,
+            token=auth_token,
         )
 
         assert response.walletname == state.wallet_name

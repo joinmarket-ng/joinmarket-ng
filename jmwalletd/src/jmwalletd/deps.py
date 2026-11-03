@@ -7,7 +7,7 @@ state and enforce authentication and resource ownership.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jwt
 from fastapi import Depends, Request
@@ -15,6 +15,9 @@ from loguru import logger
 
 from jmwalletd.errors import InvalidToken, NoWalletFound, WalletNotFound
 from jmwalletd.state import DaemonState
+
+if TYPE_CHECKING:
+    from jmwallet.wallet.service import WalletService
 
 # Module-level singleton -- set by ``create_app()``.
 _daemon_state: DaemonState | None = None
@@ -96,6 +99,21 @@ def require_current_session(state: DaemonState, token: str | None) -> None:
         state.token_authority.verify_access(token or "")
     except jwt.InvalidTokenError as exc:
         raise InvalidToken(str(exc)) from exc
+
+
+def require_wallet_session(
+    state: DaemonState, token: str | None, walletname: str
+) -> tuple[WalletService, int]:
+    """Revalidate a wallet-bound request and capture its service and generation.
+
+    Call synchronously inside the handler, without an await before the guarded
+    read or mutation. Repeat after awaits, since dependency checks can be stale.
+    """
+    require_current_session(state, token)
+    service = state.wallet_service
+    if service is None or state.wallet_name != walletname:
+        raise WalletNotFound()
+    return service, state.wallet_generation
 
 
 def require_auth_allow_expired(

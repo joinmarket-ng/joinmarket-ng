@@ -21,14 +21,13 @@ from jmwalletd.deps import (
     get_daemon_state,
     get_optional_token,
     require_auth,
-    require_current_session,
     require_wallet_match,
+    require_wallet_session,
 )
 from jmwalletd.errors import (
     ActionNotAllowed,
     ConfigNotPresent,
     InvalidRequestFormat,
-    NoWalletFound,
     YieldGeneratorDataUnreadable,
 )
 from jmwalletd.models import (
@@ -100,12 +99,15 @@ async def wallet_display(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> WalletDisplayResponse:
     """Return full wallet display with accounts, branches, and entries."""
-    ws = state.wallet_service
+    ws, _generation = require_wallet_session(state, token, walletname)
     rescanning, _progress = await state.live_rescan_status()
+    require_wallet_session(state, token, walletname)
     if not rescanning:
         await ws.sync_with_registered_bonds()
+        require_wallet_session(state, token, walletname)
 
     # Load history data so address statuses (cj-out, change, etc.) are
     # classified correctly.  Without this, all funded internal addresses
@@ -123,6 +125,7 @@ async def wallet_display(
 
     for mixdepth in range(ws.mixdepth_count):
         balance = await ws.get_balance(mixdepth)
+        require_wallet_session(state, token, walletname)
         total_balance += balance
 
         # Build external and internal branches.
@@ -192,12 +195,15 @@ async def list_utxos(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> ListUtxosResponse:
     """List all UTXOs in the wallet."""
-    ws = state.wallet_service
+    ws, _generation = require_wallet_session(state, token, walletname)
     rescanning, _progress = await state.live_rescan_status()
+    require_wallet_session(state, token, walletname)
     if not rescanning:
         await ws.sync_with_registered_bonds()
+        require_wallet_session(state, token, walletname)
     utxo_entries: list[UTXOEntry] = []
 
     for mixdepth in range(ws.mixdepth_count):
@@ -233,6 +239,7 @@ async def wallet_history(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> WalletHistoryResponse:
     """Return the active wallet's CoinJoin/spend history (from history.csv).
 
@@ -242,7 +249,7 @@ async def wallet_history(
     """
     from jmwallet.history import read_history
 
-    ws = state.wallet_service
+    ws, _generation = require_wallet_session(state, token, walletname)
 
     entries = read_history(
         state.data_dir,
@@ -295,19 +302,20 @@ async def get_new_address(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> GetAddressResponse:
     """Get a new receive address for the specified mixdepth."""
+    ws, _generation = require_wallet_session(state, token, walletname)
     try:
         md = int(mixdepth)
     except ValueError as exc:
         raise InvalidRequestFormat(f"Invalid mixdepth: {mixdepth}") from exc
 
-    ws = state.wallet_service
-
     if md < 0 or md >= ws.mixdepth_count:
         raise InvalidRequestFormat(f"Mixdepth {md} out of range (0-{ws.mixdepth_count - 1})")
 
     address = await ws.get_new_address_verified(md)
+    require_wallet_session(state, token, walletname)
     return GetAddressResponse(address=address)
 
 
@@ -323,11 +331,13 @@ async def get_timelock_address(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> GetAddressResponse:
     """Get a new timelocked (fidelity bond) address.
 
     The lockdate should be in YYYY-mm format (e.g., "2025-06").
     """
+    ws, _generation = require_wallet_session(state, token, walletname)
     try:
         parts = lockdate.split("-")
         if len(parts) != 2:
@@ -341,7 +351,6 @@ async def get_timelock_address(
         msg = f"Invalid lockdate format: {lockdate}. Expected YYYY-mm."
         raise InvalidRequestFormat(msg) from exc
 
-    ws = state.wallet_service
     # Convert lockdate to locktime (first day of the month as UNIX timestamp).
     dt = datetime.datetime(year, month, 1, tzinfo=datetime.UTC)
     locktime = calendar.timegm(dt.timetuple())
@@ -397,8 +406,10 @@ async def get_seed(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> GetSeedResponse:
     """Return the wallet's BIP39 mnemonic seed phrase."""
+    require_wallet_session(state, token, walletname)
     if not state.wallet_mnemonic:
         raise ActionNotAllowed("Seed phrase is not available in daemon state.")
     return GetSeedResponse(seedphrase=state.wallet_mnemonic)
@@ -465,15 +476,16 @@ async def freeze_utxo(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> dict[str, str]:
     """Freeze or unfreeze a UTXO."""
+    ws, _generation = require_wallet_session(state, token, walletname)
     if state.taker_running:
         raise ActionNotAllowed("Cannot freeze/unfreeze UTXOs while a coinjoin is in progress.")
 
     utxo_str = body.utxo_string
     _validate_outpoint_format(utxo_str)
 
-    ws = state.wallet_service
     if body.freeze:
         ws.freeze_utxo(utxo_str)
     else:
@@ -492,6 +504,7 @@ async def freeze_utxos_batch(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> dict[str, str]:
     """Freeze and/or unfreeze several UTXOs in one atomic request (issue #596).
 
@@ -499,6 +512,7 @@ async def freeze_utxos_batch(
     before anything is written; if any outpoint is malformed or repeated, the
     whole request is rejected and nothing on disk changes.
     """
+    ws, _generation = require_wallet_session(state, token, walletname)
     if state.taker_running:
         raise ActionNotAllowed("Cannot freeze/unfreeze UTXOs while a coinjoin is in progress.")
 
@@ -516,7 +530,6 @@ async def freeze_utxos_batch(
         seen.add((txid, vout))
         normalized_entries.append((f"{txid}:{vout}", entry.freeze))
 
-    ws = state.wallet_service
     try:
         ws.set_utxos_frozen(normalized_entries)
     except ValueError as exc:
@@ -555,8 +568,10 @@ async def config_get(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> ConfigGetResponse:
     """Read a config variable (in-memory override takes priority)."""
+    require_wallet_session(state, token, walletname)
     section = body.section.upper()
     field_name = body.field.lower()
 
@@ -645,8 +660,10 @@ async def config_set(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> dict[str, str]:
     """Set a config variable (in-memory only, not persisted)."""
+    require_wallet_session(state, token, walletname)
     section = body.section.upper()
     field_name = body.field.lower()
 
@@ -716,7 +733,8 @@ async def rescan_blockchain(
     token: str | None = Depends(get_optional_token),
 ) -> RescanBlockchainResponse:
     """Trigger a blockchain rescan from the given block height."""
-    backend = state.wallet_service.backend
+    ws, _generation = require_wallet_session(state, token, walletname)
+    backend = ws.backend
 
     # Rescan support is only available on DescriptorWalletBackend.
     if not (hasattr(backend, "start_background_rescan") or hasattr(backend, "rescan_blockchain")):
@@ -728,7 +746,6 @@ async def rescan_blockchain(
 
     # No await from here until the task exists, so a wallet lock either sees it
     # or has already invalidated this request's token.
-    require_current_session(state, token)
     state.rescanning = True
     state.rescan_progress = 0.0
     state.rescan_error = None
@@ -748,9 +765,12 @@ async def get_rescan_info(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> RescanInfoResponse:
     """Get rescan progress information (Bitcoin Core is the source of truth)."""
+    require_wallet_session(state, token, walletname)
     rescanning, progress = await state.live_rescan_status()
+    require_wallet_session(state, token, walletname)
     if rescanning:
         return RescanInfoResponse(rescanning=True, progress=progress)
     return RescanInfoResponse(rescanning=False, error=state.rescan_error)
@@ -766,9 +786,10 @@ async def sign_message(
     _auth: dict[str, Any] = Depends(require_auth),
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> SignMessageResponse:
     """Sign a message with a wallet key at the given HD path."""
-    ws = state.wallet_service
+    ws, _generation = require_wallet_session(state, token, walletname)
 
     try:
         # Parse the HD path to derive the address, then get the key.
@@ -812,6 +833,7 @@ async def sign_message(
 async def yieldgen_report(
     _auth: dict[str, Any] = Depends(require_auth),
     state: DaemonState = Depends(get_daemon_state),
+    token: str | None = Depends(get_optional_token),
 ) -> YieldGenReportResponse:
     """Return the yield generator (maker earnings) report.
 
@@ -823,13 +845,12 @@ async def yieldgen_report(
     """
     from jmwallet.history import format_yield_generator_report
 
-    if state.wallet_service is None:
-        raise NoWalletFound("No wallet loaded.")
+    ws, _generation = require_wallet_session(state, token, state.wallet_name)
 
     try:
         rows = format_yield_generator_report(
             state.data_dir,
-            wallet_fingerprint=state.wallet_service.wallet_fingerprint,
+            wallet_fingerprint=ws.wallet_fingerprint,
         )
     except Exception as exc:
         raise YieldGeneratorDataUnreadable(str(exc)) from exc

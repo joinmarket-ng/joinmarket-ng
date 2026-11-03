@@ -186,6 +186,16 @@ cryptography runs outside the event loop; cancellation waits for that work to
 finish before releasing lifecycle ownership. Wallet formats and KDF parameters
 are unchanged.
 
+Wallet-bound handlers revalidate the raw token and wallet name inside the
+handler and after wallet-related awaits. Lock requests revalidate while holding
+the lifecycle mutex. Direct sends check authorization again immediately before
+signing and separately before submission. Once submission starts, revocation
+cannot recall the transaction: its original wallet's history is finalized and
+no automatic retry occurs. Completion events and deduplication remain bound to
+the originating generation, including when the same wallet is unlocked again.
+Tumbler plan creation rechecks session and replacement protections after
+collecting balances. Existing wallet and history formats are unchanged on upgrade.
+
 Authentication failures and filesystem errors return generic details. Config
 responses mask backend tokens and password fields, including in-memory overrides;
 config updates do not log submitted values. These controls do not change the

@@ -178,6 +178,11 @@ class DaemonState:
         """Return True if a wallet is currently unlocked."""
         return self.wallet_service is not None
 
+    @property
+    def wallet_generation(self) -> int:
+        """Identify the loaded session, including relocks of the same wallet."""
+        return self._wallet_generation
+
     async def live_rescan_status(self) -> tuple[bool, float | None]:
         """Return ``(rescanning, progress)`` with Bitcoin Core as source of truth.
 

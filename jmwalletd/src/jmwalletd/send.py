@@ -6,6 +6,7 @@ in history.csv following the two-phase history persistence pattern.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,7 @@ async def do_direct_send(
     max_fee_rate_sat_vb: float = DEFAULT_MAX_FEE_RATE_SAT_VB,
     input_utxos: list[str] | None = None,
     rbf: bool = True,
+    authorization_check: Callable[[], None] | None = None,
 ) -> DirectSendResult:
     """Build, sign, broadcast, and record a direct (non-coinjoin) transaction.
 
@@ -69,12 +71,18 @@ async def do_direct_send(
     from jmwalletd._backend import get_backend
 
     data_dir: Path = wallet_service.data_dir or get_default_data_dir()
+    if authorization_check is not None:
+        authorization_check()
     backend = await get_backend(data_dir, wallet_service=wallet_service)
+    if authorization_check is not None:
+        authorization_check()
 
     # Preserve fidelity bond UTXOs on every backend. Plain sync omits branch 2
     # on address-scanning backends and can drop the bond immediately before an
     # expired-bond sweep.
     await wallet_service.sync_with_registered_bonds()
+    if authorization_check is not None:
+        authorization_check()
 
     logger.bind(sensitive=True).info(
         "Direct send: {} sats from mixdepth {} to {} (max fee rate {:.2f} sat/vB)",
@@ -100,8 +108,15 @@ async def do_direct_send(
         max_fee_rate_sat_vb=max_fee_rate_sat_vb,
         input_utxos=input_utxos,
         rbf=rbf,
+        authorization_check=authorization_check,
         **extra_kwargs,
     )
+
+    # Separate submission gate. There is no await from here through pending
+    # history persistence to broadcast initiation. Once submitted, finish this
+    # original wallet's history even if the session ends during the await.
+    if authorization_check is not None:
+        authorization_check()
 
     # --- Phase 1b: persist pending history row BEFORE broadcast ---
     network: str = getattr(wallet_service, "network", "mainnet")

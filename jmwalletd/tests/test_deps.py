@@ -15,9 +15,10 @@ from jmwalletd.deps import (
     get_daemon_state,
     require_auth,
     require_auth_allow_expired,
+    require_wallet_session,
     set_daemon_state,
 )
-from jmwalletd.errors import JMWalletDaemonError
+from jmwalletd.errors import InvalidToken, JMWalletDaemonError, WalletNotFound
 from jmwalletd.state import DaemonState
 
 
@@ -89,6 +90,23 @@ class TestExtractBearerToken:
         request = MagicMock()
         request.headers = {"authorization": "BEARER tok789"}
         assert _extract_bearer_token(request) == "tok789"
+
+
+def test_wallet_session_captures_and_revalidates(
+    daemon_state_with_wallet: DaemonState, auth_token: str
+) -> None:
+    state = daemon_state_with_wallet
+    service, generation = require_wallet_session(state, auth_token, state.wallet_name)
+    assert service is state.wallet_service
+    assert generation == state.wallet_generation
+    with pytest.raises(WalletNotFound):
+        require_wallet_session(state, auth_token, "another-wallet.jmdat")
+    state.wallet_service = None
+    with pytest.raises(WalletNotFound):
+        require_wallet_session(state, auth_token, state.wallet_name)
+    state.token_authority.reset()
+    with pytest.raises(InvalidToken):
+        require_wallet_session(state, auth_token, state.wallet_name)
 
 
 class TestRequireAuth:

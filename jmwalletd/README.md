@@ -57,6 +57,11 @@ or on an isolated container network behind an access-controlled, TLS-terminating
 reverse proxy. Binding to `0.0.0.0` makes the API reachable on any interface
 allowed by the firewall; clients must verify the daemon's TLS certificate.
 
+Locking revokes pending wallet requests and direct sends that have not started
+submission. It cannot recall an already-submitted transaction. If submission's
+outcome is uncertain, check the original wallet's history and transaction status
+before retrying. Completion notifications are not forwarded to a later wallet session.
+
 ## Configuration
 
 ### BIP39 Wallet Identity
