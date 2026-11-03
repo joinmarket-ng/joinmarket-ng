@@ -719,6 +719,9 @@ jobs:
           BITCOIN_RPC_PASSWORD: test
           OBWATCH_URL: http://127.0.0.1:8080
         run: |
+          # Explicit initialization for this job's new test volume, not daemon startup.
+          printf 'y\n' | docker compose exec -T jmwalletd \
+            jm-taker init-commitment-history --data-dir /root/.joinmarket-ng
           pytest -c pytest.ini -m tumbler_e2e --junitxml=junit/test-results.xml \
             --cov --cov-report=term-missing --cov-report=xml \
             -v -s --timeout=600 --reruns=1 --reruns-delay=10 --fail-on-skip
@@ -846,6 +849,9 @@ jobs:
           .github/scripts/wait-for-service.sh "jam-playwright" \
             "curl -sf http://127.0.0.1:29183/api/v1/session" \
             90 2
+
+          printf 'y\n' | docker compose exec -T jam-playwright \
+            /opt/venv/bin/jm-taker init-commitment-history --data-dir /root/.joinmarket-ng
 
           # Wait for at least 4 maker offers to appear in the orderbook so
           # that the collaborative-send playwright test (which requires the
@@ -1863,6 +1869,9 @@ jobs:
           COMPOSE_DOCKER_CLI_BUILD: 1
         run: |
           docker compose --profile reference-maker up -d
+
+          printf 'y\n' | docker compose run --rm --no-deps -T taker-reference \
+            jm-taker init-commitment-history --data-dir /home/jm/.joinmarket-ng
 
           echo "Waiting for Bitcoin..."
           for i in {1..60}; do

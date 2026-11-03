@@ -26,6 +26,7 @@ from loguru import logger
 
 from taker.config import TakerConfig
 from taker.config_builder import build_taker_config
+from taker.podle_manager import CommitmentHistoryError, initialize_commitment_history
 
 __all__ = ["app", "build_taker_config", "create_backend"]
 
@@ -370,6 +371,9 @@ def coinjoin(
                 input_utxos=input_utxo,
             )
         )
+    except CommitmentHistoryError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
     except RuntimeError as e:
         # Clean error for expected failures (e.g., connection failures)
         logger.error("CoinJoin failed")
@@ -549,6 +553,46 @@ async def _run_coinjoin(
         # Clean up nick state file on shutdown
         remove_nick_state(config.data_dir, "taker")
         await taker.stop()
+
+
+@app.command()
+def init_commitment_history(
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            "-d",
+            envvar="JOINMARKET_DATA_DIR",
+            help="Data directory for JoinMarket files",
+        ),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="Config file path (decoupled from data dir)",
+        ),
+    ] = None,
+) -> None:
+    """Explicitly create a missing, empty commitment history for a new taker."""
+    if data_dir is None:
+        settings = setup_cli(None, config_file=config_file)
+        data_dir = settings.get_data_dir()
+    typer.echo(
+        "WARNING: Empty history can reuse commitments from previously used wallets. "
+        "Restore trusted history instead if any wallet has already made CoinJoins. "
+        "Existing files will never be overwritten."
+    )
+    if not typer.confirm("Initialize a new, unused commitment history?", default=False):
+        typer.echo("Cancelled.")
+        return
+    try:
+        path = initialize_commitment_history(data_dir)
+    except CommitmentHistoryError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Initialized commitment history at: {path}")
 
 
 @app.command()

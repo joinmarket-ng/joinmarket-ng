@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _taker_test_helpers import make_taker_config, make_utxo
+from _taker_test_helpers import initialize_test_commitment_history, make_taker_config, make_utxo
 from jmcore.podle import generate_podle
 
 from taker.taker import Taker
@@ -38,6 +38,7 @@ def _wallet(utxos: list) -> AsyncMock:
 
 
 def _taker(tmp_path: Path, utxos: list) -> Taker:
+    initialize_test_commitment_history(tmp_path)
     backend = AsyncMock()
     backend.can_provide_neutrino_metadata = Mock(return_value=False)
     backend.requires_neutrino_metadata = Mock(return_value=False)

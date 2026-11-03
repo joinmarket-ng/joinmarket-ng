@@ -53,6 +53,9 @@ async def test_history_recording_mechanism(bitcoin_core_backend):
 
     with tempfile.TemporaryDirectory() as temp_dir:
         data_dir = Path(temp_dir)
+        from taker.podle_manager import initialize_commitment_history
+
+        initialize_commitment_history(data_dir)
 
         # Create a wallet
         wallet = WalletService(

@@ -6,10 +6,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _taker_test_helpers import make_taker_config, make_utxo
+from _taker_test_helpers import initialize_test_commitment_history, make_taker_config, make_utxo
 from jmcore.models import Offer, OfferType
 
 from taker.coinjoin_session import CoinJoinSession
+from taker.podle_manager import CommitmentHistoryError
 from taker.taker import Taker, TakerState
 
 
@@ -39,6 +40,7 @@ def _backend() -> AsyncMock:
 
 
 def _config(tmp_path: Path, **overrides: object):  # noqa: ANN202
+    initialize_test_commitment_history(tmp_path)
     defaults: dict[str, object] = {
         "select_utxos": False,
         "taker_utxo_age": 5,
@@ -163,6 +165,41 @@ async def test_coinjoin_preselects_exact_explicit_set(tmp_path: Path, amount: in
     assert taker._session.strict_input_selection is True
     wallet.select_utxos.assert_not_called()
     wallet.get_all_utxos.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_history_failure_propagates_before_fill_and_releases_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = make_utxo(value=25_000_000, confirmations=10)
+    wallet = _wallet([selected])
+    taker = Taker(wallet, _backend(), _config(tmp_path))
+    offer = _offer()
+    taker.directory_client.fetch_orderbook = AsyncMock(return_value=[offer])
+    taker._update_offers_with_bond_values = AsyncMock()  # type: ignore[method-assign]
+    taker.orderbook_manager.select_makers = Mock(return_value=({"maker1": offer}, 0))
+    error = CommitmentHistoryError("storage requires operator action")
+    taker.podle_manager.generate_fresh_commitment = Mock(side_effect=error)
+    taker._run_fill_with_replacements = AsyncMock()
+    notifier = Mock()
+    notifier.notify_coinjoin_failed = AsyncMock()
+    monkeypatch.setattr("taker.taker.get_notifier", lambda: notifier)
+
+    with pytest.raises(CommitmentHistoryError) as exc:
+        await taker.do_coinjoin(
+            amount=5_000_000,
+            destination="INTERNAL",
+            mixdepth=0,
+            input_utxos=[f"{selected.txid}:{selected.vout}"],
+        )
+
+    assert exc.value is error
+    assert taker.state == TakerState.FAILED
+    assert taker.last_failure_reason == str(error)
+    taker._run_fill_with_replacements.assert_not_awaited()
+    wallet.release_coinjoin_inputs.assert_called()
+    notifier.notify_coinjoin_failed.assert_called_once()
 
 
 @pytest.mark.asyncio

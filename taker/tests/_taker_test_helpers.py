@@ -8,12 +8,16 @@ tests from the monorepo root.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from jmcore.crypto import NickIdentity
 from jmcore.encryption import CryptoSession
 from jmcore.models import NetworkType
+from jmcore.paths import get_used_commitments_path
 from jmwallet.wallet.models import UTXOInfo
 
 from taker.config import TakerConfig
+from taker.podle_manager import initialize_commitment_history
 from taker.taker import MultiDirectoryClient
 
 # ---------------------------------------------------------------------------
@@ -31,6 +35,12 @@ TEST_NICK_AUTH_DIRECTORY_IDS = {"localhost:5222": "test:taker-directory"}
 # ---------------------------------------------------------------------------
 # Factory helpers
 # ---------------------------------------------------------------------------
+
+
+def initialize_test_commitment_history(data_dir: Path) -> None:
+    """Prepare successful fixtures without resetting any already recorded proofs."""
+    if not get_used_commitments_path(data_dir).exists():
+        initialize_commitment_history(data_dir)
 
 
 def make_utxo(

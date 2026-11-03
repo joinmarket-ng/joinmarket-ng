@@ -4,18 +4,16 @@ Manager for PoDLE commitments (used for retry tracking).
 
 from __future__ import annotations
 
-import itertools
+import binascii
 import json
-import os
-import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from jmcore.commitment_blacklist import get_blacklist
 from jmcore.paths import get_used_commitments_path
 from jmcore.podle import PoDLECommitment, generate_podle
-from jmcore.secure_files import atomic_write_sensitive_file
+from jmcore.secure_files import atomic_write_sensitive_file, create_private_file_exclusive
 from loguru import logger
 
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
@@ -24,64 +22,126 @@ if TYPE_CHECKING:
     from jmwallet.wallet.models import UTXOInfo
 
 
+class CommitmentHistoryError(Exception):
+    """Commitment history needs operator action before CoinJoin can proceed."""
+
+
+def initialize_commitment_history(data_dir: Path | None = None) -> Path:
+    """Explicitly initialize only a missing history, never replace existing state."""
+    try:
+        path = get_used_commitments_path(data_dir)
+        # Follow configured directory aliases, but never resolve the final name:
+        # O_EXCL must refuse even a dangling history-file symlink.
+        create_private_file_exclusive(
+            path.parent.resolve(strict=False) / path.name,
+            b'{"used": [], "external": {}}\n',
+        )
+    except FileExistsError as exc:
+        raise CommitmentHistoryError(
+            "Commitment history already exists; it was not replaced."
+        ) from exc
+    except OSError as exc:
+        raise CommitmentHistoryError(
+            "Could not initialize commitment history. Preserve any created bytes and "
+            "resolve the storage failure before attempting recovery."
+        ) from exc
+    return path
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate commitment-history field")
+        result[key] = value
+    return result
+
+
+def _validate_hex(value: object) -> None:
+    if not isinstance(value, str):
+        raise ValueError("Commitment-history hex fields must be strings")
+    # Match the reference persistence reader, not proof verification: either
+    # case is accepted, but whitespace and non-ASCII hex are not.
+    binascii.unhexlify(value)
+
+
+def _validate_history(data: object) -> dict[str, Any]:
+    if not isinstance(data, dict) or not isinstance(data.get("used"), list):
+        raise ValueError("Commitment history must contain a used list")
+    if not isinstance(data.get("external"), dict):
+        raise ValueError("Commitment history must contain an external object")
+    for commitment in data["used"]:
+        _validate_hex(commitment)
+    for outpoint, entry in data["external"].items():
+        if not isinstance(outpoint, str):
+            raise ValueError("External commitment outpoints must be strings")
+        parts = outpoint.split(":")
+        if len(parts) != 2 or len(parts[0]) != 64 or int(parts[1]) < 0:
+            raise ValueError("Invalid external commitment outpoint")
+        _validate_hex(parts[0])
+        if not isinstance(entry, dict) or not isinstance(entry.get("reveal"), dict):
+            raise ValueError("External commitment must contain P and reveal records")
+        _validate_hex(entry.get("P"))
+        for index, reveal in entry["reveal"].items():
+            int(index)  # Reference indices need not have canonical decimal spelling.
+            if not isinstance(reveal, dict):
+                raise ValueError("Invalid external commitment reveal")
+            for field in ("P2", "s", "e"):
+                _validate_hex(reveal.get(field))
+    return data
+
+
 class PoDLEManager:
     """Manages tracking of used PoDLE commitments."""
 
-    def __init__(self, data_dir: Path | None = None):
-        self.filepath = get_used_commitments_path(data_dir)
+    def __init__(self, data_dir: Path | None = None) -> None:
+        try:
+            self.filepath = get_used_commitments_path(data_dir)
+        except OSError as exc:
+            raise CommitmentHistoryError(
+                "Could not access the commitment-history directory."
+            ) from exc
         self.used_commitments: set[str] = set()
-        self.external_commitments: dict = {}
+        self.external_commitments: dict[str, Any] = {}
+        self._history_data: dict[str, Any] = {}
         self._load()
 
     def _load(self) -> None:
         """Load used commitments from file."""
-        if not self.filepath.exists():
-            return
         try:
-            with open(self.filepath) as f:
-                data = json.load(f)
-                # Handle reference implementation format: {"used": ["hex..."], "external": ...}
-                if isinstance(data, dict):
-                    self.used_commitments = set(data.get("used", []))
-                    self.external_commitments = data.get("external", {})
-                else:
-                    self.used_commitments = set()
-                    self.external_commitments = {}
-            logger.debug(f"Loaded {len(self.used_commitments)} used PoDLE commitments")
-        except Exception as e:
-            # Keep the unreadable file for recovery instead of overwriting it
-            # on the next save.
-            backup = self._quarantine_unreadable_file()
-            logger.error(f"Failed to load used commitments: {e}; moved file to {backup}")
-
-    def _quarantine_unreadable_file(self) -> Path:
-        """Move the unreadable file aside without replacing an earlier backup."""
-        stem = f"{self.filepath.name}.corrupt.{int(time.time())}"
-        for attempt in itertools.count():
-            backup = self.filepath.with_name(stem if attempt == 0 else f"{stem}.{attempt}")
-            try:
-                # Reserve the name so a backup from the same second is never replaced.
-                os.close(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-            except FileExistsError:
-                continue
-            try:
-                os.replace(self.filepath, backup)
-            except BaseException:
-                backup.unlink(missing_ok=True)
-                raise
-            return backup
-        raise AssertionError("unreachable")
+            with open(self.filepath, encoding="utf-8") as history:
+                data = _validate_history(json.load(history, object_pairs_hook=_unique_json_object))
+        except FileNotFoundError as exc:
+            raise CommitmentHistoryError(
+                f"Commitment history is missing at {self.filepath}. Restore trusted history "
+                "for previously used wallets. Only new, unused histories may be initialized "
+                "with jm-taker init-commitment-history."
+            ) from exc
+        except (OSError, ValueError, TypeError) as exc:
+            raise CommitmentHistoryError(
+                f"Could not load commitment history at {self.filepath}; bytes were left untouched. "
+                "Restore trusted history or resolve the read failure before retrying."
+            ) from exc
+        self._history_data = data
+        self.used_commitments = {value.lower() for value in data["used"]}
+        self.external_commitments = data["external"]
+        logger.debug(f"Loaded {len(self.used_commitments)} used PoDLE commitments")
 
     def _save(self) -> None:
         """Save used commitments to file."""
         try:
             data = {
-                "used": list(self.used_commitments),
+                **self._history_data,
+                "used": sorted(self.used_commitments),
                 "external": self.external_commitments,
             }
+            _validate_history(data)
             atomic_write_sensitive_file(self.filepath, json.dumps(data, indent=2).encode())
-        except Exception as e:
-            logger.error(f"Failed to save used commitments: {e}")
+        except (OSError, ValueError, TypeError) as exc:
+            raise CommitmentHistoryError(
+                f"Could not persist commitment history at {self.filepath}. No fresh commitment "
+                "was released; resolve the storage failure before retrying."
+            ) from exc
 
     def get_utxo_retry_count(self, utxo_str: str, private_key: bytes, max_retries: int) -> int:
         """
@@ -242,6 +302,8 @@ class PoDLEManager:
                     found = True
                     yield utxo, podle
                     break
+                except CommitmentHistoryError:
+                    raise
                 except Exception as exc:
                     logger.warning("Failed to generate PoDLE commitment")
                     logger.bind(sensitive=True).warning(

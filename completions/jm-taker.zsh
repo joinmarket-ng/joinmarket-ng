@@ -9,6 +9,7 @@ _jm_taker() {
     'clear-ignored-makers:Clear the list of ignored makers.'
     'coinjoin:Execute a single CoinJoin transaction.'
     'config-init:Initialize the config file with default settings.'
+    'init-commitment-history:Explicitly create a missing, empty commitment history for a new taker.'
   )
 
   _arguments -C \
@@ -65,6 +66,12 @@ _jm_taker() {
           _arguments \
             '--data-dir=[Data directory for JoinMarket files]:file:_files' \
             '--config-file=[Config file path (decoupled from data dir). Defaults to <data-dir>/config.toml]:file:_files' \
+            '--help[Show this message and exit]'
+          ;;
+        init-commitment-history)
+          _arguments \
+            '--data-dir=[Data directory for JoinMarket files]:file:_files' \
+            '--config-file=[Config file path (decoupled from data dir)]:file:_files' \
             '--help[Show this message and exit]'
           ;;
       esac

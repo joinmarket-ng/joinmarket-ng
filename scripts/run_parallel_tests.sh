@@ -1004,6 +1004,11 @@ run_suite_tumbler() {
         wait_for_wallet_funder "$suite"
         wait_for_maker_offers "$suite" "$obwatch_port" 2
 
+        # This suite just created a fresh, isolated volume. Explicitly initialize
+        # its new taker history; never add automatic initialization to startup.
+        printf 'y\n' | compose_cmd "$suite" exec -T jmwalletd \
+            jm-taker init-commitment-history --data-dir /root/.joinmarket-ng
+
         BITCOIN_RPC_URL="http://127.0.0.1:${btc_rpc}" \
         BITCOIN_RPC_USER=test \
         BITCOIN_RPC_PASSWORD=test \
@@ -1072,6 +1077,10 @@ run_suite_playwright() {
             log_error "JAM Playwright API not ready on port ${jam_pw_port}"
             return 1
         fi
+
+        # The browser suite's backend has its own fresh, isolated data volume.
+        printf 'y\n' | compose_cmd "$suite" exec -T jam-playwright \
+            /opt/venv/bin/jm-taker init-commitment-history --data-dir /root/.joinmarket-ng
 
         # Wait for at least 4 maker offers to appear in the orderbook so that
         # the collaborative-send playwright tests have enough counterparties.
@@ -1491,6 +1500,9 @@ run_suite_reference_maker() {
         generate_override "$suite"
         cleanup_suite "$suite"
         compose_cmd "$suite" --profile reference-maker up -d
+
+        printf 'y\n' | compose_cmd "$suite" run --rm --no-deps -T taker-reference \
+            jm-taker init-commitment-history --data-dir /home/jm/.joinmarket-ng
 
         # reference-maker uses bitcoin-jam on port 18445
         local bitcoin_jam_ready=0

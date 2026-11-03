@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from _taker_test_helpers import make_utxo
+from _taker_test_helpers import initialize_test_commitment_history, make_utxo
 from loguru import logger
 
 from taker.podle_manager import PoDLEManager
@@ -13,6 +13,7 @@ from taker.podle_manager import PoDLEManager
 
 def test_podle_outpoint_logs_are_sensitive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Outpoint-bearing PoDLE records must not reach ordinary log sinks."""
+    initialize_test_commitment_history(tmp_path)
     utxo = make_utxo(txid_char="a", vout=2, value=25_000_000, address="bcrt1qtest1")
     outpoint = f"{utxo.txid}:{utxo.vout}"
     monkeypatch.setattr(

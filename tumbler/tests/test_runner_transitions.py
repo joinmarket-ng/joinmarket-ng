@@ -17,8 +17,10 @@ import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from taker.podle_manager import CommitmentHistoryError
 
 from tumbler.builder import PlanBuilder, TumbleParameters
 from tumbler.persistence import load_plan, save_plan
@@ -313,6 +315,44 @@ class TestRunnerHappyPath:
 
 
 class TestRunnerFailure:
+    @pytest.mark.parametrize("constructor_failure", [False, True])
+    async def test_history_failure_is_persisted_without_retry(
+        self,
+        tmp_path: Path,
+        constructor_failure: bool,
+    ) -> None:
+        plan = _plan(tmp_path)
+        error = CommitmentHistoryError("restore trusted commitment history")
+        takers: list[FakeTaker] = []
+        factory_calls = 0
+
+        async def make_taker(phase: Any) -> FakeTaker:
+            nonlocal factory_calls
+            factory_calls += 1
+            if constructor_failure:
+                raise error
+            taker = FakeTaker(phase)
+            taker.do_coinjoin = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+            takers.append(taker)
+            return taker
+
+        runner = TumbleRunner(plan, _ctx(tmp_path, taker_factory=make_taker))
+        runner._try_tweak_for_retry = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        result = await runner.run()
+
+        assert result.status == PlanStatus.FAILED
+        assert result.error == str(error)
+        assert result.phases[0].status == PhaseStatus.FAILED
+        assert result.phases[0].error == str(error)
+        assert result.phases[0].attempt_count == 0
+        assert factory_calls == 1
+        runner._try_tweak_for_retry.assert_not_awaited()
+        persisted = load_plan(result.wallet_name, tmp_path)
+        assert persisted.status == PlanStatus.FAILED
+        assert persisted.error == str(error)
+        if takers:
+            assert takers[0].stopped_with == {"close_wallet": False}
+
     async def test_phase_failure_marks_plan_failed(self, tmp_path: Path) -> None:
         plan = _plan(tmp_path)
 

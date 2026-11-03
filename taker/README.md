@@ -18,6 +18,28 @@ fee-rate cap. See `config.toml.template` for those settings and current defaults
 Makers whose inputs would break the minimum-fee policy or sweep tolerance are dropped during
 authentication, heaviest input set first, and replaced for that round without being ignored.
 
+## Commitment History and Recovery
+
+Before a new taker first uses its data directory, explicitly initialize its history:
+
+```bash
+jm-taker init-commitment-history --data-dir /path/to/data
+```
+
+Confirm only for a new, unused history. The command never overwrites an existing
+file, including a corrupt file or symlink. Takers, including daemon CoinJoins and
+tumbler phases, stop on missing, unreadable, invalid, or unsavable history rather
+than resetting it or retrying with makers.
+
+On upgrade, valid `cmtdata/commitments.json` files load without migration. Preserve
+this file with wallet backups. If it is missing or damaged, stop all takers and
+restore a trusted, complete copy before resuming. Existing `.corrupt.*` backups
+are evidence for manual recovery, not permission to start empty. Commitment use
+cannot be reconstructed from the seed or blockchain; an empty replacement can
+reuse commitments and expose links between rounds. Failed writes can leave new
+bytes installed even when durability was not confirmed, so preserve and inspect
+the file instead of assuming the previous version remains.
+
 ## Documentation
 
 For full documentation, see [taker Documentation](https://joinmarket-ng.github.io/joinmarket-ng/README-taker/).
@@ -42,9 +64,11 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                               exit.                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
-│ clear-ignored-makers  Clear the list of ignored makers.                      │
-│ coinjoin              Execute a single CoinJoin transaction.                 │
-│ config-init           Initialize the config file with default settings.      │
+│ clear-ignored-makers     Clear the list of ignored makers.                   │
+│ coinjoin                 Execute a single CoinJoin transaction.              │
+│ config-init              Initialize the config file with default settings.   │
+│ init-commitment-history  Explicitly create a missing, empty commitment       │
+│                          history for a new taker.                            │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -259,5 +283,25 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 
 </details>
 
+
+<details>
+<summary><code>jm-taker init-commitment-history --help</code></summary>
+
+```
+
+ Usage: jm-taker init-commitment-history [OPTIONS]
+
+ Explicitly create a missing, empty commitment history for a new taker.
+
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --config-file          PATH  Config file path (decoupled from data dir)      │
+│                              [env var: JOINMARKET_CONFIG_FILE]               │
+│ --data-dir     -d      PATH  Data directory for JoinMarket files             │
+│                              [env var: JOINMARKET_DATA_DIR]                  │
+│ --help                       Show this message and exit.                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+</details>
 
 <!-- AUTO-GENERATED HELP END: jm-taker -->

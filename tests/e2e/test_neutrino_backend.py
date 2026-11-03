@@ -444,6 +444,9 @@ class TestNeutrinoCoinJoin:
         )
         assert taker_config.data_dir == taker_wallet.data_dir
 
+        from taker.podle_manager import initialize_commitment_history
+
+        initialize_commitment_history(tmp_path)
         taker = Taker(
             wallet=taker_wallet,
             backend=bitcoin_backend,
@@ -818,6 +821,9 @@ class TestNeutrinoCoinJoin:
         )
         assert taker_config.data_dir == taker_wallet.data_dir
 
+        from taker.podle_manager import initialize_commitment_history
+
+        initialize_commitment_history(tmp_path)
         taker = Taker(
             wallet=taker_wallet,
             backend=neutrino_backend,

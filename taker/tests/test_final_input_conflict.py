@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _taker_test_helpers import make_taker_config, make_utxo
+from _taker_test_helpers import initialize_test_commitment_history, make_taker_config, make_utxo
 from jmcore.bitcoin import parse_transaction_bytes
 from jmcore.models import Offer, OfferType
 
@@ -21,6 +21,11 @@ from taker.models import MakerSession
 from taker.taker import Taker, TakerState
 
 DESTINATION = "bcrt1qqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcruj60yu"
+
+
+@pytest.fixture(autouse=True)
+def prepared_input_history(tmp_path: Path) -> None:
+    initialize_test_commitment_history(tmp_path)
 
 
 def _wallet(preselected: list, reselected: list) -> AsyncMock:

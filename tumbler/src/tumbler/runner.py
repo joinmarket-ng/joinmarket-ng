@@ -32,6 +32,7 @@ from jmcore.settings import get_settings
 from jmwallet.wallet.service import WalletService
 from loguru import logger
 from taker.orderbook import maker_nick_selection_key
+from taker.podle_manager import CommitmentHistoryError
 
 from tumbler.persistence import save_plan
 from tumbler.plan import (
@@ -282,6 +283,13 @@ class TumbleRunner:
                         self.plan.status = PlanStatus.CANCELLED
                         self._persist()
                         return self.plan
+        except CommitmentHistoryError as exc:
+            logger.error("Commitment history requires operator action; stopping tumble")
+            logger.bind(sensitive=True).error("Commitment history failure: {}", exc)
+            self.plan.status = PlanStatus.FAILED
+            self.plan.error = str(exc)
+            self._persist()
+            return self.plan
         finally:
             await self._teardown_active()
 
@@ -386,6 +394,10 @@ class TumbleRunner:
             phase.status = PhaseStatus.CANCELLED
         except asyncio.CancelledError:
             phase.status = PhaseStatus.CANCELLED
+            raise
+        except CommitmentHistoryError as exc:
+            phase.status = PhaseStatus.FAILED
+            phase.error = str(exc)
             raise
         except TakerPhaseError as exc:
             # Known, already-explained failure (e.g. not enough makers).

@@ -15,10 +15,12 @@ import asyncio
 import base64
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from _taker_test_helpers import (
+    initialize_test_commitment_history,
     make_crypto_pair,
     make_directory_client,
     make_taker_config,
@@ -37,7 +39,7 @@ from jmwallet.wallet.models import UTXOInfo
 from loguru import logger
 
 from taker.multi_directory import ChannelBinding
-from taker.podle_manager import PoDLEManager
+from taker.podle_manager import CommitmentHistoryError, PoDLEManager
 from taker.taker import (
     MakerSession,
     PhaseResult,
@@ -47,6 +49,12 @@ from taker.taker import (
     _initial_fee_confirmation_values,
 )
 from taker.tx_builder import build_coinjoin_tx
+
+
+@pytest.fixture(autouse=True)
+def prepared_round_history(tmp_path: Path) -> None:
+    """Protocol rounds use tmp_path for explicit data-directory overrides."""
+    initialize_test_commitment_history(tmp_path)
 
 
 @pytest.fixture
@@ -3838,6 +3846,34 @@ class TestReplacementTargetRestoration:
             in taker.orderbook_manager.select_makers.call_args.kwargs["hard_exclude_nicks"]
         )
         assert "J5replacement" in taker._session.maker_sessions
+
+    @pytest.mark.asyncio
+    async def test_auth_replacement_history_failure_never_sends_mini_fill(self):
+        taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
+        next(iter(taker._session.maker_sessions.values())).responded_auth = True
+        taker._session.preselected_utxos = [MagicMock()]
+        taker._session.podle_commitment = MagicMock(name="old_commitment")
+        taker._session._phase_auth = AsyncMock(
+            return_value=PhaseResult(success=True, podle_revealed=True)
+        )
+        taker.orderbook_manager.select_makers.return_value = (
+            self._replacement_offers("J5replacement"),
+            0,
+        )
+        taker.podle_manager = MagicMock()
+        taker.podle_manager.generate_fresh_commitment.side_effect = CommitmentHistoryError(
+            "history save failed"
+        )
+        taker._fill_replacement_makers = AsyncMock()
+
+        with pytest.raises(CommitmentHistoryError):
+            await taker._run_auth_with_replacements(
+                required_features=None,
+                get_private_key=MagicMock(),
+                max_replacement_attempts=2,
+            )
+        taker._fill_replacement_makers.assert_not_awaited()
+        taker.podle_manager.generate_fresh_commitment.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_auth_replacement_rotates_revealed_commitment_before_mini_fill(self):

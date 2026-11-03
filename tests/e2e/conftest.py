@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 import pytest
 import pytest_asyncio
 from loguru import logger
+from taker.podle_manager import initialize_commitment_history
 
 if TYPE_CHECKING:
     from jmwallet.backends.base import BlockchainBackend
@@ -98,6 +99,7 @@ def _isolate_data_dir(config: pytest.Config) -> None:
 
     tmp_data_dir = tempfile.mkdtemp(prefix="jm-e2e-data-")
     os.environ["JOINMARKET_DATA_DIR"] = tmp_data_dir
+    initialize_commitment_history(Path(tmp_data_dir))
     # A leaked JOINMARKET_CONFIG_FILE would override the isolated data dir's
     # config location, so clear it too.
     os.environ.pop("JOINMARKET_CONFIG_FILE", None)
@@ -647,6 +649,7 @@ def fresh_docker_makers():
         if taker_commitments.exists():
             taker_commitments.unlink()
             logger.info(f"Cleared taker used commitments: {taker_commitments}")
+        initialize_commitment_history(taker_commitments.parent.parent)
 
         # Clear commitment blacklists for all active e2e makers before restarting.
         # Includes maker4 and maker5 to prevent blacklist carry-over from prior tests.

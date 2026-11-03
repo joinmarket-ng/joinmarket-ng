@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
-from _taker_test_helpers import make_taker_config, make_utxo
+from _taker_test_helpers import initialize_test_commitment_history, make_taker_config, make_utxo
 from jmcore.models import Offer, OfferType
 
 from taker.taker import Taker, TakerState
@@ -31,6 +31,7 @@ def _make_wallet(utxos_by_md: dict[int, list]) -> AsyncMock:
 
 
 def _make_config(tmp_path: Path, **overrides: object):  # noqa: ANN202
+    initialize_test_commitment_history(tmp_path)
     base: dict[str, object] = {
         "select_utxos": True,
         "taker_utxo_age": 5,

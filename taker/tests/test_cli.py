@@ -4,6 +4,7 @@ Tests for taker CLI module.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,11 +12,51 @@ import click
 import pytest
 from jmcore.models import NetworkType
 from jmcore.nick_auth import NickAuthMode
+from jmcore.paths import get_used_commitments_path
 from typer.testing import CliRunner
 
 from taker.cli import _run_coinjoin, app, build_taker_config, create_backend
 
 runner = CliRunner()
+
+
+@pytest.mark.parametrize("answer", ["\n", "n\n"])
+def test_history_initialization_requires_affirmative_confirmation(
+    tmp_path: Path, answer: str
+) -> None:
+    result = runner.invoke(
+        app, ["init-commitment-history", "--data-dir", str(tmp_path)], input=answer
+    )
+    assert result.exit_code == 0
+    assert "Cancelled" in result.output
+    assert not get_used_commitments_path(tmp_path).exists()
+
+
+def test_history_initialization_never_overwrites_existing_bytes(tmp_path: Path) -> None:
+    args = ["init-commitment-history", "--data-dir", str(tmp_path)]
+    result = runner.invoke(app, args, input="y\n")
+    assert result.exit_code == 0
+    path = get_used_commitments_path(tmp_path)
+    assert json.loads(path.read_bytes()) == {"used": [], "external": {}}
+    assert path.stat().st_mode & 0o777 == 0o600
+    path.write_bytes(b"corrupt but preserve")
+    repeated = runner.invoke(app, args, input="y\n")
+    assert repeated.exit_code == 1
+    assert "already exists" in repeated.output
+    assert path.read_bytes() == b"corrupt but preserve"
+
+
+def test_history_initialization_honors_config_data_directory(tmp_path: Path) -> None:
+    settings = MagicMock()
+    settings.get_data_dir.return_value = tmp_path / "configured-data"
+    config_file = tmp_path / "custom.toml"
+    with patch("taker.cli.setup_cli", return_value=settings) as setup:
+        result = runner.invoke(
+            app, ["init-commitment-history", "--config-file", str(config_file)], input="y\n"
+        )
+    assert result.exit_code == 0
+    setup.assert_called_once_with(None, config_file=config_file)
+    assert get_used_commitments_path(settings.get_data_dir.return_value).is_file()
 
 
 def test_root_help_shows_completion_options() -> None:

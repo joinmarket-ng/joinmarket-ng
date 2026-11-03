@@ -20,6 +20,7 @@ from jmcore.settings import JoinMarketSettings
 from jmwallet.wallet.spend import ExcessiveFeeRateError
 from loguru import logger
 from pydantic import SecretStr
+from taker.podle_manager import initialize_commitment_history
 from typer.testing import CliRunner
 
 from tumbler.builder import PlanBuilder, TumbleParameters
@@ -307,6 +308,7 @@ class TestRunCounterpartiesOption:
 async def test_tumbler_taker_uses_wallet_fee_cap_and_preserves_override(
     tmp_path: Path, configured_cap: float | None
 ) -> None:
+    initialize_commitment_history(tmp_path)
     settings = JoinMarketSettings(
         data_dir=tmp_path,
         network_config={"network": "regtest", "directory_servers": ["localhost:5222"]},

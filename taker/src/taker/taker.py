@@ -61,7 +61,7 @@ from taker.orderbook import (
     calculate_cj_fee,
     maker_selection_keys,
 )
-from taker.podle_manager import PoDLEManager
+from taker.podle_manager import CommitmentHistoryError, PoDLEManager
 
 # Backward-compatible re-exports: many tests and modules import these from taker.taker
 __all__ = [
@@ -1607,6 +1607,9 @@ class Taker(TakerMonitoringMixin):
                 )
             )
             self.state = TakerState.FAILED
+            if isinstance(e, CommitmentHistoryError):
+                self._session.last_failure_reason = str(e)
+                raise
             return None
         finally:
             # Before local taker signing, failure cannot produce a transaction
