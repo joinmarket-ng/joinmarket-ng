@@ -12,7 +12,6 @@ from dataclasses import dataclass
 import pytest
 
 import jmwallet.utxo_selector as utxo_selector
-from jmwallet.utxo_tui import build_display_items, utxo_sort_key
 from jmwallet.wallet.models import UTXOInfo
 from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
@@ -126,6 +125,7 @@ def _utxo(
     label: str | None = None,
     frozen: bool = False,
     locktime: int | None = None,
+    branch: int = 0,
 ) -> UTXOInfo:
     return UTXOInfo(
         txid=txid_char * 64,
@@ -134,7 +134,7 @@ def _utxo(
         address=address or f"bcrt1q{txid_char * 12}",
         confirmations=confirmations,
         scriptpubkey="0014" + txid_char * 40,
-        path=f"m/84'/0'/{mixdepth}'/0/{ord(txid_char) - ord('a'):02d}",
+        path=f"m/84'/0'/{mixdepth}'/{branch}/{ord(txid_char) - ord('a'):02d}",
         mixdepth=mixdepth,
         label=label,
         frozen=frozen,
@@ -156,7 +156,9 @@ def _run(
     excluded_outpoints: set[tuple[str, int]] | None = None,
     allow_fidelity_bonds: bool = True,
 ) -> list[UTXOInfo]:
-    display_items = build_display_items(sorted(utxos, key=utxo_sort_key))
+    # Same composition as select_utxos_interactive: extended-view group order
+    # plus labelled branch-group separators.
+    display_items = utxo_selector._prepare_display_items(utxos)
     result = utxo_selector._run_selector(
         screen,
         display_items,
@@ -686,3 +688,142 @@ print("PTY_SELECTOR_RESULT=[]", flush=True)
         if slave_fd >= 0:
             os.close(slave_fd)
         os.close(master_fd)
+
+
+def test_branch_group_separators_are_labelled_in_extended_view_order(
+    patched_selector_curses: None,
+) -> None:
+    utxos = [
+        _utxo("a", mixdepth=0),
+        _utxo("b", mixdepth=0, branch=1),
+        _utxo("c", mixdepth=0, branch=2, locktime=1_893_456_000),
+        _utxo("d", mixdepth=1),
+    ]
+    # Tall enough that every group row (blank rows included) stays visible.
+    screen = StrictScreen(30, 120, [_event(30, 120, ord("q"))])
+    _run(screen, utxos)
+    text = screen.frames[-1].text
+    # A mixdepth's first group gets the full title; further branch groups
+    # strike out only the "Mixdepth N" part and keep the branch name.
+    fragments = [
+        "Mixdepth 0 — fidelity bond addresses",
+        "---------- — external addresses",
+        "---------- — internal addresses",
+        "Mixdepth 1 — external addresses",
+    ]
+    positions = [text.index(fragment) for fragment in fragments]
+    assert positions == sorted(positions)
+    assert len(set(positions)) == len(positions)
+
+
+def test_single_group_gets_a_leading_labelled_separator(
+    patched_selector_curses: None,
+) -> None:
+    screen = StrictScreen(24, 120, [_event(24, 120, ord("q"))])
+    _run(screen, [_utxo("a")])
+    assert "Mixdepth 0 — external addresses" in screen.frames[-1].text
+
+
+class TestSeparatorLayout:
+    def test_new_mixdepth_gets_blank_row_and_full_title(
+        self, patched_selector_curses: None
+    ) -> None:
+        screen = StrictScreen(24, 120, [_event(24, 120, ord("q"))])
+        _run(screen, [_utxo("a", mixdepth=0), _utxo("b", mixdepth=1)])
+        frame = screen.frames[-1]
+        title_row = next(
+            i for i, line in enumerate(frame.lines) if "Mixdepth 1 — external addresses" in line
+        )
+        blank_row = frame.lines[title_row - 1]
+        # The blank border-only row that introduces a new mixdepth.
+        assert "|" in blank_row
+        assert "-" not in blank_row
+
+    def test_branch_continuation_strikes_out_only_the_mixdepth_part(
+        self, patched_selector_curses: None
+    ) -> None:
+        utxos = [
+            _utxo("a", mixdepth=0, branch=2, locktime=1_893_456_000),
+            _utxo("b", mixdepth=0, branch=0),
+        ]
+        screen = StrictScreen(24, 120, [_event(24, 120, ord("q"))])
+        _run(screen, utxos)
+        frame = screen.frames[-1]
+        full = _line_with(frame, "Mixdepth 0 — fidelity bond addresses")
+        short = _line_with(frame, "— external addresses")
+        # Only the "Mixdepth N" part is struck out; the em dash and the
+        # branch name keep the columns of the full title above.
+        title_col = full.index("Mixdepth 0")
+        md_width = len("Mixdepth 0")
+        assert short[title_col : title_col + md_width] == "-" * md_width
+        assert short.index(" — ") == full.index(" — ")
+        assert short.index("external addresses") == full.index("fidelity bond addresses")
+        # The rest of the row is dashes and borders only — no repeated label.
+        tail = short[short.index("external addresses") + len("external addresses") :]
+        assert "-" in tail
+        assert set(tail) <= {"-", "|", " "}
+
+    def test_branch_continuation_has_no_blank_row_above(
+        self, patched_selector_curses: None
+    ) -> None:
+        utxos = [
+            _utxo("a", mixdepth=0, branch=2, locktime=1_893_456_000),
+            _utxo("b", mixdepth=0, branch=0),
+        ]
+        screen = StrictScreen(24, 120, [_event(24, 120, ord("q"))])
+        _run(screen, utxos)
+        frame = screen.frames[-1]
+        short_row = next(i for i, line in enumerate(frame.lines) if "— external addresses" in line)
+        # A branch change within one mixdepth follows the previous coin row
+        # directly; only a new mixdepth is introduced by a blank row.
+        assert "[" in frame.lines[short_row - 1]
+
+
+def test_blocked_toggle_shows_a_transient_mixdepth_pin_notice(
+    patched_selector_curses: None,
+) -> None:
+    utxos = [_utxo("a", mixdepth=0), _utxo("b", mixdepth=1)]
+    screen = StrictScreen(
+        24,
+        120,
+        [
+            _event(24, 120, ord(" ")),  # select the only m0 coin; cursor moves to m1
+            _event(24, 120, ord(" ")),  # blocked by the mixdepth pin: notice
+            _event(24, 120, ord("j")),  # any further key clears it again
+            _event(24, 120, ord("q")),
+        ],
+    )
+    _run(screen, utxos)
+    notice = "Locked to source mixdepth m0 — press d to deselect all"
+    assert notice in screen.frames[2].text
+    assert notice not in screen.frames[3].text
+
+
+def test_pin_notice_takes_precedence_over_the_reuse_warning(
+    patched_selector_curses: None,
+) -> None:
+    shared_address = "bcrt1qsharedaddress"
+    utxos = [
+        _utxo("a", mixdepth=0, address=shared_address),
+        _utxo("b", mixdepth=1, address=shared_address),
+    ]
+    screen = StrictScreen(
+        24,
+        120,
+        [
+            _event(24, 120, ord(" ")),
+            _event(24, 120, ord(" ")),
+            _event(24, 120, ord("j")),
+            _event(24, 120, ord("q")),
+        ],
+    )
+    _run(screen, utxos)
+    ru_note = "RU! Warning: Address reuse reduces privacy"
+    notice = "Locked to source mixdepth m0 — press d to deselect all"
+    # Cursor sits on the reused m1 coin: the warning shows before and after,
+    # but the blocked-toggle notice replaces it for one render cycle.
+    assert ru_note in screen.frames[1].text
+    assert notice in screen.frames[2].text
+    assert ru_note not in screen.frames[2].text
+    assert ru_note in screen.frames[3].text
+    assert notice not in screen.frames[3].text

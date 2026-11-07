@@ -188,10 +188,16 @@ class TestSelectUtxosInteractive:
 class TestUtxoSorting:
     """Tests for display ordering through the selector's public entrypoint."""
 
-    def test_entrypoint_orders_paths_and_inserts_mixdepth_separators(
+    def test_entrypoint_orders_branch_groups_and_inserts_labelled_separators(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The public entrypoint passes path-ordered, separated items to curses."""
+        """The public entrypoint passes group-ordered, separated items to curses.
+
+        Within a mixdepth the extended view's order applies: fidelity bonds
+        (branch 2), then external (0), then internal (1). Each group — the
+        first included — is introduced by a labelled separator; a new
+        mixdepth additionally gets a leading blank row (two ``None``).
+        """
 
         class TtyStream:
             def isatty(self) -> bool:
@@ -234,7 +240,39 @@ class TestUtxoSorting:
             "m/84'/0'/1'/1/0",
             "m/84'/0'/2'/0/0",
         ]
-        assert [index for index, item in enumerate(display_items) if item is None] == [1, 4]
+        assert [index for index, item in enumerate(display_items) if item is None] == [
+            0,  # blank row introducing mixdepth 0
+            1,  # separator: m0 external
+            3,  # blank row introducing mixdepth 1
+            4,  # separator: m1 external
+            6,  # separator: m1 internal (same mixdepth, no blank row)
+            8,  # blank row introducing mixdepth 2
+            9,  # separator: m2 external
+        ]
+
+
+class TestNeighborItems:
+    """The separator renderer labels a separator from its neighbouring UTXOs."""
+
+    def test_neighbours_skip_blank_rows_and_separators(self) -> None:
+        first = _make_utxo(0)
+        second = _make_utxo(1)
+        second.txid = "b" * 64
+        items = utxo_selector._prepare_display_items([second, first])
+        # Layout: [None, None, first, None, None, second]
+        prev_item, next_item = utxo_selector._neighbor_items(items, 0)
+        assert prev_item is None
+        assert next_item is first
+        prev_item, next_item = utxo_selector._neighbor_items(items, 4)
+        assert prev_item is first
+        assert next_item is second
+
+    def test_trailing_separator_has_no_following_item(self) -> None:
+        # Not constructed by build_display_items today; renders as plain dashes.
+        items = utxo_selector._prepare_display_items([_make_utxo(0)]) + [None]
+        prev_item, next_item = utxo_selector._neighbor_items(items, len(items) - 1)
+        assert prev_item is not None
+        assert next_item is None
 
 
 class TestFrozenUtxoFormatting:
