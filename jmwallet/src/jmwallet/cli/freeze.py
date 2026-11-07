@@ -27,8 +27,9 @@ from jmwallet.utxo_tui import (
     adjust_scroll,
     build_display_items,
     format_address_column,
+    group_separator_parts,
     seek_selectable,
-    utxo_sort_key,
+    utxo_display_sort_key,
 )
 
 if TYPE_CHECKING:
@@ -238,12 +239,14 @@ async def _freeze_utxos(
             print(f"No UTXOs found{md_msg}.")
             return
 
-        # Sort by derivation path (numeric components so indices >= 10 order
-        # correctly, matching the interactive UTXO selector).
-        all_utxos.sort(key=utxo_sort_key)
+        # Sort by display order (mixdepth, branch, then derivation path with
+        # numeric components so indices >= 10 order correctly), matching the
+        # interactive UTXO selector; branch groups stay contiguous this way.
+        all_utxos.sort(key=utxo_display_sort_key)
 
-        # Build the display list with blank-line separators between mixdepths.
-        display_items = _build_display_items(all_utxos)
+        # Build the display list grouped by mixdepth/branch with labelled
+        # separators (external/internal/bond groups).
+        display_items = build_display_items(all_utxos, branch_groups=True)
 
         # Check terminal
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -309,8 +312,8 @@ def _unfreeze_utxos(wallet: WalletService, utxos: list[UTXOInfo]) -> int:
     return unfrozen_count
 
 
-# Building the display list (with mixdepth separators) is shared with the
-# interactive UTXO selector; kept under the old name for local callers/tests.
+# Building the display list is shared with the interactive UTXO selector;
+# the alias is kept under the old name for tests (mixdepth-only grouping).
 _build_display_items = build_display_items
 
 
@@ -372,6 +375,47 @@ def _build_utxo_line(utxo: UTXOInfo, prev_address: str) -> str:
     )
 
 
+def _draw_separator(
+    stdscr: curses.window,
+    display_items: list[UTXOInfo | None],
+    pos: int,
+    row: int,
+    width: int,
+) -> None:
+    """Draw the labelled separator introducing the group at ``pos``.
+
+    A new mixdepth gets its full title in bold cyan; a branch change within
+    the same mixdepth replaces the title with placeholder dashes and keeps
+    the branch name column-flush with the title above. The rest of the line
+    is padded with plain dashes; a trailing separator without a following
+    group renders as a plain dash line.
+    """
+    import curses
+
+    end_col = width - 1
+    try:
+        parts = group_separator_parts(display_items, pos)
+        if parts is None:
+            stdscr.addstr(row, 1, "-" * (end_col - 1), curses.A_NORMAL)
+            return
+        title, em_dash, branch, full_title = parts
+        col = 1
+        if full_title:
+            stdscr.addstr(row, col, title, curses.color_pair(1) | curses.A_BOLD)
+        else:
+            stdscr.addstr(row, col, "-" * len(title), curses.A_NORMAL)
+        col += len(title)
+        stdscr.addstr(row, col, em_dash, curses.color_pair(1))
+        col += len(em_dash)
+        if col + len(branch) + 1 <= end_col:
+            stdscr.addstr(row, col, f"{branch} ", curses.color_pair(1))
+            col += len(branch) + 1
+        if col < end_col:
+            stdscr.addstr(row, col, "-" * (end_col - col), curses.A_NORMAL)
+    except curses.error:
+        pass
+
+
 def _draw_utxo_rows(
     stdscr: curses.window,
     display_items: list[UTXOInfo | None],
@@ -382,10 +426,9 @@ def _draw_utxo_rows(
     height: int,
     width: int,
 ) -> None:
-    """Draw the visible UTXO rows (and mixdepth separators)."""
+    """Draw the visible UTXO rows (blank rows and labelled group separators)."""
     import curses
 
-    separator = "-" * min(len(_FREEZE_COL_HEADER) + 5, width - 1)
     prev_address = ""
     for i, item in enumerate(display_items):
         if i < scroll_offset or i >= scroll_offset + list_height:
@@ -395,13 +438,14 @@ def _draw_utxo_rows(
         if display_row >= height - 3:
             break
 
-        # Separator line between mixdepths.
+        # Two consecutive None entries encode a blank border row followed by
+        # the labelled separator of a new mixdepth; a single None is a
+        # branch-only separator.
         if item is None:
-            try:
-                stdscr.addstr(display_row, 0, separator, curses.color_pair(1) | curses.A_DIM)
-            except curses.error:
-                pass
-            prev_address = ""  # Reset on mixdepth change
+            next_is_none = i + 1 < len(display_items) and display_items[i + 1] is None
+            if not next_is_none:
+                _draw_separator(stdscr, display_items, i, display_row, width)
+            prev_address = ""  # Reset the address dedup at every group break
             continue
 
         line = _build_utxo_line(item, prev_address)
@@ -413,7 +457,7 @@ def _draw_utxo_rows(
         if i == cursor_pos:
             attr = curses.color_pair(2) | curses.A_REVERSE
         elif item.frozen:
-            attr = curses.color_pair(3)
+            attr = curses.color_pair(3) | curses.A_BOLD
         elif item.is_fidelity_bond:
             attr = curses.color_pair(5)
         else:
@@ -675,7 +719,8 @@ def _run_freeze_tui(
 
     Args:
         stdscr: The curses window.
-        display_items: All UTXOs to display with blank lines between mixdepths.
+        display_items: All UTXOs to display with labelled separators between
+        mixdepth/branch groups.
         wallet: WalletService instance for persisting freeze state.
     """
     import curses
