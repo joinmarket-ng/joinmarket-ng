@@ -15,6 +15,7 @@ from jmwallet.utxo_tui import (
     build_display_items,
     format_address_column,
     group_label,
+    group_separator_parts,
     seek_selectable,
     utxo_branch,
     utxo_display_sort_key,
@@ -260,3 +261,48 @@ class TestBuildDisplayItemsBranchGroups:
         ]
         items = build_display_items(utxos)
         assert None not in items
+
+
+class TestGroupSeparatorParts:
+    """Label parts a group separator is rendered from.
+
+    ``full_title`` distinguishes a separator opening a new mixdepth (render
+    the whole title) from one that only switches the branch within a mixdepth
+    (renderers strike the title with dashes and keep only the branch name).
+    """
+
+    def test_leading_separator_introduces_first_group_with_full_title(self) -> None:
+        items = build_display_items([_utxo(0)], branch_groups=True)
+        # Layout: [None (blank row), None (labelled separator), utxo]
+        assert group_separator_parts(items, 1) == (
+            "Mixdepth 0",
+            " — ",
+            "external addresses",
+            True,
+        )
+
+    def test_branch_change_within_mixdepth_uses_short_form(self) -> None:
+        utxos = [_utxo(0, branch=0), _utxo(0, branch=1, txid_char="b")]
+        items = build_display_items(utxos, branch_groups=True)
+        # Layout: [None, None, external, None (separator), internal]
+        assert group_separator_parts(items, 3) == (
+            "Mixdepth 0",
+            " — ",
+            "internal addresses",
+            False,
+        )
+
+    def test_new_mixdepth_uses_full_title(self) -> None:
+        items = build_display_items([_utxo(0), _utxo(1, txid_char="b")], branch_groups=True)
+        # Layout: [None, None, u0, None (blank), None (separator), u1]
+        assert group_separator_parts(items, 4) == (
+            "Mixdepth 1",
+            " — ",
+            "external addresses",
+            True,
+        )
+
+    def test_trailing_separator_has_no_parts(self) -> None:
+        # Not constructed by build_display_items today; renders as plain dashes.
+        items = build_display_items([_utxo(0)], branch_groups=True) + [None]
+        assert group_separator_parts(items, len(items) - 1) is None

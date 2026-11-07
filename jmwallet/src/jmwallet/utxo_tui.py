@@ -7,6 +7,8 @@ This module holds the layout and navigation primitives they share:
 
 - building a display list with ``None`` separators between groups (mixdepths,
   or mixdepth/branch groups with fidelity bonds shown first),
+- labelling those separators from the group they introduce (mixdepth title,
+  branch name),
 - cursor navigation that skips separators (and other non-selectable rows),
 - the address column formatting (collapsing consecutive duplicates),
 - scroll-offset adjustment to keep the cursor visible.
@@ -94,6 +96,42 @@ def group_label(utxo: UTXOInfo) -> str:
     branch = utxo_branch(utxo)
     name = _BRANCH_NAMES.get(branch, f"branch {branch}")
     return f"Mixdepth {utxo.mixdepth} — {name}"
+
+
+def _neighbor_items(
+    display_items: list[UTXOInfo | None], pos: int
+) -> tuple[UTXOInfo | None, UTXOInfo | None]:
+    """Nearest non-separator items before and after the separator at ``pos``.
+
+    Separators are constructed to precede their group, so the following item
+    identifies the group the separator introduces; the preceding item tells
+    whether that group continues the same mixdepth (branch-only separator) or
+    opens a new one (full title). A trailing separator (not constructed
+    today) has no following item and renders as plain dashes.
+    """
+    prev_item = next((item for item in reversed(display_items[:pos]) if item is not None), None)
+    next_item = next((item for item in display_items[pos + 1 :] if item is not None), None)
+    return prev_item, next_item
+
+
+def group_separator_parts(
+    display_items: list[UTXOInfo | None], pos: int
+) -> tuple[str, str, str, bool] | None:
+    """Label parts for the group separator at ``pos``.
+
+    Returns ``(title, em_dash, branch, full_title)`` — for example
+    ``("Mixdepth 0", " — ", "external addresses", True)`` — or ``None`` for a
+    trailing separator with no following group (renders as plain dashes).
+    ``full_title`` is False when the separator only switches the branch within
+    the same mixdepth; renderers then strike the title with dashes so a branch
+    change leaves only the branch name column-flush with the full title above.
+    """
+    prev_item, next_item = _neighbor_items(display_items, pos)
+    if next_item is None:
+        return None
+    title, em_dash, branch = group_label(next_item).partition(" — ")
+    full_title = prev_item is None or prev_item.mixdepth != next_item.mixdepth
+    return title, em_dash, branch, full_title
 
 
 def build_display_items(

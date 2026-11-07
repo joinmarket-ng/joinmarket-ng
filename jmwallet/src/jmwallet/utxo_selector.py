@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 from jmwallet.utxo_tui import (
     adjust_scroll,
     build_display_items,
-    group_label,
+    group_separator_parts,
     seek_selectable,
     utxo_display_sort_key,
 )
@@ -235,22 +235,6 @@ def _draw_header(stdscr: curses.window, width: int, columns: list[tuple[str, int
     return header_line
 
 
-def _neighbor_items(
-    display_items: list[UTXOInfo | None], pos: int
-) -> tuple[UTXOInfo | None, UTXOInfo | None]:
-    """Nearest non-separator items before and after the separator at ``pos``.
-
-    Separators are constructed to precede their group, so the following item
-    identifies the group the separator introduces; the preceding item tells
-    whether that group continues the same mixdepth (branch-only separator) or
-    opens a new one (full title). A trailing separator (not constructed
-    today) has no following item and renders as plain dashes.
-    """
-    prev_item = next((item for item in reversed(display_items[:pos]) if item is not None), None)
-    next_item = next((item for item in display_items[pos + 1 :] if item is not None), None)
-    return prev_item, next_item
-
-
 def _draw_utxo_rows(
     stdscr: curses.window,
     display_items: list[UTXOInfo | None],
@@ -284,14 +268,11 @@ def _draw_utxo_rows(
                 # Blank border-only row above a mixdepth title.
                 pass
             else:
-                prev_item, next_item = _neighbor_items(display_items, i)
-                if next_item is not None:
-                    md_part, dash_sep, branch_part = group_label(next_item).partition(" — ")
-                    same_mixdepth = prev_item is not None and (
-                        prev_item.mixdepth == next_item.mixdepth
-                    )
+                parts = group_separator_parts(display_items, i)
+                if parts is not None:
+                    md_part, dash_sep, branch_part, full_title = parts
                     col = 3
-                    if same_mixdepth:
+                    if not full_title:
                         # Second/third branch of this mixdepth: dashes strike
                         # out only the "Mixdepth N" part; the em dash and the
                         # branch name keep their place and color, flush with
