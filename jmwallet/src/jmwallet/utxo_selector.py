@@ -373,7 +373,8 @@ def _build_footer_lines(
     ru_note = ""
     if cursor_item is not None:
         if cursor_item.is_fidelity_bond:
-            if cursor_item.is_locked:
+            # is_locked implies a locktime; the None check lets mypy see it.
+            if cursor_item.is_locked and cursor_item.locktime is not None:
                 footer_line4 = (
                     f"Active Fidelity Bond: Locked and not spendable until "
                     f"{datetime.fromtimestamp(cursor_item.locktime, UTC).strftime('%Y-%m-%d')} UTC!"
