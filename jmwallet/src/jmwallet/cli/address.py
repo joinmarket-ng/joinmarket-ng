@@ -30,6 +30,7 @@ from jmcore.cli_help import SortedTyper
 from loguru import logger
 
 from jmwallet.cli import app
+from jmwallet.wallet.rows import path_order_key
 
 if TYPE_CHECKING:
     from jmwallet.wallet.service import WalletService
@@ -331,8 +332,11 @@ async def _address_list(c: _AddressContext) -> None:
             print("No reserved addresses.")
             return
         print(f"Reserved addresses ({len(reserved)}):")
-        for address, label in sorted(reserved.items()):
-            path = wallet._find_address_path(address)
+        entries = [
+            (wallet._find_address_path(address), address, label)
+            for address, label in reserved.items()
+        ]
+        for path, address, label in sorted(entries, key=lambda e: path_order_key(e[0])):
             md = f"md{path[0]}" if path else "md?"
             label_str = f'  "{label}"' if label else ""
             print(f"  {md}  {address}{label_str}")

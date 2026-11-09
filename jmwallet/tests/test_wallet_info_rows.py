@@ -24,6 +24,7 @@ from jmwallet.wallet.rows import (
     fb_date_str,
     filter_rows,
     group_rows,
+    path_order_key,
     sort_rows,
     summarize_branch,
     summarize_mixdepth,
@@ -363,6 +364,28 @@ class TestPipelineStages:
         assert set(groups) == {(0, 0), (0, 1)}
         assert len(groups[(0, 0)]) == 1
         assert len(groups[(0, 1)]) == 1
+
+
+class TestPathOrderKey:
+    def test_orders_by_mixdepth_branch_rank_then_index(self) -> None:
+        paths = [(2, 0, 1), (0, 1, 5), (0, 0, 9), (1, 0, 0), (0, 0, 2)]
+        ordered = sorted(paths, key=path_order_key)
+        assert ordered == [(0, 0, 2), (0, 0, 9), (0, 1, 5), (1, 0, 0), (2, 0, 1)]
+
+    def test_fidelity_bond_branch_sorts_after_external_and_internal(self) -> None:
+        paths = [(0, FIDELITY_BOND_BRANCH, 0), (0, 1, 0), (0, 0, 0)]
+        ordered = sorted(paths, key=path_order_key)
+        assert ordered == [(0, 0, 0), (0, 1, 0), (0, FIDELITY_BOND_BRANCH, 0)]
+
+    def test_unknown_branch_falls_back_to_raw_value(self) -> None:
+        paths = [(0, 5, 0), (0, FIDELITY_BOND_BRANCH, 0)]
+        ordered = sorted(paths, key=path_order_key)
+        assert ordered == [(0, FIDELITY_BOND_BRANCH, 0), (0, 5, 0)]
+
+    def test_unresolvable_path_sorts_last(self) -> None:
+        paths: list[tuple[int, int, int] | None] = [None, (1, 0, 0), (0, 0, 0), None]
+        ordered = sorted(paths, key=path_order_key)
+        assert ordered == [(0, 0, 0), (1, 0, 0), None, None]
 
 
 class TestSummaries:
