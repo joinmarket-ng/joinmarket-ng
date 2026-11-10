@@ -181,9 +181,12 @@ class OrderbookAggregator:
         nick_auth_mode: NickAuthMode = NickAuthMode.PREFER_VERIFIED,
         nick_auth_directory_ids: dict[str, str] | None = None,
         allow_clearnet_connections: bool = False,
+        bitcoin_network: str | None = None,
     ) -> None:
         self.directory_nodes = directory_nodes
         self.network = network
+        # Bond addresses are derived on the Bitcoin network; it defaults to the protocol network.
+        self.bitcoin_network = bitcoin_network or network
         self.socks_host = socks_host
         self.socks_port = socks_port
         self.stream_isolation = stream_isolation
@@ -1335,7 +1338,7 @@ class OrderbookAggregator:
             return False
         try:
             bond_address = derive_bond_address(
-                bytes.fromhex(utxo_pub_hex), bond.locktime, self.network
+                bytes.fromhex(utxo_pub_hex), bond.locktime, self.bitcoin_network
             )
         except (ValueError, TypeError) as e:
             logger.bind(sensitive=True).debug(
@@ -1493,7 +1496,7 @@ class OrderbookAggregator:
 
             try:
                 utxo_pub_bytes = bytes.fromhex(utxo_pub_hex)
-                bond_addr = derive_bond_address(utxo_pub_bytes, locktime, self.network)
+                bond_addr = derive_bond_address(utxo_pub_bytes, locktime, self.bitcoin_network)
             except Exception as e:
                 logger.bind(sensitive=True).debug(
                     f"Failed to derive bond address for {bond.utxo_txid}:{bond.utxo_vout}: {e}"

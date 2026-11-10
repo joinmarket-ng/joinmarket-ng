@@ -80,7 +80,10 @@ def _create_blockchain_backend(settings: object) -> BlockchainBackend | None:
             logger.debug("Neutrino URL not configured, falling back to mempool API")
             return None
 
-        network = settings.network_config.network.value  # type: ignore[attr-defined]
+        # Bond outputs live on the Bitcoin network, which can differ from the protocol network
+        # (regtest setups speak the testnet protocol).
+        network_config = settings.network_config  # type: ignore[attr-defined]
+        network = (network_config.bitcoin_network or network_config.network).value
 
         logger.bind(sensitive=True).info(
             f"Using neutrino backend for bond verification (URL: {neutrino_url})"
@@ -105,6 +108,7 @@ async def run_watcher(log_level: str | None = None) -> None:
     setup_logging(effective_log_level, settings.logging.sensitive)
 
     network = settings.network_config.network
+    bitcoin_network = settings.network_config.bitcoin_network or network
     watcher_settings = settings.orderbook_watcher
     data_dir = settings.get_data_dir()
 
@@ -160,6 +164,7 @@ async def run_watcher(log_level: str | None = None) -> None:
     aggregator = OrderbookAggregator(
         directory_nodes=directory_nodes,
         network=network.value,
+        bitcoin_network=bitcoin_network.value,
         socks_host=settings.tor.socks_host,
         socks_port=settings.tor.socks_port,
         timeout=watcher_settings.connection_timeout,
