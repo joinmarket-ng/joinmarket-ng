@@ -58,6 +58,7 @@ class TestCreateBlockchainBackend:
         scan_start_height: int | None = None,
         neutrino_tls_cert: str | None = None,
         neutrino_auth_token: str | None = None,
+        bitcoin_network: str | None = None,
     ) -> MagicMock:
         settings = MagicMock()
         settings.bitcoin.backend_type = backend_type
@@ -65,6 +66,10 @@ class TestCreateBlockchainBackend:
         settings.bitcoin.neutrino_tls_cert = neutrino_tls_cert
         settings.bitcoin.neutrino_auth_token = neutrino_auth_token
         settings.network_config.network.value = "signet"
+        # Unset unless a test sets it, as in NetworkConfig (a bare MagicMock attribute is truthy).
+        settings.network_config.bitcoin_network = (
+            MagicMock(value=bitcoin_network) if bitcoin_network else None
+        )
         settings.wallet.scan_start_height = scan_start_height
         settings.get_neutrino_add_peers.return_value = add_peers or []
         return settings
@@ -104,6 +109,16 @@ class TestCreateBlockchainBackend:
             tls_cert_path=None,
             auth_token=None,
         )
+
+    def test_neutrino_backend_uses_bitcoin_network(self) -> None:
+        """Regtest setups speak the testnet protocol; bond lookups must use regtest."""
+        settings = self._make_settings(bitcoin_network="regtest")
+        settings.network_config.network.value = "testnet"
+
+        with patch("orderbook_watcher.main.NeutrinoBackend") as mock_cls:
+            _create_blockchain_backend(settings)
+
+        assert mock_cls.call_args.kwargs["network"] == "regtest"
 
     def test_neutrino_backend_passes_tls_and_auth(self) -> None:
         """_create_blockchain_backend() passes neutrino TLS and auth settings."""
