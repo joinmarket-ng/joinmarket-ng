@@ -216,10 +216,15 @@ def format_address_column(address: str, prev_address: str) -> str:
     return address
 
 
-def adjust_scroll(cursor_pos: int, scroll_offset: int, list_height: int) -> int:
-    """Return a scroll offset that keeps ``cursor_pos`` visible."""
+def adjust_scroll(cursor_pos: int, scroll_offset: int, list_height: int, item_count: int) -> int:
+    """Return a scroll offset that keeps ``cursor_pos`` visible.
+
+    The result is clamped to ``max(0, item_count - list_height)`` so an
+    offset reached while the window was shrunken is given up as soon as
+    more rows fit on screen again (never scroll further than necessary).
+    """
     if cursor_pos < scroll_offset:
-        return cursor_pos
-    if cursor_pos >= scroll_offset + list_height:
-        return cursor_pos - list_height + 1
-    return scroll_offset
+        scroll_offset = cursor_pos
+    elif cursor_pos >= scroll_offset + list_height:
+        scroll_offset = cursor_pos - list_height + 1
+    return min(scroll_offset, max(0, item_count - list_height))

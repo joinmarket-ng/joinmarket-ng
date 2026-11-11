@@ -295,6 +295,28 @@ def test_resize_restore_keeps_selection_cursor_and_scroll_position(
     assert "kkkkkkkk" in restored_frame.text
 
 
+def test_enlarging_a_shrunken_window_refills_the_list(patched_selector_curses: None) -> None:
+    """A bottom-reached scroll offset from a shrunken window is given up on enlarge."""
+    coins = [_utxo(chr(ord("a") + index)) for index in range(14)]
+    events = [
+        _event(32, 120, ord("G")),  # cursor to the last coin
+        _event(19, 120, curses.KEY_RESIZE),  # shrink: only the final rows stay visible
+        _event(32, 120, curses.KEY_RESIZE),  # enlarge again
+        _event(32, 120, ord("q")),
+    ]
+    screen = StrictScreen(32, 120, events)
+
+    assert _run(screen, coins) == []
+
+    shrunk_frame = screen.frames[-2]
+    assert "Terminal too small" not in shrunk_frame.text
+    assert "nnnnnnnn" in shrunk_frame.text  # cursor row stayed visible
+    assert "aaaaaaaa" not in shrunk_frame.text
+    restored_frame = screen.frames[-1]
+    assert "aaaaaaaa" in restored_frame.text
+    assert "nnnnnnnn" in restored_frame.text
+
+
 def test_interrupted_repaint_does_not_confirm_selection(patched_selector_curses: None) -> None:
     class InterruptedScreen(StrictScreen):
         def addstr(self, y: int, x: int, text: str, _attr: int = 0) -> None:

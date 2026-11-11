@@ -109,13 +109,25 @@ class TestFormatAddressColumn:
 
 class TestAdjustScroll:
     def test_cursor_above_view(self) -> None:
-        assert adjust_scroll(2, 5, 10) == 2
+        assert adjust_scroll(2, 5, 10, 30) == 2
 
     def test_cursor_below_view(self) -> None:
-        assert adjust_scroll(20, 0, 10) == 11
+        assert adjust_scroll(20, 0, 10, 30) == 11
 
     def test_cursor_in_view_unchanged(self) -> None:
-        assert adjust_scroll(5, 3, 10) == 3
+        assert adjust_scroll(5, 3, 10, 30) == 3
+
+    def test_offset_drops_when_whole_list_fits(self) -> None:
+        # Window enlarged beyond the item count: everything is visible.
+        assert adjust_scroll(5, 3, 10, 10) == 0
+
+    def test_offset_drops_after_window_enlarged(self) -> None:
+        # A bottom-of-list offset from a shrunken window must be given up
+        # once the window is tall enough to show more rows again.
+        assert adjust_scroll(15, 14, 15, 16) == 1
+
+    def test_offset_clamped_to_last_full_page(self) -> None:
+        assert adjust_scroll(8, 9, 5, 12) == 7
 
 
 class TestUtxoSortKey:

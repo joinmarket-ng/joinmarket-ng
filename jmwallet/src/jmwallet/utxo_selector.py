@@ -628,7 +628,7 @@ def _run_selector(
                 return []
             continue
 
-        scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height)
+        scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height, len(display_items))
         try:
             header_line = _draw_header(stdscr, width, columns)
             _draw_utxo_rows(

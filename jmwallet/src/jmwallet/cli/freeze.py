@@ -591,7 +591,7 @@ def _render_freeze_screen(
     list_height = separator_row - list_start
 
     # Keep the cursor on screen.
-    scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height)
+    scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height, len(display_items))
 
     _draw_utxo_rows(
         stdscr, display_items, cursor_pos, scroll_offset, list_start, list_height, height, width
