@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import curses
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -47,8 +48,8 @@ def _utxo(
     )
 
 
-def _run(screen: StrictScreen, display_items: list[UTXOInfo], wallet: MagicMock) -> None:
-    freeze_mod._run_freeze_tui(screen, display_items, wallet)
+def _run(screen: StrictScreen, display_items: list[UTXOInfo | None], wallet: MagicMock) -> None:
+    freeze_mod._run_freeze_tui(cast(curses.window, screen), display_items, wallet)
     assert screen.pending_events == 0
 
 
