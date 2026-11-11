@@ -1,8 +1,9 @@
 """Tests for the shared UTXO TUI helpers (jmwallet.utxo_tui).
 
 These helpers back both the freeze manager and the interactive UTXO
-selector: mixdepth separators, predicate-based cursor navigation, the
-address column formatting, and scroll adjustment.
+selector: group separators (mixdepths, or mixdepth/branch groups),
+predicate-based cursor navigation, the address column formatting, and
+scroll adjustment.
 """
 
 from __future__ import annotations
@@ -10,9 +11,14 @@ from __future__ import annotations
 from jmwallet.utxo_tui import (
     ADDRESS_COL_WIDTH,
     adjust_scroll,
+    branch_display_rank,
     build_display_items,
     format_address_column,
+    group_label,
+    group_separator_parts,
     seek_selectable,
+    utxo_branch,
+    utxo_display_sort_key,
     utxo_sort_key,
 )
 from jmwallet.wallet.models import UTXOInfo
@@ -155,3 +161,148 @@ class TestUtxoSortKey:
             (84, 0, 0, 2, 12),
             (84, 0, 0, 2, 100, 1893456000),
         ]
+
+
+class TestUtxoBranch:
+    def test_external_internal_fidelity_branches(self) -> None:
+        assert utxo_branch(_utxo(0, branch=0)) == 0
+        assert utxo_branch(_utxo(0, branch=1)) == 1
+        assert utxo_branch(_utxo(0, branch=2)) == 2
+
+    def test_locktime_suffix_ignored(self) -> None:
+        u = _utxo(0, branch=2, index=9, path="m/84'/0'/0'/2/9:1893456000")
+        assert utxo_branch(u) == 2
+
+    def test_path_without_branch_groups_as_minus_one(self) -> None:
+        # Malformed paths must not crash the spend flow; they group together.
+        u = _utxo(0, path="m/84'/0'")
+        assert utxo_branch(u) == -1
+
+
+class TestBranchDisplayRank:
+    def test_fidelity_bonds_first_then_external_then_internal(self) -> None:
+        assert branch_display_rank(2) < branch_display_rank(0) < branch_display_rank(1)
+
+    def test_unknown_branch_sorts_last(self) -> None:
+        assert branch_display_rank(99) > branch_display_rank(1)
+
+
+class TestUtxoDisplaySortKey:
+    def test_branch_groups_follow_extended_view_order(self) -> None:
+        utxos = [
+            _utxo(0, branch=0, index=0),
+            _utxo(0, branch=1, index=0, txid_char="b"),
+            _utxo(0, branch=2, index=9, txid_char="c"),
+            _utxo(0, branch=0, index=1, txid_char="d"),
+        ]
+        ordered = sorted(utxos, key=utxo_display_sort_key)
+        assert [utxo_branch(u) for u in ordered] == [2, 0, 0, 1]
+
+    def test_mixdepths_stay_contiguous(self) -> None:
+        utxos = [_utxo(1, branch=2), _utxo(0, branch=0, txid_char="b")]
+        ordered = sorted(utxos, key=utxo_display_sort_key)
+        assert [u.mixdepth for u in ordered] == [0, 1]
+
+    def test_within_group_numeric_index_order_preserved(self) -> None:
+        utxos = [_utxo(0, branch=0, index=i) for i in (10, 2, 1)]
+        ordered = sorted(utxos, key=utxo_display_sort_key)
+        assert [u.path.rsplit("/", 1)[-1] for u in ordered] == ["1", "2", "10"]
+
+
+class TestGroupLabel:
+    def test_labels(self) -> None:
+        assert group_label(_utxo(0, branch=0)) == "Mixdepth 0 — external addresses"
+        assert group_label(_utxo(1, branch=1)) == "Mixdepth 1 — internal addresses"
+        assert group_label(_utxo(0, branch=2)) == "Mixdepth 0 — fidelity bond addresses"
+
+    def test_unknown_branch_labelled_by_number(self) -> None:
+        assert group_label(_utxo(0, branch=7)) == "Mixdepth 0 — branch 7"
+
+
+class TestBuildDisplayItemsBranchGroups:
+    def test_empty_list(self) -> None:
+        assert build_display_items([], branch_groups=True) == []
+
+    def test_leading_blank_row_and_labelled_separator(self) -> None:
+        # Even a single group is introduced — blank border-only row, then the
+        # labelled separator — so every separator can carry its group's title.
+        items = build_display_items([_utxo(0)], branch_groups=True)
+        assert [item is None for item in items] == [True, True, False]
+
+    def test_boundaries_at_mixdepth_and_branch(self) -> None:
+        utxos = [
+            _utxo(0, branch=0, index=0),
+            _utxo(0, branch=0, index=1, txid_char="b"),
+            _utxo(0, branch=1, index=0, txid_char="c"),
+            _utxo(1, branch=0, index=0, txid_char="d"),
+        ]
+        items = build_display_items(utxos, branch_groups=True)
+        # A new mixdepth is introduced by a blank row plus the labelled
+        # separator (two consecutive None); a branch change within the same
+        # mixdepth only adds the labelled separator.
+        assert [item is None for item in items] == [
+            True,  # blank row introducing mixdepth 0
+            True,  # separator: m0 external
+            False,
+            False,
+            True,  # separator: m0 internal
+            False,
+            True,  # blank row introducing mixdepth 1
+            True,  # separator: m1 external
+            False,
+        ]
+
+    def test_default_mode_unchanged_by_branch_changes(self) -> None:
+        # The freeze manager's default path must stay byte-identical: branch
+        # changes within a mixdepth do not open a new group.
+        utxos = [
+            _utxo(0, branch=0, index=0),
+            _utxo(0, branch=1, index=0, txid_char="b"),
+        ]
+        items = build_display_items(utxos)
+        assert None not in items
+
+
+class TestGroupSeparatorParts:
+    """Label parts a group separator is rendered from.
+
+    ``full_title`` distinguishes a separator opening a new mixdepth (render
+    the whole title) from one that only switches the branch within a mixdepth
+    (renderers strike the title with dashes and keep only the branch name).
+    """
+
+    def test_leading_separator_introduces_first_group_with_full_title(self) -> None:
+        items = build_display_items([_utxo(0)], branch_groups=True)
+        # Layout: [None (blank row), None (labelled separator), utxo]
+        assert group_separator_parts(items, 1) == (
+            "Mixdepth 0",
+            " — ",
+            "external addresses",
+            True,
+        )
+
+    def test_branch_change_within_mixdepth_uses_short_form(self) -> None:
+        utxos = [_utxo(0, branch=0), _utxo(0, branch=1, txid_char="b")]
+        items = build_display_items(utxos, branch_groups=True)
+        # Layout: [None, None, external, None (separator), internal]
+        assert group_separator_parts(items, 3) == (
+            "Mixdepth 0",
+            " — ",
+            "internal addresses",
+            False,
+        )
+
+    def test_new_mixdepth_uses_full_title(self) -> None:
+        items = build_display_items([_utxo(0), _utxo(1, txid_char="b")], branch_groups=True)
+        # Layout: [None, None, u0, None (blank), None (separator), u1]
+        assert group_separator_parts(items, 4) == (
+            "Mixdepth 1",
+            " — ",
+            "external addresses",
+            True,
+        )
+
+    def test_trailing_separator_has_no_parts(self) -> None:
+        # Not constructed by build_display_items today; renders as plain dashes.
+        items = build_display_items([_utxo(0)], branch_groups=True) + [None]
+        assert group_separator_parts(items, len(items) - 1) is None

@@ -85,12 +85,14 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
  JoinMarket Taker - Execute CoinJoin transactions
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --help                        Show this message and exit.                    │
-│ --install-completion          Install completion for the current shell.      │
-│ --show-completion             Show completion for the current shell, to copy │
-│                               it or customize the installation.              │
-│ --version                     Show the installed JoinMarket NG version and   │
-│                               exit.                                          │
+│ --help                      <bool>  Show this message and exit.              │
+│ --install-completion        <bool>  Install completion for the current       │
+│                                     shell.                                   │
+│ --show-completion           <bool>  Show completion for the current shell,   │
+│                                     to copy it or customize the              │
+│                                     installation.                            │
+│ --version                   <bool>  Show the installed JoinMarket NG version │
+│                                     and exit.                                │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
 │ clear-ignored-makers     Clear the list of ignored makers.                   │
@@ -118,7 +120,7 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                [env var: JOINMARKET_CONFIG_FILE]             │
 │ --data-dir     -d      <path>  Data directory for JoinMarket files           │
 │                                [env var: JOINMARKET_DATA_DIR]                │
-│ --help                         Show this message and exit.                   │
+│ --help                 <bool>  Show this message and exit.                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -171,7 +173,7 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                                             offers (0.0-1.0) │
 │                                                             [env var:        │
 │                                                             BONDLESS_MAKERS… │
-│ --bondless-zero-…      --no-bondless-…                      Restrict         │
+│ --bondless-zero-…      --no-bondless-…    <bool>            Restrict         │
 │                                                             allowance spots  │
 │                                                             to zero-fee      │
 │                                                             offers           │
@@ -203,7 +205,7 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                                             (comma-separate… │
 │                                                             [env var:        │
 │                                                             DIRECTORY_SERVE… │
-│ --equalize-cj-fe…      --no-equalize-…                      Pay all selected │
+│ --equalize-cj-fe…      --no-equalize-…    <bool>            Pay all selected │
 │                                                             makers the       │
 │                                                             highest realized │
 │                                                             fee in the       │
@@ -213,10 +215,10 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                                             Mutually         │
 │                                                             exclusive with   │
 │                                                             --block-target.  │
-│ --help                                                      Show this        │
+│ --help                                    <bool>            Show this        │
 │                                                             message and      │
 │                                                             exit.            │
-│ --input-utxo                              <str>             Explicit input   │
+│ --input-utxo                              <list[str]>       Explicit input   │
 │                                                             UTXO as          │
 │                                                             txid:vout        │
 │                                                             (repeatable).    │
@@ -257,16 +259,16 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                                             API URL          │
 │                                                             [env var:        │
 │                                                             NEUTRINO_URL]    │
-│ --prompt-bip39-p…                                           Prompt for BIP39 │
+│ --prompt-bip39-p…                         <bool>            Prompt for BIP39 │
 │                                                             passphrase       │
 │                                                             interactively    │
-│ --quantized-offe…      --allow-non-qu…                      Only select      │
+│ --quantized-offe…      --allow-non-qu…    <bool>            Only select      │
 │                                                             offers whose     │
 │                                                             advertised       │
 │                                                             CoinJoin fee is  │
 │                                                             on the public    │
 │                                                             grid             │
-│ --round-up-cj-fe…      --no-round-up-…                      Round selected   │
+│ --round-up-cj-fe…      --no-round-up-…    <bool>            Round selected   │
 │                                                             maker fees up to │
 │                                                             public fee       │
 │                                                             quanta           │
@@ -274,7 +276,7 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                                             node RPC URL     │
 │                                                             [env var:        │
 │                                                             BITCOIN_RPC_URL] │
-│ --select-utxos     -s                                       Interactively    │
+│ --select-utxos     -s                     <bool>            Interactively    │
 │                                                             select UTXOs     │
 │                                                             (fzf-like TUI)   │
 │ --tor-socks-host                          <str>             Tor SOCKS proxy  │
@@ -283,7 +285,7 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │ --tor-socks-port                          <int>             Tor SOCKS proxy  │
 │                                                             port (overrides  │
 │                                                             TOR__SOCKS_PORT) │
-│ --yes              -y                                       Skip             │
+│ --yes              -y                     <bool>            Skip             │
 │                                                             confirmation     │
 │                                                             prompt           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
@@ -306,7 +308,7 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                [env var: JOINMARKET_CONFIG_FILE]             │
 │ --data-dir     -d      <path>  Data directory for JoinMarket files           │
 │                                [env var: JOINMARKET_DATA_DIR]                │
-│ --help                         Show this message and exit.                   │
+│ --help                 <bool>  Show this message and exit.                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -326,7 +328,7 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │                                [env var: JOINMARKET_CONFIG_FILE]             │
 │ --data-dir     -d      <path>  Data directory for JoinMarket files           │
 │                                [env var: JOINMARKET_DATA_DIR]                │
-│ --help                         Show this message and exit.                   │
+│ --help                 <bool>  Show this message and exit.                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 

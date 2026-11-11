@@ -27,6 +27,7 @@ from typer.testing import CliRunner
 
 from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
 from jmwallet.cli import app
+from jmwallet.cli.address import _AddressContext
 
 runner = CliRunner()
 
@@ -301,6 +302,97 @@ def test_address_new_help_does_not_unlock_a_configured_wallet(
     assert result.exit_code == 0, output
     assert "Generate a fresh deposit address" in output
     assert "Enter password for wallet" not in output
+
+
+class _ReservedListStubWallet:
+    """Minimal wallet stand-in for ``_address_list`` output tests."""
+
+    def __init__(self, reserved: dict[str, str], paths: dict[str, tuple[int, int, int]]) -> None:
+        self._reserved = reserved
+        self._paths = paths
+
+    def get_reserved_addresses(self) -> dict[str, str]:
+        return dict(self._reserved)
+
+    def _find_address_path(self, address: str) -> tuple[int, int, int] | None:
+        return self._paths.get(address)
+
+    async def close(self) -> None:
+        pass
+
+
+def _build_address_list_context(tmp_path: Path) -> _AddressContext:
+    backend_settings = ResolvedBackendSettings(
+        network="regtest",
+        bitcoin_network="regtest",
+        backend_type="descriptor_wallet",
+        rpc_url="http://127.0.0.1:18443",
+        rpc_user="user",
+        rpc_password="pass",
+        neutrino_url="",
+        neutrino_add_peers=[],
+        data_dir=tmp_path,
+    )
+    return _AddressContext(
+        mnemonic="abandon " * 11 + "about",
+        bip39_passphrase="",
+        backend_settings=backend_settings,
+        creation_height=None,
+        mnemonic_file=None,
+        mixdepth_count=5,
+        max_sats_freeze_reuse=-1,
+        reconstruct_history=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_address_list_groups_by_mixdepth(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reserved addresses are grouped by mixdepth, not sorted by address string."""
+    from jmwallet.cli.address import _address_list
+
+    # Address strings are chosen so that lexicographic order differs from
+    # path order: a plain string sort would put md2 first, the fix must not.
+    reserved = {
+        "bcrt1qaaa": "payer two",
+        "bcrt1qbbb": "",
+        "bcrt1qccc": "payer one",
+        "bcrt1qzzz": "",
+    }
+    paths = {
+        "bcrt1qaaa": (2, 0, 0),
+        "bcrt1qbbb": (0, 0, 1),
+        "bcrt1qccc": (1, 0, 0),
+    }
+    wallet = _ReservedListStubWallet(reserved, paths)
+    with patch(
+        "jmwallet.cli.address._build_wallet",
+        new=AsyncMock(return_value=(wallet, "descriptor_wallet")),
+    ):
+        await _address_list(_build_address_list_context(tmp_path))
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "Reserved addresses (4):"
+    assert [line.split()[0] for line in lines[1:]] == ["md0", "md1", "md2", "md?"]
+    assert '"payer one"' in lines[2]
+
+
+@pytest.mark.asyncio
+async def test_address_list_empty_reports_no_reserved(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty reservation map keeps the dedicated empty-state message."""
+    from jmwallet.cli.address import _address_list
+
+    wallet = _ReservedListStubWallet({}, {})
+    with patch(
+        "jmwallet.cli.address._build_wallet",
+        new=AsyncMock(return_value=(wallet, "descriptor_wallet")),
+    ):
+        await _address_list(_build_address_list_context(tmp_path))
+
+    assert capsys.readouterr().out.strip() == "No reserved addresses."
 
 
 class TestExtendedInfoColorGating:

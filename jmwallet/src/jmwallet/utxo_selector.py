@@ -1,9 +1,11 @@
 """
 Interactive UTXO selector TUI.
 
-Shows every UTXO in the wallet grouped by mixdepth (same layout as the
-freeze manager) so the user can compare coins across the whole wallet
-before picking which one(s) to spend.
+Shows every UTXO in the wallet grouped by mixdepth and branch (fidelity
+bonds first, then external, then internal addresses — the extended view's
+section order) so the user can compare coins across the whole wallet before
+picking which one(s) to spend. Groups are introduced by labelled separator
+lines.
 
 A spend can only draw from a single mixdepth, so the selector pins the
 source mixdepth to the first selected UTXO: while anything is selected,
@@ -24,8 +26,9 @@ from typing import TYPE_CHECKING
 from jmwallet.utxo_tui import (
     adjust_scroll,
     build_display_items,
+    group_separator_parts,
     seek_selectable,
-    utxo_sort_key,
+    utxo_display_sort_key,
 )
 from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
@@ -225,7 +228,7 @@ def _draw_header(stdscr: curses.window, width: int, columns: list[tuple[str, int
     stdscr.addstr(3, 0, header_line[: width - 1])
     header_sep_width = min(len(header_line) - 2, width - 3)
     stdscr.addstr(4, 2, "|", curses.A_NORMAL)
-    stdscr.addstr(4, 3, "-" * (header_sep_width - 2), curses.color_pair(3))
+    stdscr.addstr(4, 3, "-" * (header_sep_width - 2), curses.A_NORMAL)
     right_pos = 3 + header_sep_width - 2
     if right_pos < width - 1:
         stdscr.addstr(4, right_pos, "|", curses.A_NORMAL)
@@ -260,9 +263,38 @@ def _draw_utxo_rows(
 
         if item is None:
             stdscr.addstr(display_row, 2, "|", curses.A_NORMAL)
-            stdscr.addstr(
-                display_row, 3, "-" * (sep_width - 2), curses.color_pair(3) | curses.A_DIM
-            )
+            inner_width = sep_width - 2
+            if i + 1 < len(display_items) and display_items[i + 1] is None:
+                # Blank border-only row above a mixdepth title.
+                pass
+            else:
+                parts = group_separator_parts(display_items, i)
+                if parts is not None:
+                    md_part, dash_sep, branch_part, full_title = parts
+                    col = 3
+                    if not full_title:
+                        # Second/third branch of this mixdepth: dashes strike
+                        # out only the "Mixdepth N" part; the em dash and the
+                        # branch name keep their place and color, flush with
+                        # the full title above.
+                        stdscr.addstr(display_row, col, "-" * len(md_part), curses.A_NORMAL)
+                        col += len(md_part)
+                    else:
+                        # Same colors as the extended view: "Mixdepth N" bold
+                        # cyan, em dash and branch name plain cyan; the dashes
+                        # stay white.
+                        stdscr.addstr(
+                            display_row, col, md_part, curses.color_pair(3) | curses.A_BOLD
+                        )
+                        col += len(md_part)
+                    stdscr.addstr(display_row, col, dash_sep, curses.color_pair(3))
+                    col += len(dash_sep)
+                    if col + len(branch_part) + 1 <= 3 + inner_width:
+                        stdscr.addstr(display_row, col, f"{branch_part} ", curses.color_pair(3))
+                        col += len(branch_part) + 1
+                    stdscr.addstr(display_row, col, "-" * (3 + inner_width - col), curses.A_NORMAL)
+                else:
+                    stdscr.addstr(display_row, 3, "-" * inner_width, curses.A_NORMAL)
             stdscr.addstr(display_row, sep_width + 1, "|", curses.A_NORMAL)
             prev_address = ""
             continue
@@ -334,12 +366,14 @@ def _build_footer_lines(
     address_utxo_counts: dict[str, int],
     min_confirmations: int = 0,
     allow_fidelity_bonds: bool = True,
+    notice: str = "",
 ) -> tuple[str, str, str, str]:
     """Build the footer text lines, returning (line1, line2, line4, ru_note).
 
     ``line1`` is the selection summary, ``line2`` the (optional) pinned source
     mixdepth, ``line4`` the cursor status with the State column first and
-    ``ru_note`` an optional address-reuse warning.
+    ``ru_note`` an optional address-reuse warning. A transient ``notice``
+    (feedback for a blocked action) takes precedence over the reuse warning.
     """
     selected_utxos = [display_items[i] for i in selected]
     total_selected = sum(u.value for u in selected_utxos if u is not None)
@@ -373,7 +407,8 @@ def _build_footer_lines(
     ru_note = ""
     if cursor_item is not None:
         if cursor_item.is_fidelity_bond:
-            if cursor_item.is_locked:
+            # is_locked implies a locktime; the None check lets mypy see it.
+            if cursor_item.is_locked and cursor_item.locktime is not None:
                 footer_line4 = (
                     f"Active Fidelity Bond: Locked and not spendable until "
                     f"{datetime.fromtimestamp(cursor_item.locktime, UTC).strftime('%Y-%m-%d')} UTC!"
@@ -417,6 +452,9 @@ def _build_footer_lines(
         is_reused = _is_address_reused(cursor_item, address_utxo_counts)
         if is_reused:
             ru_note = "RU! Warning: Address reuse reduces privacy"
+
+    if notice:
+        ru_note = notice
 
     return footer_line1, footer_line2, footer_line4, ru_note
 
@@ -514,6 +552,8 @@ def _run_selector(
 
     selected: set[int] = set()
     scroll_offset = 0
+    # Transient footer notice, shown for one render cycle after a blocked action.
+    notice = ""
 
     # Pre-compute which rows can ever be selected in this session.
     base_selectable: set[int] = {
@@ -577,6 +617,7 @@ def _run_selector(
                 address_utxo_counts,
                 min_confirmations,
                 allow_fidelity_bonds,
+                notice=notice,
             ),
         )
         list_start = 5
@@ -619,6 +660,7 @@ def _run_selector(
 
         # Handle input
         key = stdscr.getch()
+        notice = ""
 
         if key == ord("q") or key == 27:  # q or Escape
             return []
@@ -640,6 +682,11 @@ def _run_selector(
                 selected.discard(cursor_pos)
             elif is_selectable(cursor_pos):
                 selected.add(cursor_pos)
+            elif cursor_pos in base_selectable and pinned is not None:
+                # Blocked only by the mixdepth pin: a spend can never mix
+                # coins from different mixdepths. Other restrictions are
+                # explained by the State column.
+                notice = f"Locked to source mixdepth m{pinned} — press d to deselect all"
             # Move cursor down after toggle attempt
             if cursor_pos < last:
                 cursor_pos = seek_selectable(display_items, cursor_pos + 1, 1, lambda _u: True)
@@ -686,6 +733,16 @@ def _run_selector(
             selected = set()
 
 
+def _prepare_display_items(utxos: list[UTXOInfo]) -> list[UTXOInfo | None]:
+    """Sort UTXOs in extended-view group order and add labelled separators.
+
+    Groups are (mixdepth, branch) pairs; the branch order within a mixdepth
+    follows the extended view: fidelity bonds first, then external, then
+    internal addresses.
+    """
+    return build_display_items(sorted(utxos, key=utxo_display_sort_key), branch_groups=True)
+
+
 def select_utxos_interactive(
     utxos: list[UTXOInfo],
     target_amount: int = 0,
@@ -697,7 +754,8 @@ def select_utxos_interactive(
 ) -> list[UTXOInfo]:
     """Display an interactive UTXO selector over the whole wallet.
 
-    UTXOs are grouped by mixdepth (freeze-manager layout). Selection is
+    UTXOs are grouped by mixdepth and branch in the extended view's order
+    (fidelity bonds, external, internal). Selection is
     limited to a single mixdepth: the first toggled UTXO pins the source
     mixdepth until everything is deselected again.
 
@@ -752,9 +810,8 @@ def select_utxos_interactive(
             return utxos
         raise RuntimeError("Interactive UTXO selection requires a terminal")
 
-    # Sort UTXOs by derivation path (same order as freeze manager) and add separators
-    sorted_utxos = sorted(utxos, key=utxo_sort_key)
-    display_items = build_display_items(sorted_utxos)
+    # Extended-view group order (FB, external, internal) + labelled separators
+    display_items = _prepare_display_items(utxos)
 
     return curses.wrapper(
         _run_selector,

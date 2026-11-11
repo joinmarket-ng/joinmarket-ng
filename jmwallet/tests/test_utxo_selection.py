@@ -1580,6 +1580,104 @@ class TestFreezeCursorNavigation:
         assert _seek_selectable(items, 0, 1) == 0
 
 
+class TestFreezeBranchGroupSeparators:
+    """Branch-grouped freeze list renders labelled separators like the selector."""
+
+    def _utxo(
+        self,
+        txid_char: str,
+        *,
+        mixdepth: int,
+        path: str,
+        address: str | None = None,
+    ) -> UTXOInfo:
+        return UTXOInfo(
+            txid=txid_char * 64,
+            vout=0,
+            value=100_000,
+            address=address or f"bc1q{txid_char}addr",
+            confirmations=10,
+            scriptpubkey="0014" + "11" * 20,
+            path=path,
+            mixdepth=mixdepth,
+        )
+
+    def _grouped_items(self) -> list[UTXOInfo | None]:
+        from jmwallet.utxo_tui import build_display_items
+
+        utxos = [
+            self._utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0"),
+            self._utxo("b", mixdepth=0, path="m/84'/0'/0'/1/0"),
+            self._utxo("c", mixdepth=1, path="m/84'/0'/1'/0/0"),
+            self._utxo("d", mixdepth=1, path="m/84'/0'/1'/1/0"),
+        ]
+        return build_display_items(utxos, branch_groups=True)
+
+    def _render(self, items: list[UTXOInfo | None]) -> dict[tuple[int, int], str]:
+        from jmwallet.cli.freeze import _render_freeze_screen
+
+        screen = MagicMock()
+        screen.getmaxyx.return_value = (24, 160)
+        with patch("curses.color_pair", return_value=0):
+            _render_freeze_screen(screen, items, 2, 0, None, False)
+        return {(call.args[0], call.args[1]): call.args[2] for call in screen.addstr.call_args_list}
+
+    def test_first_group_gets_full_title(self) -> None:
+        written = self._render(self._grouped_items())
+        # Layout starts [None (blank), None (separator), first UTXO, ...]:
+        # the separator at row 6 introduces mixdepth 0's external branch.
+        assert written[(6, 1)] == "Mixdepth 0"
+        assert written[(6, 11)] == " — "
+        assert written[(6, 14)] == "external addresses "
+        # The rest of the line (width 160, up to col 158) is padded with dashes.
+        assert written[(6, 33)] == "-" * (159 - 33)
+
+    def test_branch_change_replaces_title_keeps_branch_column(self) -> None:
+        written = self._render(self._grouped_items())
+        # Row 8: placeholder dashes replace the title; the branch name stays
+        # column-flush with the full title above (column 14).
+        assert written[(8, 1)] == "-" * len("Mixdepth 0")
+        assert written[(8, 14)] == "internal addresses "
+        assert written[(8, 33)] == "-" * (159 - 33)
+
+    def test_new_mixdepth_gets_full_title_after_blank_row(self) -> None:
+        written = self._render(self._grouped_items())
+        # Rows 5 and 10 are blank border rows; row 11 opens mixdepth 1.
+        assert (5, 1) not in written
+        assert (10, 1) not in written
+        assert written[(11, 1)] == "Mixdepth 1"
+        assert written[(11, 14)] == "external addresses "
+
+    def test_trailing_separator_renders_plain_dash_line(self) -> None:
+        written = self._render([None])
+        # Without a following group the separator is a plain full-width
+        # dash line (cols 1..158).
+        assert written[(5, 1)] == "-" * 158
+
+    def test_cursor_seeks_past_leading_separators(self) -> None:
+        from jmwallet.cli.freeze import _seek_selectable
+
+        items = self._grouped_items()
+        assert _seek_selectable(items, 0, 1) == 2
+
+    def test_address_dedup_resets_between_branch_groups(self) -> None:
+        from jmwallet.utxo_tui import build_display_items
+
+        same = "bc1qsameaddress"
+        items = build_display_items(
+            [
+                self._utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0", address=same),
+                self._utxo("b", mixdepth=0, path="m/84'/0'/0'/1/0", address=same),
+            ],
+            branch_groups=True,
+        )
+        written = self._render(items)
+        # Rows 7 (external) and 9 (internal) both show the address: the
+        # branch separator between them resets the dedup.
+        assert same in written[(7, 0)]
+        assert same in written[(9, 0)]
+
+
 @pytest.mark.parametrize("height", [12, 24, 40])
 @pytest.mark.parametrize("has_bonds", [False, True])
 @pytest.mark.parametrize("cursor_pos", [0, 14, 20])

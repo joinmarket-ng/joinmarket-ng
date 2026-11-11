@@ -340,6 +340,25 @@ def filter_rows(rows: list[Row], predicate: Callable[[Row], bool] | None = None)
     return [row for row in rows if predicate(row)]
 
 
+def path_order_key(path: tuple[int, int, int] | None) -> tuple[int, int, int, int]:
+    """Canonical ordering key for path-addressable items.
+
+    ``path`` is ``(mixdepth, branch, derivation index)`` as returned by
+    ``WalletService._find_address_path``; the key is ``(0, mixdepth, branch
+    rank, index)`` with the branch rank taken from ``_BRANCH_SORT_RANK``
+    (external < internal < fidelity bonds). ``None`` (path not resolvable)
+    maps to ``(1, 0, 0, 0)`` so such items sort after every resolved path.
+
+    This is the canonical *sorted* order; the fidelity bond build path
+    deliberately orders by (locktime, index) instead — see the module
+    docstring.
+    """
+    if path is None:
+        return (1, 0, 0, 0)
+    mixdepth, branch, index = path
+    return (0, mixdepth, _BRANCH_SORT_RANK.get(branch, branch), index)
+
+
 def base_order_key(row: AddressRowLike) -> tuple[int, int, int, int]:
     """Canonical ordering: mixdepth, branch (external < internal < fidelity
     bonds), derivation index, then the UTXO's original position within its
@@ -349,12 +368,8 @@ def base_order_key(row: AddressRowLike) -> tuple[int, int, int, int]:
     external/internal branches. There is deliberately no txid/vout
     tiebreak: the intra-address cache order is the stable is-order.
     """
-    return (
-        row.mixdepth,
-        _BRANCH_SORT_RANK.get(row.branch, row.branch),
-        row.address_index,
-        row.original_seq,
-    )
+    _, mixdepth, branch_rank, index = path_order_key((row.mixdepth, row.branch, row.address_index))
+    return (mixdepth, branch_rank, index, row.original_seq)
 
 
 def sort_rows(
@@ -458,6 +473,7 @@ __all__ = [
     "fb_date_str",
     "filter_rows",
     "group_rows",
+    "path_order_key",
     "sort_rows",
     "summarize_branch",
     "summarize_mixdepth",

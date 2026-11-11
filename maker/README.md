@@ -159,12 +159,14 @@ synchronization and address-history verification.
  Usage: jm-maker [OPTIONS] COMMAND [ARGS]...
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --help                        Show this message and exit.                    │
-│ --install-completion          Install completion for the current shell.      │
-│ --show-completion             Show completion for the current shell, to copy │
-│                               it or customize the installation.              │
-│ --version                     Show the installed JoinMarket NG version and   │
-│                               exit.                                          │
+│ --help                      <bool>  Show this message and exit.              │
+│ --install-completion        <bool>  Install completion for the current       │
+│                                     shell.                                   │
+│ --show-completion           <bool>  Show completion for the current shell,   │
+│                                     to copy it or customize the              │
+│                                     installation.                            │
+│ --version                   <bool>  Show the installed JoinMarket NG version │
+│                                     and exit.                                │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
 │ config-init  Initialize the config file with default settings.               │
@@ -189,7 +191,7 @@ synchronization and address-history verification.
 │                                [env var: JOINMARKET_CONFIG_FILE]             │
 │ --data-dir     -d      <path>  Data directory for JoinMarket files           │
 │                                [env var: JOINMARKET_DATA_DIR]                │
-│ --help                         Show this message and exit.                   │
+│ --help                 <bool>  Show this message and exit.                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -244,9 +246,9 @@ synchronization and address-history verification.
 │                                                       host:port)             │
 │                                                       [env var:              │
 │                                                       DIRECTORY_SERVERS]     │
-│ --disable-tor-control                                 Disable Tor control    │
+│ --disable-tor-control           <bool>                Disable Tor control    │
 │                                                       port integration       │
-│ --dual-offers                                         Create both relative   │
+│ --dual-offers                   <bool>                Create both relative   │
 │                                                       and absolute fee       │
 │                                                       offers simultaneously. │
 │                                                       Each offer gets a      │
@@ -263,9 +265,9 @@ synchronization and address-history verification.
 │                                                       derivation index       │
 │                                                       [env var:              │
 │                                                       FIDELITY_BOND_INDEX]   │
-│ --fidelity-bond-lockt…  -L      <int>                 Fidelity bond          │
+│ --fidelity-bond-lockt…  -L      <list[int]>           Fidelity bond          │
 │                                                       locktimes to scan for  │
-│ --help                                                Show this message and  │
+│ --help                          <bool>                Show this message and  │
 │                                                       exit.                  │
 │ --log-level             -l      <str>                 Log level              │
 │ --merge-algorithm       -M      <str>                 UTXO selection         │
@@ -291,7 +293,7 @@ synchronization and address-history verification.
 │ --neutrino-url                  <str>                 Neutrino REST API URL  │
 │                                                       [env var:              │
 │                                                       NEUTRINO_URL]          │
-│ --no-fidelity-bond                                    Disable fidelity bond  │
+│ --no-fidelity-bond              <bool>                Disable fidelity bond  │
 │                                                       usage. Skips registry  │
 │                                                       lookup and bond proof  │
 │                                                       generation even when   │
@@ -305,7 +307,7 @@ synchronization and address-history verification.
 │                                                       .onion connections     │
 │                                                       (overrides             │
 │                                                       MAKER__ONION_SERVING_… │
-│ --prompt-bip39-passph…                                Prompt for BIP39       │
+│ --prompt-bip39-passph…          <bool>                Prompt for BIP39       │
 │                                                       passphrase             │
 │                                                       interactively          │
 │ --rpc-url                       <str>                 Bitcoin full node RPC  │

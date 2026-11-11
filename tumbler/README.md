@@ -34,12 +34,14 @@ pytest tumbler/tests
  JoinMarket tumbler - role-mixed CoinJoin schedules with YAML-persisted state
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --help                        Show this message and exit.                    │
-│ --install-completion          Install completion for the current shell.      │
-│ --show-completion             Show completion for the current shell, to copy │
-│                               it or customize the installation.              │
-│ --version                     Show the installed JoinMarket NG version and   │
-│                               exit.                                          │
+│ --help                      <bool>  Show this message and exit.              │
+│ --install-completion        <bool>  Install completion for the current       │
+│                                     shell.                                   │
+│ --show-completion           <bool>  Show completion for the current shell,   │
+│                                     to copy it or customize the              │
+│                                     installation.                            │
+│ --version                   <bool>  Show the installed JoinMarket NG version │
+│                                     and exit.                                │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ───────────────────────────────────────────────────────────────────╮
 │ config-init  Initialize the config file with default settings.               │
@@ -67,7 +69,7 @@ pytest tumbler/tests
 │                                [env var: JOINMARKET_CONFIG_FILE]             │
 │ --data-dir     -d      <path>  Data directory for JoinMarket files           │
 │                                [env var: JOINMARKET_DATA_DIR]                │
-│ --help                         Show this message and exit.                   │
+│ --help                 <bool>  Show this message and exit.                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -91,14 +93,14 @@ pytest tumbler/tests
 │                                            ~/.joinmarket-ng or               │
 │                                            $JOINMARKET_DATA_DIR)             │
 │                                            [env var: JOINMARKET_DATA_DIR]    │
-│ --help                                     Show this message and exit.       │
+│ --help                             <bool>  Show this message and exit.       │
 │ --log-level                -l      <str>                                     │
 │ --mnemonic-file            -f      <path>  Path to mnemonic file             │
-│ --prompt-bip39-passphrase                  Prompt for BIP39 passphrase       │
+│ --prompt-bip39-passphrase          <bool>  Prompt for BIP39 passphrase       │
 │                                            interactively                     │
 │ --wallet-name              -w      <str>   Wallet identifier; defaults to    │
 │                                            the mnemonic fingerprint          │
-│ --yes                      -y              Skip confirmation prompt          │
+│ --yes                      -y      <bool>  Skip confirmation prompt          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -114,7 +116,7 @@ pytest tumbler/tests
  Build a tumbler plan for the given destinations and persist it.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
-│    --allow-few-de…                                          Override the     │
+│    --allow-few-de…                         <bool>           Override the     │
 │                                                             recommended      │
 │                                                             minimum of 3     │
 │                                                             destinations.    │
@@ -145,15 +147,15 @@ pytest tumbler/tests
 │                                                             $JOINMARKET_DAT… │
 │                                                             [env var:        │
 │                                                             JOINMARKET_DATA… │
-│ *  --destination    -d                     <str>            External         │
+│ *  --destination    -d                     <list[str]>      External         │
 │                                                             destination      │
 │                                                             address          │
 │                                                             (repeatable)     │
 │                                                             [required]       │
-│    --force                                                  Overwrite an     │
+│    --force                                 <bool>           Overwrite an     │
 │                                                             existing pending │
 │                                                             plan             │
-│    --help                                                   Show this        │
+│    --help                                  <bool>           Show this        │
 │                                                             message and      │
 │                                                             exit.            │
 │    --log-level      -l                     <str>                             │
@@ -167,7 +169,7 @@ pytest tumbler/tests
 │                                                             count per CJ;    │
 │                                                             defaults to      │
 │                                                             settings.taker.… │
-│    --maker-sessio…      --no-maker-ses…                     [default:        │
+│    --maker-sessio…      --no-maker-ses…    <bool>           [default:        │
 │                                                             maker-sessions]  │
 │    --mincjamount-…                         <int>            Minimum CJ       │
 │                                                             amount in sats   │
@@ -182,7 +184,7 @@ pytest tumbler/tests
 │                                                             API URL          │
 │                                                             [env var:        │
 │                                                             NEUTRINO_URL]    │
-│    --prompt-bip39…                                          Prompt for BIP39 │
+│    --prompt-bip39…                         <bool>           Prompt for BIP39 │
 │                                                             passphrase       │
 │                                                             interactively    │
 │    --rpc-url                               <str>            Bitcoin full     │
@@ -248,7 +250,7 @@ pytest tumbler/tests
 │                                                       --block-target).       │
 │                                                       Required when the      │
 │                                                       backend is neutrino.   │
-│ --help                                                Show this message and  │
+│ --help                          <bool>                Show this message and  │
 │                                                       exit.                  │
 │ --log-level             -l      <str>                                        │
 │ --min-confirmations             <int>                 Confirmations required │
@@ -263,10 +265,10 @@ pytest tumbler/tests
 │                                 net|regtest>                                 │
 │ --neutrino-url                  <str>                 [env var:              │
 │                                                       NEUTRINO_URL]          │
-│ --prompt-bip39-passph…                                Prompt for BIP39       │
+│ --prompt-bip39-passph…          <bool>                Prompt for BIP39       │
 │                                                       passphrase             │
 │                                                       interactively          │
-│ --resume                                              Resume a plan that     │
+│ --resume                        <bool>                Resume a plan that     │
 │                                                       ended in a terminal    │
 │                                                       state (FAILED,         │
 │                                                       CANCELLED, or          │
@@ -312,10 +314,10 @@ pytest tumbler/tests
 │                                            ~/.joinmarket-ng or               │
 │                                            $JOINMARKET_DATA_DIR)             │
 │                                            [env var: JOINMARKET_DATA_DIR]    │
-│ --help                                     Show this message and exit.       │
+│ --help                             <bool>  Show this message and exit.       │
 │ --log-level                -l      <str>                                     │
 │ --mnemonic-file            -f      <path>  Path to mnemonic file             │
-│ --prompt-bip39-passphrase                  Prompt for BIP39 passphrase       │
+│ --prompt-bip39-passphrase          <bool>  Prompt for BIP39 passphrase       │
 │                                            interactively                     │
 │ --wallet-name              -w      <str>   Wallet identifier; defaults to    │
 │                                            the mnemonic fingerprint          │
