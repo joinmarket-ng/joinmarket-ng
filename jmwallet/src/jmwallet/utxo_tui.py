@@ -18,11 +18,11 @@ This module holds the layout and navigation primitives they share:
 
 from __future__ import annotations
 
-import curses
 import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import curses
     from collections.abc import Callable
 
     from jmwallet.wallet.models import UTXOInfo
@@ -235,6 +235,8 @@ def adjust_scroll(cursor_pos: int, scroll_offset: int, list_height: int, item_co
 
 def draw_resize_prompt(stdscr: curses.window, width: int) -> None:
     """Draw the minimum-size prompt shared by both TUIs."""
+    import curses
+
     try:
         stdscr.addstr(0, 0, "Terminal too small. Please resize. q/Esc: cancel"[: max(1, width - 1)])
     except curses.error:

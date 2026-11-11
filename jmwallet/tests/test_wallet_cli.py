@@ -90,6 +90,36 @@ def test_root_help_shows_completion_options() -> None:
     assert "--show-completion" in output
 
 
+def test_root_help_without_curses() -> None:
+    """Noninteractive wallet commands must start without optional curses support."""
+    script = dedent(
+        """
+        import sys
+
+        sys.modules["curses"] = None
+        sys.modules["_curses"] = None
+
+        from jmwallet.cli import main
+
+        sys.argv = ["jm-wallet", "--help"]
+        main()
+        """
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "JoinMarket Wallet Management" in result.stdout
+
+
 def test_help_output_is_alphabetically_sorted() -> None:
     """Subcommands and options (including the address sub-app) must be listed
     alphabetically in --help."""

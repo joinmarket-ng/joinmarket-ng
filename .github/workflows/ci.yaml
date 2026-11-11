@@ -399,6 +399,9 @@ jobs:
           # Install from source in editable mode mirrors the documented
           # Windows quick start.
           pip install ./jmcore ./taker ./jmwallet
+      - name: Wallet CLI starts without optional curses support
+        shell: pwsh
+        run: jm-wallet --help
       - name: Validate installed native cryptography
         shell: pwsh
         run: |
