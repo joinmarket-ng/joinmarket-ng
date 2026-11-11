@@ -9,7 +9,8 @@ tests from the monorepo root.
 from __future__ import annotations
 
 import os
-from dataclasses import replace
+from collections import deque
+from dataclasses import dataclass, replace
 from typing import Any
 
 from jmcore.bitcoin import TxInput, TxOutput, get_txid, serialize_transaction
@@ -102,3 +103,91 @@ def make_mock_rpc(
         return default
 
     return _mock_rpc
+
+
+# ---------------------------------------------------------------------------
+# Curses test doubles
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class KeyEvent:
+    """A key read and the terminal dimensions in effect for the next frame."""
+
+    height: int
+    width: int
+    key: int
+
+
+@dataclass(frozen=True)
+class Frame:
+    """A completed curses framebuffer captured by :class:`StrictScreen`."""
+
+    height: int
+    width: int
+    lines: tuple[str, ...]
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+class StrictScreen:
+    """Small curses-window double that rejects off-screen writes and extra input reads."""
+
+    def __init__(self, height: int, width: int, events: list[KeyEvent]) -> None:
+        self._height = height
+        self._width = width
+        self._events = deque(events)
+        self._rows: list[list[str]] = []
+        self.frames: list[Frame] = []
+        self.clear()
+
+    @property
+    def pending_events(self) -> int:
+        return len(self._events)
+
+    def getmaxyx(self) -> tuple[int, int]:
+        return self._height, self._width
+
+    def clear(self) -> None:
+        self._rows = [[" "] * self._width for _ in range(self._height)]
+
+    def erase(self) -> None:
+        self.clear()
+
+    def addstr(self, y: int, x: int, text: str, _attr: int = 0) -> None:
+        if y < 0 or x < 0 or y >= self._height or x + len(text) > self._width:
+            raise AssertionError(
+                f"off-screen write at ({y}, {x}) for {len(text)} chars on "
+                f"{self._height}x{self._width} screen"
+            )
+        self._rows[y][x : x + len(text)] = text
+
+    def addnstr(self, y: int, x: int, text: str, count: int, attr: int = 0) -> None:
+        self.addstr(y, x, text[:count], attr)
+
+    def attron(self, _attr: int) -> None:
+        pass
+
+    def attroff(self, _attr: int) -> None:
+        pass
+
+    def keypad(self, _enabled: bool) -> None:
+        pass
+
+    def nodelay(self, _enabled: bool) -> None:
+        pass
+
+    def refresh(self) -> None:
+        self.frames.append(
+            Frame(self._height, self._width, tuple("".join(row) for row in self._rows))
+        )
+
+    def getch(self) -> int:
+        if not self._events:
+            raise AssertionError("TUI requested input after scripted events were exhausted")
+        event = self._events.popleft()
+        self._height = event.height
+        self._width = event.width
+        return event.key
