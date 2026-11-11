@@ -11,11 +11,14 @@ This module holds the layout and navigation primitives they share:
   branch name),
 - cursor navigation that skips separators (and other non-selectable rows),
 - the address column formatting (collapsing consecutive duplicates),
-- scroll-offset adjustment to keep the cursor visible.
+- scroll-offset adjustment to keep the cursor visible,
+- the shared minimum-size prompt used while either terminal has no room
+  for the full layout.
 """
 
 from __future__ import annotations
 
+import curses
 import re
 from typing import TYPE_CHECKING
 
@@ -228,3 +231,13 @@ def adjust_scroll(cursor_pos: int, scroll_offset: int, list_height: int, item_co
     elif cursor_pos >= scroll_offset + list_height:
         scroll_offset = cursor_pos - list_height + 1
     return min(scroll_offset, max(0, item_count - list_height))
+
+
+def draw_resize_prompt(stdscr: curses.window, width: int) -> None:
+    """Draw the minimum-size prompt shared by both TUIs."""
+    try:
+        stdscr.addstr(0, 0, "Terminal too small. Please resize. q/Esc: cancel"[: max(1, width - 1)])
+    except curses.error:
+        # Curses can report ERR after successfully writing the bottom-right cell (1x1).
+        pass
+    stdscr.refresh()

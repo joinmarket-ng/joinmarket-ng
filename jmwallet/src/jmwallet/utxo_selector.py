@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from jmwallet.utxo_tui import (
     adjust_scroll,
     build_display_items,
+    draw_resize_prompt,
     group_separator_parts,
     seek_selectable,
     utxo_display_sort_key,
@@ -505,15 +506,6 @@ def _draw_footer(stdscr: curses.window, start: int, rows: list[tuple[str, int]])
         stdscr.addstr(start + offset, 2, line, attr)
 
 
-def _draw_resize_prompt(stdscr: curses.window, width: int) -> None:
-    try:
-        stdscr.addstr(0, 0, "Terminal too small. Please resize. q/Esc: cancel"[: max(1, width - 1)])
-    except curses.error:
-        # Curses can report ERR after successfully writing the bottom-right cell (1x1).
-        pass
-    stdscr.refresh()
-
-
 def _run_selector(
     stdscr: curses.window,
     display_items: list[UTXOInfo | None],
@@ -623,7 +615,7 @@ def _run_selector(
         list_start = 5
         list_height = height - list_start - len(footer)
         if list_height < 1 or width < max(80, _minimum_table_width(columns)):
-            _draw_resize_prompt(stdscr, width)
+            draw_resize_prompt(stdscr, width)
             if stdscr.getch() in (ord("q"), 27):
                 return []
             continue
@@ -652,7 +644,7 @@ def _run_selector(
             _draw_footer(stdscr, height - len(footer), footer)
         except curses.error:
             # Do not dispatch spend actions after an interrupted repaint.
-            _draw_resize_prompt(stdscr, width)
+            draw_resize_prompt(stdscr, width)
             if stdscr.getch() in (ord("q"), 27):
                 return []
             continue

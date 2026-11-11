@@ -26,6 +26,7 @@ from jmwallet.utxo_tui import (
 from jmwallet.utxo_tui import (
     adjust_scroll,
     build_display_items,
+    draw_resize_prompt,
     format_address_column,
     group_separator_parts,
     seek_selectable,
@@ -561,6 +562,17 @@ def _draw_freeze_footer(
     stdscr.attroff(curses.A_BOLD)
 
 
+def _freeze_list_height(height: int, display_items: list[UTXOInfo | None]) -> int:
+    """Rows available for the scrollable list at terminal ``height``.
+
+    The layout is fixed: five header rows above the list, and below it a
+    reserved footer of a separator, one stats line (two when fidelity
+    bonds are present), and a legend row.
+    """
+    has_bonds = any(u is not None and u.is_fidelity_bond for u in display_items)
+    return height - (5 if has_bonds else 4) - 5
+
+
 def _render_freeze_screen(
     stdscr: curses.window,
     display_items: list[UTXOInfo | None],
@@ -584,11 +596,9 @@ def _render_freeze_screen(
     stdscr.addstr(4, 0, "-" * min(len(_FREEZE_COL_HEADER) + 5, width - 1))
 
     list_start = 5  # Data starts here (+1 blank line under the header rule)
-    # Reserve the footer separator, stats, legend, and error line before
-    # sizing the scrollable list. Bonds need a second stats line.
-    has_bonds = any(u is not None and u.is_fidelity_bond for u in display_items)
-    separator_row = height - (5 if has_bonds else 4)
-    list_height = separator_row - list_start
+    # Reserve the footer separator, stats, and legend rows before sizing
+    # the scrollable list. Bonds need a second stats line.
+    list_height = _freeze_list_height(height, display_items)
 
     # Keep the cursor on screen.
     scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height, len(display_items))
@@ -746,6 +756,15 @@ def _run_freeze_tui(
         error_active = bool(state.error_message) and time.monotonic() < state.error_display_until
         if not error_active:
             state.error_message = None
+
+        list_height = _freeze_list_height(stdscr.getmaxyx()[0], display_items)
+        if list_height < 1:
+            # Not enough room even for the fixed rows: show the shared
+            # resize prompt and ignore all input except q/Escape.
+            draw_resize_prompt(stdscr, stdscr.getmaxyx()[1])
+            if stdscr.getch() in (ord("q"), 27):
+                return
+            continue
 
         state.scroll_offset, list_height = _render_freeze_screen(
             stdscr,
