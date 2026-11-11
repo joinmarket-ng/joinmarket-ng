@@ -93,6 +93,7 @@ class UTXOVerificationResult:
     error: str | None = None
     scriptpubkey_matches: bool = False
     conclusive: bool = True
+    block_height: int | None = None
 
     @property
     def unavailable(self) -> bool:

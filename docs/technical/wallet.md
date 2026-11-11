@@ -355,6 +355,13 @@ Trade-off: Addresses stored in Core wallet file - never use with third-party nod
 - Storage: Headers, compact filters, and wallet-related data; depends on retained history
 - Sync: Initial header and filter sync, then wallet scanning; duration depends on hardware and history
 
+Neutrino's UTXO list is a discovery cache and can retain outputs from transactions
+removed by a reorg. Takers verify selected inputs before consuming PoDLE commitments,
+and makers verify their selected inputs before disclosing them. Unavailable
+verification stops the attempt without permanently marking funds spent. Historical
+checks can take longer, and makers decline when verification cannot finish within
+their validation budget. These checks do not make cached wallet balances authoritative.
+
 **Decision Matrix:**
 
 - Use `descriptor_wallet` with a Bitcoin Core node you control (recommended).

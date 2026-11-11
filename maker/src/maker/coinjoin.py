@@ -47,6 +47,9 @@ from maker.tx_verification import find_output_index, verify_unsigned_transaction
 
 MINER_FEE_PREVOUT_LOOKUP_TIMEOUT_SEC = 10.0
 MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE = 10
+# Leave time for the rest of the auth exchange rather than exhausting backend
+# retry windows on every candidate in a stale discovery cache.
+OWN_INPUT_VERIFICATION_TIMEOUT_SEC = 30.0
 
 
 class CoinJoinState(StrEnum):
@@ -885,53 +888,83 @@ class CoinJoinSession:
             # Selection can still lose a race to another process after the
             # balance snapshot; atomic reservation closes that race and lets us
             # try another independent mixdepth instead of double-signing an input.
+            verification_deadline = min(
+                self.deadline, time.monotonic() + OWN_INPUT_VERIFICATION_TIMEOUT_SEC
+            )
             for candidate_mixdepth in mixdepth_attempt_order(
                 eligible_mixdepths,
                 self.wallet.mixdepth_count,
                 self.mixdepth_selection_policy,
             ):
-                try:
-                    candidate = self.wallet.select_utxos_with_merge(
-                        candidate_mixdepth,
-                        required_amount,
-                        self.min_confirmations,
-                        merge_algorithm=self.merge_algorithm,
-                        restrict_md0=self.restrict_md0,
-                        md0_mergeable_outpoints=md0_mergeable_outpoints,
-                        exclude=exclude,
-                    )
-                except ValueError as e:
-                    logger.bind(sensitive=True).debug(
-                        f"Mixdepth {candidate_mixdepth} became unavailable during selection: {e}"
-                    )
-                    continue
+                while True:
+                    try:
+                        candidate = self.wallet.select_utxos_with_merge(
+                            candidate_mixdepth,
+                            required_amount,
+                            self.min_confirmations,
+                            merge_algorithm=self.merge_algorithm,
+                            restrict_md0=self.restrict_md0,
+                            md0_mergeable_outpoints=md0_mergeable_outpoints,
+                            exclude=exclude,
+                        )
+                    except ValueError as e:
+                        logger.bind(sensitive=True).debug(
+                            "Mixdepth {} became unavailable during selection: {}",
+                            candidate_mixdepth,
+                            e,
+                        )
+                        break
 
-                candidate_dict = {(utxo.txid, utxo.vout): utxo for utxo in candidate}
-                if not candidate_dict:
-                    continue
+                    candidate_dict = {(utxo.txid, utxo.vout): utxo for utxo in candidate}
+                    if not candidate_dict:
+                        break
 
-                if active_check is not None and not active_check():
-                    return {}, "", "", -1
-                remaining_session = self.deadline - time.monotonic()
-                if remaining_session <= 0:
-                    return {}, "", "", -1
-                if not self.wallet.reserve_coinjoin_inputs(
-                    set(candidate_dict),
-                    ttl=min(float(self.pre_sign_timeout_sec), remaining_session),
-                    owner=self.input_lock_owner,
-                ):
-                    logger.warning(
-                        f"Inputs from mixdepth {candidate_mixdepth} were locked by a "
-                        "concurrent session; trying another mixdepth"
-                    )
-                    exclude |= self.wallet.get_locked_input_outpoints()
-                    continue
+                    if active_check is not None and not active_check():
+                        return {}, "", "", -1
+                    remaining_session = self.deadline - time.monotonic()
+                    if remaining_session <= 0:
+                        return {}, "", "", -1
+                    if not self.wallet.reserve_coinjoin_inputs(
+                        set(candidate_dict),
+                        ttl=min(float(self.pre_sign_timeout_sec), remaining_session),
+                        owner=self.input_lock_owner,
+                    ):
+                        logger.warning(
+                            f"Inputs from mixdepth {candidate_mixdepth} were locked by a "
+                            "concurrent session; trying another mixdepth"
+                        )
+                        exclude |= self.wallet.get_locked_input_outpoints()
+                        break
 
-                reserved_outpoints = set(candidate_dict)
-                selected = candidate
-                utxos_dict = candidate_dict
-                max_mixdepth = candidate_mixdepth
-                break
+                    reserved_outpoints = set(candidate_dict)
+                    if self.backend.requires_neutrino_metadata() is True:
+                        async with asyncio.timeout(
+                            max(0.0, verification_deadline - time.monotonic())
+                        ):
+                            rejected = await self.wallet.verify_coinjoin_inputs(
+                                candidate, self.min_confirmations
+                            )
+                        if time.monotonic() >= verification_deadline:
+                            raise TimeoutError("Own input verification deadline exceeded")
+                        if rejected:
+                            self.wallet.release_coinjoin_inputs(
+                                reserved_outpoints, owner=self.input_lock_owner
+                            )
+                            reserved_outpoints = set()
+                            exclude |= rejected
+                            continue
+                        if active_check is not None and not active_check():
+                            self.wallet.release_coinjoin_inputs(
+                                reserved_outpoints, owner=self.input_lock_owner
+                            )
+                            return {}, "", "", -1
+
+                    selected = candidate
+                    utxos_dict = candidate_dict
+                    max_mixdepth = candidate_mixdepth
+                    break
+                if max_mixdepth >= 0:
+                    break
 
             if max_mixdepth < 0:
                 logger.error("No mixdepth remained selectable after input reservations")
@@ -958,8 +991,15 @@ class CoinJoinSession:
 
             return utxos_dict, cj_address, change_address, max_mixdepth
 
+        except asyncio.CancelledError:
+            if reserved_outpoints:
+                self.wallet.release_coinjoin_inputs(reserved_outpoints, owner=self.input_lock_owner)
+            raise
         except Exception as e:
-            logger.error("Failed to select UTXOs")
+            if isinstance(e, TimeoutError):
+                logger.warning("Wallet input verification timed out; declining CoinJoin")
+            else:
+                logger.error("Failed to select UTXOs")
             logger.bind(sensitive=True).error(f"Failed to select UTXOs: {e}")
             if reserved_outpoints:
                 self.wallet.release_coinjoin_inputs(reserved_outpoints, owner=self.input_lock_owner)

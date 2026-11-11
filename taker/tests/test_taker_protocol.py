@@ -3586,6 +3586,8 @@ class TestReplacementTargetRestoration:
         taker.config.taker_utxo_age = 1
         taker.config.taker_utxo_amtpercent = 20
         taker.config.max_fee_rate_sat_vb = 100.0
+        taker.backend = MagicMock()
+        taker.backend.requires_neutrino_metadata.return_value = False
         taker.directory_client = MagicMock()
         taker.directory_client.clients = {}
         taker.directory_client.prefer_direct_connections = False

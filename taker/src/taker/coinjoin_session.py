@@ -46,6 +46,7 @@ from jmwallet.history import (
     create_taker_history_entry,
     mark_pending_transaction_failed,
 )
+from jmwallet.wallet.service import InputVerificationUnavailableError
 from jmwallet.wallet.signing import (
     TransactionSigningError,
     create_p2wpkh_script_code,
@@ -145,6 +146,8 @@ class CoinJoinSession:
         # express the build-time vs sign-time distinction explicitly).
         self.preselected_utxos: list[UTXOInfo] = []
         self.selected_utxos: list[UTXOInfo] = []
+        # Range-limited negatives only exclude a coin within this attempt.
+        self.rejected_input_outpoints: set[tuple[str, int]] = set()
         # Explicit coin control is strict: maker-fee changes and PoDLE retries
         # may not pull additional inputs from the wallet.
         self.strict_input_selection: bool = False
@@ -237,6 +240,7 @@ class CoinJoinSession:
         self.broadcast_fallback_reason = ""
         self.preselected_utxos = []
         self.selected_utxos = []
+        self.rejected_input_outpoints = set()
         self.strict_input_selection = False
         self.reserved_inputs = set()
         self.input_lock_owner = secrets.token_hex(32)
@@ -298,6 +302,44 @@ class CoinJoinSession:
                 "leases were left untouched"
             )
 
+    async def verify_own_inputs(self, utxos: list[UTXOInfo]) -> bool:
+        """Fail before disclosing or committing to unavailable local inputs."""
+        if self.backend.requires_neutrino_metadata() is not True:
+            return True
+        try:
+            rejected = await self.wallet.verify_coinjoin_inputs(utxos, self.config.taker_utxo_age)
+        except InputVerificationUnavailableError as exc:
+            self.last_failure_reason = str(exc)
+            logger.warning(self.last_failure_reason)
+            return False
+        self.rejected_input_outpoints |= rejected
+        if rejected:
+            self.last_failure_reason = "Selected wallet inputs are no longer available for CoinJoin"
+            logger.warning(self.last_failure_reason)
+            return False
+        return True
+
+    async def _expand_verified_preselected_utxos(self, mixdepth: int) -> int:
+        """Skip rejected expansion candidates without consuming their PoDLE indices."""
+        while True:
+            original = list(self.preselected_utxos)
+            added = self._expand_preselected_utxos_same_mixdepth(mixdepth)
+            if not added:
+                return 0
+            if await self.verify_own_inputs(self.preselected_utxos):
+                self.last_failure_reason = None
+                return added
+            new_outpoints = {(u.txid, u.vout) for u in self.preselected_utxos} - {
+                (u.txid, u.vout) for u in original
+            }
+            self.wallet.release_coinjoin_inputs(new_outpoints, owner=self.input_lock_owner)
+            self.reserved_inputs -= new_outpoints
+            self.preselected_utxos = original
+            if not new_outpoints & self.rejected_input_outpoints or any(
+                (u.txid, u.vout) in self.rejected_input_outpoints for u in original
+            ):
+                return 0
+
     def _expand_preselected_utxos_same_mixdepth(self, mixdepth: int) -> int:
         """Add another eligible UTXO from the same mixdepth to ``preselected_utxos``.
 
@@ -327,7 +369,9 @@ class CoinJoinSession:
             min_confirmations=self.config.taker_utxo_age,
             min_percent=self.config.taker_utxo_amtpercent,
         )
-        candidates = [u for u in eligible if (u.txid, u.vout) not in already]
+        candidates = [
+            u for u in eligible if (u.txid, u.vout) not in already | self.rejected_input_outpoints
+        ]
 
         if not candidates:
             return 0
@@ -1439,7 +1483,9 @@ class CoinJoinSession:
                     )
                     # Skip inputs locked by another in-flight round; our own
                     # already-reserved preselected UTXOs are force-included.
-                    locked_inputs = self.wallet.get_locked_input_outpoints()
+                    locked_inputs = (
+                        self.wallet.get_locked_input_outpoints() | self.rejected_input_outpoints
+                    )
                     selected_utxos = self.wallet.select_utxos(
                         mixdepth,
                         required,
@@ -1447,6 +1493,27 @@ class CoinJoinSession:
                         include_utxos=self.preselected_utxos,  # Include pre-selected (PoDLE UTXO)
                         exclude=locked_inputs,
                     )
+
+                    while not await self.verify_own_inputs(selected_utxos):
+                        # Already-committed inputs cannot be silently replaced.
+                        # Retry only when an additional funding candidate was rejected.
+                        if (
+                            any(
+                                (u.txid, u.vout) in self.rejected_input_outpoints
+                                for u in self.preselected_utxos
+                            )
+                            or not self.rejected_input_outpoints - locked_inputs
+                        ):
+                            return False
+                        locked_inputs |= self.rejected_input_outpoints
+                        selected_utxos = self.wallet.select_utxos(
+                            mixdepth,
+                            required,
+                            self.config.taker_utxo_age,
+                            include_utxos=self.preselected_utxos,
+                            exclude=locked_inputs,
+                        )
+                    self.last_failure_reason = None
 
             if not selected_utxos:
                 logger.error("Failed to select enough UTXOs")

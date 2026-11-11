@@ -787,6 +787,27 @@ class Taker(TakerMonitoringMixin):
             raise selection_error
         raise ValueError(f"Unable to select a PoDLE-capable UTXO in mixdepth {mixdepth}")
 
+    async def _select_verified_coinjoin_utxos_with_podle(
+        self,
+        mixdepth: int,
+        target_amount: int,
+        private_key_getter: Callable[[str], bytes | None],
+        excluded_outpoints: set[tuple[str, int]],
+    ) -> list[UTXOInfo]:
+        """Reselect automatic inputs after range-limited negative chain checks."""
+        excluded = set(excluded_outpoints)
+        while True:
+            selected = self._select_coinjoin_utxos_with_podle(
+                mixdepth, target_amount, private_key_getter, excluded
+            )
+            if await self._session.verify_own_inputs(selected):
+                self._session.last_failure_reason = None
+                return selected
+            newly_rejected = self._session.rejected_input_outpoints - excluded
+            if not newly_rejected:
+                raise ValueError(self._session.last_failure_reason)
+            excluded |= newly_rejected
+
     async def stop(self, *, close_wallet: bool = True) -> None:
         """Stop the taker and close connections.
 
@@ -1313,6 +1334,18 @@ class Taker(TakerMonitoringMixin):
                         f"from mixdepth (no --select-utxos)"
                     )
 
+                if explicitly_selected_utxos is None and not manually_selected_utxos:
+                    if not await self._session.verify_own_inputs(self._session.preselected_utxos):
+                        if not self._session.rejected_input_outpoints:
+                            self.state = TakerState.FAILED
+                            return None
+                        self._session.preselected_utxos = [
+                            u
+                            for u in self._session.preselected_utxos
+                            if (u.txid, u.vout) not in self._session.rejected_input_outpoints
+                        ]
+                        self._session.last_failure_reason = None
+
                 if not self._session.preselected_utxos:
                     reason = f"No eligible UTXOs in mixdepth {mixdepth}"
                     logger.error(reason)
@@ -1423,11 +1456,13 @@ class Taker(TakerMonitoringMixin):
                     # on the same wallet) so we don't build a conflicting tx.
                     locked_inputs = self.wallet.get_locked_input_outpoints()
                     try:
-                        self._session.preselected_utxos = self._select_coinjoin_utxos_with_podle(
-                            mixdepth,
-                            estimated_required,
-                            get_private_key,
-                            locked_inputs,
+                        self._session.preselected_utxos = (
+                            await self._select_verified_coinjoin_utxos_with_podle(
+                                mixdepth,
+                                estimated_required,
+                                get_private_key,
+                                locked_inputs,
+                            )
                         )
                         preselected = self._session.preselected_utxos
                         logger.bind(sensitive=True).info(
@@ -1585,6 +1620,9 @@ class Taker(TakerMonitoringMixin):
 
             # Generate PoDLE from pre-selected UTXOs only
             # This ensures the commitment is from a UTXO that will be in the transaction
+            if not await self._session.verify_own_inputs(self._session.preselected_utxos):
+                self.state = TakerState.FAILED
+                return None
             self._session.podle_commitment = self.podle_manager.generate_fresh_commitment(
                 wallet_utxos=self._session.preselected_utxos,  # Only from pre-selected UTXOs!
                 cj_amount=self._session.cj_amount,
@@ -1886,6 +1924,9 @@ class Taker(TakerMonitoringMixin):
                     )
 
                 if not replacement_commitment_ready:
+                    if not await self._session.verify_own_inputs(self._session.preselected_utxos):
+                        self.state = TakerState.FAILED
+                        return False
                     if not self._rotate_commitment_for_auth_replacement(get_private_key):
                         break
                     replacement_commitment_ready = True
@@ -2135,6 +2176,9 @@ class Taker(TakerMonitoringMixin):
                     }
                     if not self._preflight_fee_headroom(prospective_offers):
                         return False
+                    if not await self._session.verify_own_inputs(self._session.preselected_utxos):
+                        self.state = TakerState.FAILED
+                        return False
                     new_commitment = self.podle_manager.generate_fresh_commitment(
                         wallet_utxos=self._session.preselected_utxos,
                         cj_amount=self._session.cj_amount,
@@ -2144,7 +2188,7 @@ class Taker(TakerMonitoringMixin):
                         max_retries=self.config.taker_utxo_retries,
                     )
                     if new_commitment is None:
-                        added = self._session._expand_preselected_utxos_same_mixdepth(mixdepth)
+                        added = await self._session._expand_verified_preselected_utxos(mixdepth)
                         if added > 0:
                             if not self._preflight_fee_headroom(prospective_offers):
                                 return False
@@ -2162,7 +2206,9 @@ class Taker(TakerMonitoringMixin):
                                 max_retries=self.config.taker_utxo_retries,
                             )
                     if new_commitment is None:
-                        if self._session.strict_input_selection:
+                        if self._session.last_failure_reason:
+                            reason = self._session.last_failure_reason
+                        elif self._session.strict_input_selection:
                             reason = (
                                 "No more PoDLE commitments available from the explicit "
                                 "input UTXOs; automatic input expansion is disabled"

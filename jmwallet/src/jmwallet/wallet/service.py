@@ -39,10 +39,16 @@ from jmwallet.wallet.utxo_metadata import (
 # address that is neither used nor already reserved.
 MAX_ADDRESS_ALLOCATION_CANDIDATES = 10_000
 
+
+class InputVerificationUnavailableError(Exception):
+    """The backend could not establish whether selected wallet inputs are usable."""
+
+
 # Re-export constants so external code importing from service.py still works
 __all__ = [
     "DEFAULT_SCAN_RANGE",
     "FIDELITY_BOND_BRANCH",
+    "InputVerificationUnavailableError",
     "MAX_ADDRESS_ALLOCATION_CANDIDATES",
     "WalletService",
 ]
@@ -757,6 +763,57 @@ class WalletService(
         if mixdepth not in self.utxo_cache:
             await self.sync_mixdepth(mixdepth)
         return self.utxo_cache.get(mixdepth, [])
+
+    async def verify_coinjoin_inputs(
+        self, utxos: Sequence[UTXOInfo], min_confirmations: int
+    ) -> set[tuple[str, int]]:
+        """Return inputs unusable for this attempt, without changing durable wallet state.
+
+        Neutrino's list endpoint is only a discovery cache. Before consuming a
+        commitment or disclosing inputs, verify the chosen outpoints individually.
+        A negative lookup is range-limited, so it must not mark a coin permanently
+        spent. An unavailable lookup aborts the action instead of authorizing it.
+        Full-node discovery and its existing validation paths are unchanged.
+        """
+        if self.backend.requires_neutrino_metadata() is not True:
+            return set()
+
+        rejected: set[tuple[str, int]] = set()
+        for utxo in utxos:
+            if not utxo.scriptpubkey or utxo.height is None:
+                raise InputVerificationUnavailableError("Selected input is missing chain metadata")
+            try:
+                result = await self.backend.verify_wallet_utxo_with_metadata(
+                    txid=utxo.txid,
+                    vout=utxo.vout,
+                    scriptpubkey=utxo.scriptpubkey,
+                    blockheight=utxo.height,
+                )
+            except Exception as exc:
+                raise InputVerificationUnavailableError(
+                    "Could not verify selected wallet inputs"
+                ) from exc
+            if result.unavailable:
+                logger.bind(sensitive=True).warning(
+                    "Wallet input verification unavailable for {}: {}", utxo.outpoint, result.error
+                )
+                raise InputVerificationUnavailableError(
+                    "Selected wallet input verification is temporarily unavailable"
+                )
+            if (
+                not result.valid
+                or result.confirmations < min_confirmations
+                or result.value != utxo.value
+            ):
+                rejected.add((utxo.txid, utxo.vout))
+                logger.bind(sensitive=True).warning(
+                    "Rejecting selected wallet input {}: {}", utxo.outpoint, result.error
+                )
+                continue
+            utxo.confirmations = result.confirmations
+            if result.block_height is not None:
+                utxo.height = result.block_height
+        return rejected
 
     def find_utxo_by_address(self, address: str) -> UTXOInfo | None:
         """

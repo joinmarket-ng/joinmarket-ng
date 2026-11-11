@@ -2031,6 +2031,7 @@ class NeutrinoBackend(BlockchainBackend):
             return UTXOVerificationResult(
                 valid=False,
                 error=f"Blockheight {blockheight} is in the future (tip: {tip_height})",
+                conclusive=enforce_rescan_depth,
             )
 
         # Limit rescan depth to prevent DoS
@@ -2157,6 +2158,7 @@ class NeutrinoBackend(BlockchainBackend):
                 value=value,
                 confirmations=confirmations,
                 scriptpubkey_matches=True,
+                block_height=actual_blockheight,
             )
 
         except _UTXOVerificationUnavailableError as exc:
