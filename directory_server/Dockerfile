@@ -5,7 +5,7 @@
 # Update with: ./scripts/update-base-images.sh
 ARG PYTHON_VERSION=3.14
 ARG PYTHON_SLIM_DIGEST=sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
-ARG PYTHON_FULL_DIGEST=sha256:d18055009f327b22993de14458aa5a6bac032cdf459ea2a2e9bbdc3d3d49e4fb
+ARG PYTHON_FULL_DIGEST=sha256:a7097ae62ea4cf4fec036282cbf97f0d0b7b4f9cb286277951115fb30442527d
 # Pin build tools for reproducible builds
 # setuptools version is stamped into WHEEL metadata (Generator: setuptools (x.y.z))
 # Different versions produce different WHEEL/RECORD files, breaking layer reproducibility
@@ -16,7 +16,7 @@ ARG WHEEL_VERSION=0.48.0
 # Pins the whole transitive package closure so the build keeps reproducing
 # after the live archive rotates. See scripts/docker-apt-install.sh.
 # Update with: ./scripts/update-base-images.sh
-ARG DEBIAN_SNAPSHOT=20261111T023651Z
+ARG DEBIAN_SNAPSHOT=20261116T023805Z
 
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_SLIM_DIGEST} AS builder
 
