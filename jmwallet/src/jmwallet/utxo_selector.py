@@ -20,18 +20,25 @@ from __future__ import annotations
 import curses
 import sys
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from jmwallet.utxo_tui import (
+    _clip,
+    _draw_footer,
+    _is_address_reused,
+    _minimum_table_width,
+    _table_columns,
+    _utxo_state_col,
+    _wrap_footer_fields,
     adjust_scroll,
     build_display_items,
     draw_resize_prompt,
+    format_utxo_line,
     group_separator_parts,
     seek_selectable,
+    utxo_cursor_description,
     utxo_display_sort_key,
 )
-from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
 if TYPE_CHECKING:
     from jmwallet.wallet.models import UTXOInfo
@@ -41,149 +48,6 @@ _CONTROLS_HINT = (
     "Space/Tab: toggle | j/k: navigate | s: select mixdepth | "
     "d: deselect all | Enter: confirm | q/Esc: cancel"
 )
-
-
-def _clip(text: str, width: int) -> str:
-    """Clip a display field explicitly, rather than silently losing its suffix."""
-    return text if len(text) <= width else text[: max(0, width - 3)] + "." * min(3, width)
-
-
-def _table_columns(width: int, utxos: list[UTXOInfo]) -> list[tuple[str, int]]:
-    """Reserve numeric widths and warning space before expanding the address column."""
-    columns = [
-        ("Sel", 3),
-        ("MD", max(2, max((len(f"m{u.mixdepth}") for u in utxos), default=0))),
-        ("Amount (sats)", max(13, max((len(f"{u.value:,}") for u in utxos), default=0))),
-        ("Outpoint", max(15, max((len(f"{u.txid[:8]}...:{u.vout}") for u in utxos), default=0))),
-        ("Label", 10),
-        ("State", 9),
-    ]
-    full_columns = columns[:2] + [
-        ("Address", 12),
-        ("Amount", max(15, max((len(f"{u.value:,} sats") for u in utxos), default=0))),
-    ]
-    full_columns += [
-        ("Confs", max(8, max((len(f"{u.confirmations:,}") for u in utxos), default=0)))
-    ]
-    full_columns += [columns[3], ("Label", 11), columns[5]]
-    extra = width - _minimum_table_width(full_columns)
-    if extra >= 0:
-        full_columns[2] = ("Address", 12 + extra)
-        return full_columns
-    return columns
-
-
-def _minimum_table_width(columns: list[tuple[str, int]]) -> int:
-    # Indent, outer borders, RU! suffix and an unused rightmost terminal cell.
-    return sum(size for _, size in columns) + 3 * (len(columns) - 1) + 11
-
-
-def _format_cells(values: dict[str, str], columns: list[tuple[str, int]]) -> str:
-    return " | ".join(
-        f"{_clip(values[name], size):>{size}}"
-        if name in {"MD", "Amount", "Amount (sats)", "Confs"}
-        else f"{_clip(values[name], size):<{size}}"
-        for name, size in columns
-    )
-
-
-def format_utxo_line(
-    utxo: UTXOInfo,
-    max_width: int = 120,
-    prev_address: str = "",
-    excluded_outpoints: set[tuple[str, int]] | None = None,
-    term_width: int = 120,
-    *,
-    allowed_mixdepth: int | None = None,
-    min_confirmations: int = 0,
-    columns: list[tuple[str, int]] | None = None,
-    allow_fidelity_bonds: bool = True,
-) -> str:
-    """Format a single UTXO row with separate Label and State columns."""
-    columns = columns or _table_columns(term_width, [utxo])
-    addr_col_width = dict(columns).get("Address", 12)
-
-    # All addresses use the calculated column width.
-    if utxo.address == prev_address:
-        addr_str = "..."
-    else:
-        if len(utxo.address) > addr_col_width:
-            # Middle-ellipsis: show start...end
-            prefix_len = (addr_col_width - 3) // 2
-            suffix_len = addr_col_width - 3 - prefix_len
-            addr_str = utxo.address[:prefix_len] + "..." + utxo.address[-suffix_len:]
-        else:
-            addr_str = utxo.address
-
-    # Label column: FB status for fidelity bonds; remap "non-cj-change" to the
-    # shorter "reg-change" so it fits the 11-char column.
-    if utxo.is_fidelity_bond:
-        label_col = "FB-active" if utxo.is_locked else "FB-expired"
-    else:
-        label_col = "reg-change" if utxo.label == "non-cj-change" else (utxo.label or "")
-
-    values = {
-        "MD": f"m{utxo.mixdepth}",
-        "Address": addr_str,
-        "Amount": f"{utxo.value:,} sats",
-        "Amount (sats)": f"{utxo.value:,}",
-        "Confs": f"{utxo.confirmations:,}",
-        "Outpoint": f"{utxo.txid[:8]}...:{utxo.vout}",
-        "Label": label_col,
-        "State": _utxo_state_col(
-            utxo,
-            excluded_outpoints,
-            allowed_mixdepth,
-            min_confirmations,
-            allow_fidelity_bonds=allow_fidelity_bonds,
-        ),
-    }
-    return _clip(
-        _format_cells(values, [(name, size) for name, size in columns if name != "Sel"]) + " |",
-        max_width,
-    )
-
-
-def _utxo_state_col(
-    utxo: UTXOInfo,
-    excluded_outpoints: set[tuple[str, int]] | None = None,
-    allowed_mixdepth: int | None = None,
-    min_confirmations: int = 0,
-    *,
-    allow_fidelity_bonds: bool = True,
-) -> str:
-    """Return the State-column value for a UTXO (also used in the footer).
-
-    Priority order: in-use (CoinJoin active) overrides everything, then frozen
-    (user locked), then locked (FB timelock active), then ``no-cj`` for any
-    remaining fidelity bond when the caller disallows bonds (CoinJoin
-    context), then session restrictions.
-    """
-    if excluded_outpoints and (utxo.txid, utxo.vout) in excluded_outpoints:
-        return "in-use"
-    if utxo.frozen:
-        return "frozen"
-    if utxo.is_fidelity_bond and utxo.is_locked:
-        return "locked"
-    if utxo.is_fidelity_bond and not allow_fidelity_bonds:
-        return "no-cj"
-    if utxo.confirmations < min_confirmations:
-        return "immature"
-    if allowed_mixdepth is not None and utxo.mixdepth != allowed_mixdepth:
-        return "other-md"
-    return "spendable"
-
-
-def _is_address_reused(
-    utxo: UTXOInfo,
-    address_utxo_counts: dict[str, int],
-) -> bool:
-    """Whether a UTXO shares its address with other UTXOs (reduces privacy).
-
-    Reuse is detected the same way for the table's RU! indicator and the
-    footer's RU explanation.
-    """
-    return address_utxo_counts.get(utxo.address, 0) > 1 or utxo.label == AUTO_FREEZE_REUSE_LABEL
 
 
 def _is_base_selectable(
@@ -255,7 +119,6 @@ def _draw_utxo_rows(
     allow_fidelity_bonds: bool = True,
 ) -> None:
     """Draw the visible UTXO rows with separators, marks and colors."""
-    prev_address = ""
     for i, item in enumerate(display_items):
         if i < scroll_offset or i >= scroll_offset + list_height:
             continue
@@ -297,7 +160,6 @@ def _draw_utxo_rows(
                 else:
                     stdscr.addstr(display_row, 3, "-" * inner_width, curses.A_NORMAL)
             stdscr.addstr(display_row, sep_width + 1, "|", curses.A_NORMAL)
-            prev_address = ""
             continue
 
         is_selected = i in selected
@@ -312,7 +174,6 @@ def _draw_utxo_rows(
         line = f"| {mark} | " + format_utxo_line(
             item,
             width,
-            prev_address,
             excluded_outpoints,
             width,
             columns=columns,
@@ -320,7 +181,6 @@ def _draw_utxo_rows(
             min_confirmations=min_confirmations,
             allow_fidelity_bonds=allow_fidelity_bonds,
         )
-        prev_address = item.address
 
         # Apply colors
         if is_cursor:
@@ -407,25 +267,7 @@ def _build_footer_lines(
     footer_line4 = ""
     ru_note = ""
     if cursor_item is not None:
-        if cursor_item.is_fidelity_bond:
-            # is_locked implies a locktime; the None check lets mypy see it.
-            if cursor_item.is_locked and cursor_item.locktime is not None:
-                footer_line4 = (
-                    f"Active Fidelity Bond: Locked and not spendable until "
-                    f"{datetime.fromtimestamp(cursor_item.locktime, UTC).strftime('%Y-%m-%d')} UTC!"
-                )
-            else:
-                footer_line4 = "Expired Fidelity Bond"
-        elif cursor_item.label == "cj-change":
-            footer_line4 = "Change output from a CoinJoin (deanonymising, keep separate)"
-        elif cursor_item.label == "cj-out":
-            footer_line4 = "CoinJoin output (mixed funds)"
-        elif cursor_item.label in ("reg-change", "non-cj-change"):
-            footer_line4 = "Regular change (not from CoinJoin)"
-        elif cursor_item.label == "deposit":
-            footer_line4 = "Address with funds from internal or external sources"
-        elif cursor_item.label:
-            footer_line4 = f"Label: {cursor_item.label}"
+        footer_line4 = utxo_cursor_description(cursor_item)
 
         # Keep the state and restriction visible even when a long label is clipped.
         state_col = _utxo_state_col(
@@ -435,15 +277,18 @@ def _build_footer_lines(
             min_confirmations,
             allow_fidelity_bonds=allow_fidelity_bonds,
         )
-        state_text = f"State: {state_col}"
+        # "Out:" (short for Outpoint) keeps the full txid:vout visible; the
+        # state column already lives in the table, so only the WHY behind a
+        # non-selectable state is added here (it has no column).
+        state_text = f"Out: {cursor_item.txid}:{cursor_item.vout}"
         if state_col == "immature":
-            state_text += f" (requires {min_confirmations} confirmations)"
+            state_text += f" | requires {min_confirmations} confirmations"
         elif state_col == "other-md":
-            state_text += f" (source is m{pinned})"
+            state_text += f" | source is m{pinned}"
         elif state_col == "no-cj":
             state_text += (
-                " (fidelity bonds cannot be used in CoinJoins; "
-                "redeem with jm-wallet send --select-utxos)"
+                " | fidelity bonds cannot be used in CoinJoins; "
+                "redeem with jm-wallet send --select-utxos"
             )
         if footer_line4:
             footer_line4 = f"{state_text} | {footer_line4}"
@@ -458,21 +303,6 @@ def _build_footer_lines(
         ru_note = notice
 
     return footer_line1, footer_line2, footer_line4, ru_note
-
-
-def _wrap_footer_fields(text: str, width: int) -> list[str]:
-    """Wrap between fields so amounts and their units always stay together."""
-    lines: list[str] = []
-    current = ""
-    for field in text.split(" | "):
-        candidate = f"{current} | {field}" if current else field
-        if len(candidate) > width and current:
-            lines.append(current)
-            current = field
-        else:
-            current = candidate
-    lines.append(current)
-    return lines
 
 
 def _footer_rows(
@@ -498,12 +328,6 @@ def _footer_rows(
     )
     rows.append(("", curses.A_NORMAL))
     return rows
-
-
-def _draw_footer(stdscr: curses.window, start: int, rows: list[tuple[str, int]]) -> None:
-    """Draw precomputed footer rows without truncating selection amounts."""
-    for offset, (line, attr) in enumerate(rows):
-        stdscr.addstr(start + offset, 2, line, attr)
 
 
 def _run_selector(

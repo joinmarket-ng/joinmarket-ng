@@ -1626,33 +1626,40 @@ class TestFreezeBranchGroupSeparators:
         written = self._render(self._grouped_items())
         # Layout starts [None (blank), None (separator), first UTXO, ...]:
         # the separator at row 6 introduces mixdepth 0's external branch.
-        assert written[(6, 1)] == "Mixdepth 0"
-        assert written[(6, 11)] == " — "
-        assert written[(6, 14)] == "external addresses "
-        # The rest of the line (width 160, up to col 158) is padded with dashes.
-        assert written[(6, 33)] == "-" * (159 - 33)
+        # Framed layout: table content starts at column 3, border at col 154.
+        assert written[(6, 3)] == "Mixdepth 0"
+        assert written[(6, 13)] == " — "
+        assert written[(6, 16)] == "external addresses "
+        # The rest of the line (up to the right border) is padded with dashes.
+        assert written[(6, 35)] == "-" * (154 - 35)
+        assert written[(6, 154)] == "|"
 
     def test_branch_change_replaces_title_keeps_branch_column(self) -> None:
         written = self._render(self._grouped_items())
         # Row 8: placeholder dashes replace the title; the branch name stays
-        # column-flush with the full title above (column 14).
-        assert written[(8, 1)] == "-" * len("Mixdepth 0")
-        assert written[(8, 14)] == "internal addresses "
-        assert written[(8, 33)] == "-" * (159 - 33)
+        # column-flush with the full title above (column 16).
+        assert written[(8, 3)] == "-" * len("Mixdepth 0")
+        assert written[(8, 13)] == " — "
+        assert written[(8, 16)] == "internal addresses "
+        assert written[(8, 35)] == "-" * (154 - 35)
 
     def test_new_mixdepth_gets_full_title_after_blank_row(self) -> None:
         written = self._render(self._grouped_items())
-        # Rows 5 and 10 are blank border rows; row 11 opens mixdepth 1.
-        assert (5, 1) not in written
-        assert (10, 1) not in written
-        assert written[(11, 1)] == "Mixdepth 1"
-        assert written[(11, 14)] == "external addresses "
+        # Rows 5 and 10 are blank border rows (borders only); row 11 opens
+        # mixdepth 1.
+        assert (5, 3) not in written
+        assert written[(5, 2)] == "|" and written[(5, 154)] == "|"
+        assert (10, 3) not in written
+        assert written[(10, 2)] == "|" and written[(10, 154)] == "|"
+        assert written[(11, 3)] == "Mixdepth 1"
+        assert written[(11, 16)] == "external addresses "
 
     def test_trailing_separator_renders_plain_dash_line(self) -> None:
         written = self._render([None])
-        # Without a following group the separator is a plain full-width
-        # dash line (cols 1..158).
-        assert written[(5, 1)] == "-" * 158
+        # Without a following group the separator is a plain dash line inside
+        # the frame (inner width = separator width minus the border columns).
+        assert written[(5, 3)] == "-" * 151
+        assert written[(5, 154)] == "|"
 
     def test_cursor_seeks_past_leading_separators(self) -> None:
         from jmwallet.cli.freeze import _seek_selectable
@@ -1660,25 +1667,28 @@ class TestFreezeBranchGroupSeparators:
         items = self._grouped_items()
         assert _seek_selectable(items, 0, 1) == 2
 
-    def test_address_dedup_resets_between_branch_groups(self) -> None:
+    def test_address_shown_in_every_row(self) -> None:
+        """No address dedup: consecutive rows with the same address show it."""
         from jmwallet.utxo_tui import build_display_items
 
         same = "bc1qsameaddress"
         items = build_display_items(
             [
                 self._utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0", address=same),
-                self._utxo("b", mixdepth=0, path="m/84'/0'/0'/1/0", address=same),
+                self._utxo("b", mixdepth=0, path="m/84'/0'/0'/0/1", address=same),
             ],
             branch_groups=True,
         )
         written = self._render(items)
-        # Rows 7 (external) and 9 (internal) both show the address: the
-        # branch separator between them resets the dedup.
-        assert same in written[(7, 0)]
-        assert same in written[(9, 0)]
+        # Layout [None (blank, row 5), None (separator, row 6), a(7), b(8)]:
+        # both UTXO rows show the full address, no "..." placeholder.
+        assert same in written[(7, 3)]
+        assert same in written[(8, 3)]
 
 
-@pytest.mark.parametrize("height", [12, 24, 40])
+# Heights below 5 (title/header) + footer (11 or 12 rows) + table line only
+# draw the resize prompt instead, so the minimum test height is 18.
+@pytest.mark.parametrize("height", [18, 24, 40])
 @pytest.mark.parametrize("has_bonds", [False, True])
 @pytest.mark.parametrize("cursor_pos", [0, 14, 20])
 def test_freeze_viewport_keeps_selected_utxo_above_footer(
@@ -1713,7 +1723,12 @@ def test_freeze_viewport_keeps_selected_utxo_above_footer(
             screen, utxos, cursor_pos, 0, None, False
         )
 
-    separator_row = height - (5 if has_bonds else 4)
+    # Footer: separator + Freeze Details + 1-2 stats lines + separator +
+    # UTXO Status + Out line + reserved note line + separator + Controls +
+    # controls line + blank == 11 rows, plus one bond stats line when bonds
+    # exist.
+    footer_rows = 12 if has_bonds else 11
+    separator_row = height - footer_rows
     assert list_height == separator_row - 5
     assert scroll_offset <= cursor_pos < scroll_offset + list_height
 

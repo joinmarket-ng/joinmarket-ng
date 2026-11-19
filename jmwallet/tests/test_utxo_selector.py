@@ -100,10 +100,12 @@ class TestFormatUtxoLine:
         line = format_utxo_line(utxo)
 
         assert "m0" in line  # Mixdepth 0
-        assert "100,000" in line or "0.00100000" in line  # Amount
-        assert f"{utxo.confirmations:>8,}" in line  # Confirmations column
-        assert "aaaaaaaa" in line  # Truncated txid
-        assert ":0" in line  # Vout
+        assert "100,000" in line  # sats column (unit lives in the header)
+        assert "10" in line  # confs column
+        assert utxo.address in line or "bcrt1" in line  # Address column
+        # The outpoint no longer occupies a column; it moved to the
+        # footer's UTXO Status line as the full txid:vout.
+        assert "aaaaaaaa" not in line
 
     def test_format_timelocked_utxo(self, sample_utxos: list[UTXOInfo]) -> None:
         """Test formatting a timelocked (fidelity bond) UTXO."""
@@ -494,7 +496,10 @@ class TestCoinJoinContextBonds:
             0,
             allow_fidelity_bonds=False,
         )
-        assert status.startswith("State: no-cj (fidelity bonds cannot be used in CoinJoins")
+        assert status.startswith(f"Out: {bond.txid}:{bond.vout}")
+        # State value moved to the table's state column; the footer only
+        # explains WHY a non-selectable state exists.
+        assert "fidelity bonds cannot be used in CoinJoins" in status
         assert "jm-wallet send --select-utxos" in status
         assert "Expired Fidelity Bond" in status
 

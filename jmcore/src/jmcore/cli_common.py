@@ -38,6 +38,7 @@ import argparse
 import os
 import sys
 from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -265,6 +266,24 @@ def setup_logging(level: str = "INFO", sensitive: bool = False) -> None:
         colorize=True,
         filter=sensitive_log_filter(sensitive),
     )
+
+
+@contextmanager
+def suspend_stderr_logging() -> Generator[None, None, None]:
+    """Suppress all log output while a fullscreen TUI owns the screen.
+
+    Curses owns the terminal while an interactive TUI (e.g. the UTXO freeze
+    manager) runs; loguru's stderr sink writes bytes directly to the same
+    terminal, which corrupts the layout (mixed-output race). Disabling the
+    root name drops every record at the log call site, so all sinks (and
+    their levels/filters) stay exactly as they were; on context exit logging
+    resumes unchanged. Actionable errors are shown by the TUI itself.
+    """
+    logger.disable("")
+    try:
+        yield
+    finally:
+        logger.enable("")
 
 
 def _parse_sensitive_logging_env(value: str | None) -> bool | None:

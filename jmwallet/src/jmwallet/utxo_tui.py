@@ -10,15 +10,23 @@ This module holds the layout and navigation primitives they share:
 - labelling those separators from the group they introduce (mixdepth title,
   branch name),
 - cursor navigation that skips separators (and other non-selectable rows),
-- the address column formatting (collapsing consecutive duplicates),
+- the address column formatting (full address on every row, middle-ellipsis
+  when too long),
 - scroll-offset adjustment to keep the cursor visible,
 - the shared minimum-size prompt used while either terminal has no room
-  for the full layout.
+  for the full layout,
+- the table layout shared by both TUIs: dynamic columns sized to terminal
+  width and content, cell clipping/formatting, and single-row rendering,
+- footer field wrapping/rendering, address-reuse detection (the RU! badge),
+  and the cursor-item description used by both status lines,
+- the wallet-label enrichment both feeders run so the ``tag`` column is
+  never empty for regular UTXOs.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,6 +34,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from jmwallet.wallet.models import UTXOInfo
+
+from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
 # Width of the address column used by both TUIs so rows stay aligned.
 ADDRESS_COL_WIDTH = 42
@@ -205,15 +215,12 @@ def seek_selectable(
     return start
 
 
-def format_address_column(address: str, prev_address: str) -> str:
+def format_address_column(address: str) -> str:
     """Format an address for the TUI address column.
 
-    Consecutive UTXOs sharing the same address render the address only once;
-    subsequent rows show blanks so the column stays visually grouped. Long
-    addresses (e.g. fidelity bond P2WSH) are truncated in the middle.
+    Every row shows its own address so duplicate addresses stay visible.
+    Long addresses (e.g. fidelity bond P2WSH) are truncated in the middle.
     """
-    if address == prev_address:
-        return " " * ADDRESS_COL_WIDTH
     if len(address) > ADDRESS_COL_WIDTH:
         return address[:20] + "..." + address[-19:]
     return address
@@ -243,3 +250,245 @@ def draw_resize_prompt(stdscr: curses.window, width: int) -> None:
         # Curses can report ERR after successfully writing the bottom-right cell (1x1).
         pass
     stdscr.refresh()
+
+
+# -- Table layout and row formatting ----------------------------------------
+#
+# Shared by both TUIs (the interactive UTXO selector and the freeze manager):
+# column sets that expand the address column to the available terminal width
+# (falling back to a compact set below the minimum width), cell
+# clipping/formatting, and single-row rendering.
+
+
+def _clip(text: str, width: int) -> str:
+    """Clip a display field explicitly, rather than silently losing its suffix."""
+    return text if len(text) <= width else text[: max(0, width - 3)] + "." * min(3, width)
+
+
+def enrich_utxo_labels(label_lookup: Callable[[str], str], utxos: list[UTXOInfo]) -> None:
+    """Populate missing wallet labels for display in both UTXO TUIs.
+
+    ``utxo_cache`` items carry no labels, so without this the ``tag`` column
+    stays empty for every regular UTXO. Existing labels (BIP-329
+    annotations) and fidelity bond rows are preserved -- a bond's tag column
+    already describes the bond state (``FB-active``/``FB-expired``).
+    ``label_lookup`` maps an address to its wallet label (``""`` when none).
+    """
+    for utxo in utxos:
+        if utxo.label is None and not utxo.is_fidelity_bond:
+            utxo.label = label_lookup(utxo.address)
+
+
+def _label_col_value(utxo: UTXOInfo) -> str:
+    """Value of the tag column (FB status marker or label).
+
+    Shared between the row formatter and the column sizing so the width
+    always matches the actual content. Maps ``non-cj-change`` to the
+    shorter ``reg-change`` like the info table does.
+    """
+    if utxo.is_fidelity_bond:
+        return "FB-active" if utxo.is_locked else "FB-expired"
+    return "reg-change" if utxo.label == "non-cj-change" else (utxo.label or "")
+
+
+def _table_columns(
+    width: int, utxos: list[UTXOInfo], mark_title: str = "Sel"
+) -> list[tuple[str, int]]:
+    """Adaptive column widths following the ``info`` extended view.
+
+    Every non-address column is exactly as wide as its (lowercase) title or
+    the longest visible value, whichever is bigger; titles carry the units
+    (``sats``, ``confs``) so the cells stay unit-free. Only the address
+    column grabs the remaining terminal width (full layout); below the
+    minimum width the compact layout drops address and confs. The outpoint
+    no longer occupies a column -- the full value is shown in the footer's
+    UTXO Status line. The tag column is capped at 11 characters so long
+    BIP-329 labels cannot push the table past the terminal; the full label
+    always appears in the UTXO Status footer line.
+
+    ``mark_title`` names the leading checkbox-style column (``Sel`` in the
+    selector, ``F`` in the freeze manager); it is drawn by the row renderer,
+    not by :func:`format_utxo_line`.
+    """
+    tag_width = max(3, min(11, max((len(_label_col_value(u)) for u in utxos), default=0)))
+    sats_width = max(4, max((len(f"{u.value:,}") for u in utxos), default=0))
+    columns = [
+        (mark_title, 3),
+        ("MD", max(2, max((len(f"m{u.mixdepth}") for u in utxos), default=0))),
+        ("sats", sats_width),
+        ("tag", tag_width),
+        ("state", 9),
+    ]
+    full_columns = columns[:2] + [
+        ("address", 12),
+        columns[2],
+        ("confs", max(5, max((len(f"{u.confirmations:,}") for u in utxos), default=0))),
+        columns[3],
+        columns[4],
+    ]
+    extra = width - _minimum_table_width(full_columns)
+    if extra >= 0:
+        full_columns[2] = ("address", 12 + extra)
+        return full_columns
+    return columns
+
+
+def _minimum_table_width(columns: list[tuple[str, int]]) -> int:
+    # Indent, outer borders, RU! suffix and an unused rightmost terminal cell.
+    return sum(size for _, size in columns) + 3 * (len(columns) - 1) + 11
+
+
+def _format_cells(values: dict[str, str], columns: list[tuple[str, int]]) -> str:
+    return " | ".join(
+        f"{_clip(values[name], size):>{size}}"
+        if name in {"MD", "sats", "confs"}
+        else f"{_clip(values[name], size):<{size}}"
+        for name, size in columns
+    )
+
+
+def format_utxo_line(
+    utxo: UTXOInfo,
+    max_width: int = 120,
+    excluded_outpoints: set[tuple[str, int]] | None = None,
+    term_width: int = 120,
+    *,
+    allowed_mixdepth: int | None = None,
+    min_confirmations: int = 0,
+    columns: list[tuple[str, int]] | None = None,
+    allow_fidelity_bonds: bool = True,
+    mark_title: str = "Sel",
+    state_override: str | None = None,
+) -> str:
+    """Format a single UTXO row with separate Label and State columns.
+
+    ``mark_title`` names the checkbox-style column owned by the row
+    renderer; it is excluded from the formatted line. ``state_override``
+    replaces the selector's State computation (the freeze manager renders
+    its own states: frozen/locked/spendable).
+    """
+    columns = columns or _table_columns(term_width, [utxo], mark_title)
+    addr_col_width = dict(columns).get("address", 12)
+
+    # Every row shows its own address (duplicate addresses stay visible);
+    # long addresses are middle-truncated to the column width.
+    if len(utxo.address) > addr_col_width:
+        # Middle-ellipsis: show start...end
+        prefix_len = (addr_col_width - 3) // 2
+        suffix_len = addr_col_width - 3 - prefix_len
+        addr_str = utxo.address[:prefix_len] + "..." + utxo.address[-suffix_len:]
+    else:
+        addr_str = utxo.address
+
+    values = {
+        "MD": f"m{utxo.mixdepth}",
+        "address": addr_str,
+        "sats": f"{utxo.value:,}",
+        "confs": f"{utxo.confirmations:,}",
+        "tag": _label_col_value(utxo),
+        "state": (
+            state_override
+            if state_override is not None
+            else _utxo_state_col(
+                utxo,
+                excluded_outpoints,
+                allowed_mixdepth,
+                min_confirmations,
+                allow_fidelity_bonds=allow_fidelity_bonds,
+            )
+        ),
+    }
+    return _clip(
+        _format_cells(values, [(name, size) for name, size in columns if name != mark_title])
+        + " |",
+        max_width,
+    )
+
+
+def _utxo_state_col(
+    utxo: UTXOInfo,
+    excluded_outpoints: set[tuple[str, int]] | None = None,
+    allowed_mixdepth: int | None = None,
+    min_confirmations: int = 0,
+    *,
+    allow_fidelity_bonds: bool = True,
+) -> str:
+    """Return the State-column value for a UTXO (also used in the footer).
+
+    Priority order: in-use (CoinJoin active) overrides everything, then frozen
+    (user locked), then locked (FB timelock active), then ``no-cj`` for any
+    remaining fidelity bond when the caller disallows bonds (CoinJoin
+    context), then session restrictions.
+    """
+    if excluded_outpoints and (utxo.txid, utxo.vout) in excluded_outpoints:
+        return "in-use"
+    if utxo.frozen:
+        return "frozen"
+    if utxo.is_fidelity_bond and utxo.is_locked:
+        return "locked"
+    if utxo.is_fidelity_bond and not allow_fidelity_bonds:
+        return "no-cj"
+    if utxo.confirmations < min_confirmations:
+        return "immature"
+    if allowed_mixdepth is not None and utxo.mixdepth != allowed_mixdepth:
+        return "other-md"
+    return "spendable"
+
+
+def _is_address_reused(
+    utxo: UTXOInfo,
+    address_utxo_counts: dict[str, int],
+) -> bool:
+    """Whether a UTXO shares its address with other UTXOs (reduces privacy).
+
+    Reuse is detected the same way for the table's RU! indicator and the
+    footer's RU explanation.
+    """
+    return address_utxo_counts.get(utxo.address, 0) > 1 or utxo.label == AUTO_FREEZE_REUSE_LABEL
+
+
+def utxo_cursor_description(utxo: UTXOInfo) -> str:
+    """One-sentence explanation of a coin for the UTXO Status footer line.
+
+    Coin meanings are identical in the selector and the freeze manager.
+    """
+    if utxo.is_fidelity_bond:
+        # is_locked implies a locktime; the None check lets mypy see it.
+        if utxo.is_locked and utxo.locktime is not None:
+            return (
+                f"Active Fidelity Bond: Locked and not spendable until "
+                f"{datetime.fromtimestamp(utxo.locktime, UTC).strftime('%Y-%m-%d')} UTC!"
+            )
+        return "Expired Fidelity Bond"
+    if utxo.label == "cj-change":
+        return "Change output from a CoinJoin (deanonymising, keep separate)"
+    if utxo.label == "cj-out":
+        return "CoinJoin output (mixed funds)"
+    if utxo.label in ("reg-change", "non-cj-change"):
+        return "Regular change (not from CoinJoin)"
+    if utxo.label == "deposit":
+        return "Address with funds from internal or external sources"
+    if utxo.label:
+        return f"Label: {utxo.label}"
+    return ""
+
+
+def _wrap_footer_fields(text: str, width: int) -> list[str]:
+    """Wrap between fields so amounts and their units always stay together."""
+    lines: list[str] = []
+    current = ""
+    for field in text.split(" | "):
+        candidate = f"{current} | {field}" if current else field
+        if len(candidate) > width and current:
+            lines.append(current)
+            current = field
+        else:
+            current = candidate
+    lines.append(current)
+    return lines
+
+
+def _draw_footer(stdscr: curses.window, start: int, rows: list[tuple[str, int]]) -> None:
+    """Draw precomputed footer rows without truncating selection amounts."""
+    for offset, (line, attr) in enumerate(rows):
+        stdscr.addstr(start + offset, 2, line, attr)

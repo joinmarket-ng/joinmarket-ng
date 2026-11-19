@@ -98,12 +98,12 @@ def _frame_with(frames: list[Frame], text: str) -> Frame:
 
 @pytest.mark.parametrize(
     ("width", "is_full_table"),
-    [(80, False), (120, True), (160, True), (200, True)],
+    [(80, True), (120, True), (160, True), (200, True)],
 )
 def test_widths_keep_monetary_summary_and_table_essentials(
     patched_selector_curses: None, width: int, is_full_table: bool
 ) -> None:
-    """The compact 80-column table keeps spend-critical columns and full sats values."""
+    """Adaptive widths keep spend-critical columns and full sats values at any size."""
     height = 32
     coin = _utxo("a")
     screen = StrictScreen(
@@ -115,17 +115,16 @@ def test_widths_keep_monetary_summary_and_table_essentials(
     assert _run(screen, [coin], target_amount=50_000) == []
 
     selected_frame = screen.frames[-1]
-    header = _line_with(selected_frame, "Amount")
+    header = _line_with(selected_frame, "sats")
     assert "Target: 50,000 sats" in selected_frame.text
     assert "Total: 100,000 sats" in selected_frame.text
-    assert "100,000 sats" in selected_frame.text
-    assert "aaaaaaaa" in selected_frame.text
+    assert "100,000" in selected_frame.text
     if is_full_table:
-        assert "Address" in header
-        assert "Confs" in header
+        assert "address" in header
+        assert "confs" in header
     else:
-        assert "Address" not in header
-        assert "Confs" not in header
+        assert "address" not in header
+        assert "confs" not in header
 
 
 @pytest.mark.parametrize(("width", "full_footer_label"), [(80, False), (200, True)])
@@ -158,22 +157,25 @@ def test_frozen_labels_are_clipped_in_rows_but_preserved_in_footer(
 
     auto_frame = screen.frames[0]
     custom_frame = screen.frames[-1]
-    auto_row = _line_with(auto_frame, "aaaaaaaa")
-    custom_row = _line_with(custom_frame, "bbbbbbbb")
+    # Rows are anchored by the tag column (the outpoint moved to the footer).
+    auto_row = _line_with(auto_frame, "jm:autof")
+    custom_row = _line_with(custom_frame, "custom-l")
     assert "frozen" in auto_frame.text
     assert "RU!" in auto_frame.text
-    assert "jm:" in auto_row
+    assert "jm:autof" in auto_row
     assert "frozen" in custom_row
     assert "RU!" in custom_row
     assert custom_label not in custom_row
     assert "..." in custom_row
-    assert "Label: " in custom_frame.text
+    assert "Out: " in custom_frame.text
     if full_footer_label:
         assert f"Label: {AUTO_FREEZE_REUSE_LABEL}" in auto_frame.text
         assert f"Label: {custom_label}" in custom_frame.text
     else:
+        # At 80 columns the full outpoint (first status field) survives the
+        # right-side clip; the full Label drops off the status line there.
         assert custom_label not in custom_frame.text
-        assert "..." in _line_with(custom_frame, "Label: ")
+        assert "..." in _line_with(custom_frame, "Out: ")
 
 
 @pytest.mark.parametrize("width", [80, 107, 120, 160, 200])
@@ -185,26 +187,24 @@ def test_autofrozen_label_alone_keeps_row_state_and_reuse_warning(
 
     assert _run(screen, [coin]) == []
 
-    row = _line_with(screen.frames[0], "aaaaaaaa")
+    row = _line_with(screen.frames[0], "jm:autof")
     assert "frozen" in row and "RU!" in row
     assert "Warning: Address reuse" in screen.frames[0].text
 
 
 @pytest.mark.parametrize("value", [100_000_000, 10_000_000_000])
-def test_compact_table_preserves_large_coin_values(
-    patched_selector_curses: None, value: int
-) -> None:
+def test_table_preserves_large_coin_values(patched_selector_curses: None, value: int) -> None:
     screen = StrictScreen(24, 80, [_event(24, 80, ord(" ")), _event(24, 80, ord("q"))])
 
     assert _run(screen, [_utxo("a", value=value)], target_amount=value // 2) == []
 
     frame = screen.frames[-1]
-    assert "Amount (sats)" in frame.text
-    assert f"{value:,}" in _line_with(frame, "aaaaaaaa")
+    assert "sats" in _line_with(frame, "confs")
+    assert f"{value:,}" in _line_with(frame, "bcrt1q")
     assert f"Total: {value:,} sats" in frame.text
 
 
-def test_full_table_reserves_large_amount_and_outpoint_widths(
+def test_full_table_reserves_wide_values_and_shows_outpoint_in_footer(
     patched_selector_curses: None,
 ) -> None:
     coin = _utxo("a", value=2_100_000_000_000_000, label=AUTO_FREEZE_REUSE_LABEL)
@@ -213,9 +213,10 @@ def test_full_table_reserves_large_amount_and_outpoint_widths(
 
     assert _run(screen, [coin]) == []
 
-    row = _line_with(screen.frames[0], "aaaaaaaa")
-    assert "2,100,000,000,000,000 sats" in row
-    assert "aaaaaaaa...:12345" in row
+    row = _line_with(screen.frames[0], "bcrt1q")
+    assert "2,100,000,000,000,000" in row
+    status = _line_with(screen.frames[0], "Out: ")
+    assert f"{coin.txid}:12345" in status
     assert "spendable" in row and "RU!" in row
 
 
@@ -357,8 +358,8 @@ def test_immature_and_dynamically_pinned_other_mixdepth_states_match_footer(
 
     assert _run(screen, [selectable, immature, other_mixdepth], min_confirmations=5) == [selectable]
 
-    immature_frame = _frame_with(screen.frames, "State: immature")
-    other_mixdepth_frame = _frame_with(screen.frames, "State: other-md")
+    immature_frame = _frame_with(screen.frames, "requires 5 confirmations")
+    other_mixdepth_frame = _frame_with(screen.frames, "source is m0")
     assert "immature" in _line_with(immature_frame, "bbbbbbbb")
     assert "5 confirmation" in immature_frame.text
     assert "other-md" in _line_with(other_mixdepth_frame, "cccccccc")
@@ -385,7 +386,7 @@ def test_fixed_mixdepth_other_state_matches_footer_and_cannot_be_selected(
 
     assert _run(screen, [allowed, blocked], allowed_mixdepth=0) == []
 
-    blocked_frame = _frame_with(screen.frames, "State: other-md")
+    blocked_frame = _frame_with(screen.frames, "source is m0")
     assert "other-md" in _line_with(blocked_frame, "bbbbbbbb")
     assert "Source mixdepth: m0" in blocked_frame.text
     assert "[x]" not in _line_with(blocked_frame, "bbbbbbbb")
@@ -452,7 +453,7 @@ def test_coinjoin_context_blocks_expired_bond_from_toggle_and_select_all(
 
     assert _run(screen, [coin, expired_bond], allow_fidelity_bonds=False) == [coin]
 
-    bond_frame = _frame_with(screen.frames, "State: no-cj")
+    bond_frame = _frame_with(screen.frames, "fidelity bonds cannot be used in CoinJoins")
     bond_row = _line_with(bond_frame, "bbbbbbbb")
     assert "[-]" in bond_row
     assert "no-cj" in bond_row
@@ -474,7 +475,9 @@ def test_send_context_keeps_expired_bond_selectable(patched_selector_curses: Non
     )
 
     assert _run(screen, [expired_bond]) == [expired_bond]
-    assert "State: spendable" in screen.frames[0].text
+    # The spendable state lives in the table's state column only.
+    bond_row = _line_with(screen.frames[0], "bbbbbbbb")
+    assert "spendable" in bond_row
     assert "no-cj" not in screen.frames[0].text
 
 
@@ -572,7 +575,7 @@ def queue_cancel(callback, *args):
         lines = [stdscr.instr(y, 0, width - 1).decode() for y in range(height)]
         assert any("Total: 100,000 sats" in line for line in lines), lines
         assert any("Target: 50,000 sats" in line for line in lines), lines
-        frozen_row = next(line for line in lines if "bbbbbbbb" in line)
+        frozen_row = next(line for line in lines if "jm:autof" in line)
         assert "frozen" in frozen_row and "RU!" in frozen_row, frozen_row
         return result
     return real_wrapper(run_with_cancel)

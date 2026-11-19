@@ -13,6 +13,7 @@ from jmwallet.utxo_tui import (
     adjust_scroll,
     branch_display_rank,
     build_display_items,
+    enrich_utxo_labels,
     format_address_column,
     group_label,
     group_separator_parts,
@@ -32,6 +33,8 @@ def _utxo(
     index: int = 0,
     branch: int = 0,
     path: str | None = None,
+    label: str | None = None,
+    locktime: int | None = None,
 ) -> UTXOInfo:
     return UTXOInfo(
         txid=txid_char * 64,
@@ -42,6 +45,8 @@ def _utxo(
         scriptpubkey="0014" + "aa" * 20,
         path=path if path is not None else f"m/84'/0'/{mixdepth}'/{branch}/{index}",
         mixdepth=mixdepth,
+        label=label,
+        locktime=locktime,
     )
 
 
@@ -91,16 +96,13 @@ class TestSeekSelectable:
 
 
 class TestFormatAddressColumn:
-    def test_repeated_address_blanked(self) -> None:
-        out = format_address_column("bcrt1qsame", "bcrt1qsame")
-        assert out == " " * ADDRESS_COL_WIDTH
-
-    def test_new_address_shown(self) -> None:
-        assert format_address_column("bcrt1qnew", "bcrt1qold") == "bcrt1qnew"
+    def test_address_always_shown(self) -> None:
+        # No dedup: consecutive rows with the same address must each show it.
+        assert format_address_column("bcrt1qsame") == "bcrt1qsame"
 
     def test_long_address_middle_truncated(self) -> None:
         long_addr = "bcrt1q" + "x" * 60
-        out = format_address_column(long_addr, "")
+        out = format_address_column(long_addr)
         assert len(out) == ADDRESS_COL_WIDTH
         assert "..." in out
         assert out.startswith(long_addr[:20])
@@ -318,3 +320,37 @@ class TestGroupSeparatorParts:
         # Not constructed by build_display_items today; renders as plain dashes.
         items = build_display_items([_utxo(0)], branch_groups=True) + [None]
         assert group_separator_parts(items, len(items) - 1) is None
+
+
+class TestEnrichUtxoLabels:
+    """The tag column only shows something if a feeder runs this enrichment.
+
+    Both feeders (send.py for the selector, freeze.py for the freeze
+    manager) call this on their raw utxo_cache items before rendering.
+    """
+
+    def test_unlabeled_regular_utxo_gets_wallet_label(self) -> None:
+        unlabeled = _utxo(0)
+        enrich_utxo_labels(lambda _addr: "cj-out", [unlabeled])
+        assert unlabeled.label == "cj-out"
+
+    def test_existing_label_is_preserved(self) -> None:
+        labeled = _utxo(0, label="personal note")
+        enrich_utxo_labels(lambda _addr: "cj-out", [labeled])
+        assert labeled.label == "personal note"
+
+    def test_fidelity_bond_is_never_looked_up(self) -> None:
+        # A bond's tag column already renders FB-active/FB-expired; its
+        # label slot must stay untouched so nothing overwrites a user note.
+        bond = _utxo(0, locktime=1_900_000_000)
+
+        def fail_lookup(_addr: str) -> str:
+            raise AssertionError("label lookup must not run for bonds")
+
+        enrich_utxo_labels(fail_lookup, [bond])
+        assert bond.label is None
+
+    def test_unlabeled_and_no_wallet_label_stays_empty(self) -> None:
+        unlabeled = _utxo(0)
+        enrich_utxo_labels(lambda _addr: "", [unlabeled])
+        assert unlabeled.label == ""

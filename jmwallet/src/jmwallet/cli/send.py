@@ -20,6 +20,7 @@ from jmcore.cli_common import (
 from loguru import logger
 
 from jmwallet.cli import app
+from jmwallet.utxo_tui import enrich_utxo_labels
 from jmwallet.wallet.spend import (
     DEFAULT_MAX_FEE_RATE_SAT_VB as MAX_MANUAL_FEE_RATE_SAT_VB,
 )
@@ -132,9 +133,7 @@ async def _select_input_utxos(
 
         # Populate only unlabeled non-bond UTXOs from wallet internals. BIP-329
         # user labels and fidelity-bond labels must remain visible in the selector.
-        for utxo in utxos:
-            if utxo.label is None and not utxo.is_fidelity_bond:
-                utxo.label = wallet.get_utxo_label_from_wallet(utxo.address)
+        enrich_utxo_labels(wallet.get_utxo_label_from_wallet, utxos)
 
         try:
             selected_utxos = select_utxos_interactive(

@@ -16,20 +16,26 @@ from jmcore.cli_common import (
     resolve_backend_settings,
     resolve_mnemonic,
     setup_cli,
+    suspend_stderr_logging,
 )
 from loguru import logger
 
 from jmwallet.cli import app
 from jmwallet.utxo_tui import (
-    ADDRESS_COL_WIDTH as _FREEZE_ADDR_WIDTH,
-)
-from jmwallet.utxo_tui import (
+    _clip,
+    _draw_footer,
+    _is_address_reused,
+    _minimum_table_width,
+    _table_columns,
+    _wrap_footer_fields,
     adjust_scroll,
     build_display_items,
     draw_resize_prompt,
-    format_address_column,
+    enrich_utxo_labels,
+    format_utxo_line,
     group_separator_parts,
     seek_selectable,
+    utxo_cursor_description,
     utxo_display_sort_key,
 )
 
@@ -96,8 +102,8 @@ def freeze(
 
     Fidelity bonds (locked or expired) can be frozen like any other UTXO:
     freezing a still-locked bond keeps it out of the sweep fallback and coin
-    control once its timelock expires. Bonds are tagged [FB-LOCKED] or
-    [FB-EXPIRED] in the list; "freeze all"/"unfreeze all" include them.
+    control once its timelock expires. Bonds are tagged FB-active/
+    FB-expired in the Label column; "freeze all"/"unfreeze all" include them.
     """
     settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
@@ -235,6 +241,11 @@ async def _freeze_utxos(
             for md in range(wallet.mixdepth_count):
                 all_utxos.extend(wallet.utxo_cache.get(md, []))
 
+        # Same label enrichment the selector's caller (send.py) runs:
+        # utxo_cache items carry no wallet labels, so without this the tag
+        # column stays empty for every regular UTXO.
+        enrich_utxo_labels(wallet.get_utxo_label_from_wallet, all_utxos)
+
         if not all_utxos:
             md_msg = f" in mixdepth {mixdepth_filter}" if mixdepth_filter is not None else ""
             print(f"No UTXOs found{md_msg}.")
@@ -255,10 +266,13 @@ async def _freeze_utxos(
             _show_freeze_status(all_utxos)
             return
 
-        # Launch interactive TUI
+        # Launch interactive TUI. Curses owns the terminal now: all log
+        # output is suspended (see suspend_stderr_logging); freeze errors
+        # are shown in the TUI's own footer note row.
         import curses
 
-        curses.wrapper(_run_freeze_tui, display_items, wallet)
+        with suspend_stderr_logging():
+            curses.wrapper(_run_freeze_tui, display_items, wallet)
 
         # Show summary after TUI exit
         frozen_count = sum(1 for u in all_utxos if u.frozen)
@@ -318,14 +332,6 @@ def _unfreeze_utxos(wallet: WalletService, utxos: list[UTXOInfo]) -> int:
 _build_display_items = build_display_items
 
 
-# Column header for the freeze TUI; shared between the renderer and the
-# separator-line widths so everything stays aligned.
-_FREEZE_COL_HEADER = (
-    "  F  | MD | Address                                    "
-    "|      Amount     | Confirmations | Outpoint"
-)
-
-
 def _seek_selectable(display_items: list[UTXOInfo | None], start: int, direction: int) -> int:
     """Return the nearest selectable index from ``start``.
 
@@ -335,86 +341,46 @@ def _seek_selectable(display_items: list[UTXOInfo | None], start: int, direction
     return seek_selectable(display_items, start, direction, lambda _: True)
 
 
-def _format_freeze_address(address: str, prev_address: str) -> str:
-    """Format an address for the freeze TUI address column.
+_FREEZE_CONTROLS_HINT = (
+    "Space/Tab: toggle | j/k: navigate | a: freeze all | n: unfreeze all | q/Esc: exit"
+)
 
-    Consecutive UTXOs sharing the same address render the address only once;
-    subsequent rows show blanks so the column stays visually grouped. Long
-    fidelity-bond addresses are truncated in the middle to fit the column.
+
+def _freeze_state_col(utxo: UTXOInfo) -> str:
+    """State-column value of a UTXO in the freeze manager.
+
+    Unlike the selector there are no session restrictions here (every UTXO is
+    toggleable), so the state is simply frozen, locked (a still-timelocked
+    fidelity bond) or spendable.
     """
-    return format_address_column(address, prev_address)
+    if utxo.frozen:
+        return "frozen"
+    if utxo.is_fidelity_bond and utxo.is_locked:
+        return "locked"
+    return "spendable"
 
 
-def _build_utxo_line(utxo: UTXOInfo, prev_address: str) -> str:
-    """Build the single-row text for a UTXO in the freeze TUI."""
-    # [!] highlights an unfrozen bond's special role: still-locked bonds are
-    # unspendable on-chain, and expired bonds are auto-selected by the sweep
-    # fallback and coin control. A frozen bond shows [F] like any frozen UTXO;
-    # regular UTXOs show [F] or [ ].
-    if utxo.is_fidelity_bond and not utxo.frozen:
-        status = "[!]"
-    elif utxo.frozen:
-        status = "[F]"
-    else:
-        status = "[ ]"
+def _draw_header(stdscr: curses.window, width: int, columns: list[tuple[str, int]]) -> str:
+    """Draw the title bar and the table header, returning the header line.
 
-    amount_str = f"{utxo.value:,} sats"
-    conf_str = f"{utxo.confirmations:>8,} conf"
-    md_str = f"m{utxo.mixdepth}"
-
-    fb_indicator = ""
-    if utxo.is_fidelity_bond:
-        fb_indicator = " [FB-LOCKED]" if utxo.is_locked else " [FB-EXPIRED]"
-
-    label_str = f" ({utxo.label})" if utxo.label else ""
-    addr_str = _format_freeze_address(utxo.address, prev_address)
-    outpoint = f"{utxo.txid[:8]}...:{utxo.vout}"
-
-    return (
-        f" {status} | {md_str:>2} | {addr_str:<{_FREEZE_ADDR_WIDTH}} | {amount_str:>15} | "
-        f"{conf_str} | {outpoint}{fb_indicator}{label_str}"
-    )
-
-
-def _draw_separator(
-    stdscr: curses.window,
-    display_items: list[UTXOInfo | None],
-    pos: int,
-    row: int,
-    width: int,
-) -> None:
-    """Draw the labelled separator introducing the group at ``pos``.
-
-    A new mixdepth gets its full title in bold cyan; a branch change within
-    the same mixdepth replaces the title with placeholder dashes and keeps
-    the branch name column-flush with the title above. The rest of the line
-    is padded with plain dashes; a trailing separator without a following
-    group renders as a plain dash line.
+    The returned header line sizes the row separators and right borders.
     """
     import curses
 
-    end_col = width - 1
-    try:
-        parts = group_separator_parts(display_items, pos)
-        if parts is None:
-            stdscr.addstr(row, 1, "-" * (end_col - 1), curses.A_NORMAL)
-            return
-        title, em_dash, branch, full_title = parts
-        col = 1
-        if full_title:
-            stdscr.addstr(row, col, title, curses.color_pair(1) | curses.A_BOLD)
-        else:
-            stdscr.addstr(row, col, "-" * len(title), curses.A_NORMAL)
-        col += len(title)
-        stdscr.addstr(row, col, em_dash, curses.color_pair(1))
-        col += len(em_dash)
-        if col + len(branch) + 1 <= end_col:
-            stdscr.addstr(row, col, f"{branch} ", curses.color_pair(1))
-            col += len(branch) + 1
-        if col < end_col:
-            stdscr.addstr(row, col, "-" * (end_col - col), curses.A_NORMAL)
-    except curses.error:
-        pass
+    title = " — UTXO Freeze Manager —"
+    stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+    stdscr.addstr(1, 0, title.center(width)[:width])
+    stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+    header_line = "  | " + " | ".join(f"{name:^{size}}" for name, size in columns) + " |"
+    stdscr.addstr(3, 0, header_line[: width - 1])
+    header_sep_width = min(len(header_line) - 2, width - 3)
+    stdscr.addstr(4, 2, "|", curses.A_NORMAL)
+    stdscr.addstr(4, 3, "-" * (header_sep_width - 2), curses.A_NORMAL)
+    right_pos = 3 + header_sep_width - 2
+    if right_pos < width - 1:
+        stdscr.addstr(4, right_pos, "|", curses.A_NORMAL)
+    return header_line
 
 
 def _draw_utxo_rows(
@@ -422,52 +388,100 @@ def _draw_utxo_rows(
     display_items: list[UTXOInfo | None],
     cursor_pos: int,
     scroll_offset: int,
-    list_start: int,
     list_height: int,
-    height: int,
+    list_start: int,
     width: int,
+    sep_width: int,
+    address_utxo_counts: dict[str, int],
+    columns: list[tuple[str, int]],
 ) -> None:
-    """Draw the visible UTXO rows (blank rows and labelled group separators)."""
+    """Draw the visible UTXO rows with bordered separators, freeze marks and colors.
+
+    Marks: [F] frozen, [!] an unfrozen fidelity bond, [ ] anything else. A
+    frozen bond shows [F]; its Label/State columns still describe the bond.
+    Rows share the selector's layout and palette (yellow cursor, bright red
+    frozen and still-timelocked bonds, magenta expired bonds, RU! badges
+    behind the right border).
+    """
     import curses
 
-    prev_address = ""
     for i, item in enumerate(display_items):
         if i < scroll_offset or i >= scroll_offset + list_height:
             continue
-
         display_row = list_start + (i - scroll_offset)
-        if display_row >= height - 3:
-            break
 
         # Two consecutive None entries encode a blank border row followed by
         # the labelled separator of a new mixdepth; a single None is a
         # branch-only separator.
         if item is None:
-            next_is_none = i + 1 < len(display_items) and display_items[i + 1] is None
-            if not next_is_none:
-                _draw_separator(stdscr, display_items, i, display_row, width)
-            prev_address = ""  # Reset the address dedup at every group break
+            stdscr.addstr(display_row, 2, "|", curses.A_NORMAL)
+            inner_width = sep_width - 2
+            if i + 1 < len(display_items) and display_items[i + 1] is None:
+                # Blank border-only row above a mixdepth title.
+                pass
+            else:
+                parts = group_separator_parts(display_items, i)
+                if parts is not None:
+                    md_part, dash_sep, branch_part, full_title = parts
+                    col = 3
+                    if not full_title:
+                        # Branch change: dashes strike out the "Mixdepth N"
+                        # part; the branch name keeps its column and color.
+                        stdscr.addstr(display_row, col, "-" * len(md_part), curses.A_NORMAL)
+                        col += len(md_part)
+                    else:
+                        stdscr.addstr(
+                            display_row, col, md_part, curses.color_pair(3) | curses.A_BOLD
+                        )
+                        col += len(md_part)
+                    stdscr.addstr(display_row, col, dash_sep, curses.color_pair(3))
+                    col += len(dash_sep)
+                    if col + len(branch_part) + 1 <= 3 + inner_width:
+                        stdscr.addstr(display_row, col, f"{branch_part} ", curses.color_pair(3))
+                        col += len(branch_part) + 1
+                    stdscr.addstr(display_row, col, "-" * (3 + inner_width - col), curses.A_NORMAL)
+                else:
+                    stdscr.addstr(display_row, 3, "-" * inner_width, curses.A_NORMAL)
+            stdscr.addstr(display_row, sep_width + 1, "|", curses.A_NORMAL)
             continue
 
-        line = _build_utxo_line(item, prev_address)
-        prev_address = item.address
-
-        if len(line) > width - 1:
-            line = line[: width - 4] + "..."
+        if item.frozen:
+            mark = "[F]"
+        elif item.is_fidelity_bond:
+            mark = "[!]"
+        else:
+            mark = "[ ]"
+        line = f"| {mark} | " + format_utxo_line(
+            item,
+            width,
+            None,
+            width,
+            columns=columns,
+            mark_title="F",
+            state_override=_freeze_state_col(item),
+        )
 
         if i == cursor_pos:
             attr = curses.color_pair(2) | curses.A_REVERSE
-        elif item.frozen:
-            attr = curses.color_pair(3) | curses.A_BOLD
+        elif item.frozen or item.is_locked:
+            # Frozen or still-timelocked bond: both are immutable from this
+            # TUI, so both signal stop in bright red like the selector.
+            attr = curses.color_pair(4) | curses.A_BOLD
         elif item.is_fidelity_bond:
+            # Expired bond: spendable, but its address is published on the
+            # network, so only magenta like the selector's unlocked bonds.
             attr = curses.color_pair(5)
         else:
-            attr = curses.color_pair(4)
+            attr = curses.color_pair(1)  # Spendable UTXOs stay green
 
-        try:
-            stdscr.addstr(display_row, 0, line[: width - 1], attr)
-        except curses.error:
-            pass
+        stdscr.addstr(display_row, 2, "|", curses.A_NORMAL)
+        stdscr.addstr(display_row, 3, line[1:-1], attr)
+        right_border_pos = len(line) + 1
+        stdscr.addstr(display_row, right_border_pos, "|", curses.A_NORMAL)
+        if _is_address_reused(item, address_utxo_counts):
+            stdscr.addstr(
+                display_row, right_border_pos + 1, " RU!", curses.color_pair(4) | curses.A_BOLD
+            )
 
 
 def _format_freeze_footer_stats(utxo_items: list[UTXOInfo]) -> str:
@@ -526,51 +540,53 @@ def _format_freeze_footer_stats(utxo_items: list[UTXOInfo]) -> str:
     return "\n".join(lines)
 
 
-def _draw_freeze_footer(
-    stdscr: curses.window,
+def _freeze_footer_rows(
+    width: int,
     utxo_items: list[UTXOInfo],
+    cursor_item: UTXOInfo | None,
+    address_utxo_counts: dict[str, int],
     error_message: str | None,
     error_active: bool,
-    height: int,
-    width: int,
-) -> None:
-    """Draw the separator, optional error line, and footer help lines."""
+) -> list[tuple[str, int]]:
+    """Lay out the footer sections before reserving space for the coin rows.
+
+    Freeze Details holds the per-category statistics (wrapped between
+    fields), UTXO Status describes the coin under the cursor, and the note
+    row carries an active error or an RU! warning (reserved even when empty
+    so cursor moves do not resize the list).
+    """
     import curses
 
-    stats_lines = _format_freeze_footer_stats(utxo_items).split("\n")
-    legend = " Space/Tab: toggle | j/k: navigate | a: freeze all | n: unfreeze all | q: exit"
-
-    # Layout grows upward from the legend: stats line(s), then the separator.
-    separator_row = height - 3 - len(stats_lines)
-    stdscr.addstr(separator_row, 0, "-" * min(len(_FREEZE_COL_HEADER) + 5, width - 1))
-
+    content_width = max(1, width - 3)
+    separator = ("-" * content_width, curses.A_NORMAL)
+    rows = [separator, ("Freeze Details", curses.A_BOLD)]
+    for stats_line in _format_freeze_footer_stats(utxo_items).split("\n"):
+        rows.extend(
+            (line, curses.A_BOLD) for line in _wrap_footer_fields(stats_line.strip(), content_width)
+        )
+    rows.extend([separator, ("UTXO Status", curses.A_BOLD)])
+    status_text = ""
+    if cursor_item is not None:
+        # "Out:" (short for Outpoint) keeps the full txid:vout visible; the
+        # state column already lives in the table.
+        status_text = f"Out: {cursor_item.txid}:{cursor_item.vout}"
+        description = utxo_cursor_description(cursor_item)
+        if description:
+            status_text += f" | {description}"
+    rows.append((_clip(status_text, content_width), curses.A_DIM))
+    note = ""
     if error_active and error_message:
-        try:
-            stdscr.addstr(
-                height - 1, 0, f" ERROR: {error_message}"[: width - 1], curses.color_pair(3)
-            )
-        except curses.error:
-            pass
-
-    stdscr.attron(curses.A_BOLD)
-    try:
-        for i, line in enumerate(stats_lines):
-            stdscr.addstr(separator_row + 1 + i, 0, line[: width - 1])
-        stdscr.addstr(height - 2, 0, legend[: width - 1])
-    except curses.error:
-        pass
-    stdscr.attroff(curses.A_BOLD)
-
-
-def _freeze_list_height(height: int, display_items: list[UTXOInfo | None]) -> int:
-    """Rows available for the scrollable list at terminal ``height``.
-
-    The layout is fixed: five header rows above the list, and below it a
-    reserved footer of a separator, one stats line (two when fidelity
-    bonds are present), and a legend row.
-    """
-    has_bonds = any(u is not None and u.is_fidelity_bond for u in display_items)
-    return height - (5 if has_bonds else 4) - 5
+        note = f"ERROR: {error_message}"
+    elif cursor_item is not None and _is_address_reused(cursor_item, address_utxo_counts):
+        note = "RU! Warning: Address reuse reduces privacy"
+    rows.append((_clip(note, content_width), curses.color_pair(4) | curses.A_BOLD))
+    rows.extend([separator, ("Controls", curses.A_BOLD)])
+    rows.extend(
+        (line, curses.A_NORMAL)
+        for line in _wrap_footer_fields(_FREEZE_CONTROLS_HINT, content_width)
+    )
+    rows.append(("", curses.A_NORMAL))
+    return rows
 
 
 def _render_freeze_screen(
@@ -581,35 +597,48 @@ def _render_freeze_screen(
     error_message: str | None,
     error_active: bool,
 ) -> tuple[int, int]:
-    """Render the whole freeze screen; return ``(scroll_offset, list_height)``."""
-    import curses
+    """Render the whole freeze screen; return ``(scroll_offset, list_height)``.
 
+    With too little room for the framed layout nothing is drawn and the
+    returned list height is 0; the event loop then shows the resize prompt.
+    """
     stdscr.clear()
     height, width = stdscr.getmaxyx()
+    utxo_items = [u for u in display_items if u is not None]
+    columns = _table_columns(width, utxo_items, "F")
 
-    header = " — UTXO Freeze Manager —"
-    stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-    stdscr.addstr(1, 0, header.center(width)[:width])
-    stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+    # Address reuse detection: count UTXOs per address (shared RU! logic).
+    address_utxo_counts: dict[str, int] = {}
+    for item in utxo_items:
+        address_utxo_counts[item.address] = address_utxo_counts.get(item.address, 0) + 1
 
-    stdscr.addstr(3, 0, _FREEZE_COL_HEADER[: width - 1])
-    stdscr.addstr(4, 0, "-" * min(len(_FREEZE_COL_HEADER) + 5, width - 1))
+    cursor_item = display_items[cursor_pos] if cursor_pos < len(display_items) else None
+    footer_rows = _freeze_footer_rows(
+        width, utxo_items, cursor_item, address_utxo_counts, error_message, error_active
+    )
 
-    list_start = 5  # Data starts here (+1 blank line under the header rule)
-    # Reserve the footer separator, stats, and legend rows before sizing
-    # the scrollable list. Bonds need a second stats line.
-    list_height = _freeze_list_height(height, display_items)
+    list_start = 5
+    list_height = height - list_start - len(footer_rows)
+    if list_height < 1 or width < max(80, _minimum_table_width(columns)):
+        return scroll_offset, 0
 
     # Keep the cursor on screen.
     scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height, len(display_items))
 
+    header_line = _draw_header(stdscr, width, columns)
     _draw_utxo_rows(
-        stdscr, display_items, cursor_pos, scroll_offset, list_start, list_height, height, width
+        stdscr,
+        display_items,
+        cursor_pos,
+        scroll_offset,
+        list_height,
+        list_start,
+        width,
+        len(header_line) - 2,
+        address_utxo_counts,
+        columns,
     )
-
-    utxo_items = [u for u in display_items if u is not None]
-    _draw_freeze_footer(stdscr, utxo_items, error_message, error_active, height, width)
-
+    _draw_footer(stdscr, height - len(footer_rows), footer_rows)
     stdscr.refresh()
     return scroll_offset, list_height
 
@@ -739,12 +768,13 @@ def _run_freeze_tui(
     curses.curs_set(0)
     curses.use_default_colors()
 
-    # Color pairs
-    curses.init_pair(1, curses.COLOR_CYAN, -1)  # Header
-    curses.init_pair(2, curses.COLOR_YELLOW, -1)  # Cursor line
-    curses.init_pair(3, curses.COLOR_RED, -1)  # Frozen UTXOs
-    curses.init_pair(4, curses.COLOR_GREEN, -1)  # Spendable UTXOs
-    curses.init_pair(5, curses.COLOR_MAGENTA, -1)  # Fidelity bond UTXOs
+    # Palette aligned with the interactive UTXO selector; green stays the
+    # "healthy" spendable color and red marks frozen coins, errors, RU!.
+    curses.init_pair(1, curses.COLOR_GREEN, -1)  # Spendable UTXOs
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)  # Current cursor
+    curses.init_pair(3, curses.COLOR_CYAN, -1)  # Title bar and group titles
+    curses.init_pair(4, curses.COLOR_RED, -1)  # Frozen rows (bold), errors and RU! warnings
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)  # Unfrozen fidelity bonds
 
     state = _FreezeTUIState()
     # Land the cursor on the first selectable (toggleable, non-separator) item
@@ -757,23 +787,28 @@ def _run_freeze_tui(
         if not error_active:
             state.error_message = None
 
-        list_height = _freeze_list_height(stdscr.getmaxyx()[0], display_items)
+        try:
+            state.scroll_offset, list_height = _render_freeze_screen(
+                stdscr,
+                display_items,
+                state.cursor_pos,
+                state.scroll_offset,
+                state.error_message,
+                error_active,
+            )
+        except curses.error:
+            # Do not dispatch freeze actions after an interrupted repaint.
+            draw_resize_prompt(stdscr, stdscr.getmaxyx()[1])
+            if stdscr.getch() in (ord("q"), 27):
+                return
+            continue
         if list_height < 1:
-            # Not enough room even for the fixed rows: show the shared
+            # Too little room for the framed layout: show the shared
             # resize prompt and ignore all input except q/Escape.
             draw_resize_prompt(stdscr, stdscr.getmaxyx()[1])
             if stdscr.getch() in (ord("q"), 27):
                 return
             continue
-
-        state.scroll_offset, list_height = _render_freeze_screen(
-            stdscr,
-            display_items,
-            state.cursor_pos,
-            state.scroll_offset,
-            state.error_message,
-            error_active,
-        )
 
         key = stdscr.getch()
         if not _handle_freeze_key(key, state, display_items, wallet, list_height):
