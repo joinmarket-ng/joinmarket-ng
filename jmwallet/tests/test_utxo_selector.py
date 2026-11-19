@@ -112,8 +112,8 @@ class TestFormatUtxoLine:
         utxo = sample_utxos[3]  # The timelocked one
         line = format_utxo_line(utxo)
 
-        assert "FB-active" in line  # Label column for a still-locked bond
-        assert "locked" in line  # State column
+        assert "fb-a" in line  # Label column for a still-locked bond
+        assert "lock" in line  # State column
 
     def test_format_with_max_width(self, sample_utxos: list[UTXOInfo]) -> None:
         """Test that lines are truncated to max width."""
@@ -133,12 +133,12 @@ class TestFormatUtxoLine:
         assert "0.01" in line or "1,000,000" in line
 
     def test_format_with_label(self, sample_utxos: list[UTXOInfo]) -> None:
-        """Test formatting UTXO with a label."""
+        """Test formatting UTXO with a label (mapped to the short form)."""
         utxo = sample_utxos[0]
         utxo.label = "cj-out"
         line = format_utxo_line(utxo)
 
-        assert "cj-out" in line
+        assert "cj-o" in line
 
     def test_format_in_use_indicator(self, sample_utxos: list[UTXOInfo]) -> None:
         """Inputs committed to another CoinJoin are visibly marked."""
@@ -282,23 +282,23 @@ class TestFrozenUtxoFormatting:
     """Tests for frozen UTXO display formatting."""
 
     def test_frozen_indicator_shown(self, frozen_utxo: UTXOInfo) -> None:
-        """Frozen UTXOs show ``frozen`` in their State column."""
+        """Frozen UTXOs show ``frozn`` in their State column."""
         line = format_utxo_line(frozen_utxo)
-        assert "frozen" in line
+        assert "frozn" in line
 
     def test_frozen_indicator_after_label(self, frozen_utxo: UTXOInfo) -> None:
         """The frozen State column comes after the Label column."""
         frozen_utxo.label = "deposit"
         line = format_utxo_line(frozen_utxo, max_width=120)
 
-        frozen_pos = line.index("frozen")
-        label_pos = line.index("deposit")
+        frozen_pos = line.index("frozn")
+        label_pos = line.index("dep")
         assert frozen_pos > label_pos, (
-            f"frozen state at {frozen_pos} should come after deposit at {label_pos}: {line}"
+            f"frozn state at {frozen_pos} should come after dep at {label_pos}: {line}"
         )
 
     def test_frozen_indicator_after_fb_indicator(self) -> None:
-        """A frozen, still-locked bond shows FB-active and a frozen State."""
+        """A frozen, still-locked bond shows fb-a and a frozn State."""
         utxo = UTXOInfo(
             txid="f" * 64,
             vout=0,
@@ -312,17 +312,17 @@ class TestFrozenUtxoFormatting:
             frozen=True,
         )
         line = format_utxo_line(utxo)
-        # Label column shows FB-active; the State column shows frozen, and as
+        # Label column shows fb-a; the State column shows frozn, and as
         # the last column it always appears after the label.
-        assert "FB-active" in line
-        assert "frozen" in line
-        assert line.index("frozen") > line.index("FB-active")
+        assert "fb-a" in line
+        assert "frozn" in line
+        assert line.index("frozn") > line.index("fb-a")
 
     def test_unfrozen_no_indicator(self, sample_utxos: list[UTXOInfo]) -> None:
-        """Non-frozen UTXOs show ``spendable`` in their State column."""
+        """Non-frozen UTXOs show ``spend`` in their State column."""
         line = format_utxo_line(sample_utxos[0])
-        assert "spendable" in line
-        assert "frozen" not in line
+        assert "spend" in line
+        assert "frozn" not in line
 
 
 class TestFrozenUtxoUnselectability:
@@ -428,6 +428,39 @@ class TestBaseSelectability:
     def test_immature_not_selectable(self) -> None:
         assert _is_base_selectable(_make_utxo(0, confirmations=2), None, 5) is False
 
+    def test_unconf_selectable_at_zero_threshold(self) -> None:
+        """0 confs with min_confirmations == 0 (send default): unconf, selectable."""
+        utxo = _make_utxo(0, confirmations=0)
+        assert utxo_selector._utxo_state_col(utxo) == "unconf"
+        assert _is_base_selectable(utxo, None, 0) is True
+
+    def test_immature_unselectable_at_positive_threshold(self) -> None:
+        """0 confs with min_confirmations >= 1 (CoinJoin): immat, unselectable."""
+        utxo = _make_utxo(0, confirmations=0)
+        assert utxo_selector._utxo_state_col(utxo, None, None, 1) == "immat"
+        assert _is_base_selectable(utxo, None, 1) is False
+
+    def test_selectable_states_exclude_pend(self) -> None:
+        """Canary (a1): ``pend`` is catalog-only until wiring; the selectable
+        set {spend, unconf} must never include it."""
+        assert utxo_selector._SELECTABLE_STATES == frozenset({"spend", "unconf"})
+        assert "pend" not in utxo_selector._SELECTABLE_STATES
+
+    def test_state_catalog_contains_pend(self) -> None:
+        """Canary (a2): ``pend`` stays a catalog member (extended view emits it)."""
+        from jmwallet.wallet.rows import _STATE_TOKENS
+
+        assert "pend" in _STATE_TOKENS
+
+    def test_immature_never_emitted_at_zero_threshold(self) -> None:
+        """Canary (b): with min_confirmations == 0 (send default) ``immat``
+        (immature) must never appear -- 0-conf coins route to ``unconf``
+        instead."""
+        for confirmations in (0, 2, 100):
+            utxo = _make_utxo(0, confirmations=confirmations)
+            state = utxo_selector._utxo_state_col(utxo, None, None, 0)
+            assert state != "immat", (confirmations, state)
+
     def test_in_use_not_selectable(self) -> None:
         utxo = _make_utxo(0)
         assert _is_base_selectable(utxo, None, 0, {(utxo.txid, utxo.vout)}) is False
@@ -457,28 +490,26 @@ class TestCoinJoinContextBonds:
 
     def test_locked_bond_state_stays_locked(self) -> None:
         locked = _make_utxo(0, locktime=4_000_000_000)
-        assert utxo_selector._utxo_state_col(locked, allow_fidelity_bonds=False) == "locked"
+        assert utxo_selector._utxo_state_col(locked, allow_fidelity_bonds=False) == "lock"
 
     def test_frozen_bond_state_stays_frozen(self) -> None:
         frozen = _expired_bond()
         frozen.frozen = True
-        assert utxo_selector._utxo_state_col(frozen, allow_fidelity_bonds=False) == "frozen"
+        assert utxo_selector._utxo_state_col(frozen, allow_fidelity_bonds=False) == "frozn"
 
     def test_regular_utxo_unaffected(self) -> None:
         assert _is_base_selectable(_make_utxo(0), None, 0, allow_fidelity_bonds=False) is True
-        assert utxo_selector._utxo_state_col(_make_utxo(0), allow_fidelity_bonds=False) == (
-            "spendable"
-        )
+        assert utxo_selector._utxo_state_col(_make_utxo(0), allow_fidelity_bonds=False) == ("spend")
 
     def test_default_keeps_expired_bond_selectable(self) -> None:
         # Send/redeem path contract: unchanged.
         assert _is_base_selectable(_expired_bond(), None, 0) is True
-        assert utxo_selector._utxo_state_col(_expired_bond()) == "spendable"
+        assert utxo_selector._utxo_state_col(_expired_bond()) == "spend"
 
     def test_row_state_column_shows_no_cj(self) -> None:
         line = format_utxo_line(_expired_bond(), allow_fidelity_bonds=False)
         assert "no-cj" in line
-        assert "FB-expired" in line
+        assert "fb-x" in line
 
     def test_footer_explains_no_cj(self) -> None:
         bond = _expired_bond()
@@ -496,7 +527,9 @@ class TestCoinJoinContextBonds:
             0,
             allow_fidelity_bonds=False,
         )
-        assert status.startswith(f"Out: {bond.txid}:{bond.vout}")
+        # The outpoint sits on the "Outpoint:" line (forced break only on
+        # overflow); the explanation follows on its own line below.
+        assert status.startswith("Outpoint: " + f"{bond.txid}:{bond.vout}\n")
         # State value moved to the table's state column; the footer only
         # explains WHY a non-selectable state exists.
         assert "fidelity bonds cannot be used in CoinJoins" in status

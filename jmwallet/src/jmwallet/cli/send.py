@@ -141,6 +141,8 @@ async def _select_input_utxos(
                 amount,
                 allowed_mixdepth=mixdepth,
                 excluded_outpoints=locked_outpoints,
+                wallet_name=wallet.mnemonic_file.name if wallet.mnemonic_file else "(no file)",
+                wallet_fingerprint=wallet.wallet_fingerprint,
             )
         except RuntimeError as e:
             logger.error("Cannot use interactive UTXO selection")

@@ -667,9 +667,9 @@ class WalletService(
         """Get balance available to automatic CoinJoin input selection.
 
         This is the capacity counterpart to :meth:`select_utxos`: fidelity
-        bonds, frozen coins, immature coins, and excluded in-flight inputs do
-        not contribute. The md0 privacy restriction uses the same effective
-        capacity as selection.
+        bonds, frozen coins, immature (immat) coins, and excluded in-flight
+        inputs do not contribute. The md0 privacy restriction uses the same
+        effective capacity as selection.
 
         For mixdepth 0 (when ``restrict_md0`` is True), UTXOs outside the
         supplied maker-rotation lineage are restricted to a single UTXO to

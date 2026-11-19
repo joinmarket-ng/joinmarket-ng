@@ -24,25 +24,38 @@ from jmwallet.cli import app
 from jmwallet.utxo_tui import (
     _clip,
     _draw_footer,
+    _draw_frame_filler,
+    _draw_help_overlay,
+    _draw_hrule,
+    _header_line,
+    _help_overlay_rows,
     _is_address_reused,
     _minimum_table_width,
     _table_columns,
-    _wrap_footer_fields,
+    _table_sep_width,
     adjust_scroll,
+    align_control_columns,
     build_display_items,
     draw_resize_prompt,
+    draw_status_block,
     enrich_utxo_labels,
     format_utxo_line,
     group_separator_parts,
+    maker_bot_status,
     seek_selectable,
-    utxo_cursor_description,
+    status_header_lines,
     utxo_display_sort_key,
+    utxo_status_text,
+    wait_for_help_close,
+    wrap_status_text,
 )
+from jmwallet.wallet.rows import FREEZE_STATE_TOKENS
 
 if TYPE_CHECKING:
     import curses
 
     from jmwallet.wallet.models import UTXOInfo
+    from jmwallet.wallet.rows import StateToken
     from jmwallet.wallet.service import WalletService
 
 
@@ -102,8 +115,8 @@ def freeze(
 
     Fidelity bonds (locked or expired) can be frozen like any other UTXO:
     freezing a still-locked bond keeps it out of the sweep fallback and coin
-    control once its timelock expires. Bonds are tagged FB-active/
-    FB-expired in the Label column; "freeze all"/"unfreeze all" include them.
+    control once its timelock expires. Bonds are tagged fb-a/
+    fb-x in the Label column; "freeze all"/"unfreeze all" include them.
     """
     settings = setup_cli(log_level, data_dir=data_dir, config_file=config_file)
 
@@ -266,13 +279,19 @@ async def _freeze_utxos(
             _show_freeze_status(all_utxos)
             return
 
+        # Wallet identity for the status block (whiptail menu_header style):
+        # the mnemonic file name is the wallet's user-visible name.
+        wallet_display_name = (
+            wallet.mnemonic_file.name if wallet.mnemonic_file is not None else "(no file)"
+        )
+
         # Launch interactive TUI. Curses owns the terminal now: all log
         # output is suspended (see suspend_stderr_logging); freeze errors
         # are shown in the TUI's own footer note row.
         import curses
 
         with suspend_stderr_logging():
-            curses.wrapper(_run_freeze_tui, display_items, wallet)
+            curses.wrapper(_run_freeze_tui, display_items, wallet, wallet_display_name)
 
         # Show summary after TUI exit
         frozen_count = sum(1 for u in all_utxos if u.frozen)
@@ -342,28 +361,45 @@ def _seek_selectable(display_items: list[UTXOInfo | None], start: int, direction
 
 
 _FREEZE_CONTROLS_HINT = (
-    "Space/Tab: toggle | j/k: navigate | a: freeze all | n: unfreeze all | q/Esc: exit"
+    "Space/Tab: toggle | j/k: navigate | a: freeze all | n: unfreeze all | ?: help | q/Esc: exit"
 )
 
 
-def _freeze_state_col(utxo: UTXOInfo) -> str:
+def _freeze_state_col(utxo: UTXOInfo) -> StateToken:
     """State-column value of a UTXO in the freeze manager.
 
-    Unlike the selector there are no session restrictions here (every UTXO is
-    toggleable), so the state is simply frozen, locked (a still-timelocked
-    fidelity bond) or spendable.
+    The freeze manager is a SUBSET of the shared catalog
+    (:mod:`jmwallet.wallet.rows`): only ``frozn``/``lock``/``spend`` are
+    reachable here. The selection-context tokens (``in-use``, ``no-cj``,
+    ``immat``, ``oth-md``, ``unconf``, ``pend``) have no meaning in
+    this TUI -- every UTXO is toggleable and no selection session exists.
+    A frozen still-locked bond shows ``frozn`` (the user lock wins over
+    the timelock); the timelock stays visible via the ``[!]`` mark and the
+    ``fb-a`` tag.
     """
     if utxo.frozen:
-        return "frozen"
+        return "frozn"
     if utxo.is_fidelity_bond and utxo.is_locked:
-        return "locked"
-    return "spendable"
+        return "lock"
+    return "spend"
 
 
-def _draw_header(stdscr: curses.window, width: int, columns: list[tuple[str, int]]) -> str:
-    """Draw the title bar and the table header, returning the header line.
+_HELP_TITLE = " — UTXO Freeze Manager Help Screen —"
 
-    The returned header line sizes the row separators and right borders.
+
+def _draw_header(
+    stdscr: curses.window,
+    width: int,
+    columns: list[tuple[str, int]],
+    status_lines: list[str],
+) -> str:
+    """Draw the title bar, status block and table header.
+
+    The status block sits between the title rule and the header top edge
+    (whiptail ``menu_header`` style: wallet name, fingerprint, maker bot
+    status). ``status_lines`` is the prebuilt 1- or 2-line cascade from
+    :func:`status_header_lines`; the returned header line sizes the row
+    separators and right borders.
     """
     import curses
 
@@ -372,14 +408,24 @@ def _draw_header(stdscr: curses.window, width: int, columns: list[tuple[str, int
     stdscr.addstr(1, 0, title.center(width)[:width])
     stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
 
-    header_line = "  | " + " | ".join(f"{name:^{size}}" for name, size in columns) + " |"
-    stdscr.addstr(3, 0, header_line[: width - 1])
-    header_sep_width = min(len(header_line) - 2, width - 3)
-    stdscr.addstr(4, 2, "|", curses.A_NORMAL)
-    stdscr.addstr(4, 3, "-" * (header_sep_width - 2), curses.A_NORMAL)
-    right_pos = 3 + header_sep_width - 2
-    if right_pos < width - 1:
-        stdscr.addstr(4, right_pos, "|", curses.A_NORMAL)
+    header_line = _header_line(columns)
+    # Geometry: rule(2), status rows(3..2+R), block bottom rule(3+R),
+    # header(4+R), header bottom rule(5+R), list from 6+R.
+    header_row = 4 + len(status_lines)
+    stdscr.addstr(header_row, 0, header_line[:width])
+    if "RU!" in header_line:
+        # Overdraw the flush RU! header cell in the warning color.
+        ru_col = header_line.index("RU!")
+        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        stdscr.addstr(header_row, ru_col, "RU!")
+        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+    header_sep_width = min(len(header_line) - 1, width - 1)
+    # The box's top edge: a rule between the title and the status block.
+    _draw_hrule(stdscr, 2, header_sep_width)
+    status_block_end = draw_status_block(stdscr, 3, status_lines, header_sep_width)
+    # The header's own top edge below the status block.
+    _draw_hrule(stdscr, 3 + status_block_end, header_sep_width)
+    _draw_hrule(stdscr, header_row + 1, header_sep_width)
     return header_line
 
 
@@ -414,8 +460,8 @@ def _draw_utxo_rows(
         # the labelled separator of a new mixdepth; a single None is a
         # branch-only separator.
         if item is None:
-            stdscr.addstr(display_row, 2, "|", curses.A_NORMAL)
-            inner_width = sep_width - 2
+            stdscr.addstr(display_row, 0, "|", curses.A_NORMAL)
+            inner_width = sep_width - 1
             if i + 1 < len(display_items) and display_items[i + 1] is None:
                 # Blank border-only row above a mixdepth title.
                 pass
@@ -423,7 +469,7 @@ def _draw_utxo_rows(
                 parts = group_separator_parts(display_items, i)
                 if parts is not None:
                     md_part, dash_sep, branch_part, full_title = parts
-                    col = 3
+                    col = 2
                     if not full_title:
                         # Branch change: dashes strike out the "Mixdepth N"
                         # part; the branch name keeps its column and color.
@@ -436,13 +482,13 @@ def _draw_utxo_rows(
                         col += len(md_part)
                     stdscr.addstr(display_row, col, dash_sep, curses.color_pair(3))
                     col += len(dash_sep)
-                    if col + len(branch_part) + 1 <= 3 + inner_width:
+                    if col + len(branch_part) + 1 <= sep_width - 1:
                         stdscr.addstr(display_row, col, f"{branch_part} ", curses.color_pair(3))
                         col += len(branch_part) + 1
-                    stdscr.addstr(display_row, col, "-" * (3 + inner_width - col), curses.A_NORMAL)
+                    stdscr.addstr(display_row, col, "-" * (sep_width - 1 - col), curses.A_NORMAL)
                 else:
-                    stdscr.addstr(display_row, 3, "-" * inner_width, curses.A_NORMAL)
-            stdscr.addstr(display_row, sep_width + 1, "|", curses.A_NORMAL)
+                    stdscr.addstr(display_row, 1, "-" * inner_width, curses.A_NORMAL)
+            stdscr.addstr(display_row, sep_width, "|", curses.A_NORMAL)
             continue
 
         if item.frozen:
@@ -459,6 +505,7 @@ def _draw_utxo_rows(
             columns=columns,
             mark_title="F",
             state_override=_freeze_state_col(item),
+            reused=_is_address_reused(item, address_utxo_counts),
         )
 
         if i == cursor_pos:
@@ -474,14 +521,15 @@ def _draw_utxo_rows(
         else:
             attr = curses.color_pair(1)  # Spendable UTXOs stay green
 
-        stdscr.addstr(display_row, 2, "|", curses.A_NORMAL)
-        stdscr.addstr(display_row, 3, line[1:-1], attr)
-        right_border_pos = len(line) + 1
-        stdscr.addstr(display_row, right_border_pos, "|", curses.A_NORMAL)
+        stdscr.addstr(display_row, 0, "|", curses.A_NORMAL)
+        stdscr.addstr(display_row, 1, line[1:-1], attr)
+        stdscr.addstr(display_row, len(line) - 1, "|", curses.A_NORMAL)
         if _is_address_reused(item, address_utxo_counts):
-            stdscr.addstr(
-                display_row, right_border_pos + 1, " RU!", curses.color_pair(4) | curses.A_BOLD
-            )
+            # Overdraw the flush RU! cell (inside the border) in red bold.
+            ru_col = len(line) - 4
+            stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+            stdscr.addstr(display_row, ru_col, "RU!")
+            stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
 
 
 def _format_freeze_footer_stats(utxo_items: list[UTXOInfo]) -> str:
@@ -541,7 +589,7 @@ def _format_freeze_footer_stats(utxo_items: list[UTXOInfo]) -> str:
 
 
 def _freeze_footer_rows(
-    width: int,
+    sep_width: int,
     utxo_items: list[UTXOInfo],
     cursor_item: UTXOInfo | None,
     address_utxo_counts: dict[str, int],
@@ -551,41 +599,61 @@ def _freeze_footer_rows(
     """Lay out the footer sections before reserving space for the coin rows.
 
     Freeze Details holds the per-category statistics (wrapped between
-    fields), UTXO Status describes the coin under the cursor, and the note
-    row carries an active error or an RU! warning (reserved even when empty
-    so cursor moves do not resize the list).
+    fields), UTXO Status describes the coin under the cursor (wrapped the
+    same way), and the note row carries an active error or an RU! warning
+    (reserved even when empty so cursor moves do not resize the list).
+    ``sep_width`` is the table's separator span
+    (:func:`jmwallet.utxo_tui._table_sep_width`): the footer box spans the
+    table's full width -- framed separators and framed text rows, borders
+    at columns 0 and ``sep_width``.
     """
     import curses
 
-    content_width = max(1, width - 3)
-    separator = ("-" * content_width, curses.A_NORMAL)
-    rows = [separator, ("Freeze Details", curses.A_BOLD)]
+    content_width = max(1, sep_width - 4)
+    separator = ("|" + "-" * (sep_width - 1) + "|", curses.A_NORMAL)
+    title_attr = curses.color_pair(3) | curses.A_BOLD
+    # The first separator closes the table's bottom edge (the frame filler
+    # keeps the border columns connected above it).
+    rows = [separator, ("Freeze Details", title_attr)]
     for stats_line in _format_freeze_footer_stats(utxo_items).split("\n"):
         rows.extend(
-            (line, curses.A_BOLD) for line in _wrap_footer_fields(stats_line.strip(), content_width)
+            (line, curses.A_BOLD) for line in wrap_status_text(stats_line.strip(), content_width)
         )
-    rows.extend([separator, ("UTXO Status", curses.A_BOLD)])
+    rows.extend([separator, ("UTXO Status", title_attr)])
     status_text = ""
     if cursor_item is not None:
-        # "Out:" (short for Outpoint) keeps the full txid:vout visible; the
-        # state column already lives in the table.
-        status_text = f"Out: {cursor_item.txid}:{cursor_item.vout}"
-        description = utxo_cursor_description(cursor_item)
-        if description:
-            status_text += f" | {description}"
-    rows.append((_clip(status_text, content_width), curses.A_DIM))
+        # Shared payload: "Outpoint:" gets its own line (forced break, no
+        # separator before the value); the value moves whole below the
+        # label when the line is too wide (never broken mid-value).
+        status_text = utxo_status_text(cursor_item)
+    # The status block shows exactly the cursor coin's payload -- no
+    # max-reserve padding over all coins: the padding rendered as a visible
+    # empty line whenever the cursor coin wrapped shorter than the wallet
+    # maximum (e.g. the one-column window where a 2-digit-vout outpoint
+    # tips the wrap threshold), and it flipped around on resize
+    # (user decision 2026-11-15). The footer height may breathe by one line
+    # when coins of different status heights alternate under the cursor;
+    # that cost is accepted (RU!/error note stays conditional, see below).
+    status_lines = wrap_status_text(status_text, content_width)
+    rows.extend((line, curses.A_BOLD) for line in status_lines)
+    # The note row exists only when there is something to show (active error
+    # or RU! warning); an always-reserved empty row wasted a list line in the
+    # overwhelmingly common clean case (user decision 2026-11-15).
     note = ""
     if error_active and error_message:
         note = f"ERROR: {error_message}"
     elif cursor_item is not None and _is_address_reused(cursor_item, address_utxo_counts):
         note = "RU! Warning: Address reuse reduces privacy"
-    rows.append((_clip(note, content_width), curses.color_pair(4) | curses.A_BOLD))
-    rows.extend([separator, ("Controls", curses.A_BOLD)])
+    if note:
+        rows.append((_clip(note, content_width), curses.color_pair(4) | curses.A_BOLD))
+    rows.extend([separator, ("Controls", title_attr)])
     rows.extend(
         (line, curses.A_NORMAL)
-        for line in _wrap_footer_fields(_FREEZE_CONTROLS_HINT, content_width)
+        for line in align_control_columns(_FREEZE_CONTROLS_HINT, content_width)
     )
-    rows.append(("", curses.A_NORMAL))
+    # The closing separator is the box's bottom edge; the render loop keeps
+    # the terminal's last row empty below it (a one-cell black frame).
+    rows.append(separator)
     return rows
 
 
@@ -596,16 +664,33 @@ def _render_freeze_screen(
     scroll_offset: int,
     error_message: str | None,
     error_active: bool,
-) -> tuple[int, int]:
-    """Render the whole freeze screen; return ``(scroll_offset, list_height)``.
+    wallet: WalletService,
+    wallet_name: str,
+) -> tuple[int, int, str]:
+    """Render the whole freeze screen.
 
-    With too little room for the framed layout nothing is drawn and the
-    returned list height is 0; the event loop then shows the resize prompt.
+    Returns ``(scroll_offset, list_height, resize_reason)``. With too
+    little room for the framed layout nothing is drawn, the list height
+    is 0 and ``resize_reason`` names the dimension to enlarge
+    (``"width"``/``"height"``); the event loop then shows the matching
+    resize prompt.
     """
     stdscr.clear()
     height, width = stdscr.getmaxyx()
     utxo_items = [u for u in display_items if u is not None]
-    columns = _table_columns(width, utxo_items, "F")
+    columns = _table_columns(width, utxo_items, "F", state_tokens=FREEZE_STATE_TOKENS)
+
+    # Status block above the column titles (whiptail menu_header style).
+    # The maker status is process-derived (start-path independent); the
+    # wallet identity comes precomputed from the TUI runner (name/fingerprint).
+    sep_width = _table_sep_width(columns)
+    status_lines = status_header_lines(
+        sep_width,
+        wallet_name,
+        wallet.wallet_fingerprint,
+        maker_bot_status(),
+    )
+    status_count = len(status_lines)
 
     # Address reuse detection: count UTXOs per address (shared RU! logic).
     address_utxo_counts: dict[str, int] = {}
@@ -614,18 +699,61 @@ def _render_freeze_screen(
 
     cursor_item = display_items[cursor_pos] if cursor_pos < len(display_items) else None
     footer_rows = _freeze_footer_rows(
-        width, utxo_items, cursor_item, address_utxo_counts, error_message, error_active
+        sep_width,
+        utxo_items,
+        cursor_item,
+        address_utxo_counts,
+        error_message,
+        error_active,
     )
 
-    list_start = 5
-    list_height = height - list_start - len(footer_rows)
-    if list_height < 1 or width < max(80, _minimum_table_width(columns)):
-        return scroll_offset, 0
+    list_start = 6 + status_count
+    # Full layout widens the address column to fill the terminal exactly
+    # (right border in the last usable column); the compact layout stays at
+    # its own table width, so every border reads from the columns.
+    # One blank row stays below the footer box (black frame at the
+    # screen's bottom edge); it shrinks the scrollable region.
+    list_height = height - list_start - len(footer_rows) - 1
+    if width < max(80, _minimum_table_width(columns)):
+        # The table itself cannot fit: the fix is horizontal space.
+        return scroll_offset, 0, "width"
+    if list_height < 1:
+        # Width is fine but the vertical budget (title rules, status
+        # block, footer, blank frame row) leaves no list row. First try
+        # the one-line status block before blaming the terminal height:
+        # a screen that rendered before the status block must keep
+        # rendering with it.
+        if status_count > 1:
+            retry = status_header_lines(
+                sep_width,
+                wallet_name,
+                wallet.wallet_fingerprint,
+                maker_bot_status(),
+                max_lines=1,
+            )
+            retry_height = height - (6 + len(retry)) - len(footer_rows) - 1
+            if retry_height >= 1:
+                status_lines = retry
+                status_count = len(retry)
+                list_start = 6 + status_count
+                list_height = retry_height
+            else:
+                return scroll_offset, 0, "height"
+        else:
+            return scroll_offset, 0, "height"
 
     # Keep the cursor on screen.
     scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height, len(display_items))
 
-    header_line = _draw_header(stdscr, width, columns)
+    _draw_header(stdscr, width, columns, status_lines)
+    # The frame filler keeps the border columns connected across the spare
+    # list rows (rows drawn later win over the filler borders); the footer's
+    # own first separator row doubles as its top edge.
+    # One blank row stays below the footer box (black frame at the screen's
+    # bottom edge); it also keeps the terminal's unwritable bottom-right
+    # corner out of the box entirely.
+    footer_start = height - len(footer_rows) - 1
+    _draw_frame_filler(stdscr, list_start, footer_start, sep_width)
     _draw_utxo_rows(
         stdscr,
         display_items,
@@ -634,13 +762,13 @@ def _render_freeze_screen(
         list_height,
         list_start,
         width,
-        len(header_line) - 2,
+        sep_width,
         address_utxo_counts,
         columns,
     )
-    _draw_footer(stdscr, height - len(footer_rows), footer_rows)
+    _draw_footer(stdscr, footer_start, footer_rows, sep_width)
     stdscr.refresh()
-    return scroll_offset, list_height
+    return scroll_offset, list_height, ""
 
 
 @dataclass
@@ -751,6 +879,7 @@ def _run_freeze_tui(
     stdscr: curses.window,
     display_items: list[UTXOInfo | None],
     wallet: WalletService,
+    wallet_name: str,
 ) -> None:
     """Run the curses-based UTXO freeze/unfreeze TUI.
 
@@ -788,28 +917,47 @@ def _run_freeze_tui(
             state.error_message = None
 
         try:
-            state.scroll_offset, list_height = _render_freeze_screen(
+            state.scroll_offset, list_height, resize_reason = _render_freeze_screen(
                 stdscr,
                 display_items,
                 state.cursor_pos,
                 state.scroll_offset,
                 state.error_message,
                 error_active,
+                wallet,
+                wallet_name,
             )
         except curses.error:
             # Do not dispatch freeze actions after an interrupted repaint.
+            # The cause of the interruption is not diagnosable here, so the
+            # generic prompt text stays.
             draw_resize_prompt(stdscr, stdscr.getmaxyx()[1])
             if stdscr.getch() in (ord("q"), 27):
                 return
             continue
-        if list_height < 1:
-            # Too little room for the framed layout: show the shared
-            # resize prompt and ignore all input except q/Escape.
-            draw_resize_prompt(stdscr, stdscr.getmaxyx()[1])
+        if resize_reason:
+            # Too little room for the framed layout, with the failing
+            # dimension named: show the shared resize prompt and ignore
+            # all input except q/Escape.
+            draw_resize_prompt(stdscr, stdscr.getmaxyx()[1], resize_reason)
             if stdscr.getch() in (ord("q"), 27):
                 return
             continue
 
         key = stdscr.getch()
+        if key == ord("?"):
+            _, width = stdscr.getmaxyx()
+            columns = _table_columns(
+                width,
+                [u for u in display_items if u is not None],
+                "F",
+                state_tokens=FREEZE_STATE_TOKENS,
+            )
+            sep_width = _table_sep_width(columns)
+            _draw_help_overlay(
+                stdscr, _help_overlay_rows(sep_width, FREEZE_STATE_TOKENS), sep_width, _HELP_TITLE
+            )
+            wait_for_help_close(stdscr)
+            continue
         if not _handle_freeze_key(key, state, display_items, wallet, list_height):
             return

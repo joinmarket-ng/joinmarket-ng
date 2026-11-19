@@ -49,7 +49,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, cast
 
 from jmwallet.wallet.constants import FIDELITY_BOND_BRANCH
 from jmwallet.wallet.models import AddressInfo, UTXOInfo
@@ -70,6 +70,72 @@ RowLabel = Literal[
     "fb-a",
     "fb-x",
 ]
+
+# State-column tokens shared by all views. The first five form the
+# canonical extended-view vocabulary (_state_text/_fb_state_text in
+# cli/info_render.py emit them): ``frozn`` (frozen: excluded from
+# coin selection), ``pend`` (outgoing spend pending), ``unconf`` (no
+# confirmations yet), ``spend`` (positive signal), ``lock`` (fidelity
+# bond time-lock active). The remaining four are selection-context
+# extensions that only the interactive TUIs emit: ``in-use`` (a
+# running CoinJoin input from ``excluded_outpoints`` -- same CoinJoin
+# context as ``no-cj``, different reason) and ``no-cj`` (a fidelity
+# bond excluded from CoinJoin use), ``immat`` (below the session's
+# ``min_confirmations`` floor, set only by CoinJoin callers;
+# ``taker_utxo_age``) and ``oth-md`` (outside the session's mixdepth).
+# ``unconf`` is send-context bound: direct sends allow 0-conf UTXOs
+# (min_confirmations defaults to 0), CoinJoins never reach it (their
+# age floor routes 0-conf coins to ``immature``).
+#
+# ``pend`` is NOT yet emitted by the TUIs: the pending state lives in
+# jmwalletd spend history (address-scoped, not a ``UTXOInfo`` field),
+# wiring it through the selector signature is a separate follow-up.
+# Until then a 0-conf change output of an outgoing transaction renders
+# as ``spend`` and is selectable in the selector (known gap).
+# Display names are deliberately short: ``immat`` (immature) and
+# ``oth-md`` (other mixdepth) keep the state column narrow.
+StateToken = Literal[
+    "frozn",
+    "pend",
+    "unconf",
+    "spend",
+    "lock",
+    "in-use",
+    "no-cj",
+    "immat",
+    "oth-md",
+]
+
+# Runtime copy of the ``StateToken`` catalog for width derivation and
+# membership tests; keep in sync with the Literal above (mypy enforces
+# nothing between them, the catalog test does).
+_STATE_TOKENS: tuple[str, ...] = (
+    "frozn",
+    "pend",
+    "unconf",
+    "spend",
+    "lock",
+    "in-use",
+    "no-cj",
+    "immat",
+    "oth-md",
+)
+
+# States the interactive UTXO selector can emit: the full catalog minus
+# ``pend`` (defined but not yet emitted -- see the ``StateToken`` comment
+# above). Drives the selector's help overlay; the freeze manager passes
+# its own smaller emission subset instead. When the pending wiring lands,
+# add ``pend`` here AND keep STATE_HELP in sync.
+SELECTOR_STATE_TOKENS: tuple[StateToken, ...] = tuple(
+    cast("StateToken", token) for token in _STATE_TOKENS if token != "pend"
+)
+
+# States the freeze manager can emit (see ``_freeze_state_col`` in
+# ``jmwallet.cli.freeze``): a subset of the catalog, filtered in catalog
+# order so the help overlay's state section stays catalog-ordered too.
+FREEZE_STATE_TOKENS: tuple[StateToken, ...] = tuple(
+    cast("StateToken", token) for token in _STATE_TOKENS if token in ("frozn", "lock", "spend")
+)
 
 # Branch identifiers: 0 = external (receive), 1 = internal (change),
 # FIDELITY_BOND_BRANCH (2) = fidelity bonds.
@@ -243,6 +309,97 @@ def derive_label(addr: AddressInfo, *, now: int | None = None) -> tuple[RowLabel
 def fb_date_str(locktime: int) -> str:
     """Format a fidelity bond locktime as YY-MM-DD (local time)."""
     return datetime.fromtimestamp(locktime).strftime("%y-%m-%d")
+
+
+def short_label(utxo: UTXOInfo) -> str:
+    """Short tag-column label for a ``UTXOInfo`` (the TUI ``tag`` column).
+
+    Surfaces the canonical row vocabulary on UTXO rows: fidelity bonds map
+    to ``fb-a``/``fb-x`` by lock state (``derive_label`` does the same on
+    bond *addresses*), every other wallet status maps through
+    ``_STATUS_TO_LABEL`` (``deposit`` -> ``dep``, ``non-cj-change`` ->
+    ``chg``). BIP-329 user labels pass through unchanged; the TUI caps the
+    column at 11 characters and shows the full text in its footer.
+    """
+    if utxo.is_fidelity_bond:
+        return "fb-a" if utxo.is_locked else "fb-x"
+    return _STATUS_TO_LABEL.get(utxo.label or "", utxo.label or "")
+
+
+def state_token(
+    utxo: UTXOInfo,
+    excluded_outpoints: set[tuple[str, int]] | None = None,
+    allowed_mixdepth: int | None = None,
+    min_confirmations: int = 0,
+    *,
+    allow_fidelity_bonds: bool = True,
+) -> StateToken:
+    """Selection-context state token for a ``UTXOInfo`` (the TUI ``state`` column).
+
+    Priority order: ``in-use`` (running CoinJoin input) overrides
+    everything, then ``frozn`` (user locked), then ``lock`` (fidelity bond
+    time-lock active), then ``no-cj`` for any remaining fidelity bond when
+    the caller disallows bonds (CoinJoin context), then session
+    restrictions.
+
+    Context split for 0-conf UTXOs: with ``min_confirmations == 0`` (direct
+    sends) a 0-conf coin is ``unconf`` and selectable; with a positive floor
+    (CoinJoins) it is ``immat`` (immature) and unselectable. ``pend`` is
+    defined by the catalog but not yet emitted -- see the ``StateToken``
+    comment.
+    """
+    if excluded_outpoints and (utxo.txid, utxo.vout) in excluded_outpoints:
+        return "in-use"
+    if utxo.frozen:
+        return "frozn"
+    if utxo.is_fidelity_bond and utxo.is_locked:
+        return "lock"
+    if utxo.is_fidelity_bond and not allow_fidelity_bonds:
+        return "no-cj"
+    if min_confirmations == 0:
+        if utxo.confirmations == 0:
+            return "unconf"
+    elif utxo.confirmations < min_confirmations:
+        return "immat"
+    if allowed_mixdepth is not None and utxo.mixdepth != allowed_mixdepth:
+        return "oth-md"
+    return "spend"
+
+
+# Help overlay vocabulary: one display description per catalog token, shared
+# by both TUIs so the legend can never drift from the tokens the views emit.
+# Same format as the extended view's address legend: ``token - full term:
+# detail`` (entries whose token already is the term carry the detail only).
+# Tag help covers every ``RowLabel`` plus the pass-through BIP-329 case;
+# state help covers the full ``StateToken`` catalog including ``pend``
+# (defined, not yet emitted -- see the ``StateToken`` comment).
+TAG_HELP: dict[str, str] = {
+    "new": "unused: never exposed yet (first deposit)",
+    "dep": "deposit: address with no incoming transaction seen",
+    "cj-o": "coinjoin output: mixed funds",
+    "cj-c": "coinjoin change: change output from a CoinJoin (keep separate)",
+    "chg": "change: regular change (not from a CoinJoin)",
+    "used": "used: address once held a transaction output, now empty",
+    "flag": "flagged: unrecognized wallet status -- inspect before spending",
+    "rsvd": "reserved: set aside for an ongoing wallet operation",
+    "fb-a": "fidelity bond active: timelock still active (locked)",
+    "fb-x": "fidelity bond expired: redeemable, address is public",
+    "<label>": "your own BIP-329 label, capped in the tag column "
+    "(full text in the UTXO Status line)",
+}
+
+STATE_HELP: dict[str, str] = {
+    "frozn": "frozen: excluded from coin selection (toggle to release)",
+    "pend": "pending: outgoing transaction not yet visible on chain",
+    "unconf": "unconfirmed: no confirmations yet, still selectable for direct sends",
+    "spend": "spendable: available for selection",
+    "lock": "time-locked: fidelity bond cannot be spent yet",
+    "in-use": "in use: input of a currently running CoinJoin (do not touch)",
+    "no-cj": "no CoinJoin: fidelity bond excluded from CoinJoin use; "
+    "redeem with jm-wallet send --select-utxos",
+    "immat": "immature: needs more confirmations before CoinJoin selection allows it",
+    "oth-md": "other mixdepth: outside the pinned source mixdepth -- shown for context",
+}
 
 
 def build_branch_rows(
@@ -466,6 +623,8 @@ __all__ = [
     "MixdepthSummaryRow",
     "Row",
     "RowLabel",
+    "FREEZE_STATE_TOKENS",
+    "SELECTOR_STATE_TOKENS",
     "UtxoRow",
     "base_order_key",
     "build_branch_rows",

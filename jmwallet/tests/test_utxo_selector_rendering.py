@@ -29,6 +29,9 @@ def patched_selector_curses(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(utxo_selector.curses, "use_default_colors", no_op)
     monkeypatch.setattr(utxo_selector.curses, "init_pair", no_op)
     monkeypatch.setattr(utxo_selector.curses, "color_pair", color_pair)
+    # Deterministic maker status: the real check scans /proc and would flip
+    # with whatever maker processes happen to run on the test machine.
+    monkeypatch.setattr(utxo_selector, "maker_bot_status", lambda: "STOPPED")
 
 
 def _utxo(
@@ -160,22 +163,21 @@ def test_frozen_labels_are_clipped_in_rows_but_preserved_in_footer(
     # Rows are anchored by the tag column (the outpoint moved to the footer).
     auto_row = _line_with(auto_frame, "jm:autof")
     custom_row = _line_with(custom_frame, "custom-l")
-    assert "frozen" in auto_frame.text
+    assert "frozn" in auto_frame.text
     assert "RU!" in auto_frame.text
     assert "jm:autof" in auto_row
-    assert "frozen" in custom_row
+    assert "frozn" in custom_row
     assert "RU!" in custom_row
     assert custom_label not in custom_row
     assert "..." in custom_row
-    assert "Out: " in custom_frame.text
+    assert "Outpoint:" in custom_frame.text
     if full_footer_label:
         assert f"Label: {AUTO_FREEZE_REUSE_LABEL}" in auto_frame.text
         assert f"Label: {custom_label}" in custom_frame.text
     else:
-        # At 80 columns the full outpoint (first status field) survives the
-        # right-side clip; the full Label drops off the status line there.
-        assert custom_label not in custom_frame.text
-        assert "..." in _line_with(custom_frame, "Out: ")
+        # At 80 columns the outpoint wraps onto its own line instead of
+        # being clipped; the full Label still fits on a later wrapped line.
+        assert custom_label in custom_frame.text
 
 
 @pytest.mark.parametrize("width", [80, 107, 120, 160, 200])
@@ -188,7 +190,7 @@ def test_autofrozen_label_alone_keeps_row_state_and_reuse_warning(
     assert _run(screen, [coin]) == []
 
     row = _line_with(screen.frames[0], "jm:autof")
-    assert "frozen" in row and "RU!" in row
+    assert "frozn" in row and "RU!" in row
     assert "Warning: Address reuse" in screen.frames[0].text
 
 
@@ -215,9 +217,12 @@ def test_full_table_reserves_wide_values_and_shows_outpoint_in_footer(
 
     row = _line_with(screen.frames[0], "bcrt1q")
     assert "2,100,000,000,000,000" in row
-    status = _line_with(screen.frames[0], "Out: ")
+    status = _line_with(screen.frames[0], "Outpoint:")
+    # The outpoint sits on the "Outpoint:" line whenever it fits (forced
+    # break only on overflow); the explanation follows on its own line.
     assert f"{coin.txid}:12345" in status
-    assert "spendable" in row and "RU!" in row
+    assert "spend" in row and "RU!" in row
+    assert "spend" in row and "RU!" in row
 
 
 @pytest.mark.parametrize("key", [ord("q"), 27])
@@ -301,11 +306,13 @@ def test_enlarging_a_shrunken_window_refills_the_list(patched_selector_curses: N
     coins = [_utxo(chr(ord("a") + index)) for index in range(14)]
     events = [
         _event(32, 120, ord("G")),  # cursor to the last coin
-        _event(19, 120, curses.KEY_RESIZE),  # shrink: only the final rows stay visible
-        _event(32, 120, curses.KEY_RESIZE),  # enlarge again
-        _event(32, 120, ord("q")),
+        _event(20, 120, curses.KEY_RESIZE),  # shrink: only the final rows stay visible
+        # Enlarge past the footer's guaranteed blank line (14 footer rows):
+        # 34 rows give the full 14-coin list room again (5 + 14 + 14 + 1).
+        _event(34, 120, curses.KEY_RESIZE),
+        _event(34, 120, ord("q")),
     ]
-    screen = StrictScreen(32, 120, events)
+    screen = StrictScreen(34, 120, events)
 
     assert _run(screen, coins) == []
 
@@ -360,9 +367,9 @@ def test_immature_and_dynamically_pinned_other_mixdepth_states_match_footer(
 
     immature_frame = _frame_with(screen.frames, "requires 5 confirmations")
     other_mixdepth_frame = _frame_with(screen.frames, "source is m0")
-    assert "immature" in _line_with(immature_frame, "bbbbbbbb")
+    assert "immat" in _line_with(immature_frame, "bbbbbbbb")
     assert "5 confirmation" in immature_frame.text
-    assert "other-md" in _line_with(other_mixdepth_frame, "cccccccc")
+    assert "oth-md" in _line_with(other_mixdepth_frame, "cccccccc")
     assert "Source mixdepth: m0" in other_mixdepth_frame.text
 
 
@@ -387,7 +394,7 @@ def test_fixed_mixdepth_other_state_matches_footer_and_cannot_be_selected(
     assert _run(screen, [allowed, blocked], allowed_mixdepth=0) == []
 
     blocked_frame = _frame_with(screen.frames, "source is m0")
-    assert "other-md" in _line_with(blocked_frame, "bbbbbbbb")
+    assert "oth-md" in _line_with(blocked_frame, "bbbbbbbb")
     assert "Source mixdepth: m0" in blocked_frame.text
     assert "[x]" not in _line_with(blocked_frame, "bbbbbbbb")
 
@@ -427,7 +434,7 @@ def test_select_all_and_deselect_all_respect_gates_then_unpin_mixdepth(
     assert "Selected: 2/2" in screen.frames[1].text
     assert "Selected: 0/3" in screen.frames[2].text
     selected_frame = screen.frames[1]
-    for state in ("frozen", "locked", "in-use", "immature"):
+    for state in ("frozn", "lock", "in-use", "immat"):
         assert state in selected_frame.text
 
 
@@ -457,7 +464,7 @@ def test_coinjoin_context_blocks_expired_bond_from_toggle_and_select_all(
     bond_row = _line_with(bond_frame, "bbbbbbbb")
     assert "[-]" in bond_row
     assert "no-cj" in bond_row
-    assert "FB-expired" in bond_row
+    assert "fb-x" in bond_row
     assert "fidelity bonds cannot be used in CoinJoins" in bond_frame.text
     assert "Selected: 1/1" in screen.frames[-1].text
 
@@ -475,9 +482,9 @@ def test_send_context_keeps_expired_bond_selectable(patched_selector_curses: Non
     )
 
     assert _run(screen, [expired_bond]) == [expired_bond]
-    # The spendable state lives in the table's state column only.
+    # The spend state lives in the table's state column only.
     bond_row = _line_with(screen.frames[0], "bbbbbbbb")
-    assert "spendable" in bond_row
+    assert "spend" in bond_row
     assert "no-cj" not in screen.frames[0].text
 
 
@@ -529,7 +536,7 @@ def test_real_curses_pty_renders_selection_and_reuse_warning(width: int) -> None
     master_fd, slave_fd = pty.openpty()
     process: subprocess.Popen[bytes] | None = None
     try:
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, width, 0, 0))
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 25, width, 0, 0))
         environment = os.environ.copy()
         environment["TERM"] = "xterm"
         python_paths = [path for path in sys.path if path]
@@ -576,7 +583,19 @@ def queue_cancel(callback, *args):
         assert any("Total: 100,000 sats" in line for line in lines), lines
         assert any("Target: 50,000 sats" in line for line in lines), lines
         frozen_row = next(line for line in lines if "jm:autof" in line)
-        assert "frozen" in frozen_row and "RU!" in frozen_row, frozen_row
+        assert "frozn" in frozen_row and "RU!" in frozen_row, frozen_row
+        # Wiring guard: the status block must go through wrap_status_text.
+        # The displayed outpoint must sit WHOLE on a single line — a lost
+        # wiring hard-chunks it mid-value across two lines (this is the
+        # parity property, independent of which coin the cursor shows).
+        txids = (coin_a.txid, coin_b.txid)
+        whole = [line for line in lines if any(f"{t}:0" in line for t in txids)]
+        partial = [
+            line
+            for line in lines
+            if any(t[:24] in line and f"{t}:0" not in line for t in txids)
+        ]
+        assert whole and not partial, lines
         return result
     return real_wrapper(run_with_cancel)
 
@@ -629,6 +648,35 @@ print("PTY_SELECTOR_RESULT=[]", flush=True)
         if slave_fd >= 0:
             os.close(slave_fd)
         os.close(master_fd)
+
+
+@pytest.mark.parametrize("width", [80, 81, 82])
+def test_no_status_padding_line_when_wallet_has_longer_outpoints(
+    patched_selector_curses: None, width: int
+) -> None:
+    """No wallet-maximum padding line in the status block (freeze parity)."""
+
+    # Freeze-parity: a 2-digit-vout coin tips the wrap threshold one column
+    # earlier; the dropped max-reserve padding must not leave a visible
+    # empty line at width 81 (user-reported resize flip 80/81/82).
+    cursor_coin = _utxo("a")  # vout 0
+    wide_coin = _utxo("b")
+    wide_coin.vout = 15
+    screen = StrictScreen(30, width, [_event(30, width, ord("q"))])
+
+    assert _run(screen, [cursor_coin, wide_coin], target_amount=50_000) == []
+
+    lines = screen.frames[0].lines
+    start = next(i for i, line in enumerate(lines) if "UTXO Status" in line)
+    status_block = []
+    for line in lines[start + 1 :]:
+        if line.startswith("|") and set(line) <= set("|-"):
+            break
+        status_block.append(line)
+    assert any(f"{cursor_coin.txid}:0" in line for line in status_block)
+    for line in status_block:
+        inner = line.strip("|").strip()
+        assert inner, status_block
 
 
 def test_branch_group_separators_are_labelled_in_extended_view_order(
@@ -768,3 +816,178 @@ def test_pin_notice_takes_precedence_over_the_reuse_warning(
     assert ru_note not in screen.frames[2].text
     assert ru_note in screen.frames[3].text
     assert notice not in screen.frames[3].text
+
+
+def test_help_hint_in_controls_and_overlay_opens_and_closes(
+    patched_selector_curses: None,
+) -> None:
+    """``?`` opens the help overlay; the next key closes it back to the list."""
+    coins = [_utxo("a"), _utxo("b", frozen=True)]
+    # Height 48: the overlay holds the title header, the full tag + state
+    # legend plus the view rules; at smaller heights the tail (rules,
+    # close hint, closing rule) would be cut off.
+    screen = StrictScreen(
+        48,
+        120,
+        [
+            _event(48, 120, ord("?")),
+            _event(48, 120, ord("q")),  # closes the overlay only
+            _event(48, 120, ord("q")),  # cancels the selector
+        ],
+    )
+
+    assert _run(screen, coins) == []
+
+    list_frame = screen.frames[0]
+    assert "?: help" in list_frame.text  # hint lives in the Controls footer
+
+    help_frame = screen.frames[1]
+    # Help-screen title: TUI header style, second row, centered, dashes
+    # included, no frame around it.
+    assert help_frame.lines[1].strip() == "— UTXO Selector Help Screen —"
+    assert help_frame.lines[1] != help_frame.lines[1].strip()
+    # Shared legend content in the extended view's legend format.
+    assert "tags (type of address or funds):" in help_frame.text
+    assert "states (spendability):" in help_frame.text
+    assert "unconf" in help_frame.text and "in-use" in help_frame.text
+    assert "jm-wallet send --select-utxos" in help_frame.text
+    assert "q/Esc: back to the list" in help_frame.text
+    # Every section header sits under a full-width rule; the rule before
+    # the tag legend is the box's top edge; the box closes after the hint.
+    lines = help_frame.lines
+    for header in ("tags (type of address or funds):", "states (spendability):"):
+        idx = next(i for i, line in enumerate(lines) if header in line)
+        assert lines[idx - 1].startswith("|-"), lines[idx - 1]
+    close_idx = next(i for i, line in enumerate(lines) if "q/Esc: back to the list" in line)
+    assert lines[close_idx + 1].startswith("|-"), lines[close_idx + 1]
+
+    # Back to the list after closing, not exited: one more render happened.
+    back_frame = screen.frames[2]
+    assert "UTXO Selector" in back_frame.text
+    assert "tags (type of address" not in back_frame.text
+
+
+def test_reuse_column_appears_only_when_reuse_exists(
+    patched_selector_curses: None,
+) -> None:
+    """The RU! column exists if and only if the wallet has address reuse."""
+
+    def run(utxos: list[UTXOInfo]) -> Frame:
+        # Height 26: the status block costs one list row, so this run keeps
+        # the same visible list capacity the 24-row layout had before it.
+        screen = StrictScreen(26, 140, [_event(26, 140, ord("q"))])
+        assert _run(screen, utxos) == []
+        return screen.frames[0]
+
+    # No reuse: no column, nothing right of the table's right border, no
+    # footer warning.
+    clean = run([_utxo("a"), _utxo("b")])
+    assert _line_with(clean, "state").rstrip().endswith("|")
+    assert "RU!" not in clean.text
+    assert "Warning: Address reuse" not in clean.text
+
+    # Reuse: flush header cell and row cells inside the border; the footer
+    # carries the explanation.
+    reused = run(
+        [
+            _utxo("a", address="bcrt1qshared"),
+            _utxo("b", address="bcrt1qshared"),
+            _utxo("c"),
+        ]
+    )
+    assert _line_with(reused, "state").rstrip().endswith("|RU!|")
+    reused_rows = [line for line in reused.lines if "bcrt1qshared" in line and "|" in line]
+    assert reused_rows
+    for row in reused_rows:
+        assert row.rstrip().endswith("|RU!|")
+    # The unused coin's row keeps the border flush with blank cell padding.
+    other_row = _line_with(reused, "bcrt1qcccccccccccc")
+    assert other_row.rstrip().endswith("|   |")
+    assert "Warning: Address reuse" in reused.text
+
+
+def test_footer_opens_with_the_table_closing_separator(
+    patched_selector_curses: None,
+) -> None:
+    """The footer's first row closes the table; no reserved blank row remains."""
+    screen = StrictScreen(24, 140, [_event(24, 140, ord("q"))])
+    assert _run(screen, [_utxo("a")]) == []
+
+    frame = screen.frames[0]
+    sep_rows = [line for line in frame.lines if line.startswith("|-")]
+    # Bottom edge of the table plus the footer's internal separators.
+    assert len(sep_rows) >= 2
+    # Between the last coin row and the table's closing separator only empty
+    # framed rows may appear (border columns stay connected; no stray text).
+    last_coin = frame.lines.index(_line_with(frame, "bcrt1q"))
+    closing = next(
+        i
+        for i, line in enumerate(frame.lines[last_coin + 1 :], last_coin + 1)
+        if line.startswith("|-")
+    )
+    for filler in frame.lines[last_coin + 1 : closing]:
+        assert filler.startswith("|") and filler.rstrip().endswith("|")
+        assert filler.replace("|", "").strip() == ""
+
+
+def test_eighty_columns_long_wallet_name_renders_with_one_line_status(
+    patched_selector_curses: None,
+) -> None:
+    """80x22 with a long wallet name renders via the 1-line status fallback.
+
+    Regression: the 2-line status block (forced by narrow widths) pushed the
+    vertical budget below zero and the generic 'too small' prompt hid a
+    height problem that the one-line block solves. At 80 columns with the
+    selector's footer the 2-line block needs one row more than the terminal
+    offers; the one-line form fits.
+    """
+    coin = _utxo("a")
+    screen = StrictScreen(22, 80, [_event(22, 80, ord("q"))])
+
+    result = utxo_selector._run_selector(
+        screen,
+        utxo_selector._prepare_display_items([coin]),
+        0,
+        None,
+        0,
+        set(),
+        True,
+        wallet_name="a-very-long-wallet-name-for-height-budget-testing",
+        wallet_fingerprint="abcd1234",
+    )
+
+    assert result == []
+    frame = screen.frames[-1]
+    assert "Terminal too" not in frame.text
+    status_line = _line_with(frame, "Active Wallet:")
+    # One-line status form: the row is one line, so narrow widths clip even
+    # labels -- anchor on the fingerprint value, not the label.
+    assert "abcd1234" in status_line
+
+
+def test_width_below_minimum_prompt_names_width(patched_selector_curses: None) -> None:
+    """Below the table minimum the prompt names width as the fix."""
+    coin = _utxo("a")
+    screen = StrictScreen(24, 40, [_event(24, 40, ord("q"))])
+
+    result = utxo_selector._run_selector(
+        screen, utxo_selector._prepare_display_items([coin]), 0, None, 0, set(), True
+    )
+
+    assert result == []
+    assert "Terminal too narrow" in screen.frames[-1].text
+    assert "Terminal too short" not in screen.frames[-1].text
+
+
+def test_short_terminal_prompt_names_height(patched_selector_curses: None) -> None:
+    """Enough columns but no vertical budget: the prompt names height."""
+    coin = _utxo("a")
+    screen = StrictScreen(3, 120, [_event(3, 120, ord("q"))])
+
+    result = utxo_selector._run_selector(
+        screen, utxo_selector._prepare_display_items([coin]), 0, None, 0, set(), True
+    )
+
+    assert result == []
+    assert "Terminal too short" in screen.frames[-1].text
+    assert "Terminal too narrow" not in screen.frames[-1].text

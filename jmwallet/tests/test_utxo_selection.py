@@ -1617,49 +1617,56 @@ class TestFreezeBranchGroupSeparators:
         from jmwallet.cli.freeze import _render_freeze_screen
 
         screen = MagicMock()
-        screen.getmaxyx.return_value = (24, 160)
+        # 26 rows so the grouped fixture's mixdepth-1 group is inside the
+        # scroll window (list_start 7 costs two rows over the old layout).
+        screen.getmaxyx.return_value = (26, 160)
+        wallet = MagicMock()
+        wallet.wallet_fingerprint = "abcd1234"
         with patch("curses.color_pair", return_value=0):
-            _render_freeze_screen(screen, items, 2, 0, None, False)
+            _render_freeze_screen(screen, items, 2, 0, None, False, wallet, "w.mnemonic")
         return {(call.args[0], call.args[1]): call.args[2] for call in screen.addstr.call_args_list}
 
     def test_first_group_gets_full_title(self) -> None:
         written = self._render(self._grouped_items())
         # Layout starts [None (blank), None (separator), first UTXO, ...]:
-        # the separator at row 6 introduces mixdepth 0's external branch.
-        # Framed layout: table content starts at column 3, border at col 154.
-        assert written[(6, 3)] == "Mixdepth 0"
-        assert written[(6, 13)] == " — "
-        assert written[(6, 16)] == "external addresses "
+        # the separator at row 8 introduces mixdepth 0's external branch
+        # (the one-line status block sits above the table: list_start 7).
+        # Framed layout: table content starts at column 1, right border at
+        # the last usable column 159 (sep_width = width - 1; the 160th cell
+        # is the terminal's unwritable bottom-right quirk column).
+        assert written[(8, 2)] == "Mixdepth 0"
+        assert written[(8, 12)] == " — "
+        assert written[(8, 15)] == "external addresses "
         # The rest of the line (up to the right border) is padded with dashes.
-        assert written[(6, 35)] == "-" * (154 - 35)
-        assert written[(6, 154)] == "|"
+        assert written[(8, 34)] == "-" * (159 - 34 - 1)
+        assert written[(8, 159)] == "|"
 
     def test_branch_change_replaces_title_keeps_branch_column(self) -> None:
         written = self._render(self._grouped_items())
-        # Row 8: placeholder dashes replace the title; the branch name stays
+        # Row 10: placeholder dashes replace the title; the branch name stays
         # column-flush with the full title above (column 16).
-        assert written[(8, 3)] == "-" * len("Mixdepth 0")
-        assert written[(8, 13)] == " — "
-        assert written[(8, 16)] == "internal addresses "
-        assert written[(8, 35)] == "-" * (154 - 35)
+        assert written[(10, 2)] == "-" * len("Mixdepth 0")
+        assert written[(10, 12)] == " — "
+        assert written[(10, 15)] == "internal addresses "
+        assert written[(10, 34)] == "-" * (159 - 34 - 1)
 
     def test_new_mixdepth_gets_full_title_after_blank_row(self) -> None:
         written = self._render(self._grouped_items())
-        # Rows 5 and 10 are blank border rows (borders only); row 11 opens
+        # Rows 7 and 12 are blank border rows (borders only); row 13 opens
         # mixdepth 1.
-        assert (5, 3) not in written
-        assert written[(5, 2)] == "|" and written[(5, 154)] == "|"
-        assert (10, 3) not in written
-        assert written[(10, 2)] == "|" and written[(10, 154)] == "|"
-        assert written[(11, 3)] == "Mixdepth 1"
-        assert written[(11, 16)] == "external addresses "
+        assert (7, 2) not in written
+        assert written[(7, 0)] == "|" and written[(7, 159)] == "|"
+        assert (12, 2) not in written
+        assert written[(12, 0)] == "|" and written[(12, 159)] == "|"
+        assert written[(13, 2)] == "Mixdepth 1"
+        assert written[(13, 15)] == "external addresses "
 
     def test_trailing_separator_renders_plain_dash_line(self) -> None:
         written = self._render([None])
         # Without a following group the separator is a plain dash line inside
         # the frame (inner width = separator width minus the border columns).
-        assert written[(5, 3)] == "-" * 151
-        assert written[(5, 154)] == "|"
+        assert written[(7, 1)] == "-" * 158
+        assert written[(7, 159)] == "|"
 
     def test_cursor_seeks_past_leading_separators(self) -> None:
         from jmwallet.cli.freeze import _seek_selectable
@@ -1680,15 +1687,18 @@ class TestFreezeBranchGroupSeparators:
             branch_groups=True,
         )
         written = self._render(items)
-        # Layout [None (blank, row 5), None (separator, row 6), a(7), b(8)]:
+        # Layout [None (blank, row 7), None (separator, row 8), a(9), b(10)]
+        # (one-line status block above the table):
         # both UTXO rows show the full address, no "..." placeholder.
-        assert same in written[(7, 3)]
-        assert same in written[(8, 3)]
+        assert same in written[(9, 1)]
+        assert same in written[(10, 1)]
 
 
-# Heights below 5 (title/header) + footer (11 or 12 rows) + table line only
-# draw the resize prompt instead, so the minimum test height is 18.
-@pytest.mark.parametrize("height", [18, 24, 40])
+# Heights below 7 (title rules + one-line status header) + footer (11 or 12
+# rows) + table line only draw the resize prompt instead; with the taller
+# bond footer the minimum test height is 21 (20 leaves no list row when
+# bonds exist).
+@pytest.mark.parametrize("height", [21, 24, 40])
 @pytest.mark.parametrize("has_bonds", [False, True])
 @pytest.mark.parametrize("cursor_pos", [0, 14, 20])
 def test_freeze_viewport_keeps_selected_utxo_above_footer(
@@ -1718,18 +1728,31 @@ def test_freeze_viewport_keeps_selected_utxo_above_footer(
 
     screen = MagicMock()
     screen.getmaxyx.return_value = (height, 160)
+    wallet = MagicMock()
+    wallet.wallet_fingerprint = "abcd1234"
     with patch("curses.color_pair", return_value=0):
-        scroll_offset, list_height = _render_freeze_screen(
-            screen, utxos, cursor_pos, 0, None, False
+        scroll_offset, list_height, _resize_reason = _render_freeze_screen(
+            screen, utxos, cursor_pos, 0, None, False, wallet, "w.mnemonic"
         )
 
     # Footer: separator + Freeze Details + 1-2 stats lines + separator +
-    # UTXO Status + Out line + reserved note line + separator + Controls +
-    # controls line + blank == 11 rows, plus one bond stats line when bonds
-    # exist.
-    footer_rows = 12 if has_bonds else 11
+    # UTXO Status + 1 status line (the cursor coin is unlabeled: no
+    # description line) + separator + Controls + controls line + blank
+    # == 10 rows, plus one bond stats line and one bond status line when
+    # bonds exist (the bonded coin's "Active Fidelity Bond" description
+    # wraps as its own status line). (No note row: conditional since
+    # 2026-11-15, and this wallet has no reuse and no error. No status
+    # padding: max-reserve dropped 2026-11-15 -- the status block follows
+    # the cursor coin, so the footer is cursor-dependent: the bonded coin's
+    # description adds a status line only while the cursor stands on it.)
+    cursor_on_bond = has_bonds and cursor_pos == len(utxos) - 1
+    footer_rows = 10 + (1 if has_bonds else 0) + (1 if cursor_on_bond else 0)
     separator_row = height - footer_rows
-    assert list_height == separator_row - 5
+    # One blank row stays below the footer box (black frame at the screen's
+    # bottom edge). List rows start below the one-line status header
+    # (list_start = 7: title rules 1-2, status line 3, rule 4, header 5,
+    # rule 6).
+    assert list_height == separator_row - 8
     assert scroll_offset <= cursor_pos < scroll_offset + list_height
 
     selected_rows = [
@@ -1737,8 +1760,8 @@ def test_freeze_viewport_keeps_selected_utxo_above_footer(
         for call in screen.addstr.call_args_list
         if len(call.args) == 4 and call.args[3] & curses.A_REVERSE
     ]
-    assert selected_rows == [5 + cursor_pos - scroll_offset]
-    assert 5 <= selected_rows[0] < separator_row
+    assert selected_rows == [7 + cursor_pos - scroll_offset]
+    assert 7 <= selected_rows[0] < separator_row
 
 
 class TestFreezeFooterStats:

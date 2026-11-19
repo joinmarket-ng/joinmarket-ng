@@ -8,20 +8,35 @@ scroll adjustment.
 
 from __future__ import annotations
 
+import curses
+from typing import cast
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from jmwallet import utxo_tui as utxo_tui_mod
 from jmwallet.utxo_tui import (
     ADDRESS_COL_WIDTH,
+    _display_width,
+    _help_overlay_rows,
     adjust_scroll,
+    align_control_columns,
     branch_display_rank,
     build_display_items,
+    draw_resize_prompt,
+    draw_status_block,
     enrich_utxo_labels,
     format_address_column,
     group_label,
     group_separator_parts,
     seek_selectable,
+    status_header_lines,
     utxo_branch,
     utxo_display_sort_key,
     utxo_sort_key,
+    wrap_status_text,
 )
+from jmwallet.wallet import rows as rows_mod
 from jmwallet.wallet.models import UTXOInfo
 
 
@@ -340,7 +355,7 @@ class TestEnrichUtxoLabels:
         assert labeled.label == "personal note"
 
     def test_fidelity_bond_is_never_looked_up(self) -> None:
-        # A bond's tag column already renders FB-active/FB-expired; its
+        # A bond's tag column already renders fb-a/fb-x; its
         # label slot must stay untouched so nothing overwrites a user note.
         bond = _utxo(0, locktime=1_900_000_000)
 
@@ -354,3 +369,404 @@ class TestEnrichUtxoLabels:
         unlabeled = _utxo(0)
         enrich_utxo_labels(lambda _addr: "", [unlabeled])
         assert unlabeled.label == ""
+
+
+class TestWrapStatusText:
+    """The outpoint value moves whole below the label, never breaks mid-value."""
+
+    def test_value_moves_whole_below_the_label(self) -> None:
+        # 64-hex txid + vout: too wide for a 75-column box together with the
+        # label, but fits on its own line.
+        txid = "a" * 64
+        lines = wrap_status_text(f"Outpoint: {txid}:0", 75)
+        assert lines == ["Outpoint:", f"{txid}:0"]
+
+    def test_value_stays_on_the_label_line_when_it_fits(self) -> None:
+        txid = "a" * 64
+        lines = wrap_status_text(f"Outpoint: {txid}:0", 76)
+        assert lines == [f"Outpoint: {txid}:0"]
+
+    def test_overlong_value_is_hard_chunked_only_as_last_resort(self) -> None:
+        txid = "a" * 140
+        lines = wrap_status_text(f"Outpoint: {txid}:0", 75)
+        assert lines[0] == "Outpoint:"
+        assert all(len(line) <= 75 for line in lines[1:])
+        assert "".join(lines[1:]) == f"{txid}:0"
+
+    def test_explanation_wraps_below_without_separator_at_breaks(self) -> None:
+        txid = "a" * 64
+        text = f"Outpoint: {txid}:0\nfrozn | tag: keep"
+        lines = wrap_status_text(text, 75)
+        assert lines[0] == "Outpoint:"
+        assert lines[1] == f"{txid}:0"
+        assert lines[2] == "frozn | tag: keep"
+
+    def test_payload_without_outpoint_prefix_wraps_normally(self) -> None:
+        lines = wrap_status_text("a | b", 75)
+        assert lines == ["a | b"]
+
+
+class TestFrameTopEdge:
+    """The box's top edge: a rule between the title and the header row."""
+
+    def test_top_edge_rule_sits_between_title_and_header(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from jmwallet.cli.freeze import _render_freeze_screen
+
+        utxos = [
+            UTXOInfo(
+                txid=f"{i + 1:064x}",
+                vout=0,
+                value=100_000,
+                address=f"bcrt1qedge{i}",
+                confirmations=10,
+                scriptpubkey="0014" + "11" * 20,
+                path=f"m/84'/1'/0'/0/{i}",
+                mixdepth=0,
+            )
+            for i in range(3)
+        ]
+        screen = MagicMock()
+        screen.getmaxyx.return_value = (24, 160)
+        with (
+            patch("curses.color_pair", return_value=0),
+            patch("jmwallet.cli.freeze.maker_bot_status", return_value="STOPPED"),
+        ):
+            _render_freeze_screen(screen, utxos, 0, 0, None, False, MagicMock(), "w.mnemonic")
+        written = {(c.args[0], c.args[1]): c.args[2] for c in screen.addstr.call_args_list}
+        # Top edge spans columns 1..sep_width-1 on row 2, borders on both
+        # ends; bottom edge sits one row above the screen's bottom, and the
+        # screen's last row stays empty (black frame).
+        assert written[(2, 0)] == "|"
+        assert written[(2, 1)] == "-" * 158
+        assert written[(2, 159)] == "|"
+        # The closing edge is drawn as one pre-framed line.
+        assert written[(22, 0)] == "|" + "-" * 158 + "|"
+        # The screen's last row stays empty: the black frame below the box.
+        assert all(key[0] != 23 for key in written)
+
+
+class TestHelpOverlayCatalogGuards:
+    """The help overlay explains every emittable value and nothing else.
+
+    Invariant: for each TUI, the overlay's state section covers exactly
+    the states that view can emit -- a missing explanation leaves the user
+    without help for a visible token; an extra one explains a state the
+    view can never show. Same contract for tags (both TUIs share the
+    ``short_label`` emission set).
+    """
+
+    SEP = 40
+
+    @pytest.fixture(autouse=True)
+    def _patch_curses_color_pair(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # _help_overlay_rows resolves color_pair at row-build time; the
+        # overlay tests below run without a curses terminal.
+        monkeypatch.setattr(curses, "color_pair", lambda _pair_number: 0)
+
+    def _state_entries(self, state_tokens: tuple[str, ...]) -> set[str]:
+        """Collect state tokens from overlay rows via their entry structure.
+
+        Every entry is formatted ``f"{token:<7} - detail...``: the token
+        is padded to 7 and the separator " - " follows, so "- " sits
+        exactly at columns 9-10 of the raw text row. Wrapped continuation
+        lines of long explanations do not carry that structure and are
+        ignored.
+        """
+        rows = _help_overlay_rows(self.SEP, state_tokens)
+        start = next(i for i, (line, _) in enumerate(rows) if "states (spendability):" in line)
+        entries = set()
+        for line, _attr in rows[start + 1 :]:
+            if line.startswith("|-"):
+                break
+            if line[8:10] == "- ":
+                token = line[:8].strip()
+                assert token in state_tokens, token
+                entries.add(token)
+        return entries
+
+    def test_state_help_covers_exactly_the_catalog(self) -> None:
+        """Every catalog token has a STATE_HELP entry; no orphan entries."""
+        assert set(rows_mod.STATE_HELP) == set(rows_mod._STATE_TOKENS)
+
+    def test_tag_help_covers_every_short_label_value(self) -> None:
+        """TAG_HELP explains every value ``short_label`` can ever produce.
+
+        Emission set: every ``_STATUS_TO_LABEL`` value plus the fidelity
+        bond pair plus the BIP-329 pass-through form.
+        """
+        emittable = set(rows_mod._STATUS_TO_LABEL.values()) | {"fb-a", "fb-x"}
+        for token in emittable:
+            assert token in rows_mod.TAG_HELP, token
+        # The BIP-329 pass-through renders as "<label>".
+        assert "<label>" in rows_mod.TAG_HELP
+
+    def test_freeze_overlay_states_exactly_the_freeze_subset(self) -> None:
+        """Freeze help lists exactly frozn/spend/lock, in catalog order.
+
+        ``FREEZE_STATE_TOKENS`` is derived from the catalog by filtering,
+        so the overlay's order is catalog order; the tuple pin makes an
+        accidental catalog reorder loud instead of a silent visual change.
+        """
+        assert rows_mod.FREEZE_STATE_TOKENS == ("frozn", "spend", "lock")
+        assert self._state_entries(rows_mod.FREEZE_STATE_TOKENS) == {"frozn", "lock", "spend"}
+
+    def test_selector_overlay_states_exactly_catalog_minus_pend(self) -> None:
+        """Selector help lists every catalog state except ``pend``."""
+        assert set(rows_mod.SELECTOR_STATE_TOKENS) == set(rows_mod._STATE_TOKENS) - {"pend"}
+        assert self._state_entries(rows_mod.SELECTOR_STATE_TOKENS) == set(
+            rows_mod.SELECTOR_STATE_TOKENS
+        )
+
+    def test_missing_state_help_entry_crashes_loudly(self) -> None:
+        """A state token without a STATE_HELP entry raises, never skips."""
+        with pytest.raises(KeyError):
+            _help_overlay_rows(self.SEP, ("no-such-state",))
+
+
+class TestStatusHeaderLines:
+    """The status block cascade: stages, alignment, clipping, borders."""
+
+    NAME = "w.mnemonic"
+    FP = "abcd1234"
+
+    def _lines(self, sep_width: int) -> list[str]:
+        return status_header_lines(sep_width, self.NAME, self.FP, "STOPPED")
+
+    def test_wide_terminal_one_line(self) -> None:
+        """Everything fits on one line at a wide terminal."""
+        lines = self._lines(120)
+        assert lines == ["Active Wallet: w.mnemonic | Fingerprint:   abcd1234 | Maker Bot: STOPPED"]
+
+    def test_narrow_terminal_two_lines_maker_with_name(self) -> None:
+        """Stage 2: name + maker status above, fingerprint aligned below."""
+        lines = self._lines(66)
+        assert lines == [
+            "Active Wallet: w.mnemonic | Maker Bot: STOPPED",
+            "Fingerprint:   abcd1234",
+        ]
+
+    def test_very_narrow_terminal_name_alone_first(self) -> None:
+        """Stage 3: name alone, fingerprint and maker status share the second."""
+        # Geometry: the stage-3 second line (44 cols with a 7-char fingerprint)
+        # fits exactly at sep 46 while stage 2 (45 cols) does not -- the only
+        # window where stage 3 renders unclipped.
+        lines = status_header_lines(46, self.NAME, "abcd123", "STOPPED")
+        assert lines == [
+            "Active Wallet: w.mnemonic",
+            "Fingerprint:   abcd123 | Maker Bot: STOPPED",
+        ]
+
+    def test_extreme_width_clips_values_never_overflows(self) -> None:
+        """Below stage 3 thresholds every line is clipped to the body width."""
+        lines = self._lines(30)
+        assert all(_display_width(line) <= 28 for line in lines)
+        # The name line still fits whole; the second line clips its tail.
+        assert lines[0] == "Active Wallet: w.mnemonic"
+        assert lines[1].endswith("...")
+
+    def test_values_align_at_column_21_in_every_stage(self) -> None:
+        """Both labels are 15 columns, so the value starts at index 15."""
+        for sep_width in (30, 40, 50, 66, 80, 127, 200):
+            for line in self._lines(sep_width):
+                if line.startswith("Active Wallet: "):
+                    assert line[len("Active Wallet: ") :].startswith(self.NAME)
+                elif line.startswith("Fingerprint:   ") and "Maker" not in line:
+                    assert line[len("Fingerprint:   ") :].startswith(self.FP)
+
+    def test_long_wallet_name_pushes_cascade(self) -> None:
+        """A long name falls through to the later cascade stages, not overflow."""
+        lines = status_header_lines(80, "a-very-long-wallet-name.mnemonic", self.FP, "STOPPED")
+        assert len(lines) == 2
+        assert all(_display_width(line) <= 78 for line in lines)
+
+    def test_max_lines_one_forces_single_line_form(self) -> None:
+        """max_lines=1 returns the one-line form with all three fields, clipped."""
+        lines = status_header_lines(
+            110, "a-very-long-wallet-name.mnemonic", self.FP, "STOPPED", max_lines=1
+        )
+        assert len(lines) == 1
+        line = lines[0]
+        # Everything fits at this width: all three fields share the row.
+        assert line.startswith("Active Wallet: a-very-long-wallet-name.mnemonic")
+        assert "Fingerprint:   " in line
+        assert "Maker Bot: STOPPED" in line
+        assert _display_width(line) <= 108
+
+    def test_max_lines_one_clips_tail_when_narrow(self) -> None:
+        """Narrow one-line form keeps all fields and clips the long name value."""
+        lines = status_header_lines(
+            80, "a-very-long-wallet-name.mnemonic", self.FP, "STOPPED", max_lines=1
+        )
+        assert len(lines) == 1
+        line = lines[0]
+        # Name value clipped to fit, but fingerprint and maker status survive.
+        name_part = line.split(" | Fingerprint:")[0]
+        assert name_part.startswith("Active Wallet: ")
+        assert name_part.endswith("...")
+        assert "Fingerprint:   abcd1234" in line
+        assert "Maker Bot: STOPPED" in line
+        assert _display_width(line) <= 78
+
+    def test_max_lines_default_two_keeps_cascade(self) -> None:
+        """Omitting max_lines keeps the pre-existing cascade behavior."""
+        lines = status_header_lines(80, "a-very-long-wallet-name.mnemonic", self.FP, "STOPPED")
+        assert len(lines) == 2
+
+    def test_draw_resize_prompt_reason_texts(self) -> None:
+        """The prompt names the dimension it wants resized; generic stays fallback."""
+
+        class _PromptScreen:
+            """Minimal double recording the prompt text at (0, 0)."""
+
+            def __init__(self, width: int) -> None:
+                self._width = width
+                self.text = ""
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return 24, self._width
+
+            def addstr(self, _y: int, _x: int, text: str, _attr: int = 0) -> None:
+                self.text = text
+
+            def refresh(self) -> None:
+                pass
+
+        screen = _PromptScreen(60)
+        draw_resize_prompt(cast(curses.window, screen), 60, "width")
+        assert screen.text.startswith("Terminal too narrow. Please resize.")
+
+        screen = _PromptScreen(60)
+        draw_resize_prompt(cast(curses.window, screen), 60, "height")
+        assert screen.text.startswith("Terminal too short. Please resize.")
+
+        screen = _PromptScreen(60)
+        draw_resize_prompt(cast(curses.window, screen), 60)
+        assert screen.text.startswith("Terminal too small. Please resize.")
+
+    def test_display_width_counts_columns_not_characters(self) -> None:
+        """CJK-wide text measures 2 columns per char; combining marks 0."""
+        assert _display_width("ab") == 2
+        assert _display_width("中文") == 4
+        assert _display_width("é") == 1  # combining acute: 1 + 0
+
+    @staticmethod
+    def _fake_proc(monkeypatch: pytest.MonkeyPatch, argv: bytes) -> None:
+        """Pin the /proc scan to a single fake process with the given argv."""
+        import pathlib
+
+        class FakeCmdline:
+            @staticmethod
+            def read_bytes() -> bytes:
+                return argv
+
+        class FakeEntry:
+            name = "4711"
+
+            def isdigit(self) -> bool:
+                return True
+
+            def __truediv__(self, other: str) -> FakeCmdline:
+                assert other == "cmdline"
+                return FakeCmdline()
+
+            @property
+            def cmdline(self) -> FakeCmdline:
+                return FakeCmdline()
+
+        class FakeProcDir:
+            def iterdir(self):  # type: ignore[no-untyped-def]
+                yield FakeEntry()
+
+        monkeypatch.setattr(pathlib, "Path", lambda _p: FakeProcDir())
+
+    def test_maker_status_running_on_jm_maker_argv(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A process whose argv contains ``jm-maker`` reads as RUNNING."""
+        self._fake_proc(
+            monkeypatch, b"/usr/bin/python3\x00/home/u/.local/bin/jm-maker\x00serve\x00"
+        )
+        assert utxo_tui_mod.maker_bot_status() == "RUNNING"
+
+    def test_maker_status_stopped_without_jm_maker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No matching argv anywhere reads as STOPPED (never matches itself)."""
+        self._fake_proc(monkeypatch, b"/usr/bin/python3\x00/usr/local/bin/jm-taker\x00")
+        assert utxo_tui_mod.maker_bot_status() == "STOPPED"
+
+
+class TestDrawStatusBlock:
+    """The framed status block: borders, padding, value column."""
+
+    def test_block_lines_are_framed_left_and_right(self) -> None:
+        screen = MagicMock()
+        screen.getmaxyx.return_value = (10, 80)
+        with patch("curses.color_pair", return_value=0):
+            draw_status_block(screen, 3, ["Active Wallet: w | Maker Bot: STOPPED"], 78)
+        written = {(c.args[0], c.args[1]): c.args[2] for c in screen.addstr.call_args_list}
+        assert written[(3, 0)] == "|"
+        assert written[(3, 1)] == " Active Wallet: w | Maker Bot: STOPPED"
+        # Plain padding + right border flush at sep_width (37 text columns);
+        # the padding write begins after the text and ends with the border.
+        padding_write = written[(3, 39)]
+        assert padding_write.endswith("|")
+        assert padding_write == " " * 39 + "|"
+
+    def test_block_returns_row_count(self) -> None:
+        screen = MagicMock()
+        screen.getmaxyx.return_value = (10, 80)
+        with patch("curses.color_pair", return_value=0):
+            drawn = draw_status_block(screen, 3, ["a", "b"], 78)
+        assert drawn == 2
+        assert {c.args[0] for c in screen.addstr.call_args_list} == {3, 4}
+
+
+class TestAlignControlColumns:
+    """The controls hint renders as an aligned key table when it must wrap."""
+
+    def test_fits_on_one_line_stays_unwrapped(self) -> None:
+        """No grid needed when the whole hint fits: unchanged single line."""
+        text = "Space/Tab: toggle | j/k: navigate | q/Esc: exit"
+        assert align_control_columns(text, 200) == [text]
+
+    def test_selector_hint_at_footer_width_aligns_separators(self) -> None:
+        """At the 80-column footer width the selectors hint wraps aligned."""
+        hint = (
+            "Space/Tab: toggle | j/k: navigate | s: select mixdepth | "
+            "d: deselect all | Enter: confirm | ?: help | q/Esc: cancel"
+        )
+        lines = align_control_columns(hint, 75)
+        assert len(lines) == 2
+        # Separators line up vertically: row 2 pads each cell to the grid.
+        assert lines[0].startswith("Space/Tab: toggle | j/k: navigate | ")
+        assert lines[1].startswith("Enter: confirm    | ?: help       | ")
+        # Every row keeps the same separator column positions.
+        row1 = [i for i in range(len(lines[0])) if lines[0][i : i + 3] == " | "]
+        row2 = [i for i in range(len(lines[1])) if lines[1][i : i + 3] == " | "]
+        assert row1[:2] == row2[:2]
+        assert all(len(line) <= 75 for line in lines)
+
+    def test_freeze_hint_at_footer_width_aligns_separators(self) -> None:
+        """The freeze hint wraps into an aligned 4+2 grid."""
+        hint = (
+            "Space/Tab: toggle | j/k: navigate | a: freeze all | "
+            "n: unfreeze all | ?: help | q/Esc: exit"
+        )
+        lines = align_control_columns(hint, 75)
+        assert lines == [
+            "Space/Tab: toggle | j/k: navigate | a: freeze all | n: unfreeze all",
+            "?: help           | q/Esc: exit",
+        ]
+
+    def test_very_narrow_width_falls_back_to_one_column_per_row(self) -> None:
+        """Below the widest single field the grid degrades to one per row."""
+        hint = "a: freeze all | n: unfreeze all | q/Esc: exit"
+        lines = align_control_columns(hint, 15)
+        assert lines == ["a: freeze all", "n: unfreeze all", "q/Esc: exit"]
+
+    def test_oversized_field_hard_chunks_like_plain_wrap(self) -> None:
+        """A field wider than the box falls back to the plain hard-chunk wrap."""
+        huge = "x" * 40
+        text = f"{huge} | q/Esc: exit"
+        lines = align_control_columns(text, 20)
+        assert all(len(line) <= 20 for line in lines)
+        assert any("q/Esc: exit" in line for line in lines)

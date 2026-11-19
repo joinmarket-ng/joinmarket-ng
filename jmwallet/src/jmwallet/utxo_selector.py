@@ -23,22 +23,35 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from jmwallet.utxo_tui import (
-    _clip,
     _draw_footer,
+    _draw_frame_filler,
+    _draw_help_overlay,
+    _draw_hrule,
+    _header_line,
+    _help_overlay_rows,
     _is_address_reused,
     _minimum_table_width,
     _table_columns,
+    _table_sep_width,
     _utxo_state_col,
     _wrap_footer_fields,
     adjust_scroll,
+    align_control_columns,
     build_display_items,
     draw_resize_prompt,
+    draw_status_block,
     format_utxo_line,
     group_separator_parts,
+    maker_bot_status,
     seek_selectable,
+    status_header_lines,
     utxo_cursor_description,
     utxo_display_sort_key,
+    utxo_status_text,
+    wait_for_help_close,
+    wrap_status_text,
 )
+from jmwallet.wallet.rows import SELECTOR_STATE_TOKENS
 
 if TYPE_CHECKING:
     from jmwallet.wallet.models import UTXOInfo
@@ -46,8 +59,14 @@ if TYPE_CHECKING:
 
 _CONTROLS_HINT = (
     "Space/Tab: toggle | j/k: navigate | s: select mixdepth | "
-    "d: deselect all | Enter: confirm | q/Esc: cancel"
+    "d: deselect all | Enter: confirm | ?: help | q/Esc: cancel"
 )
+
+# States that may ever be selected in a session. ``unconf`` is selectable
+# only because direct sends run with min_confirmations == 0 (CoinJoins
+# route 0-conf coins to ``immat`` instead); ``pend`` is catalog-only
+# until the pending wiring lands and must never appear here.
+_SELECTABLE_STATES: frozenset[str] = frozenset({"spend", "unconf"})
 
 
 def _is_base_selectable(
@@ -74,29 +93,50 @@ def _is_base_selectable(
             min_confirmations,
             allow_fidelity_bonds=allow_fidelity_bonds,
         )
-        == "spendable"
+        in _SELECTABLE_STATES
     )
 
 
-def _draw_header(stdscr: curses.window, width: int, columns: list[tuple[str, int]]) -> str:
-    """Draw the title bar and the table header, returning the header line.
+_HELP_TITLE = " — UTXO Selector Help Screen —"
 
-    The returned header line is used to size the row separators and the
-    footer separators.
+
+def _draw_header(
+    stdscr: curses.window,
+    width: int,
+    columns: list[tuple[str, int]],
+    status_lines: list[str],
+) -> str:
+    """Draw the title bar, status block and table header.
+
+    The status block sits between the title rule and the header top edge
+    (whiptail ``menu_header`` style: wallet name, fingerprint, maker bot
+    status). ``status_lines`` is the prebuilt 1- or 2-line cascade from
+    :func:`status_header_lines`; the returned header line is used to size
+    the row separators and the footer separators.
     """
     header = " — UTXO Selector —"
     stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
     stdscr.addstr(1, 0, header.center(width)[:width])
     stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
 
-    header_line = "  | " + " | ".join(f"{name:^{size}}" for name, size in columns) + " |"
-    stdscr.addstr(3, 0, header_line[: width - 1])
-    header_sep_width = min(len(header_line) - 2, width - 3)
-    stdscr.addstr(4, 2, "|", curses.A_NORMAL)
-    stdscr.addstr(4, 3, "-" * (header_sep_width - 2), curses.A_NORMAL)
-    right_pos = 3 + header_sep_width - 2
-    if right_pos < width - 1:
-        stdscr.addstr(4, right_pos, "|", curses.A_NORMAL)
+    header_line = _header_line(columns)
+    # Geometry: rule(2), status rows(3..2+R), block bottom rule(3+R),
+    # header(4+R), header bottom rule(5+R), list from 6+R.
+    header_row = 4 + len(status_lines)
+    stdscr.addstr(header_row, 0, header_line[:width])
+    if "RU!" in header_line:
+        # Overdraw the flush RU! header cell in the warning color.
+        ru_col = header_line.index("RU!")
+        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        stdscr.addstr(header_row, ru_col, "RU!")
+        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+    header_sep_width = min(len(header_line) - 1, width - 1)
+    # The box's top edge: a rule between the title and the status block.
+    _draw_hrule(stdscr, 2, header_sep_width)
+    status_block_end = draw_status_block(stdscr, 3, status_lines, header_sep_width)
+    # The header's own top edge below the status block.
+    _draw_hrule(stdscr, 3 + status_block_end, header_sep_width)
+    _draw_hrule(stdscr, header_row + 1, header_sep_width)
     return header_line
 
 
@@ -126,8 +166,8 @@ def _draw_utxo_rows(
         display_row = list_start + (i - scroll_offset)
 
         if item is None:
-            stdscr.addstr(display_row, 2, "|", curses.A_NORMAL)
-            inner_width = sep_width - 2
+            stdscr.addstr(display_row, 0, "|", curses.A_NORMAL)
+            inner_width = sep_width - 1
             if i + 1 < len(display_items) and display_items[i + 1] is None:
                 # Blank border-only row above a mixdepth title.
                 pass
@@ -135,7 +175,7 @@ def _draw_utxo_rows(
                 parts = group_separator_parts(display_items, i)
                 if parts is not None:
                     md_part, dash_sep, branch_part, full_title = parts
-                    col = 3
+                    col = 2
                     if not full_title:
                         # Second/third branch of this mixdepth: dashes strike
                         # out only the "Mixdepth N" part; the em dash and the
@@ -153,13 +193,13 @@ def _draw_utxo_rows(
                         col += len(md_part)
                     stdscr.addstr(display_row, col, dash_sep, curses.color_pair(3))
                     col += len(dash_sep)
-                    if col + len(branch_part) + 1 <= 3 + inner_width:
+                    if col + len(branch_part) + 1 <= sep_width - 1:
                         stdscr.addstr(display_row, col, f"{branch_part} ", curses.color_pair(3))
                         col += len(branch_part) + 1
-                    stdscr.addstr(display_row, col, "-" * (3 + inner_width - col), curses.A_NORMAL)
+                    stdscr.addstr(display_row, col, "-" * (sep_width - 1 - col), curses.A_NORMAL)
                 else:
-                    stdscr.addstr(display_row, 3, "-" * inner_width, curses.A_NORMAL)
-            stdscr.addstr(display_row, sep_width + 1, "|", curses.A_NORMAL)
+                    stdscr.addstr(display_row, 1, "-" * inner_width, curses.A_NORMAL)
+            stdscr.addstr(display_row, sep_width, "|", curses.A_NORMAL)
             continue
 
         is_selected = i in selected
@@ -180,6 +220,7 @@ def _draw_utxo_rows(
             allowed_mixdepth=pinned,
             min_confirmations=min_confirmations,
             allow_fidelity_bonds=allow_fidelity_bonds,
+            reused=_is_address_reused(item, address_utxo_counts),
         )
 
         # Apply colors
@@ -204,14 +245,15 @@ def _draw_utxo_rows(
         else:
             attr = curses.A_NORMAL
 
-        stdscr.addstr(display_row, 2, "|", curses.A_NORMAL)
-        stdscr.addstr(display_row, 3, line[1:-1], attr)
-        right_border_pos = len(line) + 1
-        stdscr.addstr(display_row, right_border_pos, "|", curses.A_NORMAL)
+        stdscr.addstr(display_row, 0, "|", curses.A_NORMAL)
+        stdscr.addstr(display_row, 1, line[1:-1], attr)
+        stdscr.addstr(display_row, len(line) - 1, "|", curses.A_NORMAL)
         if _is_address_reused(item, address_utxo_counts):
-            stdscr.addstr(
-                display_row, right_border_pos + 1, " RU!", curses.color_pair(4) | curses.A_BOLD
-            )
+            # Overdraw the flush RU! cell (inside the border) in red bold.
+            ru_col = len(line) - 4
+            stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+            stdscr.addstr(display_row, ru_col, "RU!")
+            stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
 
 
 def _build_footer_lines(
@@ -277,23 +319,20 @@ def _build_footer_lines(
             min_confirmations,
             allow_fidelity_bonds=allow_fidelity_bonds,
         )
-        # "Out:" (short for Outpoint) keeps the full txid:vout visible; the
-        # state column already lives in the table, so only the WHY behind a
-        # non-selectable state is added here (it has no column).
-        state_text = f"Out: {cursor_item.txid}:{cursor_item.vout}"
-        if state_col == "immature":
-            state_text += f" | requires {min_confirmations} confirmations"
-        elif state_col == "other-md":
-            state_text += f" | source is m{pinned}"
+        # Shared payload: line 1 is the outpoint (wrapped only when it is
+        # too wide for the box); the explanation line below carries the
+        # cursor description plus the WHY behind a non-selectable state.
+        extra: list[str] = []
+        if state_col == "immat":
+            extra.append(f"requires {min_confirmations} confirmations")
+        elif state_col == "oth-md":
+            extra.append(f"source is m{pinned}")
         elif state_col == "no-cj":
-            state_text += (
-                " | fidelity bonds cannot be used in CoinJoins; "
+            extra.append(
+                "fidelity bonds cannot be used in CoinJoins; "
                 "redeem with jm-wallet send --select-utxos"
             )
-        if footer_line4:
-            footer_line4 = f"{state_text} | {footer_line4}"
-        else:
-            footer_line4 = state_text
+        footer_line4 = utxo_status_text(cursor_item, extra)
         # RU note for address reuse (same logic as the table's RU! indicator).
         is_reused = _is_address_reused(cursor_item, address_utxo_counts)
         if is_reused:
@@ -306,27 +345,50 @@ def _build_footer_lines(
 
 
 def _footer_rows(
-    width: int,
+    sep_width: int,
     footer_line1: str,
     footer_line2: str,
     footer_line4: str,
     ru_note: str,
 ) -> list[tuple[str, int]]:
-    """Lay out the footer before reserving space for the scrollable coin rows."""
-    content_width = max(1, width - 3)
-    separator = ("-" * content_width, curses.A_NORMAL)
-    rows = [separator, ("Selection Details", curses.A_BOLD)]
+    """Lay out the footer before reserving space for the scrollable coin rows.
+
+    ``sep_width`` is the table's separator span
+    (:func:`jmwallet.utxo_tui._table_sep_width`): the footer box spans the
+    table's full width -- framed separators and framed text rows, borders
+    at columns 0 and ``sep_width``.
+    """
+    content_width = max(1, sep_width - 4)
+    separator = ("|" + "-" * (sep_width - 1) + "|", curses.A_NORMAL)
+    title_attr = curses.color_pair(3) | curses.A_BOLD
+    # The first separator closes the table's bottom edge (the frame filler
+    # keeps the border columns connected above it).
+    rows = [separator, ("Selection Details", title_attr)]
     rows.extend((line, curses.A_BOLD) for line in _wrap_footer_fields(footer_line1, content_width))
     rows.append((footer_line2, curses.A_BOLD))
-    rows.extend([separator, ("UTXO Status", curses.A_BOLD)])
-    rows.append((_clip(footer_line4, content_width), curses.A_DIM))
-    # Reserve the warning row even when not reused, so moving the cursor does not resize the list.
-    rows.append((ru_note, curses.color_pair(4) | curses.A_BOLD))
-    rows.extend([separator, ("Controls", curses.A_BOLD)])
+    rows.extend([separator, ("UTXO Status", title_attr)])
+    # The status block shows exactly the cursor coin's payload -- no
+    # max-reserve padding over all coins: the padding rendered as a visible
+    # empty line whenever the cursor coin wrapped shorter than the wallet
+    # maximum (e.g. the one-column window where a 2-digit-vout outpoint
+    # tips the wrap threshold), and it flipped around on resize
+    # (user decision 2026-11-15). The footer height may breathe by one line
+    # when coins of different status heights alternate under the cursor;
+    # that cost is accepted (RU!/notice rows stay conditional, see below).
+    status_lines = wrap_status_text(footer_line4, content_width)
+    rows.extend((line, curses.A_BOLD) for line in status_lines)
+    # The note row exists only when there is something to show (RU! or a
+    # transient notice); an always-reserved empty row wasted a list line in
+    # the overwhelmingly common no-reuse case (user decision 2026-11-15).
+    if ru_note:
+        rows.append((ru_note, curses.color_pair(4) | curses.A_BOLD))
+    rows.extend([separator, ("Controls", title_attr)])
     rows.extend(
-        (line, curses.A_NORMAL) for line in _wrap_footer_fields(_CONTROLS_HINT, content_width)
+        (line, curses.A_NORMAL) for line in align_control_columns(_CONTROLS_HINT, content_width)
     )
-    rows.append(("", curses.A_NORMAL))
+    # The closing separator is the box's bottom edge; the render loop keeps
+    # the terminal's last row empty below it (a one-cell black frame).
+    rows.append(separator)
     return rows
 
 
@@ -338,6 +400,8 @@ def _run_selector(
     min_confirmations: int,
     excluded_outpoints: set[tuple[str, int]],
     allow_fidelity_bonds: bool = True,
+    wallet_name: str = "",
+    wallet_fingerprint: str = "",
 ) -> list[UTXOInfo]:
     """Run the curses-based UTXO selector.
 
@@ -351,6 +415,8 @@ def _run_selector(
             with a ``[-]`` mark; unavailable for selection
         allow_fidelity_bonds: When ``False`` (CoinJoin context) expired bonds
             are shown as State ``no-cj`` and cannot be selected
+        wallet_name: Wallet file name shown in the status block header
+        wallet_fingerprint: Wallet fingerprint shown in the status block header
 
     Returns:
         List of selected UTXOs
@@ -418,8 +484,18 @@ def _run_selector(
 
         pinned = pinned_mixdepth()
         columns = _table_columns(width, utxos)
+        # Status block above the column titles (whiptail menu_header style).
+        # The maker status is process-derived (start-path independent).
+        sep_width = _table_sep_width(columns)
+        status_lines = status_header_lines(
+            sep_width,
+            wallet_name or "(no file)",
+            wallet_fingerprint,
+            maker_bot_status(),
+        )
+        status_count = len(status_lines)
         footer = _footer_rows(
-            width,
+            _table_sep_width(columns),
             *_build_footer_lines(
                 display_items,
                 selected,
@@ -436,17 +512,61 @@ def _run_selector(
                 notice=notice,
             ),
         )
-        list_start = 5
-        list_height = height - list_start - len(footer)
-        if list_height < 1 or width < max(80, _minimum_table_width(columns)):
-            draw_resize_prompt(stdscr, width)
+        list_start = 6 + status_count
+        # Full layout widens the address column to fill the terminal exactly
+        # (right border in the last usable column); the compact layout stays
+        # at its own table width, so every border reads from the columns.
+        # One blank row stays below the footer box (black frame at the
+        # screen's bottom edge); it shrinks the scrollable region.
+        list_height = height - list_start - len(footer) - 1
+        if width < max(80, _minimum_table_width(columns)):
+            # The table itself cannot fit: the fix is horizontal space.
+            draw_resize_prompt(stdscr, width, "width")
             if stdscr.getch() in (ord("q"), 27):
                 return []
             continue
+        if list_height < 1:
+            # Width is fine but the vertical budget (title rules, status
+            # block, footer, blank frame row) leaves no list row. First try
+            # the one-line status block before blaming the terminal height:
+            # a screen that rendered before the status block must keep
+            # rendering with it.
+            if status_count > 1:
+                retry = status_header_lines(
+                    sep_width,
+                    wallet_name or "(no file)",
+                    wallet_fingerprint,
+                    maker_bot_status(),
+                    max_lines=1,
+                )
+                retry_height = height - (6 + len(retry)) - len(footer) - 1
+                if retry_height >= 1:
+                    status_lines = retry
+                    status_count = len(retry)
+                    list_start = 6 + status_count
+                    list_height = retry_height
+                else:
+                    draw_resize_prompt(stdscr, width, "height")
+                    if stdscr.getch() in (ord("q"), 27):
+                        return []
+                    continue
+            else:
+                draw_resize_prompt(stdscr, width, "height")
+                if stdscr.getch() in (ord("q"), 27):
+                    return []
+                continue
 
         scroll_offset = adjust_scroll(cursor_pos, scroll_offset, list_height, len(display_items))
         try:
-            header_line = _draw_header(stdscr, width, columns)
+            _draw_header(stdscr, width, columns, status_lines)
+            # The frame filler keeps the border columns connected across the
+            # spare list rows (rows drawn later win over the filler borders);
+            # the footer's own first separator row doubles as its top edge.
+            # One blank row stays below the footer box (black frame at the
+            # screen's bottom edge); it also keeps the terminal's unwritable
+            # bottom-right corner out of the box entirely.
+            footer_start = height - len(footer) - 1
+            _draw_frame_filler(stdscr, list_start, footer_start, sep_width)
             _draw_utxo_rows(
                 stdscr,
                 display_items,
@@ -456,7 +576,7 @@ def _run_selector(
                 list_height,
                 list_start,
                 width,
-                len(header_line) - 2,
+                sep_width,
                 excluded_outpoints,
                 address_utxo_counts,
                 is_selectable,
@@ -465,9 +585,11 @@ def _run_selector(
                 min_confirmations,
                 allow_fidelity_bonds,
             )
-            _draw_footer(stdscr, height - len(footer), footer)
+            _draw_footer(stdscr, footer_start, footer, sep_width)
         except curses.error:
             # Do not dispatch spend actions after an interrupted repaint.
+            # The cause of the interruption is not diagnosable here, so the
+            # generic prompt text stays.
             draw_resize_prompt(stdscr, width)
             if stdscr.getch() in (ord("q"), 27):
                 return []
@@ -477,6 +599,13 @@ def _run_selector(
         # Handle input
         key = stdscr.getch()
         notice = ""
+
+        if key == ord("?"):
+            _, width = stdscr.getmaxyx()
+            overlay = _help_overlay_rows(sep_width, SELECTOR_STATE_TOKENS)
+            _draw_help_overlay(stdscr, overlay, sep_width, _HELP_TITLE)
+            wait_for_help_close(stdscr)
+            continue
 
         if key == ord("q") or key == 27:  # q or Escape
             return []
@@ -567,6 +696,8 @@ def select_utxos_interactive(
     excluded_outpoints: set[tuple[str, int]] | None = None,
     *,
     allow_fidelity_bonds: bool = True,
+    wallet_name: str = "",
+    wallet_fingerprint: str = "",
 ) -> list[UTXOInfo]:
     """Display an interactive UTXO selector over the whole wallet.
 
@@ -598,6 +729,10 @@ def select_utxos_interactive(
             fidelity bonds. CoinJoin callers pass ``False`` so every bond is
             shown as State ``no-cj`` with a ``[-]`` mark: bond inputs would
             be disclosed to makers and then rejected at signing.
+        wallet_name: Wallet file name shown in the status block header
+            (keyword-only); empty falls back to ``(no file)``
+        wallet_fingerprint: Wallet fingerprint shown in the status block
+            header (keyword-only)
 
     Returns:
         List of selected UTXOs (all from one mixdepth), empty if cancelled
@@ -637,4 +772,6 @@ def select_utxos_interactive(
         min_confirmations,
         excluded_outpoints,
         allow_fidelity_bonds,
+        wallet_name,
+        wallet_fingerprint,
     )
