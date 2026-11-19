@@ -281,8 +281,17 @@ def draw_resize_prompt(stdscr: curses.window, width: int, reason: str = "") -> N
 
 
 def _clip(text: str, width: int) -> str:
-    """Clip a display field explicitly, rather than silently losing its suffix."""
-    return text if len(text) <= width else text[: max(0, width - 3)] + "." * min(3, width)
+    """Clip a display field to ``width`` terminal columns (never characters).
+
+    Adds an explicit ellipsis instead of silently losing the suffix; for
+    ASCII text identical to the historical character-count clip.
+    """
+    if _display_width(text) <= width:
+        return text
+    target = max(0, width - 3)
+    while text and _display_width(text) > target:
+        text = text[:-1]
+    return text + "." * min(3, width)
 
 
 def _display_width(text: str) -> int:
@@ -391,7 +400,11 @@ def _table_columns(
     selector, ``F`` in the freeze manager); it is drawn by the row renderer,
     not by :func:`format_utxo_line`.
     """
-    tag_width = max(4, min(11, max((len(_label_col_value(u)) for u in utxos), default=0)))
+    # Tag values may be user BIP-329 labels with wide characters: measure the
+    # column budget in terminal columns, not characters (numeric/token widths
+    # below are ASCII by construction).
+    tag_cols = (_display_width(_label_col_value(u)) for u in utxos)
+    tag_width = max(4, min(11, max(tag_cols, default=0)))
     sats_width = max(4, max((len(f"{u.value:,}") for u in utxos), default=0))
     state_width = max(5, max((len(t) for t in state_tokens), default=0))
     columns = [
@@ -460,12 +473,14 @@ def _header_line(columns: list[tuple[str, int]]) -> str:
 
 
 def _format_cells(values: dict[str, str], columns: list[tuple[str, int]]) -> str:
-    return " | ".join(
-        f"{_clip(values[name], size):>{size}}"
-        if name in {"MD", "sats", "confs"}
-        else f"{_clip(values[name], size):<{size}}"
-        for name, size in columns
-    )
+    """Join clipped cells, padded in terminal columns (a wide char renders 2)."""
+
+    def cell(name: str, size: int) -> str:
+        text = _clip(values[name], size)
+        padding = " " * (size - _display_width(text))
+        return padding + text if name in {"MD", "sats", "confs"} else text + padding
+
+    return " | ".join(cell(name, size) for name, size in columns)
 
 
 def format_utxo_line(
@@ -599,28 +614,54 @@ def utxo_cursor_description(utxo: UTXOInfo) -> str:
 def _wrap_footer_fields(text: str, width: int) -> list[str]:
     """Wrap between fields so amounts and their units always stay together.
 
-    A single field longer than ``width`` (a full txid at a narrow terminal)
-    is hard-chunked so it still renders instead of overflowing the frame.
+    Widths are measured in terminal columns (:func:`_display_width`), never
+    character count -- user labels may contain CJK-wide characters that
+    render 2 columns each. A single field wider than ``width`` columns (a
+    full txid at a narrow terminal) is hard-chunked so it still renders
+    instead of overflowing the frame.
     """
     lines: list[str] = []
     for segment in text.split("\n"):
         current = ""
         for field in segment.split(" | "):
-            if len(field) > width:
+            if _display_width(field) > width:
                 if current:
                     lines.append(current)
                     current = ""
-                chunks = [field[i : i + width] for i in range(0, len(field), width)]
+                chunks = chunk_to_display_width(field, width)
                 lines.extend(chunks[:-1])
                 field = chunks[-1]
             candidate = f"{current} | {field}" if current else field
-            if len(candidate) > width and current:
+            candidate_cols = _display_width(candidate)
+            if candidate_cols > width and current:
                 lines.append(current)
                 current = field
             else:
                 current = candidate
         lines.append(current)
     return lines
+
+
+def chunk_to_display_width(text: str, width: int) -> list[str]:
+    """Split ``text`` into chunks of at most ``width`` display columns.
+
+    Character boundaries are preferred so a wide character is never split in
+    half: the chunk grows until adding the next character would exceed
+    ``width`` columns.
+    """
+    chunks: list[str] = []
+    chunk = ""
+    chunk_cols = 0
+    for char in text:
+        char_cols = _display_width(char)
+        if chunk_cols + char_cols > width and chunk:
+            chunks.append(chunk)
+            chunk = ""
+            chunk_cols = 0
+        chunk += char
+        chunk_cols += char_cols
+    chunks.append(chunk)
+    return chunks
 
 
 def _footer_content_width(sep_width: int) -> int:
@@ -641,20 +682,25 @@ def align_control_columns(text: str, width: int) -> list[str]:
     field wrap (:func:`_wrap_footer_fields`), which hard-chunks it.
     """
     fields = text.split(" | ")
-    if len(fields) == 1 or max(len(field) for field in fields) > width:
+    if len(fields) == 1 or max(_display_width(field) for field in fields) > width:
         return _wrap_footer_fields(text, width)
-    if sum(len(field) for field in fields) + 3 * (len(fields) - 1) <= width:
+    if sum(_display_width(field) for field in fields) + 3 * (len(fields) - 1) <= width:
         return [text]
 
     def grid(rows_of_fields: list[list[str]]) -> list[str]:
         """Render rows on the shared column grid (longest field per column)."""
         column_count = max(len(row) for row in rows_of_fields)
         column_widths = [
-            max(len(row[i]) for row in rows_of_fields if i < len(row)) for i in range(column_count)
+            max(_display_width(row[i]) for row in rows_of_fields if i < len(row))
+            for i in range(column_count)
         ]
         lines = []
         for row in rows_of_fields:
-            cells = [field.ljust(column_widths[i]) for i, field in enumerate(row[:-1])]
+            # Pad in columns, not characters: a wide character renders 2.
+            cells = [
+                field + " " * (column_widths[i] - _display_width(field))
+                for i, field in enumerate(row[:-1])
+            ]
             cells.append(row[-1])
             lines.append(" | ".join(cells))
         return lines
@@ -668,7 +714,7 @@ def align_control_columns(text: str, width: int) -> list[str]:
     for columns in range(len(fields), 0, -1):
         rows_of_fields = [fields[i : i + columns] for i in range(0, len(fields), columns)]
         rendered = grid(rows_of_fields)
-        if max(len(line) for line in rendered) <= width:
+        if max(_display_width(line) for line in rendered) <= width:
             best, best_cols = rendered, columns
             break
     if best is None:  # unreachable: single-column always fits (checked above)
@@ -710,10 +756,10 @@ def wrap_status_text(text: str, width: int) -> list[str]:
     prefix = "Outpoint: "
     if head.startswith(prefix):
         value = head[len(prefix) :]
-        if len(head) > width:
+        if _display_width(head) > width:
             lines.append("Outpoint:")
-            if len(value) > width:
-                lines.extend(value[i : i + width] for i in range(0, len(value), width))
+            if _display_width(value) > width:
+                lines.extend(chunk_to_display_width(value, width))
             else:
                 lines.append(value)
         else:
@@ -743,13 +789,15 @@ def _draw_footer(
             stdscr.addstr(row, 0, line, attr)
             continue
         text = f" {line}"
+        text_cols = _display_width(text)
         stdscr.addstr(row, 0, "|", curses.A_NORMAL)
         stdscr.addstr(row, 1, text, attr)
-        if 1 + len(text) <= sep_width:
+        if 1 + text_cols <= sep_width:
             # Padding and right border stay plain: only the text carries the
             # row's attribute, the box frame never takes the text color.
+            # Positions in terminal columns: wide characters render 2.
             stdscr.addstr(
-                row, 1 + len(text), " " * (sep_width - 1 - len(text)) + "|", curses.A_NORMAL
+                row, 1 + text_cols, " " * (sep_width - 1 - text_cols) + "|", curses.A_NORMAL
             )
 
 

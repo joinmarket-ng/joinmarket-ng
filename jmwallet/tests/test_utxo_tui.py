@@ -19,10 +19,12 @@ from jmwallet.utxo_tui import (
     ADDRESS_COL_WIDTH,
     _display_width,
     _help_overlay_rows,
+    _wrap_footer_fields,
     adjust_scroll,
     align_control_columns,
     branch_display_rank,
     build_display_items,
+    chunk_to_display_width,
     draw_resize_prompt,
     draw_status_block,
     enrich_utxo_labels,
@@ -718,6 +720,52 @@ class TestDrawStatusBlock:
             drawn = draw_status_block(screen, 3, ["a", "b"], 78)
         assert drawn == 2
         assert {c.args[0] for c in screen.addstr.call_args_list} == {3, 4}
+
+
+class TestFooterWidthMeasurement:
+    """Footer wrapping measures terminal columns, never characters (rule 15b).
+
+    A user BIP-329 label may contain CJK-wide characters that render 2
+    columns each; character-count wrapping would emit lines wider than the
+    footer box (overflowing the frame or triggering a bogus resize prompt).
+    Every line below is asserted with _display_width, mirroring the caller's
+    column budget.
+    """
+
+    def test_wrap_lines_never_exceed_the_column_budget_with_wide_chars(self) -> None:
+        # 6 CJK chars = 12 columns + ASCII text: character count (9) says it
+        # fits in a 10-column box, the real width (17) does not.
+        wide_label = "漢字漢字漢字"
+        lines = _wrap_footer_fields(f"State: spend | tag: {wide_label}", 20)
+        assert all(_display_width(line) <= 20 for line in lines)
+
+    def test_wide_field_hard_chunks_without_splitting_a_wide_char(self) -> None:
+        wide = "漢" * 12  # 24 columns
+        chunks = chunk_to_display_width(wide, 10)
+        assert all(_display_width(chunk) <= 10 for chunk in chunks)
+        assert "".join(chunks) == wide
+
+    def test_chunk_and_reassembly_survive_combining_marks(self) -> None:
+        text = "á́b́ć" * 4  # combining marks render 0 columns
+        chunks = chunk_to_display_width(text, 7)
+        assert all(_display_width(chunk) <= 7 for chunk in chunks)
+        assert "".join(chunks) == text
+
+    def test_wrap_status_explanation_with_wide_label_stays_in_the_box(self) -> None:
+        txid = "a" * 64
+        wide_label = "漢字漢字漢字"
+        text = f"Outpoint: {txid}:0\nState: spend | tag: {wide_label}"
+        lines = wrap_status_text(text, 75)
+        assert lines[0] == "Outpoint:"
+        assert lines[1] == f"{txid}:0"
+        assert all(_display_width(line) <= 80 for line in lines[2:])
+
+    def test_align_control_columns_with_wide_field_pads_in_columns(self) -> None:
+        # Same-length-in-chars fields, one wide: a len()-grid would align the
+        # separators wrongly and overflow the budget.
+        text = "漢漢: toggle | abcd: exit"
+        lines = align_control_columns(text, 14)
+        assert all(_display_width(line) <= 14 for line in lines)
 
 
 class TestAlignControlColumns:
