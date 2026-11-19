@@ -140,3 +140,115 @@ async def test_external_deposit_produces_ws_notification(
                 )
         finally:
             await client.get(f"{API}/wallet/{name}/lock", headers=_auth(token))
+
+
+async def _history_row(
+    client: httpx.AsyncClient, name: str, token: str, txid: str
+) -> dict[str, Any] | None:
+    r = await client.get(f"{API}/wallet/{name}/history", headers=_auth(token))
+    assert r.status_code == 200, f"history failed: {r.status_code} {r.text}"
+    return next((row for row in r.json()["history"] if row["txid"] == txid), None)
+
+
+@pytest.mark.asyncio
+async def test_coinjoin_history_confirms_after_taker_stops(
+    bitcoin_rpc_config: dict[str, str],
+    ensure_blockchain_ready: None,
+) -> None:
+    """Issue #672: a CoinJoin started through the API must not stay pending.
+
+    The one-shot taker is torn down right after broadcast, so the daemon's
+    transaction monitor has to record the confirmation. The wallet is locked
+    while the block is mined, which exercises the repair on the next unlock.
+    The regtest auto-miner may confirm earlier; the final state is the same.
+    """
+    cfg = bitcoin_rpc_config
+    await _wait_for_jmwalletd()
+    name = f"txmon-cj-{uuid.uuid4().hex[:8]}.jmdat"
+    unrelated = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+
+    async with httpx.AsyncClient(verify=TLS_VERIFY, timeout=60.0) as client:
+        r = await client.post(
+            f"{API}/wallet/create",
+            json={"walletname": name, "password": "testpass", "wallettype": "sw-fb"},
+        )
+        assert r.status_code == 201, f"create failed: {r.status_code} {r.text}"
+        token = r.json()["token"]
+
+        try:
+            r = await client.get(
+                f"{API}/wallet/{name}/address/new/0", headers=_auth(token)
+            )
+            assert r.status_code == 200, f"address/new failed: {r.status_code} {r.text}"
+            await _rpc(
+                cfg, "sendtoaddress", [r.json()["address"], 1.0], wallet="test-funder"
+            )
+            await _rpc(cfg, "generatetoaddress", [6, unrelated])
+
+            deadline = asyncio.get_event_loop().time() + 90.0
+            while True:
+                r = await client.get(
+                    f"{API}/wallet/{name}/display", headers=_auth(token)
+                )
+                if (
+                    r.status_code == 200
+                    and float(r.json()["walletinfo"]["total_balance"]) >= 1.0
+                ):
+                    break
+                assert asyncio.get_event_loop().time() < deadline, (
+                    "wallet never saw funds"
+                )
+                await asyncio.sleep(1.0)
+
+            destination = await _rpc(cfg, "getnewaddress", wallet="test-funder")
+            r = await client.post(
+                f"{API}/wallet/{name}/taker/coinjoin",
+                headers=_auth(token),
+                json={
+                    "mixdepth": 0,
+                    "amount_sats": 5_000_000,
+                    "counterparties": 2,
+                    "destination": destination,
+                },
+            )
+            assert r.status_code == 202, f"coinjoin failed: {r.status_code} {r.text}"
+
+            deadline = asyncio.get_event_loop().time() + 300.0
+            while True:
+                r = await client.get(
+                    f"{API}/wallet/{name}/taker/status", headers=_auth(token)
+                )
+                status = r.json()
+                if not status["running"]:
+                    break
+                assert asyncio.get_event_loop().time() < deadline, (
+                    "coinjoin did not finish"
+                )
+                await asyncio.sleep(2.0)
+            assert status["status"] == "complete", status
+            txid = status["txid"]
+            assert txid
+
+            # Confirm while the wallet is locked, then reopen it.
+            r = await client.get(f"{API}/wallet/{name}/lock", headers=_auth(token))
+            assert r.status_code == 200, f"lock failed: {r.status_code} {r.text}"
+            await _rpc(cfg, "generatetoaddress", [1, unrelated])
+            r = await client.post(
+                f"{API}/wallet/{name}/unlock", json={"password": "testpass"}
+            )
+            assert r.status_code == 200, f"unlock failed: {r.status_code} {r.text}"
+            token = r.json()["token"]
+
+            deadline = asyncio.get_event_loop().time() + 60.0
+            row: dict[str, Any] | None = None
+            while asyncio.get_event_loop().time() < deadline:
+                row = await _history_row(client, name, token, txid)
+                if row is not None and row["success"]:
+                    break
+                await asyncio.sleep(1.0)
+            assert row is not None and row["success"], (
+                f"history row stayed pending: {row}"
+            )
+            assert row["confirmations"] >= 1
+        finally:
+            await client.get(f"{API}/wallet/{name}/lock", headers=_auth(token))

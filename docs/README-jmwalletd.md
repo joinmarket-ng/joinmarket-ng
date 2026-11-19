@@ -10,7 +10,9 @@ can talk to JoinMarket NG without modification.
 ## What It Provides
 
 - REST API under `/api/v1` (wallet, direct send, CoinJoin, maker, tumbler)
-- WebSocket notifications on `/ws`, `/api/v1/ws`, and `/jmws`
+- WebSocket notifications on `/ws`, `/api/v1/ws`, and `/jmws`, and confirmation
+  tracking that keeps the wallet history (`/history`) current while it is
+  unlocked and repairs entries that confirmed while it was locked
 - JWT authentication (access and refresh tokens)
 - Orderbook proxy endpoints under `/obwatch/*` (also without the `/api/v1`
   prefix, as JAM expects)

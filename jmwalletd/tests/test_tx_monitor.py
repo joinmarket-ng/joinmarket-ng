@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +21,12 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 from jmwallet.backends.base import WalletTxEntry
+from jmwallet.history import (
+    TransactionHistoryEntry,
+    append_history_entry,
+    expire_pending_transaction_monitoring,
+    read_history,
+)
 from jmwalletd.tx_monitor import run_tx_monitor
 from jmwalletd.txinfo import build_txinfo_from_hex
 
@@ -339,6 +347,166 @@ async def test_baseline_waits_for_backend_ready() -> None:
     assert len(state.broadcasts) == 1
     assert state.broadcasts[0]["txid"] == new_txid
     assert hist_txid in state._tx_broadcast_notified
+
+
+_FINGERPRINT = "aabbccdd"
+
+
+class HistoryState(FakeState):
+    """FakeState with the wallet identity and data dir used for history writes."""
+
+    def __init__(self, backend: Any, data_dir: Path, coinjoin_state: Any = None) -> None:
+        from jmwalletd.state import CoinjoinState
+
+        super().__init__(backend)
+        self.wallet_service = SimpleNamespace(backend=backend, wallet_fingerprint=_FINGERPRINT)
+        self.data_dir = data_dir
+        self.coinjoin_state = coinjoin_state or CoinjoinState.NOT_RUNNING
+
+
+def _record(
+    data_dir: Path,
+    txid: str,
+    *,
+    role: str = "taker",
+    fingerprint: str = _FINGERPRINT,
+    cj_amount: int = 100_000,
+) -> None:
+    append_history_entry(
+        TransactionHistoryEntry(
+            timestamp=datetime.now().isoformat(),
+            role=role,  # type: ignore[arg-type]
+            success=False,
+            txid=txid,
+            cj_amount=cj_amount,
+            destination_address="bcrt1qexampledestination",
+            network="regtest",
+            wallet_fingerprint=fingerprint,
+        ),
+        data_dir,
+    )
+
+
+def _row(data_dir: Path, txid: str) -> TransactionHistoryEntry:
+    return next(e for e in read_history(data_dir) if e.txid == txid)
+
+
+class TestHistoryReconciliation:
+    """Issue #672: confirmed CoinJoins must not stay pending after the taker stops."""
+
+    @pytest.mark.asyncio
+    async def test_live_confirmation_marks_pending_row_confirmed(self, tmp_path: Path) -> None:
+        txid, raw = _make_tx(50)
+        _record(tmp_path, txid)
+        backend = FakeBackend(
+            polls=[
+                [],
+                [WalletTxEntry(txid=txid, confirmations=0)],
+                [WalletTxEntry(txid=txid, confirmations=2)],
+            ],
+            txs={txid: raw},
+        )
+        await _drive(HistoryState(backend, tmp_path), backend)  # type: ignore[arg-type]
+
+        row = _row(tmp_path, txid)
+        assert row.success is True
+        assert row.confirmations == 2
+
+    @pytest.mark.asyncio
+    async def test_baseline_repairs_row_confirmed_while_locked(self, tmp_path: Path) -> None:
+        txid, raw = _make_tx(51)
+        _record(tmp_path, txid)
+        backend = FakeBackend(polls=[[WalletTxEntry(txid=txid, confirmations=5)]], txs={txid: raw})
+        state = HistoryState(backend, tmp_path)
+        await _drive(state, backend)  # type: ignore[arg-type]
+
+        assert state.broadcasts == []  # baseline stays silent
+        row = _row(tmp_path, txid)
+        assert row.success is True
+        assert row.confirmations == 5
+
+    @pytest.mark.asyncio
+    async def test_timed_out_row_is_repaired(self, tmp_path: Path) -> None:
+        txid, raw = _make_tx(52)
+        _record(tmp_path, txid)
+        entry = _row(tmp_path, txid)
+        entry.timestamp = (datetime.now() - timedelta(days=4)).isoformat()
+        assert expire_pending_transaction_monitoring(
+            entry, max_age_minutes=60, data_dir=tmp_path, wallet_fingerprint=_FINGERPRINT
+        )
+        assert _row(tmp_path, txid).completed_at
+
+        backend = FakeBackend(polls=[[WalletTxEntry(txid=txid, confirmations=9)]], txs={txid: raw})
+        await _drive(HistoryState(backend, tmp_path), backend)  # type: ignore[arg-type]
+
+        row = _row(tmp_path, txid)
+        assert row.success is True
+        assert row.failure_reason == ""
+
+    @pytest.mark.asyncio
+    async def test_running_maker_keeps_its_pending_rows(self, tmp_path: Path) -> None:
+        from jmwalletd.state import CoinjoinState
+
+        txid, raw = _make_tx(53)
+        _record(tmp_path, txid, role="maker")
+        backend = FakeBackend(polls=[[WalletTxEntry(txid=txid, confirmations=1)]], txs={txid: raw})
+        state = HistoryState(backend, tmp_path, CoinjoinState.MAKER_RUNNING)
+        await _drive(state, backend)  # type: ignore[arg-type]
+
+        assert _row(tmp_path, txid).success is False
+
+    @pytest.mark.asyncio
+    async def test_stopped_maker_row_is_confirmed_with_peer_count(self, tmp_path: Path) -> None:
+        txid, raw = _make_tx(54, value=100_000)
+        _record(tmp_path, txid, role="maker", cj_amount=100_000)
+        backend = FakeBackend(polls=[[WalletTxEntry(txid=txid, confirmations=1)]], txs={txid: raw})
+        await _drive(HistoryState(backend, tmp_path), backend)  # type: ignore[arg-type]
+
+        row = _row(tmp_path, txid)
+        assert row.success is True
+        assert row.peer_count == 1
+
+    @pytest.mark.asyncio
+    async def test_other_wallet_rows_are_untouched(self, tmp_path: Path) -> None:
+        txid, raw = _make_tx(55)
+        _record(tmp_path, txid, fingerprint="11223344")
+        backend = FakeBackend(polls=[[WalletTxEntry(txid=txid, confirmations=3)]], txs={txid: raw})
+        await _drive(HistoryState(backend, tmp_path), backend)  # type: ignore[arg-type]
+
+        assert _row(tmp_path, txid).success is False
+
+    @pytest.mark.asyncio
+    async def test_missing_history_file_is_not_created(self, tmp_path: Path) -> None:
+        txid, raw = _make_tx(56)
+        backend = FakeBackend(polls=[[WalletTxEntry(txid=txid, confirmations=3)]], txs={txid: raw})
+        await _drive(HistoryState(backend, tmp_path), backend)  # type: ignore[arg-type]
+
+        assert not (tmp_path / "history.csv").exists()
+
+    @pytest.mark.asyncio
+    async def test_history_failure_does_not_stop_notifications(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import jmwallet.history
+
+        def broken(*_args: Any, **_kwargs: Any) -> list[TransactionHistoryEntry]:
+            raise OSError("history unavailable")
+
+        monkeypatch.setattr(jmwallet.history, "get_pending_transactions", broken)
+        first, first_raw = _make_tx(57)
+        second, second_raw = _make_tx(58)
+        backend = FakeBackend(
+            polls=[
+                [],
+                [WalletTxEntry(txid=first, confirmations=1)],
+                [WalletTxEntry(txid=second, confirmations=1)],
+            ],
+            txs={first: first_raw, second: second_raw},
+        )
+        state = HistoryState(backend, tmp_path)
+        await _drive(state, backend)  # type: ignore[arg-type]
+
+        assert [frame["txid"] for frame in state.broadcasts] == [first, second]
 
 
 class TestBuildTxinfoFromHex:

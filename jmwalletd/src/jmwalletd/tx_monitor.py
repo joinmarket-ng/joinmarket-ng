@@ -11,6 +11,13 @@ mempool) and once when it first confirms (the ``txdetails`` then carries a
 ``confirmations`` count). The direct-send endpoint announces its own
 transaction inline and marks it so the monitor does not duplicate the
 first-seen notification (it still reports the later confirmation).
+
+The monitor also records confirmations it observes in this wallet's
+``history.csv`` (issue #672). A one-shot CoinJoin started through the API tears
+down its taker, and with it the taker's confirmation monitor, right after
+broadcast, so without this its history row would stay pending after the
+transaction confirms. The silent first pass reconciles rows whose transaction
+confirmed while the daemon was stopped or the wallet was locked.
 """
 
 from __future__ import annotations
@@ -72,6 +79,9 @@ async def run_tx_monitor(
             await asyncio.sleep(poll_interval)
             continue
 
+        confirmed = {
+            entry.txid: entry.confirmations for entry in entries if entry.confirmations > 0
+        }
         notification_failed = False
         for entry in entries:
             txid = entry.txid
@@ -131,7 +141,75 @@ async def run_tx_monitor(
             first_pass = False
             if ready is not None:
                 ready.set()
+
+        # After readiness so history I/O and maker peer-count lookups never
+        # delay unlock.
+        if confirmed:
+            await _reconcile_history(state, backend, confirmed)
         await asyncio.sleep(poll_interval)
+
+
+async def _reconcile_history(
+    state: DaemonState,
+    backend: BlockchainBackend,
+    confirmed: dict[str, int],
+) -> None:
+    """Mark this wallet's unresolved history rows confirmed by the backend.
+
+    Only recorded txids that the backend reports confirmed are updated, which
+    matches the explicit ``jm-wallet info`` refresh: failed rows with a txid
+    (e.g. a local monitoring timeout) are repaired too, because a local outcome
+    cannot prove a signed transaction never confirmed. Rows are never created.
+
+    A running maker (directly or inside a tumble) owns its pending rows: its
+    own monitor sends the confirmation notification and detects the peer
+    count, so this monitor leaves them alone until the maker stops.
+    """
+    from jmwallet.history import (
+        get_pending_transactions,
+        update_transaction_confirmation_with_detection,
+    )
+    from jmwalletd.state import CoinjoinState
+
+    ws = state.wallet_service
+    fingerprint = getattr(ws, "wallet_fingerprint", "") if ws is not None else ""
+    if not fingerprint:
+        # Unscoped updates could touch another wallet's rows in a shared data dir.
+        return
+
+    try:
+        unresolved = get_pending_transactions(
+            state.data_dir, wallet_fingerprint=fingerprint, include_failed=True
+        )
+        maker_active = state.coinjoin_state in (
+            CoinjoinState.MAKER_RUNNING,
+            CoinjoinState.TUMBLER_RUNNING,
+        )
+        for row in unresolved:
+            confirmations = confirmed.get(row.txid) if row.txid else None
+            if confirmations is None:
+                continue
+            if row.role == "maker" and maker_active and not row.completed_at:
+                continue
+            await update_transaction_confirmation_with_detection(
+                txid=row.txid,
+                confirmations=confirmations,
+                backend=backend,
+                data_dir=state.data_dir,
+                wallet_fingerprint=fingerprint,
+            )
+            logger.info("tx monitor: recorded history confirmation")
+            logger.bind(sensitive=True).info(
+                f"tx monitor: marked {row.txid[:16]}... confirmed in history "
+                f"({confirmations} confirmation(s))"
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("tx monitor: failed to record history confirmations")
+        logger.bind(sensitive=True).warning(
+            f"tx monitor: history confirmation update failed: {exc}"
+        )
 
 
 async def _notify(
