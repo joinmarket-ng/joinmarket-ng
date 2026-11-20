@@ -17,6 +17,8 @@ import json
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -2704,6 +2706,8 @@ class TestPhaseAuthMakerAuthentication:
         utxo_list_override: str | None = None,
         cj_addr: str = "bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t",
         change_addr: str = "bcrt1qqgpqyqszqgpqyqszqgpqyqszqgpqyqszazmwwa",
+        wallet_addresses: dict[str, tuple[int, int, int]] | None = None,
+        wallet_utxos: dict[int, list[Any]] | None = None,
     ):
         from bitcointx.core.key import CKey
         from jmcore.bitcoin import pubkey_to_p2wpkh_script
@@ -2767,6 +2771,8 @@ class TestPhaseAuthMakerAuthentication:
             taker._session = CoinJoinSession()
             taker._session.attach(taker)
             taker.wallet = MagicMock()
+            taker.wallet.address_cache = wallet_addresses or {}
+            taker.wallet.utxo_cache = wallet_utxos or {}
             taker.backend = AsyncMock()
             taker.backend.requires_neutrino_metadata = MagicMock(
                 return_value=is_neutrino_unavailable
@@ -2895,6 +2901,25 @@ class TestPhaseAuthMakerAuthentication:
         )
         assert result.success is False
         assert nick not in session_state.maker_sessions
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("wallet_addresses", "wallet_utxos"),
+        [
+            ({"bcrt1qtest": (1, 0, 0)}, None),
+            (None, {1: [SimpleNamespace(txid="B" * 64, vout=0)]}),
+        ],
+    )
+    async def test_rejects_maker_declaring_our_wallet_input(self, wallet_addresses, wallet_utxos):
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True,
+            valid_btc_sig=True,
+            wallet_addresses=wallet_addresses,
+            wallet_utxos=wallet_utxos,
+        )
+        assert result.success is False
+        assert nick not in session_state.maker_sessions
+        assert result.failed_makers == [nick]
 
     @pytest.mark.asyncio
     async def test_accepts_authenticated_maker_with_uppercase_scriptpubkey(self):
