@@ -399,8 +399,8 @@ For full documentation, see [jmwallet Documentation](https://joinmarket-ng.githu
 
  Fidelity bonds (locked or expired) can be frozen like any other UTXO:
  freezing a still-locked bond keeps it out of the sweep fallback and coin
- control once its timelock expires. Bonds are tagged [FB-LOCKED] or
- [FB-EXPIRED] in the list; "freeze all"/"unfreeze all" include them.
+ control once its timelock expires. Bonds are tagged fb-a/
+ fb-x in the Label column; "freeze all"/"unfreeze all" include them.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────╮
 │ --backend                  -b      <str>   Backend: descriptor_wallet |      │
