@@ -978,6 +978,12 @@ class CoinJoinSession:
                         del self.maker_sessions[nick]
                         continue
 
+                    if self._declares_wallet_input(session.utxos):
+                        logger.warning(f"Dropping maker {nick}: declared an input of our wallet")
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
                     # Reference-taker parity: the maker must fund its CoinJoin
                     # output and still leave a non-dust change output. Otherwise
                     # the tx build fails (negative change) or the maker's change
@@ -1218,6 +1224,17 @@ class CoinJoinSession:
             except (ValueError, KeyError):
                 continue
         return result
+
+    def _declares_wallet_input(self, utxos: list[dict[str, Any]]) -> bool:
+        owned = {
+            (utxo.txid.lower(), utxo.vout)
+            for mixdepth_utxos in self.wallet.utxo_cache.values()
+            for utxo in mixdepth_utxos
+        }
+        return any(
+            u.get("address") in self.wallet.address_cache or (u["txid"].lower(), u["vout"]) in owned
+            for u in utxos
+        )
 
     def _is_usable_maker_address(self, address: str) -> bool:
         network = (self.config.bitcoin_network or self.config.network).value
