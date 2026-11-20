@@ -3065,34 +3065,77 @@ def test_freeze_sorts_utxos_by_path_not_mixdepth_value() -> None:
     assert [u.txid for u in utxos] == ["b", "e", "d", "c", "a"]
 
 
-def test_freeze_address_truncation_for_long_addresses() -> None:
-    """FB addresses >42 chars must be truncated with ... in middle."""
-    from jmwallet.cli.freeze import _format_freeze_address
+def test_freeze_row_truncates_long_addresses_in_middle() -> None:
+    """FB addresses longer than the address column get middle-ellipsised."""
+    from jmwallet.utxo_tui import ADDRESS_COL_WIDTH, format_utxo_line
 
-    # Long FB address (62 chars).
     long_addr = "bc1qa82tuh6vnq0ukc9y5wk4dggxtfqqmn7e9teefea4wn5jle59d6rq98j8jg"
+    assert len(long_addr) > ADDRESS_COL_WIDTH
 
-    truncated = _format_freeze_address(long_addr, prev_address="")
+    line = format_utxo_line(
+        _make_freeze_utxo("a", mixdepth=0, path="m/84'/0'/0'/0/0", address=long_addr),
+        max_width=120,
+        term_width=120,
+        columns=[("address", ADDRESS_COL_WIDTH)],
+        mark_title="F",
+    )
 
-    assert len(truncated) == 42
-    assert "..." in truncated
-    assert truncated == "bc1qa82tuh6vnq0ukc9y...4wn5jle59d6rq98j8jg"
+    # Middle-ellipsis contract: prefix 19, "..." (3), suffix 20 — the cell
+    # fills the column exactly (prefix_len = (ADDRESS_COL_WIDTH - 3) // 2).
+    # format_utxo_line emits no mark cell, so the line starts with the first
+    # real column and ends with the shared " |" row border.
+    expected = re.escape(long_addr[:19]) + r"\.\.\." + re.escape(long_addr[-20:])
+    assert re.fullmatch(expected + r" \|", line)
 
 
-def test_freeze_short_address_not_truncated() -> None:
-    """Short addresses (<=42 chars) must be shown verbatim."""
-    from jmwallet.cli.freeze import _format_freeze_address
+def test_freeze_row_shows_short_address_verbatim() -> None:
+    """Addresses fitting the address column must be shown verbatim."""
+    from jmwallet.utxo_tui import ADDRESS_COL_WIDTH, format_utxo_line
 
-    addr = "bc1qshortaddress"
-    assert _format_freeze_address(addr, prev_address="") == addr
+    line = format_utxo_line(
+        _make_freeze_utxo(
+            "a", mixdepth=0, path="m/84'/0'/0'/0/0", address="bc1qshortaddress"
+        ),
+        max_width=120,
+        term_width=120,
+        columns=[("address", ADDRESS_COL_WIDTH)],
+        mark_title="F",
+    )
+
+    assert "bc1qshortaddress" in line
 
 
-def test_freeze_duplicate_address_collapsed_to_spaces() -> None:
-    """Duplicate addresses must show spaces on subsequent rows."""
-    from jmwallet.cli.freeze import _format_freeze_address
+def test_freeze_rows_show_duplicate_addresses_on_every_row() -> None:
+    """Duplicate addresses stay visible: every row carries its own address.
 
-    addr_str = _format_freeze_address("bc1qtest", prev_address="bc1qtest")
-    assert addr_str == " " * 42
+    Inverts the pre-redesign behaviour (later rows collapsed the address
+    column to spaces) — #673 keeps each row self-describing. Two distinct
+    UTXOs sharing one address must both render it.
+    """
+    from jmwallet.cli.freeze import _build_display_items
+    from jmwallet.utxo_tui import ADDRESS_COL_WIDTH, format_utxo_line
+
+    shared_addr = "bc1qtest"
+    utxo_a = _make_freeze_utxo(
+        "a", mixdepth=0, path="m/84'/0'/0'/0/0", address=shared_addr
+    )
+    utxo_b = _make_freeze_utxo(
+        "b", mixdepth=0, path="m/84'/0'/0'/0/1", address=shared_addr
+    )
+
+    rows = [
+        format_utxo_line(
+            utxo,
+            max_width=120,
+            term_width=120,
+            columns=[("address", ADDRESS_COL_WIDTH)],
+            mark_title="F",
+        )
+        for utxo in _build_display_items([utxo_a, utxo_b])
+    ]
+
+    assert len(rows) == 2
+    assert sum(shared_addr in row for row in rows) == 2
 
 
 def test_freeze_build_display_items_inserts_separators() -> None:
@@ -3155,37 +3198,43 @@ def test_freeze_seek_selectable_returns_start_when_nothing_selectable() -> None:
     assert _seek_selectable(items, 0, 1) == 0
 
 
-def test_freeze_build_utxo_line_contains_address_and_amount() -> None:
-    """The rendered line must include the address, amount, and outpoint."""
-    from jmwallet.cli.freeze import _build_utxo_line
+def test_freeze_row_contains_mixdepth_address_and_amount() -> None:
+    """The rendered row carries mixdepth, address, and formatted amount.
 
-    utxo = _make_freeze_utxo(
-        "deadbeefcafe",
-        mixdepth=3,
-        path="m/84'/0'/3'/0/0",
-        address="bc1qexample",
-        value=123456,
+    The outpoint is no longer a row column: the redesign moved it to the
+    footer status line (covered by the freeze rendering component tests).
+    """
+    from jmwallet.utxo_tui import format_utxo_line
+
+    line = format_utxo_line(
+        _make_freeze_utxo(
+            "deadbeefcafe",
+            mixdepth=3,
+            path="m/84'/0'/3'/0/0",
+            address="bc1qexample",
+            value=123456,
+        ),
+        max_width=120,
+        term_width=120,
+        columns=[("MD", 2), ("address", 12), ("sats", 9)],
+        mark_title="F",
     )
 
-    line = _build_utxo_line(utxo, prev_address="")
-
+    assert line.split(" |")[0].strip() == "m3"
     assert "bc1qexample" in line
-    assert "123,456 sats" in line
-    assert "m3" in line
-    assert "deadbeef...:0" in line
-    # A second row with the same address collapses the address column.
-    repeated = _build_utxo_line(utxo, prev_address="bc1qexample")
-    assert "bc1qexample" not in repeated
+    assert "123,456" in line
 
 
-def test_freeze_build_utxo_line_marks_unfrozen_locked_bond_special() -> None:
-    """A still-locked fidelity bond shows [!] until it is frozen.
+def test_freeze_row_marks_still_locked_bond_with_lock_state() -> None:
+    """A still-locked bond renders tag fb-a; frozen wins the State column.
 
-    [!] highlights the bond's special role (unspendable on-chain until its
-    timelock expires); once the user freezes the bond, the row shows [F]
-    like any frozen UTXO. The [FB-LOCKED] suffix carries the identity.
+    Row-level identity of the old [!]/[FB-LOCKED] rendering: the [!] mark
+    is prefixed by the freeze draw loop (component-tested), while the row
+    itself describes the bond through the tag and State columns. A frozen
+    still-locked bond shows frozn — the user lock wins over the timelock.
     """
-    from jmwallet.cli.freeze import _build_utxo_line
+    from jmwallet.cli.freeze import _freeze_state_col
+    from jmwallet.utxo_tui import format_utxo_line
 
     future = int(time.time()) + 86_400
     unfrozen = _make_freeze_utxo(
@@ -3195,24 +3244,29 @@ def test_freeze_build_utxo_line_marks_unfrozen_locked_bond_special() -> None:
         "frozenlocked", mixdepth=0, path="m/84'/0'/0'/0/1", locktime=future, frozen=True
     )
 
-    unfrozen_line = _build_utxo_line(unfrozen, prev_address="")
-    frozen_line = _build_utxo_line(frozen, prev_address="")
+    for utxo, state in ((unfrozen, "lock"), (frozen, "frozn")):
+        line = format_utxo_line(
+            utxo,
+            max_width=120,
+            term_width=120,
+            columns=[("address", 12), ("tag", 11), ("state", 5)],
+            mark_title="F",
+            state_override=_freeze_state_col(utxo),
+        )
+        assert "fb-a" in line
+        assert state in line
 
-    assert unfrozen_line.startswith(" [!]")
-    assert "[FB-LOCKED]" in unfrozen_line
-    assert frozen_line.startswith(" [F]")
-    assert "[FB-LOCKED]" in frozen_line
 
+def test_freeze_row_marks_expired_bond_with_spend_state() -> None:
+    """An expired bond renders tag fb-x; unfrozen it is spendable again.
 
-def test_freeze_build_utxo_line_marks_unfrozen_expired_bond_special() -> None:
-    """An expired fidelity bond shows [!] until it is frozen.
-
-    [!] highlights the bond's special role: expired unfrozen bonds are
-    auto-selected by the sweep fallback and coin control. Once the user
-    freezes the bond it shows [F] like any frozen UTXO; the [FB-EXPIRED]
-    suffix carries the identity.
+    Expired unfrozen bonds are auto-selected by the sweep fallback and
+    coin control, so the State column returns to spend; freezing the
+    bond shows frozn like any frozen UTXO. The fb-x tag carries the
+    bond identity that the old [FB-EXPIRED] suffix provided.
     """
-    from jmwallet.cli.freeze import _build_utxo_line
+    from jmwallet.cli.freeze import _freeze_state_col
+    from jmwallet.utxo_tui import format_utxo_line
 
     past = int(time.time()) - 86_400
     unfrozen_fb = _make_freeze_utxo(
@@ -3222,13 +3276,17 @@ def test_freeze_build_utxo_line_marks_unfrozen_expired_bond_special() -> None:
         "frozenfb", mixdepth=0, path="m/84'/0'/0'/0/1", locktime=past, frozen=True
     )
 
-    unfrozen_line = _build_utxo_line(unfrozen_fb, prev_address="")
-    frozen_line = _build_utxo_line(frozen_fb, prev_address="")
-
-    assert unfrozen_line.startswith(" [!]")
-    assert "[FB-EXPIRED]" in unfrozen_line
-    assert frozen_line.startswith(" [F]")
-    assert "[FB-EXPIRED]" in frozen_line
+    for utxo, state in ((unfrozen_fb, "spend"), (frozen_fb, "frozn")):
+        line = format_utxo_line(
+            utxo,
+            max_width=120,
+            term_width=120,
+            columns=[("address", 12), ("tag", 11), ("state", 5)],
+            mark_title="F",
+            state_override=_freeze_state_col(utxo),
+        )
+        assert "fb-x" in line
+        assert state in line
 
 
 def test_tui_script_uses_portable_backup_detection() -> None:
