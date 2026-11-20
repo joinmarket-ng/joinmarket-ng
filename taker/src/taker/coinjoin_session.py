@@ -1032,6 +1032,14 @@ class CoinJoinSession:
                         del self.maker_sessions[nick]
                         continue
 
+                    if cj_addr.lower() == change_addr.lower():
+                        logger.warning(
+                            f"Dropping maker {nick}: change address equals CoinJoin address"
+                        )
+                        failed_makers.append(nick)
+                        del self.maker_sessions[nick]
+                        continue
+
                     session.cj_address = cj_addr
                     session.change_address = change_addr
                     session.auth_pubkey = auth_pub  # Store for later verification

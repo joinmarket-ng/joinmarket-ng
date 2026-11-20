@@ -50,6 +50,8 @@ MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE = 10
 # Leave time for the rest of the auth exchange rather than exhausting backend
 # retry windows on every candidate in a stale discovery cache.
 OWN_INPUT_VERIFICATION_TIMEOUT_SEC = 30.0
+LOCKTIME_THRESHOLD = 500_000_000
+MAX_LOCKTIME_BLOCKS_AHEAD = 6
 
 
 class CoinJoinState(StrEnum):
@@ -646,6 +648,11 @@ class CoinJoinSession:
                 self.state = CoinJoinState.FAILED
                 return False, {"error": f"Transaction verification failed: {error}"}
 
+            locktime_error = await self._locktime_error(tx_hex)
+            if locktime_error is not None:
+                self.state = CoinJoinState.FAILED
+                return False, {"error": locktime_error}
+
             if (
                 self.backend.can_lookup_arbitrary_utxos()
                 and self.minimum_fee_rate_sat_vb is not None
@@ -726,6 +733,16 @@ class CoinJoinSession:
             if self.state != CoinJoinState.SIG_SENT:
                 self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
+
+    async def _locktime_error(self, tx_hex: str) -> str | None:
+        locktime = parse_transaction(tx_hex).locktime
+        if locktime == 0:
+            return None
+        if locktime < LOCKTIME_THRESHOLD:
+            tip = await self.backend.get_block_height()
+            if locktime <= tip + MAX_LOCKTIME_BLOCKS_AHEAD:
+                return None
+        return f"Transaction locktime {locktime} is not a current block height"
 
     async def _verify_minimum_miner_fee(
         self, tx_hex: str, active_check: Callable[[], bool] | None
