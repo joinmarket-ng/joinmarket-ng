@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import typer
+from loguru import logger
 
 from jmwallet.cli.send import _select_input_utxos
 from jmwallet.wallet.models import UTXOInfo
@@ -162,3 +163,51 @@ async def test_sweep_never_selects_frozen_bonds() -> None:
             fee_rate=1.0,
         )
     backend.get_median_time_past.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interactive_selection_suspends_logging_during_the_tui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The selector TUI owns the terminal: log records are dropped inside.
+
+    Parity with the freeze manager: without the guard, loguru's stderr sink
+    writes into the fullscreen curses layout (mixed-output race). Asserted
+    behaviorally: a log call made while the TUI runs is dropped; logging
+    works before and after the TUI again.
+    """
+    records: list = []
+    handler_id = logger.add(lambda message: records.append(message), level="DEBUG")
+    try:
+        wallet = AsyncMock()
+        wallet.mixdepth_count = 1
+        wallet.get_utxos = AsyncMock(return_value=[_utxo(label="cj-out")])
+        wallet.get_utxo_label_from_wallet = Mock(return_value="cj-out")
+        wallet.get_locked_input_outpoints = Mock(return_value=set())
+
+        import jmwallet.utxo_selector
+
+        def fake_select(utxos, *_args, **_kwargs):  # noqa: ANN001, ANN202
+            logger.error("suppressed-while-tui-runs")
+            return []
+
+        monkeypatch.setattr(jmwallet.utxo_selector, "select_utxos_interactive", fake_select)
+
+        logger.info("marker-before-tui")
+        assert any("marker-before-tui" in str(record) for record in records)
+
+        await _select_input_utxos(
+            wallet=wallet,
+            backend=Mock(),
+            amount=50_000,
+            mixdepth=None,
+            interactive=True,
+            destination="bcrt1qq6hag67dl53wl99vzg42z8eyzfz2xlkvwk6f7m",
+            fee_rate=1.0,
+        )
+        # Suppressed: the log call made inside the TUI never reached the sink.
+        assert not any("suppressed-while-tui-runs" in str(record) for record in records)
+        # Re-enabled: the log call after the TUI exited reached the sink.
+        assert any("UTXO selection cancelled" in str(record) for record in records)
+    finally:
+        logger.remove(handler_id)

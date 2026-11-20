@@ -16,6 +16,7 @@ from jmcore.cli_common import (
     resolve_backend_settings,
     resolve_mnemonic,
     setup_cli,
+    suspend_stderr_logging,
 )
 from loguru import logger
 
@@ -136,14 +137,20 @@ async def _select_input_utxos(
         enrich_utxo_labels(wallet.get_utxo_label_from_wallet, utxos)
 
         try:
-            selected_utxos = select_utxos_interactive(
-                utxos,
-                amount,
-                allowed_mixdepth=mixdepth,
-                excluded_outpoints=locked_outpoints,
-                wallet_name=wallet.mnemonic_file.name if wallet.mnemonic_file else "(no file)",
-                wallet_fingerprint=wallet.wallet_fingerprint,
-            )
+            # Curses owns the terminal while the selector TUI runs: log output
+            # is suspended (same guard as the freeze manager's TUI); errors
+            # are shown in the selector's own footer note row.
+            with suspend_stderr_logging():
+                selected_utxos = select_utxos_interactive(
+                    utxos,
+                    amount,
+                    allowed_mixdepth=mixdepth,
+                    excluded_outpoints=locked_outpoints,
+                    wallet_name=(
+                        wallet.mnemonic_file.name if wallet.mnemonic_file else "(no file)"
+                    ),
+                    wallet_fingerprint=wallet.wallet_fingerprint,
+                )
         except RuntimeError as e:
             logger.error("Cannot use interactive UTXO selection")
             logger.bind(sensitive=True).error(f"Cannot use interactive UTXO selection: {e}")
