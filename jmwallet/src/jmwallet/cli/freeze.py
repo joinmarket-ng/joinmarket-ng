@@ -25,10 +25,8 @@ from jmwallet.utxo_tui import (
     _clip,
     _draw_footer,
     _draw_frame_filler,
-    _draw_help_overlay,
     _draw_hrule,
     _header_line,
-    _help_overlay_rows,
     _is_address_reused,
     _minimum_table_width,
     _table_columns,
@@ -43,10 +41,10 @@ from jmwallet.utxo_tui import (
     group_separator_parts,
     maker_bot_status,
     seek_selectable,
+    show_help_overlay,
     status_header_lines,
     utxo_display_sort_key,
     utxo_status_text,
-    wait_for_help_close,
     wrap_status_text,
 )
 from jmwallet.wallet.rows import FREEZE_STATE_TOKENS
@@ -946,18 +944,7 @@ def _run_freeze_tui(
 
         key = stdscr.getch()
         if key == ord("?"):
-            _, width = stdscr.getmaxyx()
-            columns = _table_columns(
-                width,
-                [u for u in display_items if u is not None],
-                "F",
-                state_tokens=FREEZE_STATE_TOKENS,
-            )
-            sep_width = _table_sep_width(columns)
-            _draw_help_overlay(
-                stdscr, _help_overlay_rows(sep_width, FREEZE_STATE_TOKENS), sep_width, _HELP_TITLE
-            )
-            wait_for_help_close(stdscr)
+            show_help_overlay(stdscr, FREEZE_STATE_TOKENS, _HELP_TITLE)
             continue
         if not _handle_freeze_key(key, state, display_items, wallet, list_height):
             return

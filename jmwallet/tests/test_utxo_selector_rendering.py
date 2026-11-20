@@ -867,6 +867,44 @@ def test_help_hint_in_controls_and_overlay_opens_and_closes(
     assert "tags (type of address" not in back_frame.text
 
 
+def test_help_scrolls_at_24_lines_and_reflows_after_resize(
+    patched_selector_curses: None,
+) -> None:
+    screen = StrictScreen(
+        24,
+        100,
+        [
+            _event(24, 80, ord("?")),  # Resize between drawing the list and opening help.
+            *[_event(24, 80, curses.KEY_DOWN) for _ in range(20)],
+            _event(24, 60, curses.KEY_RESIZE),
+            _event(24, 100, ord("q")),
+            _event(24, 100, ord("q")),
+        ],
+    )
+
+    assert _run(screen, [_utxo("a")]) == []
+
+    first_help = screen.frames[1]
+    assert first_help.width == 80
+    assert "q/Esc: back to the list" in first_help.text
+    assert "oth-md" not in first_help.text
+    before_resize, after_resize, back_to_list = screen.frames[-3:]
+    assert "oth-md" in before_resize.text
+    assert after_resize.width == 60
+    assert "UTXO Selector Help Screen" in after_resize.text
+    assert "q/Esc: back to the list" in after_resize.text
+    assert "UTXO Selector Help Screen" not in back_to_list.text
+
+
+def test_enter_cannot_auto_select_unconfirmed_coin_outside_pinned_mixdepth(
+    patched_selector_curses: None,
+) -> None:
+    screen = StrictScreen(24, 100, [_event(24, 100, ord("\n")), _event(24, 100, ord("q"))])
+
+    assert _run(screen, [_utxo("a", mixdepth=1, confirmations=0)], allowed_mixdepth=0) == []
+    assert "oth-md" in screen.frames[0].text
+
+
 def test_reuse_column_appears_only_when_reuse_exists(
     patched_selector_curses: None,
 ) -> None:

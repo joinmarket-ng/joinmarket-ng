@@ -356,13 +356,12 @@ def state_token(
         return "lock"
     if utxo.is_fidelity_bond and not allow_fidelity_bonds:
         return "no-cj"
-    if min_confirmations == 0:
-        if utxo.confirmations == 0:
-            return "unconf"
-    elif utxo.confirmations < min_confirmations:
+    if utxo.confirmations < min_confirmations:
         return "immat"
     if allowed_mixdepth is not None and utxo.mixdepth != allowed_mixdepth:
         return "oth-md"
+    if min_confirmations == 0 and utxo.confirmations == 0:
+        return "unconf"
     return "spend"
 
 

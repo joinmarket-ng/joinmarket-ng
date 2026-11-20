@@ -434,6 +434,21 @@ class TestBaseSelectability:
         assert utxo_selector._utxo_state_col(utxo) == "unconf"
         assert _is_base_selectable(utxo, None, 0) is True
 
+    @pytest.mark.parametrize(
+        ("mixdepth", "confirmations", "expected"),
+        [(0, 0, True), (1, 0, False), (0, -1, False)],
+    )
+    def test_single_coin_direct_send_checks_mixdepth_and_confirmation_floor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mixdepth: int,
+        confirmations: int,
+        expected: bool,
+    ) -> None:
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+        utxo = _make_utxo(mixdepth, confirmations=confirmations)
+        assert select_utxos_interactive([utxo], allowed_mixdepth=0) == ([utxo] if expected else [])
+
     def test_immature_unselectable_at_positive_threshold(self) -> None:
         """0 confs with min_confirmations >= 1 (CoinJoin): immat, unselectable."""
         utxo = _make_utxo(0, confirmations=0)

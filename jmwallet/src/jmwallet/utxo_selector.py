@@ -25,10 +25,8 @@ from typing import TYPE_CHECKING
 from jmwallet.utxo_tui import (
     _draw_footer,
     _draw_frame_filler,
-    _draw_help_overlay,
     _draw_hrule,
     _header_line,
-    _help_overlay_rows,
     _is_address_reused,
     _minimum_table_width,
     _table_columns,
@@ -44,11 +42,11 @@ from jmwallet.utxo_tui import (
     group_separator_parts,
     maker_bot_status,
     seek_selectable,
+    show_help_overlay,
     status_header_lines,
     utxo_cursor_description,
     utxo_display_sort_key,
     utxo_status_text,
-    wait_for_help_close,
     wrap_status_text,
 )
 from jmwallet.wallet.rows import SELECTOR_STATE_TOKENS
@@ -601,10 +599,7 @@ def _run_selector(
         notice = ""
 
         if key == ord("?"):
-            _, width = stdscr.getmaxyx()
-            overlay = _help_overlay_rows(sep_width, SELECTOR_STATE_TOKENS)
-            _draw_help_overlay(stdscr, overlay, sep_width, _HELP_TITLE)
-            wait_for_help_close(stdscr)
+            show_help_overlay(stdscr, SELECTOR_STATE_TOKENS, _HELP_TITLE)
             continue
 
         if key == ord("q") or key == 27:  # q or Escape

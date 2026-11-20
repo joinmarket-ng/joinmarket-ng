@@ -695,6 +695,21 @@ class TestStatusHeaderLines:
         self._fake_proc(monkeypatch, b"/usr/bin/python3\x00/usr/local/bin/jm-taker\x00")
         assert utxo_tui_mod.maker_bot_status() == "STOPPED"
 
+    @pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
+    def test_maker_status_unknown_when_procfs_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, error: type[OSError]
+    ) -> None:
+        from pathlib import Path
+
+        def unavailable(path: Path) -> None:
+            assert path == Path("/proc")
+            raise error(path)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Path, "iterdir", unavailable)
+            status = utxo_tui_mod.maker_bot_status()
+        assert status == "UNKNOWN"
+
 
 class TestDrawStatusBlock:
     """The framed status block: borders, padding, value column."""

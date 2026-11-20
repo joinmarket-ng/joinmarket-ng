@@ -312,7 +312,7 @@ def _display_width(text: str) -> int:
 
 
 def maker_bot_status() -> str:
-    """``RUNNING``/``STOPPED`` for the maker bot, independent of how it started.
+    """Maker process status, or ``UNKNOWN`` when procfs is unavailable.
 
     Scans ``/proc`` argv for ``jm-maker`` (the maker console script and the
     systemd unit both run this entry point), so the TUI sees the maker
@@ -323,7 +323,12 @@ def maker_bot_status() -> str:
     """
     from pathlib import Path
 
-    for proc_dir in Path("/proc").iterdir():
+    try:
+        proc_dirs = list(Path("/proc").iterdir())
+    except OSError:
+        return "UNKNOWN"
+
+    for proc_dir in proc_dirs:
         if not proc_dir.name.isdigit():
             continue
         try:
@@ -988,35 +993,45 @@ def _help_overlay_rows(sep_width: int, state_tokens: Sequence[str]) -> list[tupl
     return rows
 
 
-def _draw_help_overlay(
-    stdscr: curses.window, rows: list[tuple[str, int]], sep_width: int, title: str
-) -> None:
-    """Draw the help overlay top-down over the whole screen (same frame).
-
-    Mirrors the main screen's header geometry: the TUI's title sits
-    centered on the second terminal row (em-dashes included, same color
-    as the TUI title), and the framed help box starts below it -- the
-    first row of ``rows`` is the box's top edge.
-    """
+def show_help_overlay(stdscr: curses.window, state_tokens: Sequence[str], title: str) -> None:
+    """Keep the help legend scrollable and its controls visible after a resize."""
     import curses
 
-    stdscr.clear()
-    height, width = stdscr.getmaxyx()
-    stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
-    stdscr.addstr(1, 0, title.center(width)[:width])
-    stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
-    # Keep the last terminal row blank (same guard as the old full-screen
-    # layout): rows[:height-3] with start 2 ends the box at height-2.
-    _draw_footer(stdscr, 2, rows[: max(0, height - 3)], sep_width)
-    stdscr.refresh()
+    offset = 0
+    while True:
+        height, width = stdscr.getmaxyx()
+        try:
+            stdscr.clear()
+            if height < 8 or width < 30:
+                draw_resize_prompt(stdscr, width, "height" if height < 8 else "width")
+            else:
+                sep_width = width - 1
+                rows = _help_overlay_rows(sep_width, state_tokens)
+                body, controls = rows[1:-3], rows[-3:]
+                # Reserve the title, top border, controls section and last screen row.
+                capacity = height - 7
+                max_offset = max(0, len(body) - capacity)
+                offset = min(offset, max_offset)
+                if max_offset:
+                    hint, attr = controls[1]
+                    hint = f"j/k: scroll | {hint}"
+                    if len(hint) > sep_width - 2:
+                        hint = "j/k: scroll | q/Esc: back"
+                    controls[1] = (hint, attr)
+                stdscr.addstr(
+                    1, 0, title.center(width)[:width], curses.color_pair(3) | curses.A_BOLD
+                )
+                visible_rows = [rows[0], *body[offset : offset + capacity], *controls]
+                _draw_footer(stdscr, 2, visible_rows, sep_width)
+                stdscr.refresh()
+        except curses.error:
+            # A resize can invalidate the dimensions between getmaxyx() and a write.
+            pass
 
-
-def wait_for_help_close(stdscr: curses.window) -> bool:
-    """Block until the overlay closes. Always returns to the list.
-
-    Any key (``q``/``Esc`` per the controls hint) closes the help page; the
-    TUI itself only quits from the list view, so a second ``q`` is needed
-    there.
-    """
-    stdscr.getch()
-    return True
+        key = stdscr.getch()
+        if key in (curses.KEY_DOWN, ord("j")):
+            offset += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key != curses.KEY_RESIZE:
+            return
