@@ -1597,6 +1597,53 @@ async def test_signing_failure_crosses_lock_retention_boundary():
     assert session.state == CoinJoinState.SIG_SENT
 
 
+@pytest.mark.parametrize(
+    ("locktime", "signs"),
+    [
+        (0, True),
+        (901, True),
+        (1000, True),
+        (1006, True),
+        (1007, False),
+        (500_000_000, False),
+        (0x7FFFFFFF, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_maker_refuses_locktime_beyond_current_height(locktime: int, signs: bool) -> None:
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from maker.coinjoin import CoinJoinSession, CoinJoinState
+
+    wallet = MagicMock()
+    wallet.network = "regtest"
+    backend = MagicMock()
+    backend.requires_neutrino_metadata.return_value = False
+    backend.get_block_height = AsyncMock(return_value=1000)
+    session = CoinJoinSession(
+        taker_nick="J5LocktimeTaker",
+        offer=MagicMock(),
+        wallet=wallet,
+        backend=backend,
+    )
+    session.state = CoinJoinState.IOAUTH_SENT
+    sign = AsyncMock(return_value=[])
+
+    with (
+        patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
+        patch.object(session, "_sign_transaction", new=sign),
+    ):
+        success, response = await session.handle_tx(_maker_signing_tx(session, locktime=locktime))
+
+    assert success is False
+    if signs:
+        sign.assert_awaited_once()
+    else:
+        sign.assert_not_awaited()
+        assert "locktime" in response["error"]
+        assert session.state == CoinJoinState.FAILED
+
+
 def _fee_policy_tx(output_value: int) -> str:
     from jmcore.bitcoin import TxInput, TxOutput, serialize_transaction
 
@@ -1608,7 +1655,9 @@ def _fee_policy_tx(output_value: int) -> str:
     ).hex()
 
 
-def _maker_signing_tx(session: CoinJoinSession, input_txid: str = "aa" * 32) -> str:
+def _maker_signing_tx(
+    session: CoinJoinSession, input_txid: str = "aa" * 32, locktime: int = 0
+) -> str:
     """Valid regtest outputs for tests that simulate the signing boundary."""
     from jmcore.bitcoin import TxInput, TxOutput, scriptpubkey_to_address, serialize_transaction
 
@@ -1623,7 +1672,7 @@ def _maker_signing_tx(session: CoinJoinSession, input_txid: str = "aa" * 32) -> 
             TxOutput(value=18_000, script=cj_script),
             TxOutput(value=1_000, script=change_script),
         ],
-        locktime=0,
+        locktime=locktime,
     ).hex()
 
 
@@ -2058,7 +2107,7 @@ async def test_maker_does_not_sign_after_input_ownership_loss(tmp_path):
         patch("maker.coinjoin.verify_unsigned_transaction", return_value=(True, "")),
         patch.object(session, "_sign_transaction", new=sign),
     ):
-        success, response = await session.handle_tx("00")
+        success, response = await session.handle_tx(_maker_signing_tx(session))
 
     assert success is False
     assert "ownership was lost" in response["error"]

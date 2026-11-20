@@ -2970,6 +2970,25 @@ class TestPhaseAuthMakerAuthentication:
         assert result.failed_makers == [nick]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "change_addr",
+        [
+            "bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t",
+            "BCRT1QQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPVXAT9T",
+        ],
+    )
+    async def test_rejects_maker_with_change_address_equal_to_cj_address(self, change_addr):
+        result, session_state, nick = await self._drive_phase_auth(
+            auth_owns_utxo=True,
+            valid_btc_sig=True,
+            cj_addr="bcrt1qqyqszqgpqyqszqgpqyqszqgpqyqszqgpvxat9t",
+            change_addr=change_addr,
+        )
+        assert result.success is False
+        assert nick not in session_state.maker_sessions
+        assert result.failed_makers == [nick]
+
+    @pytest.mark.asyncio
     async def test_accepts_maker_with_uppercase_bech32_addresses(self):
         """BIP173 allows all-uppercase addresses, and the tx builder decodes them."""
         result, session_state, nick = await self._drive_phase_auth(
