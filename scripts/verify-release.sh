@@ -72,6 +72,26 @@ download_release_asset() {
     fi
 }
 
+verify_signer() {
+    local fingerprint="$1" signature="$2" artifact="$3" status
+    status=$(gpg --no-options --homedir "$VERIFY_GNUPG_HOME" --batch \
+        --no-auto-key-retrieve --status-fd 1 --verify "$signature" "$artifact" 2>/dev/null) ||
+        return 1
+
+    # VALIDSIG reports the signing fingerprint and, for a subkey, its primary.
+    awk -v expected="$fingerprint" '
+        $1 != "[GNUPG:]" { next }
+        $2 ~ /^(REVKEYSIG|EXPKEYSIG|EXPSIG|KEYREVOKED|KEYEXPIRED|SIGEXPIRED)$/ {
+            unusable = 1
+        }
+        $2 == "VALIDSIG" {
+            valid++
+            primary = ($12 == "" ? $3 : $12)
+        }
+        END { exit !(valid == 1 && !unusable && primary == expected) }
+    ' <<< "$status"
+}
+
 section_image_name() {
     local section="$1"
     section="${section%-amd64-layers}"
@@ -214,7 +234,7 @@ setup_buildx_builder() {
 
 # Create temp directory for verification
 WORK_DIR=$(mktemp -d)
-trap "rm -rf $WORK_DIR" EXIT
+trap 'rm -rf "$WORK_DIR"' EXIT
 
 log_info "Verifying JoinMarket NG release $VERSION"
 log_info "Working directory: $WORK_DIR"
@@ -256,41 +276,48 @@ else
     VALID_SIGS=0
     SIGNERS=()
 
+    TRUSTED_KEYS="$PROJECT_ROOT/signatures/trusted-keys.txt"
+    if [[ ! -f "$TRUSTED_KEYS" || ! -r "$TRUSTED_KEYS" ]]; then
+        log_error "Cannot read trusted signer list: $TRUSTED_KEYS"
+        exit 1
+    fi
+    TRUSTED_FINGERPRINTS=()
+    while read -r fingerprint; do
+        TRUSTED_FINGERPRINTS+=("$fingerprint")
+    done < <(awk 'length($1) == 40 && $1 ~ /^[0-9A-F]+$/ && !seen[$1]++ { print $1 }' "$TRUSTED_KEYS")
+    if [[ -z "${TRUSTED_FINGERPRINTS[*]:-}" ]]; then
+        log_error "No trusted signer fingerprints in $TRUSTED_KEYS"
+        exit 1
+    fi
+
+    VERIFY_GNUPG_HOME="$WORK_DIR/gnupg"
+    mkdir -m 700 "$VERIFY_GNUPG_HOME"
+
     if [[ -d "$SIG_DIR" ]]; then
-        # Import trusted keys. Prefer the public keys committed in this
-        # repository (deterministic, works offline and in CI); fall back to
-        # keyservers for fingerprints without a committed key file.
-        TRUSTED_KEYS="$PROJECT_ROOT/signatures/trusted-keys.txt"
-        if [[ -f "$TRUSTED_KEYS" ]]; then
-            log_info "Importing trusted keys..."
-            while IFS=' ' read -r fingerprint name || [[ -n "$fingerprint" ]]; do
-                # Skip comments and empty lines
-                [[ "$fingerprint" =~ ^#.*$ || -z "$fingerprint" ]] && continue
+        log_info "Importing trusted keys..."
+        for fingerprint in "${TRUSTED_FINGERPRINTS[@]}"; do
+            committed_key="$PROJECT_ROOT/signatures/pubkeys/${fingerprint}.asc"
+            if [[ -f "$committed_key" ]]; then
+                gpg --no-options --homedir "$VERIFY_GNUPG_HOME" --batch \
+                    --import "$committed_key" 2>/dev/null ||
+                    log_warn "Could not import committed key $fingerprint"
+            else
+                gpg --no-options --homedir "$VERIFY_GNUPG_HOME" --batch \
+                    --keyserver hkps://keys.openpgp.org --recv-keys "$fingerprint" 2>/dev/null ||
+                gpg --no-options --homedir "$VERIFY_GNUPG_HOME" --batch \
+                    --keyserver hkps://keyserver.ubuntu.com --recv-keys "$fingerprint" 2>/dev/null ||
+                    log_warn "Could not import key $fingerprint"
+            fi
+        done
 
-                committed_key="$PROJECT_ROOT/signatures/pubkeys/${fingerprint}.asc"
-                if [[ -f "$committed_key" ]]; then
-                    gpg --import "$committed_key" 2>/dev/null || \
-                    log_warn "Could not import committed key $fingerprint ($name)"
-                    continue
-                fi
-
-                # Try to import from keyserver
-                gpg --keyserver hkps://keys.openpgp.org --recv-keys "$fingerprint" 2>/dev/null || \
-                gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "$fingerprint" 2>/dev/null || \
-                log_warn "Could not import key $fingerprint ($name)"
-            done < "$TRUSTED_KEYS"
-        fi
-
-        # Verify each signature
-        for sig_file in "$SIG_DIR"/*.sig; do
+        # Each allowlisted primary fingerprint gets at most one vote.
+        for fingerprint in "${TRUSTED_FINGERPRINTS[@]}"; do
+            sig_file="$SIG_DIR/$fingerprint.sig"
             [[ -f "$sig_file" ]] || continue
-            # Installer signatures cover a different artifact, not a manifest.
-            [[ "$sig_file" == *.install.sh.sig ]] && continue
 
-            fingerprint=$(basename "$sig_file" .sig)
             log_info "Verifying signature from $fingerprint..."
 
-            if gpg --verify "$sig_file" "$MANIFEST_FILE" 2>/dev/null; then
+            if verify_signer "$fingerprint" "$sig_file" "$MANIFEST_FILE"; then
                 # Signature matches the CI manifest directly
                 log_info "Valid signature from $fingerprint (verified against CI manifest)"
                 VALID_SIGS=$((VALID_SIGS + 1))
@@ -298,7 +325,7 @@ else
             else
                 # Check if signer used local-first workflow (signed a local manifest)
                 local_manifest="$SIG_DIR/${fingerprint}-manifest.txt"
-                if [[ -f "$local_manifest" ]] && gpg --verify "$sig_file" "$local_manifest" 2>/dev/null; then
+                if [[ -f "$local_manifest" ]] && verify_signer "$fingerprint" "$sig_file" "$local_manifest"; then
                     log_info "Valid signature from $fingerprint (verified against local manifest)"
 
                     # Cross-check: verify local manifest layer digests match CI manifest
@@ -390,12 +417,12 @@ if [[ "$SKIP_SIGNATURES" != true ]]; then
             log_warn "Release commit not available locally; skipping installer/commit comparison"
         fi
 
-        for sig_file in "$SIG_DIR"/*.install.sh.sig; do
+        for fingerprint in "${TRUSTED_FINGERPRINTS[@]}"; do
+            sig_file="$SIG_DIR/$fingerprint.install.sh.sig"
             [[ -f "$sig_file" ]] || continue
-            fingerprint=$(basename "$sig_file" .install.sh.sig)
             log_info "Verifying installer signature from $fingerprint..."
 
-            if gpg --verify "$sig_file" "$INSTALLER_FILE" 2>/dev/null; then
+            if verify_signer "$fingerprint" "$sig_file" "$INSTALLER_FILE"; then
                 log_info "Valid installer signature from $fingerprint"
                 INSTALLER_SIGS=$((INSTALLER_SIGS + 1))
                 INSTALLER_SIGNERS+=("$fingerprint")

@@ -231,13 +231,14 @@ set -euo pipefail
 if [[ "${{1:-}}" == "--keyserver" ]]; then
     exit 0
 fi
-if [[ "${{1:-}}" == "--verify" ]]; then
+if [[ "${{@: -3:1}}" == "--verify" ]]; then
     manifest="${{@: -1}}"
     case "$manifest" in
         *release-manifest-1.2.3.txt)
             exit 1
             ;;
         *{TEST_FINGERPRINT}-manifest.txt)
+            echo '[GNUPG:] VALIDSIG {TEST_FINGERPRINT} 2026-01-01 0 0 4 0 22 8 00'
             exit 0
             ;;
         *)
@@ -515,8 +516,8 @@ def _setup_verify_release(
 ) -> tuple[Path, Path]:
     """Build a hermetic repo + mock-bin sandbox for verify-release.sh.
 
-    Manifest signature quorum always passes (two GOODSIG manifest signatures)
-    so tests exercise the installer verification step in isolation.
+    Start with two valid manifest signatures so installer checks can be tested
+    independently.
     """
     repo_dir = tmp_path / "repo"
     scripts_dir = repo_dir / "scripts"
@@ -547,7 +548,7 @@ def _setup_verify_release(
     commit = run_git(repo_dir, "rev-parse", "HEAD").stdout.strip()
 
     for fingerprint in (TEST_FINGERPRINT, SECOND_FINGERPRINT):
-        (signatures_dir / f"{fingerprint}.sig").write_text("GOODSIG manifest\n")
+        (signatures_dir / f"{fingerprint}.sig").write_text(f"GOODSIG {fingerprint}\n")
     for fingerprint, contents in installer_sig_contents.items():
         (signatures_dir / f"{fingerprint}.install.sh.sig").write_text(contents)
 
@@ -612,9 +613,10 @@ esac
         textwrap.dedent(
             """#!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == "--verify" ]]; then
-    grep -q GOODSIG "$2"
-    exit $?
+if [[ "${@: -3:1}" == "--verify" ]]; then
+    read -r result signer primary < "${@: -2:1}"
+    [[ "$result" == "GOODSIG" ]] || exit 1
+    printf '[GNUPG:] VALIDSIG %s 2026-01-01 0 0 4 0 22 8 00 %s\\n' "$signer" "$primary"
 fi
 exit 0
 """
@@ -659,8 +661,8 @@ def test_verify_release_passes_with_installer_and_manifest_quorum(
         tmp_path,
         installer_asset=installer,
         installer_sig_contents={
-            TEST_FINGERPRINT: "GOODSIG installer\n",
-            SECOND_FINGERPRINT: "GOODSIG installer\n",
+            TEST_FINGERPRINT: f"GOODSIG {'B' * 40} {TEST_FINGERPRINT}\n",
+            SECOND_FINGERPRINT: f"GOODSIG {SECOND_FINGERPRINT}\n",
         },
         committed_installer=installer,
     )
@@ -680,7 +682,7 @@ def test_verify_release_fails_without_installer_signature_quorum(
         tmp_path,
         installer_asset=installer,
         installer_sig_contents={
-            TEST_FINGERPRINT: "GOODSIG installer\n",
+            TEST_FINGERPRINT: f"GOODSIG {TEST_FINGERPRINT}\n",
             SECOND_FINGERPRINT: "BADSIG installer\n",
         },
         committed_installer=installer,
@@ -700,8 +702,8 @@ def test_verify_release_rejects_tampered_installer_asset(tmp_path: Path) -> None
         tmp_path,
         installer_asset="tampered installer bytes\n",
         installer_sig_contents={
-            TEST_FINGERPRINT: "GOODSIG installer\n",
-            SECOND_FINGERPRINT: "GOODSIG installer\n",
+            TEST_FINGERPRINT: f"GOODSIG {TEST_FINGERPRINT}\n",
+            SECOND_FINGERPRINT: f"GOODSIG {SECOND_FINGERPRINT}\n",
         },
         committed_installer="attested installer bytes\n",
     )
@@ -732,3 +734,44 @@ def test_verify_release_skips_installer_check_for_historical_releases(
     gated = _run_verify_release(repo_dir, bin_dir, "--require-installer")
     assert gated.returncode != 0
     assert "required by --require-installer" in gated.stdout
+
+
+def test_verify_release_counts_trusted_primary_once(tmp_path: Path) -> None:
+    repo_dir, bin_dir = _setup_verify_release(
+        tmp_path,
+        installer_asset=None,
+        installer_sig_contents={},
+        committed_installer=None,
+    )
+    signatures = repo_dir / "signatures"
+    (signatures / "trusted-keys.txt").write_text(
+        f"{TEST_FINGERPRINT} Test User\n{TEST_FINGERPRINT} Duplicate entry\n"
+    )
+
+    result = _run_verify_release(repo_dir, bin_dir)
+
+    assert result.returncode != 0
+    assert "Insufficient valid signatures. Required: 2, Found: 1" in result.stdout
+
+
+def test_verify_release_rejects_installer_signature_from_untrusted_primary(
+    tmp_path: Path,
+) -> None:
+    installer = "verified installer bytes\n"
+    repo_dir, bin_dir = _setup_verify_release(
+        tmp_path,
+        installer_asset=installer,
+        installer_sig_contents={
+            TEST_FINGERPRINT: f"GOODSIG {TEST_FINGERPRINT}\n",
+            SECOND_FINGERPRINT: f"GOODSIG {SECOND_FINGERPRINT} {'B' * 40}\n",
+        },
+        committed_installer=installer,
+    )
+
+    result = _run_verify_release(repo_dir, bin_dir, "--require-installer")
+
+    assert result.returncode != 0
+    assert (
+        "Insufficient valid installer signatures. Required: 2, Found: 1"
+        in result.stdout
+    )

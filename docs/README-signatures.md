@@ -90,6 +90,8 @@ Users can deliberately select another threshold with `--min-sigs N`.
 `trusted-keys.txt` lists release signers for the maintainer tools. Installed
 copies of `install.sh` pin their own fingerprints; editing this list alone
 cannot authorize a new installer signer.
+`verify-release.sh` uses a temporary GnuPG keyring, so keys in your personal
+keyring do not count toward the quorum.
 
 Full public keys are stored in `pubkeys/<fingerprint>.asc` for convenience.
 
