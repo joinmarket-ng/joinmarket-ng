@@ -1644,6 +1644,41 @@ async def test_maker_refuses_locktime_beyond_current_height(locktime: int, signs
         assert session.state == CoinJoinState.FAILED
 
 
+@pytest.mark.parametrize(
+    ("version", "sequence", "rejected"),
+    [
+        (1, 1, False),
+        (2, 0, False),
+        (2, 0x00400000, False),
+        (2, 0xFFFFFFFE, False),
+        (2, 1, True),
+        (3, 0x00400001, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_maker_relative_locktime_policy(version: int, sequence: int, rejected: bool) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from jmcore.bitcoin import parse_transaction
+
+    from maker.coinjoin import CoinJoinSession
+
+    backend = MagicMock()
+    backend.get_block_height = AsyncMock()
+    session = CoinJoinSession(
+        taker_nick="J5LocktimeTaker",
+        offer=MagicMock(),
+        wallet=MagicMock(),
+        backend=backend,
+    )
+    tx = parse_transaction(_maker_signing_tx(session, version=version, sequence=sequence))
+
+    error = await session._locktime_error(tx)
+
+    assert error == ("Transaction input has a BIP68 relative locktime" if rejected else None)
+    backend.get_block_height.assert_not_awaited()
+
+
 def _fee_policy_tx(output_value: int) -> str:
     from jmcore.bitcoin import TxInput, TxOutput, serialize_transaction
 
@@ -1656,7 +1691,12 @@ def _fee_policy_tx(output_value: int) -> str:
 
 
 def _maker_signing_tx(
-    session: CoinJoinSession, input_txid: str = "aa" * 32, locktime: int = 0
+    session: CoinJoinSession,
+    input_txid: str = "aa" * 32,
+    locktime: int = 0,
+    *,
+    version: int = 2,
+    sequence: int = 0xFFFFFFFF,
 ) -> str:
     """Valid regtest outputs for tests that simulate the signing boundary."""
     from jmcore.bitcoin import TxInput, TxOutput, scriptpubkey_to_address, serialize_transaction
@@ -1666,8 +1706,8 @@ def _maker_signing_tx(
     session.cj_address = scriptpubkey_to_address(cj_script, "regtest")
     session.change_address = scriptpubkey_to_address(change_script, "regtest")
     return serialize_transaction(
-        version=2,
-        inputs=[TxInput.from_hex(input_txid, 0), TxInput.from_hex("bb" * 32, 1)],
+        version=version,
+        inputs=[TxInput.from_hex(input_txid, 0), TxInput.from_hex("bb" * 32, 1, sequence=sequence)],
         outputs=[
             TxOutput(value=18_000, script=cj_script),
             TxOutput(value=1_000, script=change_script),

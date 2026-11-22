@@ -19,7 +19,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import Any
 
-from jmcore.bitcoin import address_to_scriptpubkey, parse_transaction
+from jmcore.bitcoin import ParsedTransaction, address_to_scriptpubkey, parse_transaction
 from jmcore.encryption import CryptoSession
 from jmcore.fee_policy import (
     estimate_p2wpkh_vsize,
@@ -52,6 +52,8 @@ MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE = 10
 OWN_INPUT_VERIFICATION_TIMEOUT_SEC = 30.0
 LOCKTIME_THRESHOLD = 500_000_000
 MAX_LOCKTIME_BLOCKS_AHEAD = 6
+BIP68_DISABLE_FLAG = 1 << 31
+BIP68_DELAY_MASK = 0xFFFF
 
 
 class CoinJoinState(StrEnum):
@@ -648,7 +650,8 @@ class CoinJoinSession:
                 self.state = CoinJoinState.FAILED
                 return False, {"error": f"Transaction verification failed: {error}"}
 
-            locktime_error = await self._locktime_error(tx_hex)
+            tx = parse_transaction(tx_hex)
+            locktime_error = await self._locktime_error(tx)
             if locktime_error is not None:
                 self.state = CoinJoinState.FAILED
                 return False, {"error": locktime_error}
@@ -685,7 +688,7 @@ class CoinJoinSession:
                 return False, {"error": "Maker input lock ownership was lost before signing"}
 
             self.wallet.validate_generated_outputs(
-                parse_transaction(tx_hex),
+                tx,
                 [
                     address_to_scriptpubkey(self.cj_address),
                     address_to_scriptpubkey(self.change_address),
@@ -734,8 +737,15 @@ class CoinJoinSession:
                 self.state = CoinJoinState.FAILED
             return False, {"error": str(e)}
 
-    async def _locktime_error(self, tx_hex: str) -> str | None:
-        locktime = parse_transaction(tx_hex).locktime
+    async def _locktime_error(self, tx: ParsedTransaction) -> str | None:
+        # Any input can impose a relative delay on the entire transaction.
+        if tx.version >= 2 and any(
+            not (tx_input.sequence & BIP68_DISABLE_FLAG) and tx_input.sequence & BIP68_DELAY_MASK
+            for tx_input in tx.inputs
+        ):
+            return "Transaction input has a BIP68 relative locktime"
+
+        locktime = tx.locktime
         if locktime == 0:
             return None
         if locktime < LOCKTIME_THRESHOLD:
