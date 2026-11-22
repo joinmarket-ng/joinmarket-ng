@@ -74,6 +74,19 @@ permitted and ignored.
   failure with `Verification error: ...`. The transaction is never trusted on
   exception paths.
 
+## Locktime Policy
+
+After structural verification and before signing, `CoinJoinSession.handle_tx`
+applies the following checks.
+
+- An absolute locktime of zero is accepted. A block-height locktime may be at
+  most six blocks ahead of the maker backend's tip. The allowance accommodates
+  small tip differences between peers. Timestamp locktimes are refused.
+- For versions 2 and 3, the maker refuses a nonzero BIP68 relative lock on any
+  input. An active relative delay on a single input can delay confirmation of
+  the entire transaction. Version 1, disabled BIP68 sequences, and zero
+  relative delays pass this check.
+
 ## Reference
 
 - Implementation: `maker/src/maker/tx_verification.py`.

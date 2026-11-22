@@ -1234,6 +1234,8 @@ class CoinJoinSession:
         return result
 
     def _declares_wallet_input(self, utxos: list[dict[str, Any]]) -> bool:
+        # Check beyond preselection so a maker cannot leave an unselected wallet
+        # input unsigned. Outpoints also cover verified inputs without an address.
         owned = {
             (utxo.txid.lower(), utxo.vout)
             for mixdepth_utxos in self.wallet.utxo_cache.values()

@@ -50,7 +50,9 @@ MINER_FEE_PREVOUT_LOOKUP_BATCH_SIZE = 10
 # Leave time for the rest of the auth exchange rather than exhausting backend
 # retry windows on every candidate in a stale discovery cache.
 OWN_INPUT_VERIFICATION_TIMEOUT_SEC = 30.0
+# Bitcoin interprets nLockTime values at or above this threshold as timestamps.
 LOCKTIME_THRESHOLD = 500_000_000
+# Allow modest tip differences between otherwise synced makers and takers.
 MAX_LOCKTIME_BLOCKS_AHEAD = 6
 BIP68_DISABLE_FLAG = 1 << 31
 BIP68_DELAY_MASK = 0xFFFF
