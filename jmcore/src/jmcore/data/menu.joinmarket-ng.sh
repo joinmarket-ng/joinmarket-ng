@@ -240,6 +240,26 @@ export LOGGING__LEVEL="$(get_tui_log_level)"
 # ---- Defaults for send/coinjoin parameters ----------------------------------
 DEFAULT_AMOUNT="0"
 DEFAULT_MIXDEPTH="0"
+# Mixdepth count default: read from config.toml [wallet] section, fall back to 5
+DEFAULT_MIXDEPTH_COUNT=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
+import sys, pathlib
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    try:
+        data = tomllib.loads(path.read_text())
+        val = data.get("wallet", {}).get("mixdepth_count")
+        if val is not None:
+            print(int(val))
+    except Exception:
+        pass
+PYEOF
+)
+DEFAULT_MIXDEPTH_COUNT="${DEFAULT_MIXDEPTH_COUNT:-5}"
+
 # Counterparty default: read from config.toml [taker] section, fall back to 10
 DEFAULT_COUNTERPARTIES=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
 import sys, pathlib
@@ -1697,6 +1717,232 @@ offer_maker_passphrase_storage() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Receive flow: prompt for mixdepth and an optional label, derive a fresh
+# deposit address, and show it in a dialog. Used by the main-menu R entry
+# and the Address Handling submenu (ADDR / NEW).
+# ---------------------------------------------------------------------------
+receive_address_flow() {
+    if ! ensure_active_wallet; then
+        return 1
+    fi
+
+    local RECV_MIXDEPTH=""
+    local RECV_LABEL=""
+
+    # 1. Target mixdepth for the deposit address (empty = 0)
+    while true; do
+      RECV_MIXDEPTH=$(prompt_param "Receive Mixdepth" \
+        "Mixdepth (account) to derive the deposit address from.\nLeave empty for mixdepth 0.") || return 1
+      if [ -z "$RECV_MIXDEPTH" ]; then
+        RECV_MIXDEPTH=0
+        break
+      fi
+      if ! [[ "$RECV_MIXDEPTH" =~ ^[0-9]+$ ]]; then
+        whiptail --title " Error " --msgbox "Mixdepth must be a non-negative integer." 8 50
+        continue
+      fi
+      if [ "$RECV_MIXDEPTH" -ge "$DEFAULT_MIXDEPTH_COUNT" ]; then
+        whiptail --title " Error " --msgbox "Mixdepth must be 0-$((DEFAULT_MIXDEPTH_COUNT - 1))." 8 60
+        continue
+      fi
+      break
+    done
+    RECV_MIXDEPTH=$(to_int "$RECV_MIXDEPTH" 0)
+
+    # 2. Optional label (empty = no label)
+    RECV_LABEL=$(prompt_param "Address Label (optional)" \
+      "Optional label to reserve the address under.\nLeave empty for no label.") || return 1
+
+    # Build the command as an array so labels with spaces stay intact.
+    local -a ADDR_ARGS=(address new "$RECV_MIXDEPTH")
+    if [ -n "$RECV_LABEL" ]; then
+        ADDR_ARGS+=("--label" "$RECV_LABEL")
+    fi
+
+    # 3. Generate the address; capture stdout via command substitution
+    #    (whiptail password prompts draw on stderr, so they still show).
+    clear
+    echo "Please wait..."
+    local NEW_ADDR
+    NEW_ADDR=$(ensure_wallet_password "$CURRENT_WALLET" \
+        && ensure_wallet_unlocked_global \
+        && jm-wallet "${ADDR_ARGS[@]}")
+    local RECV_EXIT=$?
+    # Guard against stray stdout lines: only the address itself is shown.
+    NEW_ADDR="${NEW_ADDR%%$'\n'*}"
+
+    if [ $RECV_EXIT -eq 0 ] && [ -n "$NEW_ADDR" ]; then
+        local BOX_TEXT="Fresh deposit address (mixdepth ${RECV_MIXDEPTH}):
+
+${NEW_ADDR}
+
+"
+        local BOX_H=11
+        if [ -n "$RECV_LABEL" ]; then
+            BOX_TEXT+="Reserved under label \"${RECV_LABEL}\".
+
+"
+            BOX_H=13
+        fi
+        BOX_TEXT+="Only send bitcoin that should end up in this wallet."
+        whiptail --title " Receive Address " --msgbox "${BOX_TEXT}" "${BOX_H}" 70
+    else
+        echo ""
+        echo "Could not generate a deposit address."
+        echo "See the output above for details."
+        pause
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Show the wallet's reserved deposit addresses (jm-wallet address list).
+# ---------------------------------------------------------------------------
+list_reserved_addresses() {
+    if ! ensure_active_wallet; then
+        return 1
+    fi
+
+    clear
+    echo "Please wait..."
+    local LIST_OUT
+    LIST_OUT=$(ensure_wallet_password "$CURRENT_WALLET" \
+        && ensure_wallet_unlocked_global \
+        && jm-wallet address list)
+    local LIST_EXIT=$?
+
+    if [ $LIST_EXIT -eq 0 ]; then
+        whiptail --title " Reserved Addresses " --msgbox "${LIST_OUT:-No reserved addresses.}" 20 78
+    else
+        echo ""
+        echo "Could not list reserved addresses."
+        echo "See the output above for details."
+        pause
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Release a reserved deposit address (jm-wallet address release): pick from
+# the reserved list, confirm, then release. A released address can be issued
+# again unless it already has on-chain history.
+# ---------------------------------------------------------------------------
+release_reserved_address() {
+    if ! ensure_active_wallet; then
+        return 1
+    fi
+
+    clear
+    echo "Please wait..."
+    local LIST_OUT
+    LIST_OUT=$(ensure_wallet_password "$CURRENT_WALLET" \
+        && ensure_wallet_unlocked_global \
+        && jm-wallet address list)
+    local LIST_EXIT=$?
+
+    if [ $LIST_EXIT -ne 0 ]; then
+        echo ""
+        echo "Could not list reserved addresses."
+        echo "See the output above for details."
+        pause
+        return 1
+    fi
+
+    # Parse the list output: entries look like '  md0  bc1q...  "label"'.
+    # Only lines starting with two spaces are entries; header lines are not.
+    local -a MENU_ITEMS=()
+    local -A ADDR_LABELS=()
+    local entry md addr label
+    while IFS= read -r entry; do
+        md=$(printf '%s' "$entry" | awk '{print $1}')
+        addr=$(printf '%s' "$entry" | awk '{print $2}')
+        [ -n "$addr" ] || continue
+        label=$(printf '%s' "$entry" | sed -n 's/[^"]*"\([^"]*\)".*/  "\1"/p')
+        MENU_ITEMS+=("$addr" "${md}${label}")
+        ADDR_LABELS[$addr]="$label"
+    done < <(printf '%s\n' "$LIST_OUT" | grep '^  ')
+
+    local MENU_COUNT=$(( ${#MENU_ITEMS[@]} / 2 ))
+    if [ "$MENU_COUNT" -eq 0 ]; then
+        if [ -n "$LIST_OUT" ] \
+            && [ "$LIST_OUT" != "No reserved addresses." ]; then
+            # The list output is not the known empty marker but nothing
+            # parsed as an entry: show the raw output instead of
+            # claiming the list is empty.
+            whiptail --title " Reserved Addresses " \
+                --msgbox "Could not parse the address list. Raw output:
+
+${LIST_OUT}" 20 78
+        else
+            whiptail --title " Reserved Addresses " --msgbox "No reserved addresses." 8 50
+        fi
+        return 0
+    fi
+
+    # Cap the visible menu rows so the box cannot grow past the terminal
+    # height; whiptail menus scroll when listheight < entry count.
+    local LIST_ROWS=$MENU_COUNT
+    if [ "$LIST_ROWS" -gt 12 ]; then
+        LIST_ROWS=12
+    fi
+    local selected
+    selected=$(whiptail --title " Release Reserved Address " \
+        --menu "Select the address to release:" \
+        $(( LIST_ROWS + 11 )) 78 "$LIST_ROWS" \
+        "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3) || return 0
+
+    local SEL_LABEL="${ADDR_LABELS[$selected]-}"
+    SEL_LABEL=$(printf '%s' "$SEL_LABEL" | sed 's/^ *//; s/^"//; s/"$//')
+    local CONF_TEXT="Release reservation for:
+
+${selected}
+
+"
+    local CONF_H=12
+    if [ -n "$SEL_LABEL" ]; then
+        CONF_TEXT+="Label: ${SEL_LABEL}
+
+"
+        CONF_H=14
+    fi
+    CONF_TEXT+="The address can be issued again unless it already has on-chain history."
+    whiptail --title " Confirm Release " --yesno "${CONF_TEXT}" "${CONF_H}" 70 --defaultno || return 0
+
+    clear
+    echo "Please wait..."
+    local REL_OUT
+    REL_OUT=$(ensure_wallet_password "$CURRENT_WALLET" \
+        && ensure_wallet_unlocked_global \
+        && jm-wallet address release "$selected")
+    local REL_EXIT=$?
+
+    if [ $REL_EXIT -eq 0 ]; then
+        local SEL_LABEL="${ADDR_LABELS[$selected]-}"
+        SEL_LABEL=$(printf '%s' "$SEL_LABEL" | sed 's/^ *//; s/^"//; s/"$//')
+        local REL_TEXT="Reservation removed for:
+
+${selected}
+
+"
+        local REL_H=12
+        if [ -n "$SEL_LABEL" ]; then
+            REL_TEXT+="Label: ${SEL_LABEL}
+
+"
+            REL_H=14
+        fi
+        REL_TEXT+="The address can be issued again unless it already has on-chain history."
+        whiptail --title " Address Released " --msgbox "${REL_TEXT}" "${REL_H}" 70
+    else
+        echo ""
+        echo "Could not release the address."
+        echo "See the output above for details."
+        pause
+    fi
+    return 0
+}
+
 # =============================================================================
 # Main Loop
 # =============================================================================
@@ -1717,18 +1963,19 @@ while true; do
   # Build the main menu once; RaspiBlitz adds its own exit entry.
   MAIN_MENU_ITEMS=(
       "S" "Send Bitcoin"
+      "R" "Receive Bitcoin"
       "W" "Wallet Management"
       "M" "Maker Bot Control"
       "C" "Config Center"
       "U" "Update JoinMarket-NG"
       "I" "Info / Documentation"
   )
-  MAIN_MENU_HEIGHT=18
-  MAIN_MENU_LIST_HEIGHT=7
+  MAIN_MENU_HEIGHT=21
+  MAIN_MENU_LIST_HEIGHT=8
   if [ "${RASPIBLITZ}" -eq 1 ]; then
       MAIN_MENU_ITEMS+=("B" "Exit to RaspiBlitz Menu")
-      MAIN_MENU_HEIGHT=21
-      MAIN_MENU_LIST_HEIGHT=8
+      MAIN_MENU_HEIGHT=24
+      MAIN_MENU_LIST_HEIGHT=9
   fi
   MAIN_MENU_ITEMS+=("X" "Exit to JoinMarket-NG CLI Shell")
 
@@ -2004,6 +2251,13 @@ No:  automatic coin selection from one mixdepth." 12 64
       ;;
 
     # ------------------------------------------------------------------
+    # RECEIVE BITCOIN (fresh deposit address via jm-wallet address new)
+    # ------------------------------------------------------------------
+    R)
+      receive_address_flow
+      ;;
+
+    # ------------------------------------------------------------------
     # WALLET MANAGEMENT
     # ------------------------------------------------------------------
     W)
@@ -2026,6 +2280,7 @@ No:  automatic coin selection from one mixdepth." 12 64
         fi
         WMENU_ITEMS+=(
           "FREEZE"   "UTXO Freeze Manager"
+          "ADDR"     "Address Handling"
           "NEW"      "Create New Wallet (12 or 24-word seed)"
           "IMP"      "Import Existing Wallet (from seed)"
           "SEL"      "Select Active Wallet"
@@ -2502,6 +2757,33 @@ for item in json.load(sys.stdin):
                   read -r _
               )
               clear
+              ;;
+
+          # --------------------------------------------------------------
+          # ADDR - Address Handling (new/list/release deposit addresses)
+          # --------------------------------------------------------------
+          ADDR)
+              while true; do
+                  # Refresh wallet info at the START of each ADDR submenu iteration
+                  check_stale_wallet
+                  ACHOICE=$(whiptail --title " Address Handling " \
+                    --menu "\n$(menu_header)\n\nWallet: $(basename "$CURRENT_WALLET")" \
+                    19 78 4 \
+                    "NEW"     "New Deposit Address" \
+                    "LIST"    "List Reserved Addresses" \
+                    "RELEASE" "Release Reserved Address" \
+                    "BACK"    "Back to Wallet Management" 3>&1 1>&2 2>&3)
+
+                  # Handle ESC/Cancel - exit Address Handling submenu
+                  [ $? -ne 0 ] && break
+
+                  case $ACHOICE in
+                      NEW)      receive_address_flow ;;
+                      LIST)     list_reserved_addresses ;;
+                      RELEASE)  release_reserved_address ;;
+                      BACK)     break ;;
+                  esac
+              done
               ;;
 
           # --------------------------------------------------------------

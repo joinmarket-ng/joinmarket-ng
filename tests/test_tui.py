@@ -4,6 +4,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -269,11 +270,13 @@ def test_tui_main_menu_arguments_and_cancellation(
         "--menu",
         "\\nActive Wallet: active wallet | Maker Bot: "
         f"{'RUNNING' if maker_running else 'STOPPED'}\nFingerprint:   0123456789abcdef",
-        "21" if raspiblitz else "18",
+        "24" if raspiblitz else "21",
         "64",
-        "8" if raspiblitz else "7",
+        "9" if raspiblitz else "8",
         "S",
         "Send Bitcoin",
+        "R",
+        "Receive Bitcoin",
         "W",
         "Wallet Management",
         "M",
@@ -297,6 +300,370 @@ def test_tui_main_menu_arguments_and_cancellation(
         assert not (tmp_path / "menu-2.args").exists()
     else:
         assert result.stdout.splitlines() == ["CHOICE=W STATUS=0"] * 2
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "success",
+        "success_default",
+        "invalid_then_valid",
+        "mixdepth_too_large",
+        "cancel",
+        "wallet_error",
+    ],
+)
+def test_tui_receive_flow(tmp_path: Path, scenario: str) -> None:
+    """The Receive flow derives a fresh deposit address via jm-wallet address new."""
+    content = SCRIPT_PATH.read_text()
+    functions = "\n".join(
+        _extract_script_function(content, name)
+        for name in ("prompt_param", "to_int", "receive_address_flow")
+    )
+    choices: list[str]
+    jmwallet_rc = 0
+    if scenario == "success":
+        choices = ["2", "my label"]
+    elif scenario == "success_default":
+        choices = ["", ""]
+    elif scenario == "invalid_then_valid":
+        choices = ["abc", "2", ""]
+    elif scenario == "mixdepth_too_large":
+        choices = ["5", "2", ""]
+    elif scenario == "cancel":
+        choices = ["CANCEL"]
+    else:
+        choices = ["", ""]
+        jmwallet_rc = 1
+    choices_file = tmp_path / "choices"
+    choices_file.write_text("".join(f"{choice}\n" for choice in choices))
+    call_log = tmp_path / "calls.log"
+    script = (
+        functions
+        + f"""
+CALL_LOG={shlex.quote(str(call_log))}
+CHOICES={shlex.quote(str(choices_file))}
+JMWALLET_RC={jmwallet_rc}
+DEFAULT_MIXDEPTH_COUNT=5
+ensure_active_wallet() {{ :; }}
+ensure_wallet_password() {{ :; }}
+ensure_wallet_unlocked_global() {{ :; }}
+pause() {{ :; }}
+whiptail() {{
+    case " $* " in
+      *" --msgbox "*)
+        local IFS=$'\\x1f'
+        printf '%s\\n' "${{*//$'\\n'/ }}" >> "$CALL_LOG"
+        return 0
+        ;;
+    esac
+    local IFS=$'\\x1f'
+    printf '%s\\n' "${{*//$'\\n'/ }}" >> "$CALL_LOG"
+    local choice
+    if [ -s "$CHOICES" ]; then
+        choice=$(head -n 1 "$CHOICES")
+        sed -i 1d "$CHOICES"
+    else
+        choice=CANCEL
+    fi
+    [ "$choice" = CANCEL ] && return 1
+    printf '%s' "$choice" >&2
+}}
+jm-wallet() {{
+    local IFS=$'\\x1f'
+    printf '%s\\n' "$*" >> "$CALL_LOG"
+    if [ "$JMWALLET_RC" -ne 0 ]; then
+        printf 'jm-wallet: backend unreachable\\n' >&2
+        return "$JMWALLET_RC"
+    fi
+    printf 'bcrt1qreceivetestaddress\\n'
+}}
+receive_address_flow
+"""
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == (1 if scenario == "cancel" else 0), result.stderr
+    calls = [line.split("\x1f") for line in call_log.read_text().splitlines()]
+    jmwallet_calls = [call for call in calls if call[:2] == ["address", "new"]]
+    msgboxes = [
+        call[call.index("--msgbox") + 1] for call in calls if "--msgbox" in call
+    ]
+    if scenario == "success":
+        assert jmwallet_calls == [["address", "new", "2", "--label", "my label"]]
+        box_calls = [call for call in calls if "--msgbox" in call]
+        assert box_calls[0][-2:] == ["13", "70"]
+        # Goldstring: the exact composed dialog text (newlines flattened to
+        # spaces by the mock log); variable parts are mixdepth and address.
+        assert msgboxes[0] == (
+            "Fresh deposit address (mixdepth 2):  "
+            "bcrt1qreceivetestaddress  "
+            'Reserved under label "my label".  '
+            "Only send bitcoin that should end up in this wallet."
+        )
+    elif scenario == "success_default":
+        assert jmwallet_calls == [["address", "new", "0"]]
+        box_calls = [call for call in calls if "--msgbox" in call]
+        assert box_calls[0][-2:] == ["11", "70"]
+        assert any(
+            "bcrt1qreceivetestaddress" in box and "mixdepth 0" in box
+            for box in msgboxes
+        )
+    elif scenario == "invalid_then_valid":
+        assert any(
+            "Mixdepth must be a non-negative integer." in box for box in msgboxes
+        )
+        assert jmwallet_calls == [["address", "new", "2"]]
+    elif scenario == "mixdepth_too_large":
+        # The configured mixdepth count bounds the input; the rejected
+        # value never reaches jm-wallet.
+        assert any("Mixdepth must be 0-4." in box for box in msgboxes)
+        assert jmwallet_calls == [["address", "new", "2"]]
+    elif scenario == "cancel":
+        assert not jmwallet_calls
+        assert not msgboxes
+    else:
+        assert jmwallet_calls == [["address", "new", "0"]]
+        assert "Could not generate a deposit address." in result.stdout
+        assert not any("bcrt1qreceivetestaddress" in box for box in msgboxes)
+
+
+RESERVED_LIST_OUTPUT = (
+    "Reserved addresses (2):\n"
+    '  md0  bcrt1qlistaddrone  "label one"\n'
+    "  md1  bcrt1qlistaddrtwo\n"
+)
+
+
+def _run_address_function(
+    tmp_path: Path,
+    function_name: str,
+    *,
+    choices: list[str],
+    list_output: str,
+    list_fail: bool = False,
+    release_fail: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run one address-handling flow function with mocked helpers and CLI."""
+    content = SCRIPT_PATH.read_text()
+    call_log = tmp_path / "calls.log"
+    choices_file = tmp_path / "choices"
+    choices_file.write_text("".join(f"{choice}\n" for choice in choices))
+    script = (
+        _extract_script_function(content, function_name)
+        + f"""
+CALL_LOG={shlex.quote(str(call_log))}
+CHOICES={shlex.quote(str(choices_file))}
+LIST_TEXT={shlex.quote(list_output)}
+LIST_RC={1 if list_fail else 0}
+RELEASE_RC={1 if release_fail else 0}
+ensure_active_wallet() {{ :; }}
+ensure_wallet_password() {{ :; }}
+ensure_wallet_unlocked_global() {{ :; }}
+pause() {{ :; }}
+whiptail() {{
+    local kind
+    case " $* " in
+      *" --msgbox "*) kind=msgbox ;;
+      *" --yesno "*) kind=yesno ;;
+      *) kind=other ;;
+    esac
+    local IFS=$'\x1f'
+    local flat
+    flat=$(printf '%s' "$*" | tr '\\n' ' ')
+    printf '%s\n' "$flat" >> "$CALL_LOG"
+    local choice
+    if [ -s "$CHOICES" ]; then
+        choice=$(head -n 1 "$CHOICES")
+        sed -i 1d "$CHOICES"
+    else
+        choice=CANCEL
+    fi
+    if [ "$kind" = msgbox ]; then
+        return 0
+    fi
+    if [ "$kind" = yesno ]; then
+        if [ "$choice" = yes ]; then return 0; else return 1; fi
+    fi
+    if [ "$choice" = CANCEL ]; then return 1; fi
+    printf '%s' "$choice" >&2
+}}
+jm-wallet() {{
+    local IFS=$'\x1f'
+    printf '%s\n' "$*" >> "$CALL_LOG"
+    if [ "$1:$2" = address:list ] && [ "$LIST_RC" -ne 0 ]; then
+        printf 'jm-wallet: backend unreachable\n' >&2
+        return 1
+    fi
+    if [ "$1:$2" = address:release ]; then
+        if [ "$RELEASE_RC" -ne 0 ]; then
+            printf 'jm-wallet: release failed\n' >&2
+            return 1
+        fi
+        printf 'Released reservation for bcrt1qlistaddrone.\n'
+        return 0
+    fi
+    printf '%s' "$LIST_TEXT"
+}}
+{function_name}
+"""
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=15
+    )
+    return result, call_log
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["success", "empty", "list_error"],
+)
+def test_tui_list_reserved_addresses(tmp_path: Path, scenario: str) -> None:
+    """The LIST flow shows jm-wallet address list output in a message box."""
+    list_output = RESERVED_LIST_OUTPUT if scenario == "success" else ""
+    result, call_log = _run_address_function(
+        tmp_path,
+        "list_reserved_addresses",
+        choices=[],
+        list_output=list_output,
+        list_fail=scenario == "list_error",
+    )
+    assert result.returncode == 0, result.stderr
+    calls = [line.split("\x1f") for line in call_log.read_text().splitlines()]
+    msgboxes = [
+        call[call.index("--msgbox") + 1] for call in calls if "--msgbox" in call
+    ]
+    if scenario == "success":
+        assert len(msgboxes) == 1
+        assert "bcrt1qlistaddrone" in msgboxes[0]
+        assert "bcrt1qlistaddrtwo" in msgboxes[0]
+    elif scenario == "empty":
+        assert msgboxes == ["No reserved addresses."]
+    else:
+        assert not msgboxes
+        assert "Could not list reserved addresses." in result.stdout
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "success",
+        "no_confirm",
+        "menu_cancel",
+        "empty_list",
+        "unparseable",
+        "many_entries",
+        "list_error",
+        "release_error",
+    ],
+)
+def test_tui_release_reserved_address(tmp_path: Path, scenario: str) -> None:
+    """The RELEASE flow picks a reserved address, confirms it, then releases it."""
+    choices: list[str]
+    list_fail = False
+    release_fail = False
+    if scenario == "success":
+        choices = ["bcrt1qlistaddrone", "yes"]
+    elif scenario == "no_confirm":
+        choices = ["bcrt1qlistaddrone", "no"]
+    elif scenario == "menu_cancel":
+        choices = ["CANCEL"]
+    elif scenario == "empty_list":
+        choices = []
+    elif scenario == "unparseable":
+        choices = []
+    elif scenario == "many_entries":
+        choices = ["CANCEL"]
+    elif scenario == "list_error":
+        choices = []
+        list_fail = True
+    else:
+        choices = ["bcrt1qlistaddrone", "yes"]
+        release_fail = True
+    if scenario == "empty_list":
+        list_output = "No reserved addresses."
+    elif scenario == "unparseable":
+        list_output = "Unexpected address list format from a future CLI version."
+    elif scenario == "many_entries":
+        list_output = "".join(
+            '  md0  bcrt1qentry{:02d}aaaa  "entry label {}"'.format(i, i) + chr(10)
+            for i in range(15)
+        )
+    else:
+        list_output = RESERVED_LIST_OUTPUT
+    result, call_log = _run_address_function(
+        tmp_path,
+        "release_reserved_address",
+        choices=choices,
+        list_output=list_output,
+        list_fail=list_fail,
+        release_fail=release_fail,
+    )
+    assert result.returncode == (1 if scenario == "list_error" else 0), result.stderr
+    calls = [line.split("\x1f") for line in call_log.read_text().splitlines()]
+    releases = [call for call in calls if call[:2] == ["address", "release"]]
+    menus = [call for call in calls if "--menu" in call]
+    yesnos = [call for call in calls if "--yesno" in call]
+    msgboxes = [
+        call[call.index("--msgbox") + 1] for call in calls if "--msgbox" in call
+    ]
+    if scenario == "success":
+        assert releases == [["address", "release", "bcrt1qlistaddrone"]]
+        assert any("bcrt1qlistaddrone" in call for call in menus)
+        assert any('md0  "label one"' in " ".join(call) for call in menus)
+        assert len(yesnos) == 1 and "bcrt1qlistaddrone" in " ".join(yesnos[0])
+        assert len(msgboxes) == 1
+        # Goldstring: confirmation and success dialog texts, exact (flattened).
+        assert yesnos[0][3] == (
+            "Release reservation for:  "
+            "bcrt1qlistaddrone  "
+            "Label: label one  "
+            "The address can be issued again unless it already has on-chain history."
+        )
+        assert msgboxes[0] == (
+            "Reservation removed for:  "
+            "bcrt1qlistaddrone  "
+            "Label: label one  "
+            "The address can be issued again unless it already has on-chain history."
+        )
+        # Geometry: both boxes 14 rows x 70 cols so a 62-char bech32 address
+        # fits on its own line.
+        assert yesnos[0][-3:-1] == ["14", "70"]
+        box_calls = [call for call in calls if "--msgbox" in call]
+        assert box_calls[0][-2:] == ["14", "70"]
+    elif scenario == "no_confirm":
+        assert not releases
+        assert len(yesnos) == 1
+        assert not msgboxes
+    elif scenario == "menu_cancel":
+        assert not releases and not yesnos and not msgboxes
+    elif scenario == "empty_list":
+        assert msgboxes == ["No reserved addresses."]
+        assert not menus and not releases
+    elif scenario == "unparseable":
+        # Non-empty but unparseable list output must NOT claim an empty list;
+        # the raw output is shown instead.
+        assert msgboxes == [
+            "Could not parse the address list. Raw output:  "
+            "Unexpected address list format from a future CLI version."
+        ]
+        assert not menus and not releases
+    elif scenario == "many_entries":
+        # Picker list height is capped at 12 rows: height 23 = 12 + 11.
+        assert menus, "picker menu expected"
+        assert menus[0][4:7] == ["23", "78", "12"]
+        assert not releases
+    elif scenario == "list_error":
+        assert not menus and not releases
+        assert "Could not list reserved addresses." in result.stdout
+    else:
+        assert releases == [["address", "release", "bcrt1qlistaddrone"]]
+        assert not msgboxes
+        assert "Could not release the address." in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -402,6 +769,68 @@ while true; do
     width = int(args[prompt_index + 2])
     assert len(header.splitlines()) == 2
     assert all(len(line) <= width - 4 for line in header.splitlines())
+
+
+def test_tui_addr_submenu_box_fits_header_and_wallet_line(tmp_path: Path) -> None:
+    """The ADDR menu height fits header + wallet line + 4 entries.
+
+    Regression (F9): the header prompt was added without raising the box
+    height from 13; whiptail clipped the prompt and the fingerprint line
+    vanished from the display. The menu renders 5 prompt lines (blank +
+    two header lines + blank + wallet line) plus 4 entries; height 19
+    matches the Wallet Info submenu, which embeds the same header shape.
+    """
+    content = SCRIPT_PATH.read_text()
+    flow = content.split("\n          ADDR)\n", 1)[1].split("\n              ;;", 1)[0]
+    functions = "\n".join(
+        _extract_script_function(content, name)
+        for name in (
+            "truncate_wallet_name",
+            "wallet_identity_summary",
+            "update_wallet_header",
+            "menu_header",
+            "check_stale_wallet",
+        )
+    )
+    args_file = tmp_path / "dialog.args"
+    wallet_file = tmp_path / "aaaaaaaaaaaaaaa.mnemonic"
+    wallet_file.write_bytes(b"x")
+    script = (
+        functions
+        + """
+CURRENT_WALLET="$1"
+MAKER_STATUS=STOPPED
+wallet_identity_summary() { printf 0123456789abcdef; }
+get_mnemonic_file() { printf %s "$CURRENT_WALLET"; }
+show_config_save_error() { :; }
+clear_active_wallet_config() { return 1; }
+whiptail() { printf '%s\\0' "$@" > "$ARGS_FILE"; return 1; }
+"""
+        + flow
+    )
+    subprocess.run(
+        ["bash", "-c", script, "bash", str(wallet_file)],
+        env=os.environ | {"TUI_PYTHON": sys.executable, "ARGS_FILE": str(args_file)},
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    args = args_file.read_bytes().decode().rstrip("\0").split("\0")
+    prompt_index = args.index("--menu") + 1
+    prompt = args[prompt_index].replace("\\n", "\n")
+    height = int(args[prompt_index + 1])
+    width = int(args[prompt_index + 2])
+    lines = prompt.lstrip("\n").split("\n\n", 1)[0].splitlines()
+    # Header must be complete (2 lines) and the wallet line present.
+    assert lines == [
+        "Active Wallet: aaaaaaaaaaaaaaa.mnemonic | Maker Bot: STOPPED",
+        "Fingerprint:   0123456789abcdef",
+    ]
+    assert "Wallet: aaaaaaaaaaaaaaa.mnemonic" in prompt
+    # Height budget: 5 prompt lines + 4 entries + whiptail chrome.
+    assert height == 19
+    assert width == 78
 
 
 def test_tui_prefers_its_virtual_environment() -> None:
@@ -2559,7 +2988,7 @@ def test_tui_pause_before_clear_on_cli_errors() -> None:
     assert pause_pos < clear_pos, "RESTART: pause must come before clear in error block"
 
     # Check Wallet NEW error path
-    new = content.split("NEW)")[1].split(";;")[0]
+    new = content.split("NEW)\n")[1].split(";;")[0]
     after_res = new.split("RESULT=$?")[1]
     else_block = after_res.split("else")[1].split("fi")[0]
     assert "pause" in else_block, "NEW missing pause"
@@ -2925,7 +3354,7 @@ def _menu_snippet(content: str, array_name: str) -> str:
 
 @pytest.mark.parametrize(
     ("gate_open", "expect_entries", "height", "listheight"),
-    [(0, True, "23", "12"), (1, False, "21", "10")],
+    [(0, True, "24", "13"), (1, False, "22", "11")],
 )
 def test_tui_wallet_menu_identity_entry_gating(
     tmp_path: Path, gate_open: int, expect_entries: bool, height: str, listheight: str

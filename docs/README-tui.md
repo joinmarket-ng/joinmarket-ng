@@ -33,6 +33,13 @@ zero-value payment. Review the fee and destination before confirming.
 Manual coin control is limited to one mixdepth. See [wallet tasks](README-jmwallet.md)
 for direct payments and [the taker guide](README-taker.md) for CoinJoins.
 
+## Receive Bitcoin
+
+Generate a fresh deposit address from the active wallet: choose the mixdepth
+(empty for 0) and an optional label, then the address is shown for copying. The
+address is reserved so it is never reissued; `jm-wallet address release` removes
+a reservation and `jm-wallet address list` shows reserved addresses.
+
 ## Wallet Management
 
 Use the balance, history, address, and freeze controls to inspect the selected
