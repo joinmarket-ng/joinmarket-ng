@@ -24,7 +24,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from jmwallet.backends.base import BlockchainBackend
 
-from jmwallet.backends.base import BondVerificationRequest
+from jmwallet.backends.base import BondVerificationRequest, BondVerificationResult
 
 from orderbook_watcher.directory_client import DirectoryClient
 from orderbook_watcher.health_checker import MakerHealthChecker
@@ -33,7 +33,10 @@ BOND_CACHE_TTL_SECONDS = 60.0
 BOND_CACHE_MAX_SIZE = 4096
 BOND_RETRY_CACHE_TTL_SECONDS = 60.0
 BOND_RETRY_CACHE_MAX_SIZE = 4096
-MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE = 256
+# Bond proofs do not sign the outpoint, so fresh bogus claims cost a maker
+# nothing; each one still costs a backend lookup (a filter scan on neutrino).
+MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE = 256
+MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE = MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE
 MEMPOOL_VERIFICATION_CONCURRENCY = 5
 FEATURE_SCAN_BUDGET_SECONDS = 300.0
 
@@ -1455,6 +1458,46 @@ class OrderbookAggregator:
             return None
         return current_block_height
 
+    def _select_bond_claims_for_verification(
+        self, orderbook: OrderBook
+    ) -> list[tuple[str, list[FidelityBond]]]:
+        """Pick at most a bounded number of distinct claims needing verification.
+
+        Claims whose earlier verification succeeded but has gone stale come
+        first, so a flood of fresh bogus claims cannot displace known bonds.
+        Each selected claim lists every bond object carrying it, representative
+        (a stale verified one when present) first.
+        """
+        claims: dict[str, list[FidelityBond]] = {}
+        stale_verified: set[str] = set()
+
+        for bond in orderbook.fidelity_bonds:
+            if bond.bond_value is not None and not bond.verification_stale:
+                continue
+
+            cache_key = self._bond_claim_key(bond)
+            retry_entry = self._get_active_bond_retry(cache_key)
+            if retry_entry is not None:
+                self._apply_bond_retry(bond, retry_entry[0])
+                continue
+
+            group = claims.setdefault(cache_key, [])
+            is_stale_verified = bond.verification_valid is True and bond.verification_stale
+            if is_stale_verified and cache_key not in stale_verified:
+                stale_verified.add(cache_key)
+                group.insert(0, bond)
+            else:
+                group.append(bond)
+
+        ordered = [item for item in claims.items() if item[0] in stale_verified]
+        ordered.extend(item for item in claims.items() if item[0] not in stale_verified)
+        if len(ordered) > MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE:
+            logger.warning(
+                f"Deferring verification for {len(ordered) - MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE}"
+                f" bond claims after {MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE} this update"
+            )
+        return ordered[:MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE]
+
     async def _calculate_bond_values_via_backend(self, orderbook: OrderBook) -> None:
         """Calculate bond values using the blockchain backend's verify_bonds().
 
@@ -1464,17 +1507,10 @@ class OrderbookAggregator:
         current_time = int(datetime.now(UTC).timestamp())
 
         # Build verification requests from bonds that need values
-        bonds_to_verify: list[tuple[FidelityBond, BondVerificationRequest]] = []
+        bonds_to_verify: list[tuple[list[FidelityBond], BondVerificationRequest]] = []
 
-        for bond in orderbook.fidelity_bonds:
-            if bond.bond_value is not None and not bond.verification_stale:
-                continue
-
-            retry_entry = self._get_active_bond_retry(self._bond_claim_key(bond))
-            if retry_entry is not None:
-                self._apply_bond_retry(bond, retry_entry[0])
-                continue
-
+        for _cache_key, claim_bonds in self._select_bond_claims_for_verification(orderbook):
+            bond = claim_bonds[0]
             # Get utxo_pub and locktime from bond data
             bond_data = bond.fidelity_bond_data
             utxo_pub_hex: str | None = None
@@ -1491,7 +1527,8 @@ class OrderbookAggregator:
                 logger.bind(sensitive=True).debug(
                     f"Bond {bond.utxo_txid}:{bond.utxo_vout} missing utxo_pub, skipping"
                 )
-                self._record_bond_retry(bond, False)
+                for claim_bond in claim_bonds:
+                    self._record_bond_retry(claim_bond, False)
                 continue
 
             try:
@@ -1501,7 +1538,8 @@ class OrderbookAggregator:
                 logger.bind(sensitive=True).debug(
                     f"Failed to derive bond address for {bond.utxo_txid}:{bond.utxo_vout}: {e}"
                 )
-                self._record_bond_retry(bond, False)
+                for claim_bond in claim_bonds:
+                    self._record_bond_retry(claim_bond, False)
                 continue
 
             request = BondVerificationRequest(
@@ -1512,7 +1550,7 @@ class OrderbookAggregator:
                 address=bond_addr.address,
                 scriptpubkey=bond_addr.scriptpubkey.hex(),
             )
-            bonds_to_verify.append((bond, request))
+            bonds_to_verify.append((claim_bonds, request))
 
         if not bonds_to_verify:
             return
@@ -1527,61 +1565,73 @@ class OrderbookAggregator:
         except Exception as e:
             logger.error("Backend bond verification failed")
             logger.bind(sensitive=True).error(f"Backend bond verification failed: {e}")
-            for bond, _request in bonds_to_verify:
-                self._record_bond_retry(bond, None)
+            for claim_bonds, _request in bonds_to_verify:
+                for bond in claim_bonds:
+                    self._record_bond_retry(bond, None)
             return
         if len(results) != len(bonds_to_verify):
             logger.bind(sensitive=True).error(
                 f"Backend returned {len(results)} bond results for {len(bonds_to_verify)} requests"
             )
-            for bond, _request in bonds_to_verify:
-                self._record_bond_retry(bond, None)
+            for claim_bonds, _request in bonds_to_verify:
+                for bond in claim_bonds:
+                    self._record_bond_retry(bond, None)
             return
 
         # Update bond objects with results
-        for (bond, request), result in zip(bonds_to_verify, results, strict=True):
-            if (result.txid, result.vout) != (request.txid, request.vout):
-                logger.bind(sensitive=True).error(
-                    f"Bond verification result mismatch: requested "
-                    f"{request.txid}:{request.vout}, received {result.txid}:{result.vout}"
-                )
-                self._record_bond_retry(bond, None)
-                continue
-            if not result.valid:
-                logger.bind(sensitive=True).debug(
-                    f"Bond {bond.utxo_txid}:{bond.utxo_vout} invalid: {result.error}"
-                )
-                bond.bond_value = None
-                bond.amount = 0
-                bond.utxo_confirmation_timestamp = 0
-                bond.utxo_confirmations = 0
-                bond.verification_valid = False
-                bond.verification_stale = False
-                self._record_bond_retry(bond, False)
-                continue
-
-            bond_value = calculate_timelocked_fidelity_bond_value(
-                result.value, result.block_time, bond.locktime, current_time
-            )
-
-            bond.bond_value = bond_value
-            bond.amount = result.value
-            bond.utxo_confirmation_timestamp = result.block_time
-            bond.utxo_confirmations = result.confirmations
-            bond.verification_valid = True
-            bond.verification_stale = False
-            cache_key = self._bond_claim_key(bond)
-            self._bond_claims_reverified.add(cache_key)
-            self._bond_retry_cache.pop(cache_key, None)
-
-            logger.bind(sensitive=True).debug(
-                f"Bond {bond.counterparty}: value={bond_value}, "
-                f"amount={result.value}, locktime={datetime.fromtimestamp(bond.locktime, UTC)}, "
-                f"confirmed={datetime.fromtimestamp(result.block_time, UTC)}"
-            )
+        for (claim_bonds, request), result in zip(bonds_to_verify, results, strict=True):
+            for bond in claim_bonds:
+                self._apply_backend_bond_result(bond, request, result, current_time)
 
         valid_count = sum(1 for r in results if r.valid)
         logger.info(f"Bond verification complete: {valid_count}/{len(bonds_to_verify)} verified")
+
+    def _apply_backend_bond_result(
+        self,
+        bond: FidelityBond,
+        request: BondVerificationRequest,
+        result: BondVerificationResult,
+        current_time: int,
+    ) -> None:
+        if (result.txid, result.vout) != (request.txid, request.vout):
+            logger.bind(sensitive=True).error(
+                f"Bond verification result mismatch: requested "
+                f"{request.txid}:{request.vout}, received {result.txid}:{result.vout}"
+            )
+            self._record_bond_retry(bond, None)
+            return
+        if not result.valid:
+            logger.bind(sensitive=True).debug(
+                f"Bond {bond.utxo_txid}:{bond.utxo_vout} invalid: {result.error}"
+            )
+            bond.bond_value = None
+            bond.amount = 0
+            bond.utxo_confirmation_timestamp = 0
+            bond.utxo_confirmations = 0
+            bond.verification_valid = False
+            bond.verification_stale = False
+            self._record_bond_retry(bond, False)
+            return
+
+        bond_value = calculate_timelocked_fidelity_bond_value(
+            result.value, result.block_time, bond.locktime, current_time
+        )
+
+        bond.bond_value = bond_value
+        bond.amount = result.value
+        bond.utxo_confirmation_timestamp = result.block_time
+        bond.utxo_confirmations = result.confirmations
+        bond.verification_valid = True
+        bond.verification_stale = False
+        cache_key = self._bond_claim_key(bond)
+        self._bond_claims_reverified.add(cache_key)
+        self._bond_retry_cache.pop(cache_key, None)
+
+        logger.bind(sensitive=True).debug(
+            f"Bond {bond.counterparty}: value={bond_value}, "
+            f"amount={result.value}, locktime={datetime.fromtimestamp(bond.locktime, UTC)}, "
+            f"confirmed={datetime.fromtimestamp(result.block_time, UTC)}"
+        )
 
     async def _calculate_bond_values_via_mempool(self, orderbook: OrderBook) -> None:
         """Calculate bond values via mempool API (legacy path)."""
@@ -1590,52 +1640,11 @@ class OrderbookAggregator:
             return
 
         current_time = int(datetime.now(UTC).timestamp())
-        stale_jobs: list[tuple[str, FidelityBond]] = []
-        fresh_jobs: list[tuple[str, FidelityBond]] = []
-        selected_claims: dict[str, bool] = {}
-        deferred_claims = False
-
-        for bond in orderbook.fidelity_bonds:
-            if bond.bond_value is not None and not bond.verification_stale:
-                continue
-
-            cache_key = self._bond_claim_key(bond)
-            retry_entry = self._get_active_bond_retry(cache_key)
-            if retry_entry is not None:
-                self._apply_bond_retry(bond, retry_entry[0])
-                continue
-
-            is_stale_verified_claim = bond.verification_valid is True and bond.verification_stale
-            if cache_key in selected_claims:
-                if is_stale_verified_claim and not selected_claims[cache_key]:
-                    fresh_jobs = [job for job in fresh_jobs if job[0] != cache_key]
-                    selected_claims.pop(cache_key)
-                    if len(stale_jobs) < MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE:
-                        stale_jobs.append((cache_key, bond))
-                        selected_claims[cache_key] = True
-                continue
-
-            if is_stale_verified_claim:
-                if len(stale_jobs) >= MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE:
-                    deferred_claims = True
-                    continue
-                stale_jobs.append((cache_key, bond))
-                selected_claims[cache_key] = True
-                if len(stale_jobs) + len(fresh_jobs) > MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE:
-                    evicted_key, _evicted_bond = fresh_jobs.pop()
-                    selected_claims.pop(evicted_key)
-            elif len(stale_jobs) + len(fresh_jobs) < MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE:
-                fresh_jobs.append((cache_key, bond))
-                selected_claims[cache_key] = False
-            else:
-                deferred_claims = True
-
-        jobs = stale_jobs + fresh_jobs
-        if deferred_claims:
-            logger.warning(
-                f"Deferring mempool verification for additional bond claims after "
-                f"{MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE} jobs"
-            )
+        # Only the representative of each claim is looked up, as before.
+        jobs = [
+            (cache_key, claim_bonds[0])
+            for cache_key, claim_bonds in self._select_bond_claims_for_verification(orderbook)
+        ]
 
         for start in range(0, len(jobs), MEMPOOL_VERIFICATION_CONCURRENCY):
             batch = jobs[start : start + MEMPOOL_VERIFICATION_CONCURRENCY]

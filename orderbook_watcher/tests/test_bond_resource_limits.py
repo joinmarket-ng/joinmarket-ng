@@ -9,11 +9,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 from jmcore.models import FidelityBond, OrderBook
+from jmwallet.backends.base import BondVerificationRequest, BondVerificationResult
 
 from orderbook_watcher.aggregator import (
     BOND_CACHE_MAX_SIZE,
     BOND_RETRY_CACHE_MAX_SIZE,
     BOND_RETRY_CACHE_TTL_SECONDS,
+    MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE,
     MAX_MEMPOOL_VERIFICATION_CLAIMS_PER_UPDATE,
     MEMPOOL_VERIFICATION_CONCURRENCY,
     OrderbookAggregator,
@@ -175,6 +177,52 @@ async def test_mempool_jobs_are_bounded_deduplicated_and_prioritize_stale_claims
     assert requested_txids[0] == stale.utxo_txid
     assert requested_txids.count(fresh_bonds[0].utxo_txid) == 1
     assert peak_active_requests == MEMPOOL_VERIFICATION_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_backend_claims_are_bounded_deduplicated_and_prioritize_stale_claims() -> None:
+    aggregator = _aggregator()
+    requests: list[BondVerificationRequest] = []
+
+    async def verify_bonds(
+        batch: list[BondVerificationRequest],
+    ) -> list[BondVerificationResult]:
+        requests.extend(batch)
+        return [
+            BondVerificationResult(
+                txid=request.txid,
+                vout=request.vout,
+                value=2_000_000,
+                confirmations=10,
+                block_time=int(time.time()) - 600,
+                valid=True,
+            )
+            for request in batch
+        ]
+
+    backend = AsyncMock()
+    backend.verify_bonds.side_effect = verify_bonds
+    aggregator.blockchain_backend = backend
+    fresh_bonds = [_bond(index) for index in range(10, 310)]
+    # The same claim seen through another directory or nick.
+    duplicate = _bond(10)
+    duplicate.counterparty = "OtherNick"
+    stale = _bond(999, bond_value=1)
+    stale.verification_valid = True
+    stale.verification_stale = True
+
+    await aggregator._calculate_bond_values_via_backend(
+        OrderBook(fidelity_bonds=[fresh_bonds[0], duplicate, *fresh_bonds[1:], stale])
+    )
+
+    assert backend.verify_bonds.await_count == 1
+    assert len(requests) == MAX_BOND_VERIFICATION_CLAIMS_PER_UPDATE
+    assert requests[0].txid == stale.utxo_txid
+    assert [request.txid for request in requests].count(fresh_bonds[0].utxo_txid) == 1
+    assert stale.verification_stale is False and stale.amount == 2_000_000
+    assert duplicate.verification_valid is True
+    assert duplicate.bond_value == fresh_bonds[0].bond_value
+    assert fresh_bonds[-1].verification_valid is None
 
 
 @pytest.mark.asyncio
