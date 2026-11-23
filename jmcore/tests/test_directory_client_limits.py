@@ -302,6 +302,26 @@ def test_storage_field_byte_limits_reject_untrusted_values() -> None:
         client._merge_peer_features(VALID_MAKER_NICKS[0], {"f" * 129: True})
 
 
+def test_oversized_peerlist_entry_is_skipped_without_dropping_valid_peers() -> None:
+    client = DirectoryClient("host", 1234, "mainnet")
+    good = VALID_MAKER_NICKS[0]
+    multibyte_nick = "\u20ac" * 22  # 22 characters, 66 UTF-8 bytes
+    chunk = ",".join(
+        [
+            f"{multibyte_nick};big.onion:5222",
+            f"{good};good.onion:5222",
+            f"{VALID_MAKER_NICKS[1]};{'l' * 301}",
+        ]
+    )
+
+    peers, malformed = client._process_peerlist_response(chunk)
+
+    assert [(nick, location) for nick, location, _features in peers] == [(good, "good.onion:5222")]
+    # Skipped entries still mark the snapshot incomplete so nothing is pruned.
+    assert malformed is True
+    assert client._active_peers == {good: "good.onion:5222"}
+
+
 def test_feature_merge_preflights_all_caches_before_any_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

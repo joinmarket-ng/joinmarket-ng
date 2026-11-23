@@ -279,6 +279,15 @@ def test_handshake_rejects_location_peerlist_injection(handler, location):
         )
 
 
+def test_handshake_bounds_nick_by_encoded_bytes(handler):
+    # 22 characters but 66 UTF-8 bytes: clients reject such a nick, so admitting
+    # it would make every peerlist from this directory unusable for them.
+    with pytest.raises(HandshakeError, match="Invalid nickname for peerlist"):
+        handler.process_handshake(_valid_handshake(nick="\u20ac" * 22), "127.0.0.1:12345")
+
+    handler.process_handshake(_valid_handshake(nick="n" * 64), "127.0.0.1:12345")
+
+
 @pytest.mark.parametrize(
     "features",
     [

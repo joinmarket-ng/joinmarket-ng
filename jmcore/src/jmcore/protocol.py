@@ -77,6 +77,10 @@ _NICK_RE = re.compile(rf"J[0-9][1-9A-HJ-NP-Za-km-zO]{{{NICK_MAX_ENCODED}}}")
 _HOSTNAME_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _MAX_HOSTNAME_LENGTH = 253
 _PEERLIST_FIELD_DELIMITERS = frozenset({",", NICK_PEERLOCATOR_SEPARATOR, COMMAND_PREFIX})
+# Encoded-size bounds shared by directory admission and peerlist parsing. A
+# character limit alone admits multibyte nicks that clients cannot store.
+MAX_PEERLIST_NICK_UTF8_BYTES = 64
+MAX_PEERLIST_LOCATION_UTF8_BYTES = 300
 _FEATURE_IDENTIFIER_DELIMITERS = _PEERLIST_FIELD_DELIMITERS | {"+"}
 
 # Feature flag constants
@@ -105,24 +109,32 @@ ALL_FEATURES = {
 }
 
 
-def _is_safe_peerlist_value(value: object, delimiters: frozenset[str]) -> bool:
-    return (
-        isinstance(value, str)
-        and bool(value)
-        and all(
-            char not in delimiters and char.isprintable() and not char.isspace() for char in value
-        )
+def _is_safe_peerlist_value(
+    value: object, delimiters: frozenset[str], max_bytes: int | None = None
+) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if max_bytes is not None:
+        try:
+            if len(value.encode("utf-8")) > max_bytes:
+                return False
+        except UnicodeEncodeError:
+            return False
+    return all(
+        char not in delimiters and char.isprintable() and not char.isspace() for char in value
     )
 
 
 def is_safe_peerlist_nick(nick: object) -> bool:
     """Return whether a nick can be represented in a peerlist entry."""
-    return _is_safe_peerlist_value(nick, _PEERLIST_FIELD_DELIMITERS)
+    return _is_safe_peerlist_value(nick, _PEERLIST_FIELD_DELIMITERS, MAX_PEERLIST_NICK_UTF8_BYTES)
 
 
 def is_safe_peerlist_location(location: object) -> bool:
     """Return whether a location can be represented in a peerlist entry."""
-    return _is_safe_peerlist_value(location, _PEERLIST_FIELD_DELIMITERS)
+    return _is_safe_peerlist_value(
+        location, _PEERLIST_FIELD_DELIMITERS, MAX_PEERLIST_LOCATION_UTF8_BYTES
+    )
 
 
 def is_safe_peerlist_feature(feature: object) -> bool:
