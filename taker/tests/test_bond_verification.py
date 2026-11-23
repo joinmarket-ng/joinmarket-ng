@@ -482,3 +482,51 @@ async def test_conflicting_claims_are_verified_independently(
     requests = mock_backend.verify_bonds.call_args.args[0]
     assert len(requests) == 2
     assert requests[0].scriptpubkey != requests[1].scriptpubkey
+
+
+@pytest.mark.asyncio
+async def test_shared_bond_claim_is_verified_once_across_nicks_and_offers(
+    mock_wallet, mock_backend, mock_config
+):
+    """Reference makers may publish several offers per bond, and a copied bond
+    certificate may appear under another nick. Either way the backend sees one
+    claim, and the cheapest offer per bond is chosen later at selection time."""
+    taker = Taker(mock_wallet, mock_backend, mock_config)
+    current_time = int(time.time())
+    txid = "4" * 64
+    bond_data = {
+        "utxo_txid": txid,
+        "utxo_vout": 1,
+        "locktime": current_time + 31536000,
+        "utxo_pub": TEST_PUBKEY_HEX,
+        "cert_expiry": VALID_CERT_EXPIRY,
+    }
+    offers = [
+        Offer(
+            ordertype=OfferType.SW0_RELATIVE,
+            oid=oid,
+            minsize=10000,
+            maxsize=1000000,
+            txfee=1000,
+            cjfee="0.001",
+            counterparty=nick,
+            fidelity_bond_data=dict(bond_data),
+        )
+        for nick, oid in (("MakerA", 0), ("MakerA", 1), ("MakerB", 0))
+    ]
+    mock_backend.verify_bonds.return_value = [
+        BondVerificationResult(
+            txid=txid,
+            vout=1,
+            value=1_000_000_000,
+            confirmations=10000,
+            block_time=current_time - (10000 * 600),
+            valid=True,
+        )
+    ]
+
+    await taker._update_offers_with_bond_values(offers)
+
+    assert len(mock_backend.verify_bonds.call_args.args[0]) == 1
+    assert offers[0].fidelity_bond_value > 0
+    assert {offer.fidelity_bond_value for offer in offers} == {offers[0].fidelity_bond_value}
