@@ -158,6 +158,32 @@ class TestMessageDeduplicator:
         assert len(dedup) == 52_000
         assert elapsed < 0.5
 
+    def test_retained_memory_does_not_scale_with_message_size(self) -> None:
+        dedup = MessageDeduplicator(window_seconds=30.0)
+        body = "x" * 1_000_000
+        for i in range(20):
+            dedup.is_duplicate(MessageDeduplicator.make_fingerprint(f"n{i}", "pubmsg", body), "d")
+
+        assert all(len(key) == 32 for key in dedup._seen)
+        assert dedup.is_duplicate(
+            MessageDeduplicator.make_fingerprint("n3", "pubmsg", body), "d2"
+        ) == (True, "d", 2)
+
+    def test_distinct_flood_is_capped_by_evicting_oldest(self) -> None:
+        dedup = MessageDeduplicator(window_seconds=30.0, max_entries=100)
+        for i in range(1_000):
+            dedup.is_duplicate(f"flood{i}", "dir1")
+
+        assert len(dedup) == 100
+        assert dedup.is_duplicate("flood999", "dir2")[0] is True
+        assert dedup.is_duplicate("flood0", "dir2")[0] is False
+
+    def test_unpaired_surrogate_fingerprint_is_accepted(self) -> None:
+        dedup = MessageDeduplicator()
+
+        assert dedup.is_duplicate("alice:pubmsg:\ud800", "dir1")[0] is False
+        assert dedup.is_duplicate("alice:pubmsg:\ud800", "dir2")[0] is True
+
     def test_make_fingerprint_format(self) -> None:
         """Test fingerprint format."""
         fp = MessageDeduplicator.make_fingerprint("alice", "fill", "order123")

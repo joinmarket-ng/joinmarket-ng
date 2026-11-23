@@ -7,9 +7,14 @@ N times. This module provides deduplication to avoid processing duplicates.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+
+# About 25 MB of entries; only a malicious directory can deliver this many
+# distinct messages inside one window.
+DEFAULT_MAX_DEDUP_ENTRIES = 100_000
 
 
 @dataclass
@@ -52,6 +57,8 @@ class MessageDeduplicator:
     - Message fingerprint: from_nick + command + first_arg (e.g., "alice:fill:order123")
     - Tracks first source for each message to enable better logging
     - Auto-cleanup of old entries to prevent memory leaks
+    - Fingerprints are stored as SHA-256 digests under an entry cap, so peer
+      controlled message bodies cannot grow memory without limit
 
     Example:
         >>> dedup = MessageDeduplicator(window_seconds=30.0)
@@ -64,17 +71,24 @@ class MessageDeduplicator:
         Duplicate: True, first source: dir1.onion, count: 2
     """
 
-    def __init__(self, window_seconds: float = 30.0):
+    def __init__(self, window_seconds: float = 30.0, max_entries: int = DEFAULT_MAX_DEDUP_ENTRIES):
         """
         Initialize deduplicator.
 
         Args:
             window_seconds: How long to remember messages (default 30s).
                            Should be longer than expected network latency variance.
+            max_entries: Upper bound on remembered messages. Past it the oldest
+                         entry is forgotten early, so a flood of distinct
+                         messages cannot grow memory without limit.
         """
+        if max_entries < 1:
+            raise ValueError("max_entries must be positive")
         self.window_seconds = window_seconds
+        self.max_entries = max_entries
+        # Keys are fixed-size digests: fingerprints can embed whole peer messages.
         # Insertion order is timestamp order, so expiry only pops from the front.
-        self._seen: OrderedDict[str, SeenMessage] = OrderedDict()
+        self._seen: OrderedDict[bytes, SeenMessage] = OrderedDict()
         self._stats = DeduplicationStats()
 
     def is_duplicate(self, fingerprint: str, source: str) -> tuple[bool, str, int]:
@@ -95,14 +109,17 @@ class MessageDeduplicator:
         self._cleanup(now)
         self._stats.total_processed += 1
 
-        if fingerprint in self._seen:
-            entry = self._seen[fingerprint]
+        key = hashlib.sha256(fingerprint.encode("utf-8", "surrogatepass")).digest()
+        entry = self._seen.get(key)
+        if entry is not None:
             entry.count += 1
             self._stats.duplicates_dropped += 1
             return (True, entry.source, entry.count)
 
         # First time seeing this message
-        self._seen[fingerprint] = SeenMessage(timestamp=now, source=source, count=1)
+        while len(self._seen) >= self.max_entries:
+            self._seen.popitem(last=False)
+        self._seen[key] = SeenMessage(timestamp=now, source=source, count=1)
         self._stats.unique_messages += 1
         return (False, source, 1)
 
