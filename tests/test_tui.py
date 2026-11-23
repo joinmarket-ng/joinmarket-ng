@@ -309,7 +309,11 @@ def test_tui_main_menu_arguments_and_cancellation(
         "success_default",
         "invalid_then_valid",
         "mixdepth_too_large",
+        "mixdepth_huge",
+        "effective_count_larger",
+        "count_unavailable",
         "cancel",
+        "cancel_label",
         "wallet_error",
     ],
 )
@@ -322,6 +326,9 @@ def test_tui_receive_flow(tmp_path: Path, scenario: str) -> None:
     )
     choices: list[str]
     jmwallet_rc = 0
+    # The effective count comes from jmcore settings (environment included),
+    # not a TOML value read once at startup.
+    mixdepth_count = "5"
     if scenario == "success":
         choices = ["2", "my label"]
     elif scenario == "success_default":
@@ -330,8 +337,19 @@ def test_tui_receive_flow(tmp_path: Path, scenario: str) -> None:
         choices = ["abc", "2", ""]
     elif scenario == "mixdepth_too_large":
         choices = ["5", "2", ""]
+    elif scenario == "mixdepth_huge":
+        choices = ["99999999999999999999999", "2", ""]
+    elif scenario == "effective_count_larger":
+        mixdepth_count = "8"
+        choices = ["7", ""]
+    elif scenario == "count_unavailable":
+        # Unknown count: no upper bound in the TUI; jm-wallet validates.
+        mixdepth_count = ""
+        choices = ["7", ""]
     elif scenario == "cancel":
         choices = ["CANCEL"]
+    elif scenario == "cancel_label":
+        choices = ["1", "CANCEL"]
     else:
         choices = ["", ""]
         jmwallet_rc = 1
@@ -344,8 +362,8 @@ def test_tui_receive_flow(tmp_path: Path, scenario: str) -> None:
 CALL_LOG={shlex.quote(str(call_log))}
 CHOICES={shlex.quote(str(choices_file))}
 JMWALLET_RC={jmwallet_rc}
-DEFAULT_MIXDEPTH_COUNT=5
-ensure_active_wallet() {{ :; }}
+get_wallet_mixdepth_count() {{ printf '%s\\n' {shlex.quote(mixdepth_count)}; }}
+ensure_active_wallet() {{ printf 'ensure_active_wallet\\n' >> "$CALL_LOG"; }}
 ensure_wallet_password() {{ :; }}
 ensure_wallet_unlocked_global() {{ :; }}
 pause() {{ :; }}
@@ -387,8 +405,12 @@ receive_address_flow
         text=True,
         timeout=15,
     )
-    assert result.returncode == (1 if scenario == "cancel" else 0), result.stderr
+    cancelled = scenario in ("cancel", "cancel_label")
+    assert result.returncode == (1 if cancelled else 0), result.stderr
     calls = [line.split("\x1f") for line in call_log.read_text().splitlines()]
+    # Wallet activation can persist an auto-selected wallet, so it must not
+    # run before the user has answered every prompt.
+    assert (["ensure_active_wallet"] in calls) is not cancelled
     jmwallet_calls = [call for call in calls if call[:2] == ["address", "new"]]
     msgboxes = [
         call[call.index("--msgbox") + 1] for call in calls if "--msgbox" in call
@@ -423,7 +445,14 @@ receive_address_flow
         # value never reaches jm-wallet.
         assert any("Mixdepth must be 0-4." in box for box in msgboxes)
         assert jmwallet_calls == [["address", "new", "2"]]
-    elif scenario == "cancel":
+    elif scenario == "mixdepth_huge":
+        assert msgboxes[0] == "Mixdepth must be 0-4."
+        assert jmwallet_calls == [["address", "new", "2"]]
+        assert "integer expression" not in result.stderr
+    elif scenario in ("effective_count_larger", "count_unavailable"):
+        assert not any("Mixdepth must be" in box for box in msgboxes)
+        assert jmwallet_calls == [["address", "new", "7"]]
+    elif cancelled:
         assert not jmwallet_calls
         assert not msgboxes
     else:
@@ -453,8 +482,12 @@ def _run_address_function(
     call_log = tmp_path / "calls.log"
     choices_file = tmp_path / "choices"
     choices_file.write_text("".join(f"{choice}\n" for choice in choices))
+    helpers = "\n".join(
+        _extract_script_function(content, name)
+        for name in ("load_reserved_addresses", "reserved_menu_rows", function_name)
+    )
     script = (
-        _extract_script_function(content, function_name)
+        helpers
         + f"""
 CALL_LOG={shlex.quote(str(call_log))}
 CHOICES={shlex.quote(str(choices_file))}
@@ -520,11 +553,18 @@ jm-wallet() {{
 
 @pytest.mark.parametrize(
     "scenario",
-    ["success", "empty", "list_error"],
+    ["success", "many_entries", "empty", "list_error"],
 )
 def test_tui_list_reserved_addresses(tmp_path: Path, scenario: str) -> None:
-    """The LIST flow shows jm-wallet address list output in a message box."""
-    list_output = RESERVED_LIST_OUTPUT if scenario == "success" else ""
+    """The LIST flow shows the reserved addresses in a scrollable menu."""
+    if scenario == "success":
+        list_output = RESERVED_LIST_OUTPUT
+    elif scenario == "many_entries":
+        list_output = "".join(
+            f'  md{i % 5}  bcrt1qentry{i:02d}aaaa  "say "hi" {i}"\n' for i in range(30)
+        )
+    else:
+        list_output = ""
     result, call_log = _run_address_function(
         tmp_path,
         "list_reserved_addresses",
@@ -537,10 +577,30 @@ def test_tui_list_reserved_addresses(tmp_path: Path, scenario: str) -> None:
     msgboxes = [
         call[call.index("--msgbox") + 1] for call in calls if "--msgbox" in call
     ]
+    menus = [call for call in calls if "--menu" in call]
     if scenario == "success":
-        assert len(msgboxes) == 1
-        assert "bcrt1qlistaddrone" in msgboxes[0]
-        assert "bcrt1qlistaddrtwo" in msgboxes[0]
+        assert not msgboxes
+        assert len(menus) == 1
+        menu = menus[0]
+        assert "--nocancel" in menu
+        assert menu[menu.index("--ok-button") + 1] == "Close"
+        start = menu.index("--menu")
+        assert menu[start + 2 : start + 5] == ["13", "78", "2"]
+        assert menu[start + 5 :] == [
+            "bcrt1qlistaddrone",
+            'md0  "label one"',
+            "bcrt1qlistaddrtwo",
+            "md1",
+        ]
+    elif scenario == "many_entries":
+        # Long lists scroll inside a capped menu instead of overflowing a
+        # fixed message box; labels containing quotes stay intact.
+        menu = menus[0]
+        start = menu.index("--menu")
+        assert menu[start + 2 : start + 5] == ["23", "78", "12"]
+        items = menu[start + 5 :]
+        assert len(items) == 60
+        assert items[-2:] == ["bcrt1qentry29aaaa", 'md4  "say "hi" 29"']
     elif scenario == "empty":
         assert msgboxes == ["No reserved addresses."]
     else:
@@ -559,6 +619,7 @@ def test_tui_list_reserved_addresses(tmp_path: Path, scenario: str) -> None:
         "many_entries",
         "list_error",
         "release_error",
+        "success_unlabeled",
     ],
 )
 def test_tui_release_reserved_address(tmp_path: Path, scenario: str) -> None:
@@ -568,6 +629,8 @@ def test_tui_release_reserved_address(tmp_path: Path, scenario: str) -> None:
     release_fail = False
     if scenario == "success":
         choices = ["bcrt1qlistaddrone", "yes"]
+    elif scenario == "success_unlabeled":
+        choices = ["bcrt1qlistaddrtwo", "yes"]
     elif scenario == "no_confirm":
         choices = ["bcrt1qlistaddrone", "no"]
     elif scenario == "menu_cancel":
@@ -612,7 +675,10 @@ def test_tui_release_reserved_address(tmp_path: Path, scenario: str) -> None:
         call[call.index("--msgbox") + 1] for call in calls if "--msgbox" in call
     ]
     if scenario == "success":
-        assert releases == [["address", "release", "bcrt1qlistaddrone"]]
+        # The release only applies to the reservation the user confirmed.
+        assert releases == [
+            ["address", "release", "bcrt1qlistaddrone", "--expect-label", "label one"]
+        ]
         assert any("bcrt1qlistaddrone" in call for call in menus)
         assert any('md0  "label one"' in " ".join(call) for call in menus)
         assert len(yesnos) == 1 and "bcrt1qlistaddrone" in " ".join(yesnos[0])
@@ -635,6 +701,13 @@ def test_tui_release_reserved_address(tmp_path: Path, scenario: str) -> None:
         assert yesnos[0][-3:-1] == ["14", "70"]
         box_calls = [call for call in calls if "--msgbox" in call]
         assert box_calls[0][-2:] == ["14", "70"]
+    elif scenario == "success_unlabeled":
+        # An unlabeled reservation is released only while it stays unlabeled.
+        assert releases == [
+            ["address", "release", "bcrt1qlistaddrtwo", "--expect-label", ""]
+        ]
+        assert yesnos[0][-3:-1] == ["12", "70"]
+        assert len(msgboxes) == 1 and "Label:" not in msgboxes[0]
     elif scenario == "no_confirm":
         assert not releases
         assert len(yesnos) == 1
@@ -661,9 +734,40 @@ def test_tui_release_reserved_address(tmp_path: Path, scenario: str) -> None:
         assert not menus and not releases
         assert "Could not list reserved addresses." in result.stdout
     else:
-        assert releases == [["address", "release", "bcrt1qlistaddrone"]]
+        assert releases == [
+            ["address", "release", "bcrt1qlistaddrone", "--expect-label", "label one"]
+        ]
         assert not msgboxes
         assert "Could not release the address." in result.stdout
+        assert "nothing was changed" in result.stdout
+
+
+def test_tui_mixdepth_count_follows_effective_settings(tmp_path: Path) -> None:
+    """The Receive bound uses the same settings sources as jm-wallet."""
+    config = tmp_path / "config.toml"
+    config.write_text("[wallet]\nmixdepth_count = 3\n")
+    script = (
+        _extract_script_function(SCRIPT_PATH.read_text(), "get_wallet_mixdepth_count")
+        + "\nget_wallet_mixdepth_count\n"
+    )
+    base_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("WALLET__")
+    } | {"TUI_PYTHON": sys.executable, "CONFIG_FILE": str(config)}
+
+    def run(env: dict[str, str]) -> str:
+        return subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.strip()
+
+    assert run(base_env) == "3"
+    assert run(base_env | {"WALLET__MIXDEPTH_COUNT": "8"}) == "8"
 
 
 @pytest.mark.parametrize(

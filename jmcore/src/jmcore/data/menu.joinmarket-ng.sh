@@ -240,26 +240,6 @@ export LOGGING__LEVEL="$(get_tui_log_level)"
 # ---- Defaults for send/coinjoin parameters ----------------------------------
 DEFAULT_AMOUNT="0"
 DEFAULT_MIXDEPTH="0"
-# Mixdepth count default: read from config.toml [wallet] section, fall back to 5
-DEFAULT_MIXDEPTH_COUNT=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
-import sys, pathlib
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore[no-redef]
-path = pathlib.Path(sys.argv[1])
-if path.exists():
-    try:
-        data = tomllib.loads(path.read_text())
-        val = data.get("wallet", {}).get("mixdepth_count")
-        if val is not None:
-            print(int(val))
-    except Exception:
-        pass
-PYEOF
-)
-DEFAULT_MIXDEPTH_COUNT="${DEFAULT_MIXDEPTH_COUNT:-5}"
-
 # Counterparty default: read from config.toml [taker] section, fall back to 10
 DEFAULT_COUNTERPARTIES=$("$TUI_PYTHON" - "$CONFIG_FILE" <<'PYEOF' 2>/dev/null
 import sys, pathlib
@@ -348,6 +328,16 @@ get_wallet_with_passphrase() {
     JOINMARKET_CONFIG_FILE="$CONFIG_FILE" "$TUI_PYTHON" - <<'PY'
 from jmcore.settings import get_settings
 print(str(get_settings().wallet.bip39_passphrase_enabled).lower())
+PY
+}
+
+# Helper: effective wallet.mixdepth_count, resolved like jm-wallet resolves it
+# (environment overrides, then config.toml, then the default). Read on each
+# use so config edits made while the TUI runs apply. Empty if unavailable.
+get_wallet_mixdepth_count() {
+    JOINMARKET_CONFIG_FILE="$CONFIG_FILE" "$TUI_PYTHON" - <<'PY' 2>/dev/null
+from jmcore.settings import get_settings
+print(get_settings().wallet.mixdepth_count)
 PY
 }
 
@@ -1721,14 +1711,18 @@ offer_maker_passphrase_storage() {
 # Receive flow: prompt for mixdepth and an optional label, derive a fresh
 # deposit address, and show it in a dialog. Used by the main-menu R entry
 # and the Address Handling submenu (ADDR / NEW).
+#
+# The prompts come before ensure_active_wallet, which may persist an
+# auto-selected wallet, so cancelling a prompt leaves the config untouched.
 # ---------------------------------------------------------------------------
 receive_address_flow() {
-    if ! ensure_active_wallet; then
-        return 1
-    fi
-
     local RECV_MIXDEPTH=""
     local RECV_LABEL=""
+    # Unknown count (settings unreadable): skip the upper bound here and let
+    # jm-wallet, which validates against the wallet, reject it instead.
+    local MIXDEPTH_COUNT
+    MIXDEPTH_COUNT=$(get_wallet_mixdepth_count)
+    [[ "$MIXDEPTH_COUNT" =~ ^[1-9][0-9]*$ ]] || MIXDEPTH_COUNT=""
 
     # 1. Target mixdepth for the deposit address (empty = 0)
     while true; do
@@ -1742,17 +1736,23 @@ receive_address_flow() {
         whiptail --title " Error " --msgbox "Mixdepth must be a non-negative integer." 8 50
         continue
       fi
-      if [ "$RECV_MIXDEPTH" -ge "$DEFAULT_MIXDEPTH_COUNT" ]; then
-        whiptail --title " Error " --msgbox "Mixdepth must be 0-$((DEFAULT_MIXDEPTH_COUNT - 1))." 8 60
+      RECV_MIXDEPTH=$(to_int "$RECV_MIXDEPTH" 0)
+      # The length check keeps huge inputs out of shell arithmetic.
+      if [ -n "$MIXDEPTH_COUNT" ] && { [ "${#RECV_MIXDEPTH}" -gt "${#MIXDEPTH_COUNT}" ] \
+          || [ "$RECV_MIXDEPTH" -ge "$MIXDEPTH_COUNT" ]; }; then
+        whiptail --title " Error " --msgbox "Mixdepth must be 0-$((MIXDEPTH_COUNT - 1))." 8 60
         continue
       fi
       break
     done
-    RECV_MIXDEPTH=$(to_int "$RECV_MIXDEPTH" 0)
 
     # 2. Optional label (empty = no label)
     RECV_LABEL=$(prompt_param "Address Label (optional)" \
       "Optional label to reserve the address under.\nLeave empty for no label.") || return 1
+
+    if ! ensure_active_wallet; then
+        return 1
+    fi
 
     # Build the command as an array so labels with spaces stay intact.
     local -a ADDR_ARGS=(address new "$RECV_MIXDEPTH")
@@ -1797,146 +1797,153 @@ ${NEW_ADDR}
 }
 
 # ---------------------------------------------------------------------------
-# Show the wallet's reserved deposit addresses (jm-wallet address list).
+# Load the reserved addresses (jm-wallet address list) into the caller's
+# arrays: $1 = whiptail menu items (tag = address, item = mixdepth and
+# quoted label), $2 = associative address -> label map. Entries are the
+# lines indented by two spaces: '  md0  bc1q...  "label"'. When nothing
+# parses, a dialog explains why (empty list, or the raw output when it is
+# not the known empty marker) and the function returns 1. Returns 2 if the
+# list command failed (reported on the terminal).
+# ---------------------------------------------------------------------------
+load_reserved_addresses() {
+    local -n items_ref="$1"
+    local -n labels_ref="$2"
+    clear
+    echo "Please wait..."
+    local list_out
+    list_out=$(ensure_wallet_password "$CURRENT_WALLET" \
+        && ensure_wallet_unlocked_global \
+        && jm-wallet address list)
+    if [ $? -ne 0 ]; then
+        echo ""
+        echo "Could not list reserved addresses."
+        echo "See the output above for details."
+        pause
+        return 2
+    fi
+
+    local entry md addr rest label
+    while IFS= read -r entry; do
+        [[ "$entry" == "  "* ]] || continue
+        read -r md addr rest <<< "$entry"
+        [ -n "$addr" ] || continue
+        # The label is everything between the first and the last quote, so
+        # labels that contain quotes stay intact.
+        label=""
+        [[ "$rest" =~ ^\"(.*)\"$ ]] && label="${BASH_REMATCH[1]}"
+        if [ -n "$label" ]; then
+            items_ref+=("$addr" "${md}  \"${label}\"")
+        else
+            items_ref+=("$addr" "$md")
+        fi
+        labels_ref[$addr]="$label"
+    done <<< "$list_out"
+
+    [ "${#items_ref[@]}" -gt 0 ] && return 0
+    if [ -n "$list_out" ] && [ "$list_out" != "No reserved addresses." ]; then
+        # Not the known empty marker, yet nothing parsed as an entry: show
+        # the raw output instead of claiming the list is empty.
+        whiptail --title " Reserved Addresses " \
+            --msgbox "Could not parse the address list. Raw output:
+
+${list_out}" 20 78
+    else
+        whiptail --title " Reserved Addresses " --msgbox "No reserved addresses." 8 50
+    fi
+    return 1
+}
+
+# Visible rows for a reserved-address menu: whiptail menus scroll when the
+# list height is below the entry count, so cap it to keep the box inside an
+# 80x24 terminal.
+reserved_menu_rows() {
+    local count=$(( $1 / 2 ))
+    [ "$count" -gt 12 ] && count=12
+    echo "$count"
+}
+
+# ---------------------------------------------------------------------------
+# Show the wallet's reserved deposit addresses (jm-wallet address list) in a
+# scrollable menu; a fixed-size message box would cut off long lists.
 # ---------------------------------------------------------------------------
 list_reserved_addresses() {
     if ! ensure_active_wallet; then
         return 1
     fi
 
-    clear
-    echo "Please wait..."
-    local LIST_OUT
-    LIST_OUT=$(ensure_wallet_password "$CURRENT_WALLET" \
-        && ensure_wallet_unlocked_global \
-        && jm-wallet address list)
-    local LIST_EXIT=$?
+    local -a MENU_ITEMS=()
+    local -A ADDR_LABELS=()
+    load_reserved_addresses MENU_ITEMS ADDR_LABELS || return 0
 
-    if [ $LIST_EXIT -eq 0 ]; then
-        whiptail --title " Reserved Addresses " --msgbox "${LIST_OUT:-No reserved addresses.}" 20 78
-    else
-        echo ""
-        echo "Could not list reserved addresses."
-        echo "See the output above for details."
-        pause
-    fi
+    local rows
+    rows=$(reserved_menu_rows "${#MENU_ITEMS[@]}")
+    whiptail --title " Reserved Addresses " --nocancel --ok-button "Close" \
+        --menu "Reserved addresses: $(( ${#MENU_ITEMS[@]} / 2 )) (scroll with the arrow keys)" \
+        $(( rows + 11 )) 78 "$rows" \
+        "${MENU_ITEMS[@]}" 2>/dev/null || true
     return 0
 }
 
 # ---------------------------------------------------------------------------
 # Release a reserved deposit address (jm-wallet address release): pick from
 # the reserved list, confirm, then release. A released address can be issued
-# again unless it already has on-chain history.
+# again unless it already has on-chain history. The release is conditional
+# on the label shown, so a reservation released or relabeled elsewhere while
+# the dialogs were open is left alone and reported as a failure.
 # ---------------------------------------------------------------------------
 release_reserved_address() {
     if ! ensure_active_wallet; then
         return 1
     fi
 
-    clear
-    echo "Please wait..."
-    local LIST_OUT
-    LIST_OUT=$(ensure_wallet_password "$CURRENT_WALLET" \
-        && ensure_wallet_unlocked_global \
-        && jm-wallet address list)
-    local LIST_EXIT=$?
-
-    if [ $LIST_EXIT -ne 0 ]; then
-        echo ""
-        echo "Could not list reserved addresses."
-        echo "See the output above for details."
-        pause
-        return 1
-    fi
-
-    # Parse the list output: entries look like '  md0  bc1q...  "label"'.
-    # Only lines starting with two spaces are entries; header lines are not.
     local -a MENU_ITEMS=()
     local -A ADDR_LABELS=()
-    local entry md addr label
-    while IFS= read -r entry; do
-        md=$(printf '%s' "$entry" | awk '{print $1}')
-        addr=$(printf '%s' "$entry" | awk '{print $2}')
-        [ -n "$addr" ] || continue
-        label=$(printf '%s' "$entry" | sed -n 's/[^"]*"\([^"]*\)".*/  "\1"/p')
-        MENU_ITEMS+=("$addr" "${md}${label}")
-        ADDR_LABELS[$addr]="$label"
-    done < <(printf '%s\n' "$LIST_OUT" | grep '^  ')
+    load_reserved_addresses MENU_ITEMS ADDR_LABELS
+    case $? in
+        0) ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
 
-    local MENU_COUNT=$(( ${#MENU_ITEMS[@]} / 2 ))
-    if [ "$MENU_COUNT" -eq 0 ]; then
-        if [ -n "$LIST_OUT" ] \
-            && [ "$LIST_OUT" != "No reserved addresses." ]; then
-            # The list output is not the known empty marker but nothing
-            # parsed as an entry: show the raw output instead of
-            # claiming the list is empty.
-            whiptail --title " Reserved Addresses " \
-                --msgbox "Could not parse the address list. Raw output:
-
-${LIST_OUT}" 20 78
-        else
-            whiptail --title " Reserved Addresses " --msgbox "No reserved addresses." 8 50
-        fi
-        return 0
-    fi
-
-    # Cap the visible menu rows so the box cannot grow past the terminal
-    # height; whiptail menus scroll when listheight < entry count.
-    local LIST_ROWS=$MENU_COUNT
-    if [ "$LIST_ROWS" -gt 12 ]; then
-        LIST_ROWS=12
-    fi
+    local rows
+    rows=$(reserved_menu_rows "${#MENU_ITEMS[@]}")
     local selected
     selected=$(whiptail --title " Release Reserved Address " \
         --menu "Select the address to release:" \
-        $(( LIST_ROWS + 11 )) 78 "$LIST_ROWS" \
+        $(( rows + 11 )) 78 "$rows" \
         "${MENU_ITEMS[@]}" 3>&1 1>&2 2>&3) || return 0
 
     local SEL_LABEL="${ADDR_LABELS[$selected]-}"
-    SEL_LABEL=$(printf '%s' "$SEL_LABEL" | sed 's/^ *//; s/^"//; s/"$//')
-    local CONF_TEXT="Release reservation for:
-
-${selected}
+    local ADDR_TEXT="${selected}
 
 "
-    local CONF_H=12
+    local BOX_H=12
     if [ -n "$SEL_LABEL" ]; then
-        CONF_TEXT+="Label: ${SEL_LABEL}
+        ADDR_TEXT+="Label: ${SEL_LABEL}
 
 "
-        CONF_H=14
+        BOX_H=14
     fi
-    CONF_TEXT+="The address can be issued again unless it already has on-chain history."
-    whiptail --title " Confirm Release " --yesno "${CONF_TEXT}" "${CONF_H}" 70 --defaultno || return 0
+    local REISSUE_NOTE="The address can be issued again unless it already has on-chain history."
+    whiptail --title " Confirm Release " --yesno "Release reservation for:
+
+${ADDR_TEXT}${REISSUE_NOTE}" "${BOX_H}" 70 --defaultno || return 0
 
     clear
     echo "Please wait..."
-    local REL_OUT
-    REL_OUT=$(ensure_wallet_password "$CURRENT_WALLET" \
+    (ensure_wallet_password "$CURRENT_WALLET" \
         && ensure_wallet_unlocked_global \
-        && jm-wallet address release "$selected")
+        && jm-wallet address release "$selected" --expect-label "$SEL_LABEL") >/dev/null
     local REL_EXIT=$?
 
     if [ $REL_EXIT -eq 0 ]; then
-        local SEL_LABEL="${ADDR_LABELS[$selected]-}"
-        SEL_LABEL=$(printf '%s' "$SEL_LABEL" | sed 's/^ *//; s/^"//; s/"$//')
-        local REL_TEXT="Reservation removed for:
+        whiptail --title " Address Released " --msgbox "Reservation removed for:
 
-${selected}
-
-"
-        local REL_H=12
-        if [ -n "$SEL_LABEL" ]; then
-            REL_TEXT+="Label: ${SEL_LABEL}
-
-"
-            REL_H=14
-        fi
-        REL_TEXT+="The address can be issued again unless it already has on-chain history."
-        whiptail --title " Address Released " --msgbox "${REL_TEXT}" "${REL_H}" 70
+${ADDR_TEXT}${REISSUE_NOTE}" "${BOX_H}" 70
     else
         echo ""
         echo "Could not release the address."
+        echo "If it was released or relabeled elsewhere, nothing was changed."
         echo "See the output above for details."
         pause
     fi
