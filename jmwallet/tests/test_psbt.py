@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from jmcore.bitcoin import TxInput, TxOutput, encode_varint, serialize_transaction
 from jmcore.constants import MAX_MONEY
@@ -69,6 +71,29 @@ def test_roundtrip_preserves_ordered_unknown_records_in_every_map() -> None:
 def test_rejects_duplicate_full_key_within_a_map() -> None:
     unsigned_tx = _unsigned_transaction()
     raw = _psbt(unsigned_tx, [_map((b"\xfcx", b"one"), (b"\xfcx", b"two"))], [_map()])
+
+    with pytest.raises(PSBTError, match="Duplicate PSBT key"):
+        parse_psbt(raw)
+
+
+def test_many_distinct_records_parse_in_linear_time() -> None:
+    # A quadratic duplicate scan needs about 1.8e9 comparisons here, which takes
+    # far longer than the bound; a set-based check finishes in well under a second.
+    records = [(b"\xfc" + index.to_bytes(3, "big"), b"") for index in range(60_000)]
+    raw = _psbt(_unsigned_transaction(), [_map(*records)], [_map()])
+
+    started = time.perf_counter()
+    parsed = parse_psbt(raw)
+    elapsed = time.perf_counter() - started
+
+    assert len(parsed.input_maps[0].records) == len(records)
+    assert parsed.serialize() == raw
+    assert elapsed < 10
+
+
+def test_rejects_duplicate_key_after_many_distinct_records() -> None:
+    records = [(b"\xfc" + index.to_bytes(2, "big"), b"") for index in range(1_000)]
+    raw = _psbt(_unsigned_transaction(), [_map(*records, records[0])], [_map()])
 
     with pytest.raises(PSBTError, match="Duplicate PSBT key"):
         parse_psbt(raw)

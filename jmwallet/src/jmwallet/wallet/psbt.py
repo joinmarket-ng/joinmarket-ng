@@ -401,6 +401,9 @@ def _read_expected_maps(
 
 def _read_map(data: bytes, offset: int, map_kind: str) -> tuple[PSBTMap, int]:
     parsed_map = PSBTMap()
+    # Untrusted input can hold millions of tiny records, so duplicate detection
+    # must not rescan the whole map per record as PSBTMap.append does.
+    seen_keys: set[bytes] = set()
     while True:
         key_length, offset = _read_compact_size(data, offset, f"{map_kind} map key length")
         if key_length == 0:
@@ -409,7 +412,10 @@ def _read_map(data: bytes, offset: int, map_kind: str) -> tuple[PSBTMap, int]:
         _validate_key(map_kind, key)
         value_length, offset = _read_compact_size(data, offset, f"{map_kind} map value length")
         value, offset = _read_bytes(data, offset, value_length, f"{map_kind} map value")
-        parsed_map.append(key, value)
+        if key in seen_keys:
+            raise PSBTError(f"Duplicate PSBT key: {key.hex()}")
+        seen_keys.add(key)
+        parsed_map.records.append(PSBTKeyValue(key=key, value=value))
 
 
 def _read_compact_size(data: bytes, offset: int, context: str) -> tuple[int, int]:
