@@ -18,12 +18,15 @@ Example:
     # Creates: ./tor_keys/hs_ed25519_secret_key
     #          ./tor_keys/hs_ed25519_public_key
     #          ./tor_keys/hostname
+
+Files are created owner-only (0600). Existing key files are never overwritten.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -116,6 +119,26 @@ def create_tor_public_key_file(public_key: bytes) -> bytes:
     return header + public_key
 
 
+def write_new_private_file(path: Path, content: bytes) -> None:
+    """Create ``path`` with mode 0600, refusing existing files and symlinks.
+
+    The mode is applied at creation, so the key is never readable by other
+    users, and O_EXCL plus O_NOFOLLOW never write through a planted link.
+    """
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as file:
+        file.write(content)
+        file.flush()
+        os.fsync(file.fileno())
+
+
 def main() -> int:
     """Generate Tor hidden service keys."""
     # Determine output directory
@@ -124,7 +147,26 @@ def main() -> int:
     else:
         output_dir = Path.cwd()
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # A new directory is owner-only. An existing one is left as the caller set it;
+    # the files themselves are created private either way.
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    secret_key_path = output_dir / "hs_ed25519_secret_key"
+    public_key_path = output_dir / "hs_ed25519_public_key"
+    hostname_path = output_dir / "hostname"
+    existing = [
+        p
+        for p in (secret_key_path, public_key_path, hostname_path)
+        if os.path.lexists(p)
+    ]
+    if existing:
+        print(
+            "Error: refusing to overwrite existing files (an onion identity may be lost):"
+        )
+        for path in existing:
+            print(f"  {path}")
+        print("Choose an empty output directory or move these files away first.")
+        return 1
 
     # Generate keypair
     print("Generating Ed25519 keypair...")
@@ -140,22 +182,12 @@ def main() -> int:
     secret_key_content = create_tor_secret_key_file(expanded_key)
     public_key_content = create_tor_public_key_file(public_key)
 
-    # Write files
-    secret_key_path = output_dir / "hs_ed25519_secret_key"
-    public_key_path = output_dir / "hs_ed25519_public_key"
-    hostname_path = output_dir / "hostname"
-
     # This is a key generation script - writing the secret key is the intended behavior
-    secret_key_path.write_bytes(
-        secret_key_content
+    write_new_private_file(
+        secret_key_path, secret_key_content
     )  # codeql[py/clear-text-storage-sensitive-data]
-    secret_key_path.chmod(0o600)
-
-    public_key_path.write_bytes(public_key_content)
-    public_key_path.chmod(0o600)
-
-    hostname_path.write_text(f"{onion_address}\n")
-    hostname_path.chmod(0o600)
+    write_new_private_file(public_key_path, public_key_content)
+    write_new_private_file(hostname_path, f"{onion_address}\n".encode())
 
     print(f"Generated Tor hidden service keys in: {output_dir}")
     print(f"Onion address: {onion_address}")
