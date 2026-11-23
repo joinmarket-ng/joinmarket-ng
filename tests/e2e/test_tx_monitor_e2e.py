@@ -212,6 +212,7 @@ async def test_coinjoin_history_confirms_after_taker_stops(
                 },
             )
             assert r.status_code == 202, f"coinjoin failed: {r.status_code} {r.text}"
+            run_id = r.json()["run_id"]
 
             deadline = asyncio.get_event_loop().time() + 300.0
             while True:
@@ -226,6 +227,7 @@ async def test_coinjoin_history_confirms_after_taker_stops(
                 )
                 await asyncio.sleep(2.0)
             assert status["status"] == "complete", status
+            assert status["run_id"] == run_id, status
             txid = status["txid"]
             assert txid
 

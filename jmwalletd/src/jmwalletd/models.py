@@ -431,6 +431,18 @@ class DoCoinjoinRequest(BaseModel):
     input_utxos: list[str] | None = None
 
 
+class DoCoinjoinResponse(BaseModel):
+    """POST /api/v1/wallet/{walletname}/taker/coinjoin response (202).
+
+    ``run_id`` is an opaque identifier for the run this request started. It
+    matches ``TakerStatusResponse.run_id`` for as long as ``taker/status``
+    reports this run, so a caller can tell its own run apart from an earlier
+    or later one without comparing request times (issue #676).
+    """
+
+    run_id: str
+
+
 class TakerStatusResponse(BaseModel):
     """GET /api/v1/wallet/{walletname}/taker/status response.
 
@@ -452,6 +464,11 @@ class TakerStatusResponse(BaseModel):
     reports completion once a maker accepted delivery, not once it has
     confirmed the tx is actually in the mempool. Check ``broadcast_method``
     to tell the two apart before wording a success message.
+
+    ``run_id`` is the opaque id ``taker/coinjoin`` returned for the run being
+    reported, or ``None`` if no taker run has happened yet this session. Match
+    it against the id of your own request before treating the rest of the
+    response as that request's outcome.
     """
 
     running: bool
@@ -459,6 +476,7 @@ class TakerStatusResponse(BaseModel):
     txid: str | None = None
     error: str | None = None
     broadcast_method: str | None = None
+    run_id: str | None = None
 
 
 class TumblerPlanRequest(BaseModel):

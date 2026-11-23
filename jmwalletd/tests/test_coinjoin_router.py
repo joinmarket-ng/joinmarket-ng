@@ -474,6 +474,8 @@ class TestDoCoinjoin:
             headers=_auth_headers(token),
         )
         assert resp.status_code == 202
+        run_id = resp.json()["run_id"]
+        assert isinstance(run_id, str) and run_id
 
         _, kwargs = mock_config.call_args
         assert kwargs["mnemonic"].get_secret_value() == state.wallet_mnemonic
@@ -497,6 +499,14 @@ class TestDoCoinjoin:
         assert state.last_taker_status == "complete"
         assert state.last_taker_txid == "f" * 64
         assert state.last_taker_error is None
+
+        # The snapshot left after teardown is attributed to this request's run.
+        status = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        ).json()
+        assert status["status"] == "complete"
+        assert status["run_id"] == run_id
 
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("taker.taker.Taker")
@@ -559,6 +569,11 @@ class TestDoCoinjoin:
         assert state.last_taker_status == "failed"
         assert state.last_taker_txid is None
         assert "Failed to connect to any directory server" in (state.last_taker_error or "")
+        status = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        ).json()
+        assert status["run_id"] == resp.json()["run_id"]
 
     @patch("jmwalletd._backend.get_backend", new_callable=AsyncMock)
     @patch("taker.taker.Taker")
@@ -632,6 +647,7 @@ class TestDoCoinjoin:
             headers=_auth_headers(token),
         )
         assert second.status_code == 202
+        assert first.json()["run_id"] != second.json()["run_id"]
 
         assert len(mock_config.call_args_list) == 2
         first_kwargs, second_kwargs = (recorded.kwargs for recorded in mock_config.call_args_list)
@@ -640,6 +656,38 @@ class TestDoCoinjoin:
         assert second_kwargs["fee_rate"] == expected_fee_rate
         assert second_kwargs["fee_block_target"] == expected_target
         assert state.config_overrides == overrides_before
+
+    def test_failed_start_reports_no_run_id(self, authed_client: tuple[TestClient, str]) -> None:
+        """A start that never scheduled a run returns no id to the caller, so
+        taker/status must not report one either (issue #676)."""
+        client, token = authed_client
+        state = get_daemon_state()
+        state.taker_run_id = "6" * 32  # from an earlier run
+
+        def _fail(coro: Any) -> None:
+            coro.close()
+            raise RuntimeError("event loop unavailable")
+
+        with patch("jmwalletd.routers.coinjoin.asyncio.create_task", side_effect=_fail):
+            resp = client.post(
+                "/api/v1/wallet/test_wallet.jmdat/taker/coinjoin",
+                json={
+                    "mixdepth": 0,
+                    "amount_sats": 100000,
+                    "destination": "bcrt1qdest",
+                    "counterparties": 3,
+                },
+                headers=_auth_headers(token),
+            )
+
+        assert resp.status_code != 202
+        assert state.taker_running is False
+        status = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/taker/status",
+            headers=_auth_headers(token),
+        ).json()
+        assert status["run_id"] is None
+        assert status["status"] is None
 
     @patch("taker.taker.Taker")
     def test_coinjoin_rejects_unusable_request_txfee(
@@ -743,14 +791,29 @@ class TestStopCoinjoin:
                 headers=_auth_headers(token),
             )
             assert resp.status_code == 202
+            run_id = resp.json()["run_id"]
             assert started.wait(timeout=5), "background taker task never started"
             assert state.taker_running is True, "task must still be running when stop is called"
+
+            live = client.get(
+                "/api/v1/wallet/test_wallet.jmdat/taker/status",
+                headers=_auth_headers(token),
+            ).json()
+            assert live["running"] is True
+            assert live["run_id"] == run_id
 
             resp = client.get(
                 "/api/v1/wallet/test_wallet.jmdat/taker/stop",
                 headers=_auth_headers(token),
             )
             assert resp.status_code == 202
+
+            final = client.get(
+                "/api/v1/wallet/test_wallet.jmdat/taker/status",
+                headers=_auth_headers(token),
+            ).json()
+            assert final["status"] == "cancelled"
+            assert final["run_id"] == run_id
 
         assert state.last_taker_status == "cancelled"
         assert state.last_taker_txid is None
@@ -1492,6 +1555,7 @@ class TestTakerStatus:
             "txid": None,
             "error": None,
             "broadcast_method": None,
+            "run_id": None,
         }
 
     def test_reads_live_off_a_running_taker(self, authed_client: tuple[TestClient, str]) -> None:
@@ -1505,6 +1569,7 @@ class TestTakerStatus:
         mock_taker.last_failure_reason = None
         mock_taker.last_broadcast_method = None
         state._taker_ref = mock_taker
+        state.taker_run_id = "1" * 32
         # A stale snapshot from a previous run must not leak through while
         # a new one is live.
         state.last_taker_status = "failed"
@@ -1522,6 +1587,7 @@ class TestTakerStatus:
             "txid": None,
             "error": None,
             "broadcast_method": None,
+            "run_id": "1" * 32,
         }
 
     def test_running_is_false_during_a_tumble_even_though_taker_running_is_true(
@@ -1543,6 +1609,7 @@ class TestTakerStatus:
         state.last_taker_status = "complete"
         state.last_taker_txid = "b" * 64
         state.last_taker_error = None
+        state.taker_run_id = "2" * 32
 
         resp = client.get(
             "/api/v1/wallet/test_wallet.jmdat/taker/status",
@@ -1550,6 +1617,9 @@ class TestTakerStatus:
         )
         assert resp.status_code == 200
         assert resp.json()["running"] is False
+        # The leftover snapshot keeps its own run's id, so a caller waiting on
+        # a different run cannot mistake it for its outcome.
+        assert resp.json()["run_id"] == "2" * 32
 
     def test_completed_status_includes_broadcast_method(
         self, authed_client: tuple[TestClient, str]
@@ -1584,6 +1654,7 @@ class TestTakerStatus:
         state.last_taker_status = "complete"
         state.last_taker_txid = "a" * 64
         state.last_taker_error = None
+        state.taker_run_id = "3" * 32
 
         resp = client.get(
             "/api/v1/wallet/test_wallet.jmdat/taker/status",
@@ -1596,6 +1667,7 @@ class TestTakerStatus:
             "txid": "a" * 64,
             "error": None,
             "broadcast_method": None,
+            "run_id": "3" * 32,
         }
 
     def test_reports_failed_snapshot_with_error_after_teardown(
@@ -1608,6 +1680,7 @@ class TestTakerStatus:
         state.last_taker_status = "failed"
         state.last_taker_txid = None
         state.last_taker_error = "No suitable counterparties found."
+        state.taker_run_id = "4" * 32
 
         resp = client.get(
             "/api/v1/wallet/test_wallet.jmdat/taker/status",
@@ -1620,4 +1693,5 @@ class TestTakerStatus:
             "txid": None,
             "error": "No suitable counterparties found.",
             "broadcast_method": None,
+            "run_id": "4" * 32,
         }

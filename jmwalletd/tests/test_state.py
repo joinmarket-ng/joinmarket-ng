@@ -96,12 +96,14 @@ class TestDaemonState:
         daemon_state.last_taker_status = "complete"
         daemon_state.last_taker_txid = "d" * 64
         daemon_state.last_taker_error = None
+        daemon_state.taker_run_id = "5" * 32
 
         await daemon_state.lock_wallet()
 
         assert daemon_state.last_taker_status is None
         assert daemon_state.last_taker_txid is None
         assert daemon_state.last_taker_error is None
+        assert daemon_state.taker_run_id is None
 
     @pytest.mark.asyncio
     async def test_lock_wallet_clears_logs_only_on_loaded_transition(

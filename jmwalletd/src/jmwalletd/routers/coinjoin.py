@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from typing import Any, cast
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -34,6 +35,7 @@ from jmwalletd.models import (
     DirectSendRequest,
     DirectSendResponse,
     DoCoinjoinRequest,
+    DoCoinjoinResponse,
     StartMakerRequest,
     TakerStatusResponse,
     TxInfo,
@@ -184,8 +186,11 @@ async def do_coinjoin(
     _wallet: None = Depends(require_wallet_match),
     state: DaemonState = Depends(get_daemon_state),
     token: str | None = Depends(get_optional_token),
-) -> JSONResponse:
-    """Initiate a coinjoin transaction (asynchronous)."""
+) -> DoCoinjoinResponse:
+    """Initiate a coinjoin transaction (asynchronous).
+
+    Returns the ``run_id`` that ``taker/status`` reports for this run.
+    """
     ws, generation = require_wallet_session(state, token, walletname)
     if state.coinjoin_state != CoinjoinState.NOT_RUNNING:
         raise ServiceAlreadyStarted("A coinjoin or maker service is already running.")
@@ -209,6 +214,8 @@ async def do_coinjoin(
         state.last_taker_status = None
         state.last_taker_txid = None
         state.last_taker_error = None
+        run_id = uuid4().hex
+        state.taker_run_id = run_id
 
         async def _run_coinjoin() -> None:
             taker: Any | None = None
@@ -319,12 +326,14 @@ async def do_coinjoin(
 
     except ImportError:
         state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+        state.taker_run_id = None
         raise BackendNotReady("Taker module not available.") from None
     except Exception as exc:
         state.activate_coinjoin_state(CoinjoinState.NOT_RUNNING)
+        state.taker_run_id = None
         raise BackendNotReady(str(exc)) from exc
 
-    return JSONResponse(content={}, status_code=202)
+    return DoCoinjoinResponse(run_id=run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +411,7 @@ async def taker_status(
             txid=taker.txid or None,
             error=taker.last_failure_reason or None,
             broadcast_method=taker.last_broadcast_method or None,
+            run_id=state.taker_run_id,
         )
 
     return TakerStatusResponse(
@@ -410,6 +420,7 @@ async def taker_status(
         txid=state.last_taker_txid,
         error=state.last_taker_error,
         broadcast_method=state.last_broadcast_method,
+        run_id=state.taker_run_id,
     )
 
 

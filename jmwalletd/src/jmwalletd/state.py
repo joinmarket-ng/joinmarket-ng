@@ -122,6 +122,10 @@ class DaemonState:
         self.last_taker_status: str | None = None
         self.last_taker_txid: str | None = None
         self.last_taker_error: str | None = None
+        # Opaque id of the single-shot taker run the fields above describe,
+        # returned by POST /taker/coinjoin so a caller can tell its own run
+        # apart from an earlier or later one in GET /taker/status (issue #676).
+        self.taker_run_id: str | None = None
 
         # Runtime references to active taker/maker instances (for stop signals).
         self._taker_ref: Any = None
@@ -337,6 +341,7 @@ class DaemonState:
         self.last_taker_status = None
         self.last_taker_txid = None
         self.last_taker_error = None
+        self.taker_run_id = None
         self._taker_ref = None
         self._maker_ref = None
         self._maker_task = None
