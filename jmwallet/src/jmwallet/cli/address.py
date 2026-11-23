@@ -299,18 +299,37 @@ async def _address_label(c: _AddressContext, address: str, label: str) -> None:
 def address_release(
     ctx: typer.Context,
     address: Annotated[str, typer.Argument(help="Reserved address to release")],
+    expect_label: Annotated[
+        str | None,
+        typer.Option(
+            "--expect-label",
+            help=(
+                "Release only if the address is still reserved under exactly this label "
+                '(use "" for no label); otherwise change nothing and exit 1'
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Remove a reservation/label so the address is no longer set aside.
 
     An address that has real on-chain history is still never reissued.
     """
-    asyncio.run(_address_release(_resolve_address_context(ctx.obj), address))
+    asyncio.run(_address_release(_resolve_address_context(ctx.obj), address, expect_label))
 
 
-async def _address_release(c: _AddressContext, address: str) -> None:
+async def _address_release(
+    c: _AddressContext, address: str, expect_label: str | None = None
+) -> None:
     wallet, _ = await _build_wallet(c)
     try:
-        if wallet.unreserve_address(address):
+        if expect_label is not None:
+            if not wallet.unreserve_address(address, expected_label=expect_label):
+                logger.error(
+                    "Address is no longer reserved under the expected label; nothing changed"
+                )
+                raise typer.Exit(1)
+            print(f"Released reservation for {address}.")
+        elif wallet.unreserve_address(address):
             print(f"Released reservation for {address}.")
         else:
             print(f"Address was not reserved: {address}.")

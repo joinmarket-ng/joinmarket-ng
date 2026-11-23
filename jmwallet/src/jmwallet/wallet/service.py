@@ -1102,22 +1102,34 @@ class WalletService(
             self.issued_receive_addresses.add(address)
             self.reserved_address_labels[address] = label or ""
 
-    def unreserve_address(self, address: str) -> bool:
+    def unreserve_address(self, address: str, expected_label: str | None = None) -> bool:
         """Remove a reservation so the address may be reissued.
 
         Note: an address that has real on-chain history is still never
         reissued (the pickers also consult ``addresses_with_history``); this
         only clears the "set aside" marker and its label.
+
+        With ``expected_label``, nothing changes (and ``False`` is returned)
+        unless the address is still reserved under exactly that label. The
+        durable store makes this check atomically across wallet processes.
         """
         with self._address_allocation_lock:
-            changed = (
-                address in self.reserved_addresses
-                or address in self.issued_receive_addresses
-                or address in self.reserved_address_labels
-            )
             store = self.metadata_store
-            if store is not None and store.unreserve_address(address):
-                changed = True
+            if expected_label is not None:
+                if store is not None:
+                    changed = store.unreserve_address(address, expected_label)
+                else:
+                    changed = self.reserved_address_labels.get(address) == expected_label
+                if not changed:
+                    return False
+            else:
+                changed = (
+                    address in self.reserved_addresses
+                    or address in self.issued_receive_addresses
+                    or address in self.reserved_address_labels
+                )
+                if store is not None and store.unreserve_address(address):
+                    changed = True
 
             # Update memory only after the durable state change succeeds.
             self.reserved_addresses.discard(address)

@@ -1142,11 +1142,20 @@ class UTXOMetadataStore:
                 raise AddressReservationError(msg) from exc
             return address
 
-    def unreserve_address(self, address: str) -> bool:
-        """Remove any reservation for ``address``. Returns ``True`` if changed."""
+    def unreserve_address(self, address: str, expected_label: str | None = None) -> bool:
+        """Remove any reservation for ``address``. Returns ``True`` if changed.
+
+        With ``expected_label``, the reservation is removed only if it still
+        carries that user label, checked under the file lock. This lets a caller
+        release exactly the reservation it showed to the user, not one that was
+        relabeled by another process in the meantime.
+        """
         with self._exclusive_file_lock():
             self.load()
-            if address in self.reserved_records:
+            record = self.reserved_records.get(address)
+            if record is not None and (
+                expected_label is None or record.user_label == expected_label
+            ):
                 del self.reserved_records[address]
                 self.save()
                 return True

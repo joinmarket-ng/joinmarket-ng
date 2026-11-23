@@ -873,6 +873,22 @@ class TestReservedAddresses:
         s2.load()
         assert s2.get_reserved_addresses() == set()
 
+    def test_unreserve_expected_label_sees_other_process_changes(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        s = UTXOMetadataStore(path=path)
+        s.load()
+        s.reserve_address("bcrt1qa", "Alice")
+        # Another process relabels the reservation after ``s`` loaded it.
+        other = UTXOMetadataStore(path=path)
+        other.load()
+        other.reserve_address("bcrt1qa", "Bob")
+
+        assert s.unreserve_address("bcrt1qa", expected_label="Alice") is False
+        assert s.get_reserved_labels() == {"bcrt1qa": "Bob"}
+        assert s.unreserve_address("bcrt1qa", expected_label="Bob") is True
+        assert s.unreserve_address("bcrt1qa", expected_label="Bob") is False
+        assert s.unreserve_address("bcrt1qa", expected_label="") is False
+
     def test_label_with_special_characters_round_trip(self, tmp_path):
         path = tmp_path / "m.jsonl"
         s = UTXOMetadataStore(path=path)

@@ -1864,6 +1864,22 @@ class TestReservedAddressPersistence:
         wallet3 = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
         assert addr not in wallet3.get_reserved_addresses()
 
+    def test_conditional_release_keeps_mismatched_reservation(
+        self, mock_backend, temp_data_dir, test_mnemonic, test_network
+    ):
+        wallet = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        addr = wallet.get_receive_address(0, 3)
+        wallet.reserve_address(addr, "Alice")
+
+        assert wallet.unreserve_address(addr, expected_label="Bob") is False
+        assert wallet.get_reserved_addresses()[addr] == "Alice"
+        assert addr in wallet.reserved_addresses
+        assert wallet.unreserve_address(addr, expected_label="Alice") is True
+        assert addr not in wallet.reserved_addresses
+        assert addr not in wallet.issued_receive_addresses
+        restarted = self._make_wallet(mock_backend, temp_data_dir, test_mnemonic, test_network)
+        assert addr not in restarted.get_reserved_addresses()
+
     def test_reserved_empty_address_status_and_label(
         self, mock_backend, temp_data_dir, test_mnemonic, test_network
     ):

@@ -425,6 +425,48 @@ async def test_address_list_empty_reports_no_reserved(
     assert capsys.readouterr().out.strip() == "No reserved addresses."
 
 
+class _ReleaseStubWallet:
+    """Wallet stand-in recording conditional releases for ``_address_release``."""
+
+    def __init__(self, released: bool) -> None:
+        self.released = released
+        self.calls: list[tuple[str, str | None]] = []
+
+    def unreserve_address(self, address: str, expected_label: str | None = None) -> bool:
+        self.calls.append((address, expected_label))
+        return self.released
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("released", [True, False])
+async def test_address_release_expect_label_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], released: bool
+) -> None:
+    """A conditional release exits 1 unless the expected reservation was removed."""
+    import typer
+
+    from jmwallet.cli.address import _address_release
+
+    wallet = _ReleaseStubWallet(released)
+    with patch(
+        "jmwallet.cli.address._build_wallet",
+        new=AsyncMock(return_value=(wallet, "descriptor_wallet")),
+    ):
+        if released:
+            await _address_release(_build_address_list_context(tmp_path), "bcrt1qa", "")
+        else:
+            with pytest.raises(typer.Exit) as exc_info:
+                await _address_release(_build_address_list_context(tmp_path), "bcrt1qa", "")
+            assert exc_info.value.exit_code == 1
+
+    assert wallet.calls == [("bcrt1qa", "")]
+    out = capsys.readouterr().out
+    assert ("Released reservation for bcrt1qa." in out) is released
+
+
 class TestExtendedInfoColorGating:
     """The extended wallet-info view must only emit ANSI colors on a TTY.
 
