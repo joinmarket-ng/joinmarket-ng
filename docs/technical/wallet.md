@@ -233,10 +233,12 @@ later transaction. See https://en.bitcoin.it/wiki/Privacy#Forced_address_reuse.
 Only re-funding of an already-spent (empty) used address is frozen. Coins
 arriving on an address that still holds funds are left spendable, because the
 privacy-correct action there is to fully spend all coins on that address
-together. A freshly arrived UTXO on a brand-new address is never frozen, and a
-pre-existing UTXO is never auto-frozen. Frozen reuse UTXOs are labeled in the
-metadata store and can be released with `jm-wallet unfreeze` (an explicit
-unfreeze is never overridden by a later sync). Fidelity bonds are exempt.
+together. Coins this defense froze don't count as funds, since they are never
+spent, so a second forced payment to the same address is frozen too. A freshly
+arrived UTXO on a brand-new address is never frozen, and a pre-existing UTXO is
+never auto-frozen. Frozen reuse UTXOs are labeled in the metadata store and can
+be released with `jm-wallet unfreeze` (an explicit unfreeze is never overridden
+by a later sync). Fidelity bonds are exempt.
 
 To decide that an address was "spent empty", the wallet relies on having
 positively observed that address holding a coin, not merely on the persisted

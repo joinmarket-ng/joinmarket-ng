@@ -24,6 +24,7 @@ from jmwallet.wallet.constants import (
     MAX_DESCRIPTOR_RANGE,
 )
 from jmwallet.wallet.models import UTXOInfo
+from jmwallet.wallet.utxo_metadata import AUTO_FREEZE_REUSE_LABEL
 
 NEUTRINO_HISTORICAL_BACKFILL_BATCH_SIZE = 100
 
@@ -159,8 +160,29 @@ class WalletSyncMixin:
         payment to an already-spent (empty) used address should be frozen,
         whereas coins arriving on an address that still holds funds should be
         fully spent together (so we do not freeze those).
+
+        Coins that are still frozen by this defense don't count as funds: they
+        are never spent, so a second forced payment to the same address can't be
+        spent together with them and must be frozen too (issue #677).
         """
-        return {utxo.address for utxos in self.utxo_cache.values() for utxo in utxos}
+        return {
+            utxo.address
+            for utxos in self.utxo_cache.values()
+            for utxo in utxos
+            if not self._is_auto_frozen_reuse(utxo)
+        }
+
+    def _is_auto_frozen_reuse(self, utxo: UTXOInfo) -> bool:
+        """Whether ``utxo`` is still frozen by the forced-address-reuse defense.
+
+        A reuse UTXO the user explicitly unfroze keeps its label but is spendable
+        again, so it counts as regular funds.
+        """
+        store = getattr(self, "metadata_store", None)
+        if store is None:
+            return False
+        record = store.records.get(utxo.outpoint)
+        return record is not None and record.is_frozen and record.label == AUTO_FREEZE_REUSE_LABEL
 
     def _freeze_reused_after_sync(self, prior_funded_addresses: set[str]) -> None:
         """Run the forced-reuse auto-freeze, then record what this sync observed.
@@ -173,12 +195,13 @@ class WalletSyncMixin:
         # On the first sync after a restart ``utxo_cache`` had no pre-sync
         # snapshot. A persisted seen outpoint that is still present proves its
         # address never became empty, so a second payment must remain spendable
-        # with the original coin.
+        # with the original coin. An auto-frozen reuse coin is never spent, so it
+        # doesn't keep its address funded (issue #677).
         effective_prior_funded = prior_funded_addresses | {
             utxo.address
             for utxos in self.utxo_cache.values()
             for utxo in utxos
-            if utxo.outpoint in self._observed_outpoints
+            if utxo.outpoint in self._observed_outpoints and not self._is_auto_frozen_reuse(utxo)
         }
         self._auto_freeze_reused_address_utxos(
             self._observed_funded_addresses,

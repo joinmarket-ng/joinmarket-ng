@@ -338,6 +338,75 @@ async def test_reuse_is_frozen_after_witnessed_spend(
     assert ws.metadata_store.is_frozen(reuse.outpoint)
 
 
+def _scripted_sync(ws: WalletService) -> dict[int, list[UTXOInfo]]:
+    """Make ``ws.sync_all`` see whatever UTXOs the returned dict holds."""
+    scan: dict[int, list[UTXOInfo]] = {0: []}
+
+    async def fake_descriptor_sync(_bonds: object = None) -> dict[int, list[UTXOInfo]]:
+        ws.utxo_cache = {0: list(scan[0])}
+        return ws.utxo_cache
+
+    ws.backend.is_wallet_setup = AsyncMock(return_value=True)
+    ws.backend.list_descriptors = AsyncMock(return_value=[])
+    ws.setup_descriptor_wallet = AsyncMock(return_value=True)
+    ws._sync_all_with_descriptors = fake_descriptor_sync
+    return scan
+
+
+async def _freeze_first_forced_payment(
+    ws: WalletService, scan: dict[int, list[UTXOInfo]]
+) -> UTXOInfo:
+    """Fund, empty, then re-fund REUSED_ADDRESS so the new coin is auto-frozen."""
+    scan[0] = [_utxo(txid="d0" * 32, address=REUSED_ADDRESS, value=10_000)]
+    await ws.sync_all()
+    scan[0] = []
+    await ws.sync_all()
+    first = _utxo(txid="e5" * 32, address=REUSED_ADDRESS, value=600)
+    scan[0] = [first]
+    await ws.sync_all()
+    assert first.frozen is True
+    return first
+
+
+async def test_second_forced_payment_to_frozen_reuse_address_is_frozen(
+    tmp_path: Path,
+) -> None:
+    """Regression for #677: an address whose only coin is an auto-frozen reuse
+    coin is still empty for the defense, so a second forced payment to it must
+    be frozen too. Otherwise a sweep spends it with the wallet's other coins."""
+    ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
+    scan = _scripted_sync(ws)
+    first = await _freeze_first_forced_payment(ws, scan)
+
+    second = _utxo(txid="f6" * 32, address=REUSED_ADDRESS, value=600, vout=1)
+    scan[0] = [first, second]
+    await ws.sync_all()
+
+    assert second.frozen is True
+    assert ws.metadata_store.is_frozen(second.outpoint)
+    assert ws.metadata_store.records[second.outpoint].label == AUTO_FREEZE_REUSE_LABEL
+
+
+async def test_second_payment_after_user_unfreezes_reuse_coin_not_frozen(
+    tmp_path: Path,
+) -> None:
+    """A reuse coin the user unfroze is regular funds again, so a later payment
+    to the same address stays spendable to be spent together with it."""
+    ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
+    scan = _scripted_sync(ws)
+    first = await _freeze_first_forced_payment(ws, scan)
+    ws.metadata_store.unfreeze(first.outpoint)
+    await ws.sync_all()
+    assert first.frozen is False
+
+    second = _utxo(txid="f6" * 32, address=REUSED_ADDRESS, value=600, vout=1)
+    scan[0] = [first, second]
+    await ws.sync_all()
+
+    assert second.frozen is False
+    assert not ws.metadata_store.is_frozen(second.outpoint)
+
+
 async def test_incomplete_first_sync_does_not_freeze_late_discovered_coin(
     tmp_path: Path,
 ) -> None:
@@ -464,6 +533,30 @@ def test_second_payment_to_still_funded_address_after_restart_not_frozen(tmp_pat
     assert original.frozen is False
     assert second.frozen is False
     assert not ws2.metadata_store.is_frozen(second.outpoint)
+
+
+def test_second_forced_payment_after_restart_is_frozen(tmp_path: Path) -> None:
+    """#677 across a restart: the auto-frozen coin persisted as seen must not
+    make its address look funded on the first post-restart sync."""
+    ws1 = _reopen_natural_wallet(tmp_path)
+    original = _utxo(txid="d0" * 32, address=REUSED_ADDRESS, value=10_000)
+    ws1.utxo_cache = {0: [original]}
+    ws1._freeze_reused_after_sync(prior_funded_addresses=set())
+    ws1.utxo_cache = {0: []}
+    ws1._freeze_reused_after_sync(prior_funded_addresses={REUSED_ADDRESS})
+    first = _utxo(txid="e5" * 32, address=REUSED_ADDRESS, value=600)
+    ws1.utxo_cache = {0: [first]}
+    ws1._freeze_reused_after_sync(prior_funded_addresses=set())
+    assert first.frozen is True
+
+    ws2 = _reopen_natural_wallet(tmp_path)
+    first_again = _utxo(txid="e5" * 32, address=REUSED_ADDRESS, value=600)
+    second = _utxo(txid="f6" * 32, address=REUSED_ADDRESS, value=600, vout=1)
+    ws2.utxo_cache = {0: [first_again, second]}
+    ws2._freeze_reused_after_sync(prior_funded_addresses=set())
+
+    assert second.frozen is True
+    assert ws2.metadata_store.is_frozen(second.outpoint)
 
 
 def test_late_first_use_across_restart_not_frozen(tmp_path: Path) -> None:

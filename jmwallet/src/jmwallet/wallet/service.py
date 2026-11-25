@@ -1180,9 +1180,10 @@ class WalletService(
           merely *discovered late* (e.g. by a background rescan), because we
           would not have seen its address funded before.
         * Its address is NOT in ``prior_funded_addresses`` -- the address held
-          no UTXO at the start of this sync, i.e. it was emptied before this
-          arrival. If the address still holds funds the privacy-correct action
-          is to fully spend them together, so those are left untouched. This is
+          no UTXO at the start of this sync (coins still frozen by this defense
+          don't count), i.e. it was emptied before this arrival. If the address
+          still holds funds the privacy-correct action is to fully spend them
+          together, so those are left untouched. This is
           the key difference from legacy joinmarket-clientserver, which froze
           reuse on any used address.
         * It passes the value filter: ``max_sats_freeze_reuse == -1`` freezes

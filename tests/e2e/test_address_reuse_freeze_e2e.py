@@ -416,3 +416,71 @@ async def test_reuse_freeze_survives_wallet_restart(
             assert wallet2.metadata_store.is_frozen(reuse[0].outpoint)
         finally:
             await wallet2.close()
+
+
+@pytest.mark.asyncio
+async def test_second_forced_payment_is_frozen_and_not_swept(
+    bitcoin_rpc_config: dict[str, str],
+    ensure_blockchain_ready: None,
+    funded_miner: tuple[str, str],
+) -> None:
+    """Issue #677: a second forced payment to an address whose only coin is
+    auto-frozen is frozen too, so a mixdepth sweep doesn't link it to the
+    wallet's other coins."""
+    miner, miner_addr = funded_miner
+    mnemonic = generate_mnemonic_secure(word_count=12)
+    fingerprint = get_mnemonic_fingerprint(mnemonic, "")
+    wallet_name = generate_wallet_name(fingerprint, "regtest")
+
+    with TemporaryDirectory() as tmp:
+        wallet = _build_wallet(bitcoin_rpc_config, mnemonic, wallet_name, Path(tmp))
+        try:
+            deposit = wallet.get_receive_address(mixdepth=0, index=0)
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.01)
+            await wallet.setup_descriptor_wallet(scan_range=1000, rescan=True)
+            await wallet.sync_with_descriptor_wallet()
+            await direct_send(
+                wallet=wallet,
+                backend=wallet.backend,
+                mixdepth=0,
+                amount_sats=0,  # sweep the deposit address empty
+                destination=wallet.get_receive_address(mixdepth=1, index=0),
+                fee_rate=2.0,
+            )
+            await _rpc(
+                bitcoin_rpc_config, "generatetoaddress", [1, miner_addr], wallet=miner
+            )
+            await wallet.sync_with_descriptor_wallet()
+
+            # Two forced payments to the spent-empty address, on separate syncs.
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.00001)
+            await wallet.sync_with_descriptor_wallet()
+            await _fund(bitcoin_rpc_config, miner, miner_addr, deposit, 0.00001)
+            await wallet.sync_with_descriptor_wallet()
+            reuse = [u for u in wallet.utxo_cache.get(0, []) if u.address == deposit]
+            assert len(reuse) == 2
+            assert all(u.frozen for u in reuse), (
+                "both forced payments to the spent-empty address must be frozen"
+            )
+
+            # An unrelated coin in the same mixdepth, then sweep the mixdepth.
+            other = wallet.get_receive_address(mixdepth=0, index=1)
+            await _fund(bitcoin_rpc_config, miner, miner_addr, other, 0.02)
+            await wallet.sync_with_descriptor_wallet()
+            result = await direct_send(
+                wallet=wallet,
+                backend=wallet.backend,
+                mixdepth=0,
+                amount_sats=0,
+                destination=wallet.get_receive_address(mixdepth=1, index=1),
+                fee_rate=2.0,
+            )
+            tx = await _rpc(
+                bitcoin_rpc_config, "getrawtransaction", [result.txid, True]
+            )
+            inputs = {f"{vin['txid']}:{vin['vout']}" for vin in tx["vin"]}
+            assert not inputs & {u.outpoint for u in reuse}, (
+                "the sweep must not spend either forced payment"
+            )
+        finally:
+            await wallet.close()
