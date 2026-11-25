@@ -407,6 +407,42 @@ async def test_second_payment_after_user_unfreezes_reuse_coin_not_frozen(
     assert not ws.metadata_store.is_frozen(second.outpoint)
 
 
+async def test_unfreeze_from_another_process_is_honored(tmp_path: Path) -> None:
+    """An unfreeze written by another process (``jm-wallet unfreeze`` while a
+    maker runs) must count before the next freeze decision, not after it."""
+    ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
+    scan = _scripted_sync(ws)
+    first = await _freeze_first_forced_payment(ws, scan)
+    UTXOMetadataStore(path=ws.metadata_store.path).unfreeze(first.outpoint)
+
+    second = _utxo(txid="f6" * 32, address=REUSED_ADDRESS, value=600, vout=1)
+    scan[0] = [first, second]
+    await ws.sync_all()
+
+    assert first.frozen is False
+    assert second.frozen is False
+    assert not ws.metadata_store.is_frozen(second.outpoint)
+
+
+async def test_refreeze_from_another_process_is_honored(tmp_path: Path) -> None:
+    """A reuse coin refrozen by another process no longer keeps its address
+    funded, so the next forced payment to that address is frozen."""
+    ws = _make_wallet(tmp_path, max_sats_freeze_reuse=-1)
+    scan = _scripted_sync(ws)
+    first = await _freeze_first_forced_payment(ws, scan)
+    ws.metadata_store.unfreeze(first.outpoint)
+    await ws.sync_all()
+    assert first.frozen is False
+    UTXOMetadataStore(path=ws.metadata_store.path).freeze(first.outpoint)
+
+    second = _utxo(txid="f6" * 32, address=REUSED_ADDRESS, value=600, vout=1)
+    scan[0] = [first, second]
+    await ws.sync_all()
+
+    assert second.frozen is True
+    assert ws.metadata_store.is_frozen(second.outpoint)
+
+
 async def test_incomplete_first_sync_does_not_freeze_late_discovered_coin(
     tmp_path: Path,
 ) -> None:

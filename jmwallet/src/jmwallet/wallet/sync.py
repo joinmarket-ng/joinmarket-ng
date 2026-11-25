@@ -164,7 +164,14 @@ class WalletSyncMixin:
         Coins that are still frozen by this defense don't count as funds: they
         are never spent, so a second forced payment to the same address can't be
         spent together with them and must be frozen too (issue #677).
+
+        The metadata store is reloaded first so a freeze or unfreeze made by
+        another process (``jm-wallet unfreeze`` while a maker runs) is honored.
+        The freeze decision after the scan reuses this freshly loaded state.
         """
+        store = getattr(self, "metadata_store", None)
+        if store is not None:
+            store.load()
         return {
             utxo.address
             for utxos in self.utxo_cache.values()
