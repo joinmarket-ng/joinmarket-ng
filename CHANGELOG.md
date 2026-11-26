@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-11-26
+
+More security hardening and other improvements and bug fixes.
+
+### Added
+
+- Group --select-utxos UTXOs by branch (fidelity bonds, ([06ef00ce](../../commit/06ef00ce12dbfa7af0b8b1ebef6f5af7d3f6c2a7))
+- Group the freeze list by mixdepth and branch with labelled separators ([9f3c15d0](../../commit/9f3c15d025ce180592b76e03649d5db3e4f331cb))
+- One shared TUI design for the freeze manager and the UTXO selector ([7bd3db5f](../../commit/7bd3db5f3d3e8678842ef7c2ab6ecf3d1a64b097))
+- Add "Receive Bitcoin" to the TUI main menu with fresh deposit addresses and an address-handling submenu (list/release reservations) ([28e70433](../../commit/28e7043304ff2c15f84d9a03f1594682c999ee3b))
+- Add `jm-wallet address release --expect-label` to release a reservation only if it is still held under the confirmed label ([a516ee50](../../commit/a516ee50e25d94fe2a9e7495021127e9ed1a39d7))
+- taker/coinjoin returns a run_id that taker/status echoes, so clients can tell which run a status belongs to ([e25dbdcd](../../commit/e25dbdcd7a666bb93946efdb075b46e2d7448f80))
+
+### Fixed
+
+- Group `jm-wallet address list` output by mixdepth ([ec1c8e59](../../commit/ec1c8e590b4b126d7116f9bec59ff5139b6f4150))
+- The orderbook watcher verifies fidelity bonds on regtest setups that use the testnet protocol ([7eca68f9](../../commit/7eca68f9b3e150f88f7dda0b2991f298cc6de0fa))
+- Verify Neutrino inputs before CoinJoin commitments and maker disclosure ([3adb56b4](../../commit/3adb56b475f87ef7a5d401f268ad1980a74a6935))
+- Fix TUI lists staying mostly empty after shrinking and ([d6421897](../../commit/d6421897903bff4e5a5534f64fdff5dbebbb4db8))
+- Fix freeze manager crashing when the terminal is shrunk ([10fa8747](../../commit/10fa874757e0dc4114e1175719d7f2a26c8ad5bf))
+- Keep wallet commands usable without optional curses support ([5ca6cd63](../../commit/5ca6cd63ad8853818ca7351f4e67dcb9eff49bf8))
+- Fix CoinJoins staying pending in the wallet history after they confirm ([234c1417](../../commit/234c1417da930ecda5d6ef0ff27464fa158f4776))
+- Add a status block and help screen to both TUIs, render fidelity-bond tags lowercase, and make the layout resize-aware and small-terminal-safe ([b6090864](../../commit/b60908643f1af716a90faa3164d8899ee8842b1c))
+- Measure TUI cell and footer widths in terminal columns so wide-character labels cannot overflow the frame ([57b105d4](../../commit/57b105d487ebf69d8f34956eaddebb0a8404b5aa))
+- Suspend log output while the interactive UTXO selection TUI owns the terminal, like the freeze manager ([19162237](../../commit/191622371b9965db61683191a01542e134c797ba))
+- Respect source mixdepth for unconfirmed inputs and keep UTXO TUIs usable without procfs and on short terminals ([439ef369](../../commit/439ef369b5353a74da0cd614dfdd341ac158aac8))
+- Takers drop makers that declare one of the taker's own coins in !ioauth ([0bc0b55d](../../commit/0bc0b55d1052653e935aa6f7b5e46e626e8c7e19))
+- Takers drop makers whose change address equals their CoinJoin address ([21b0af52](../../commit/21b0af527717b948acd31fd4ebc9091b9c262258))
+- Makers refuse CoinJoins whose locktime is beyond the current block height ([21b0af52](../../commit/21b0af527717b948acd31fd4ebc9091b9c262258))
+- Makers refuse CoinJoins with nonzero BIP68 relative locktimes. ([79cdfad3](../../commit/79cdfad329c6035c2310911ac131bd4289ca99c5))
+- Require distinct trusted signers when verifying releases ([bf50d649](../../commit/bf50d649e4eb2f8fcb069b490f6ad75b3cd57504))
+- Make TUI address release conditional on the confirmed label and make the reserved-address list scrollable ([d0e98971](../../commit/d0e9897116b28a666b5560820e339be3c9c4e696))
+- Prevent oversized PSBTs from stalling local signing during parsing ([80e0d5f0](../../commit/80e0d5f0e759f783c4a5f52db0b66ec6b2a5b4cf))
+- Create generated Tor hidden-service keys owner-only and never overwrite an existing onion key ([871de3f1](../../commit/871de3f18b6d7d3e74b61c53d661d59e338dbf04))
+- Bound maker message deduplication memory against floods of large distinct messages ([8f39c8b0](../../commit/8f39c8b0525d2593d2aeed572be78e31c574c9a0))
+- Stop a peer with an oversized multibyte nick from disconnecting clients from a directory ([d8a816f0](../../commit/d8a816f0a4b80e27d6e667037b98159d85a00e1c))
+- Bound watcher bond verification on full node and neutrino backends against floods of bogus bond claims ([159b8918](../../commit/159b8918805eb1d0eede9394153ec6f15cd83834))
+- Freeze repeated forced address-reuse payments so sweeps and CoinJoins don't spend them ([f4ad6701](../../commit/f4ad6701884c58a57b63a635b53a48da8a3efa25))
+- Honor freeze changes from other wallet processes in the forced address-reuse defense ([85e1e6e4](../../commit/85e1e6e4eaef1b138683f3163fd5cf46886db429))
+- Harden how the taker authenticates makers that send a key-only !pubkey, configurable via taker.bare_pubkey_policy ([5e87c3b3](../../commit/5e87c3b348efea2c54ce1264da5550a088eb8fea))
+
+### Configuration Changes
+
+Existing `config.toml` files are not updated automatically. Review the bundled template changes below and apply the relevant options manually.
+
+````diff
+--- config.toml.template (0.43.0)
++++ config.toml.template (0.44.0)
+@@ -596,6 +596,13 @@ [taker]
+ # Set to 0 to disable the cap (not recommended).
+ # max_maker_utxos = 15
+
++# Makers whose !pubkey carries only the encryption key (legacy makers) cannot
++# prove that key until after !auth reveals your PoDLE commitment.
++# "direct": send !auth to them only over a direct onion connection to the
++#   location every directory agrees on; skip them for the round otherwise.
++# "reject": always skip them. "allow": send !auth over any channel.
++# bare_pubkey_policy = "direct"
++
+ # PoDLE commitment requirements (control which UTXOs can be used as PoDLE inputs).
+ # These match the reference JoinMarket defaults; loosening them weakens the
+ # anti-DoS commitment scheme.
+````
+
 ## [0.43.0] - 2026-11-03
 
 New features, bug fixes, and security hardening.
@@ -4662,7 +4726,8 @@ This release did not change the bundled `config.toml.template`.
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.43.0...HEAD
+[Unreleased]: ../../compare/0.44.0...HEAD
+[0.44.0]: ../../compare/0.43.0...0.44.0
 [0.43.0]: ../../compare/0.42.1...0.43.0
 [0.42.1]: ../../compare/0.42.0...0.42.1
 [0.42.0]: ../../compare/0.41.0...0.42.0
