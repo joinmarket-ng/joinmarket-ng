@@ -23,6 +23,7 @@ from jmcore.settings import DEFAULT_DIRECTORY_SERVERS, JoinMarketSettings
 
 from taker.config import (
     DEFAULT_COUNTERPARTY_COUNT_MAX,
+    BarePubkeyPolicy,
     BroadcastPolicy,
     MaxCjFee,
     TakerConfig,
@@ -298,6 +299,7 @@ def build_taker_config_kwargs(
         "taker_utxo_retries": settings.taker.taker_utxo_retries,
         "taker_utxo_amtpercent": settings.taker.taker_utxo_amtpercent,
         "max_maker_utxos": settings.taker.max_maker_utxos,
+        "bare_pubkey_policy": BarePubkeyPolicy(settings.taker.bare_pubkey_policy),
     }
 
 

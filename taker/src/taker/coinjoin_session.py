@@ -18,6 +18,7 @@ keeps ``Taker`` focused on lifecycle (start/stop/sync_wallet/run_schedule).
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -56,7 +57,7 @@ from jmwallet.wallet.signing import (
 from jmwallet.wallet.spend import enforce_fee_rate_cap
 from loguru import logger
 
-from taker.config import BroadcastPolicy
+from taker.config import BarePubkeyPolicy, BroadcastPolicy
 from taker.models import MakerSession, PhaseResult
 from taker.orderbook import calculate_cj_fee, calculate_cj_fee_plan
 from taker.podle import ExtendedPoDLECommitment, get_eligible_podle_utxos
@@ -70,6 +71,29 @@ if TYPE_CHECKING:
     from taker.config import TakerConfig
     from taker.multi_directory import MultiDirectoryClient
     from taker.taker import Taker
+
+
+_NACL_PUBKEY_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def parse_pubkey_fields(payload: str) -> list[str] | None:
+    """Return the signed fields of a ``!pubkey`` payload, or None if malformed.
+
+    ``payload`` is the verified response data followed by the nick signing
+    pubkey and signature. Fields are split on single ASCII spaces, exactly as
+    the signature verifier splits them, and must be non-empty and free of any
+    other whitespace; the first must be a 64-hex NaCl key. A generic
+    ``split()`` would also split on tabs, letting a signed single-token body
+    (for example a commitment a legacy maker echoed back) pose as an extended
+    reply with a ``features=`` field.
+    """
+    tokens = payload.split(" ")
+    fields = tokens[:-2]
+    if not fields or not _NACL_PUBKEY_RE.fullmatch(fields[0]):
+        return None
+    if any(not field or any(ch.isspace() for ch in field) for field in fields):
+        return None
+    return fields
 
 
 @dataclass(frozen=True)
@@ -428,15 +452,16 @@ class CoinJoinSession:
         """Parse a maker's !pubkey payload and set up its encryption session.
 
         Payload format: ``<nacl_pubkey_hex> [features=<comma-separated>]
-        <signing_pk> <sig>``. Records the maker's NaCl pubkey, parses the
-        optional features field (e.g. ``features=neutrino_compat``) into
-        ``supports_neutrino_compat``, and creates the per-maker crypto session
+        <signing_pk> <sig>`` (see :func:`parse_pubkey_fields`). Records the
+        maker's NaCl pubkey and whether the reply carried a field after it,
+        parses the optional features field (e.g. ``features=neutrino_compat``)
+        into ``supports_neutrino_compat``, and creates the per-maker crypto session
         reusing the taker keypair from ``self.crypto_session`` (the pubkey the
         maker saw in !fill). Used for both the initial fill phase and the
         mini-fill run for replacement makers, so feature detection stays
         consistent across the two paths.
 
-        Returns True on success; False on an empty payload or missing taker
+        Returns True on success; False on a malformed payload or missing taker
         crypto session (the caller drops the maker session). Exceptions from
         an invalid pubkey propagate and are handled the same way by callers.
         """
@@ -444,18 +469,19 @@ class CoinJoinSession:
             logger.error(f"No taker crypto session while processing !pubkey from {nick}")
             return False
 
-        parts = response_data.split()
-        if not parts:
-            logger.warning(f"Empty !pubkey response from {nick}")
+        fields = parse_pubkey_fields(response_data)
+        if fields is None:
+            logger.warning(f"Malformed !pubkey response from {nick}")
             return False
 
         session = self.maker_sessions[nick]
-        nacl_pubkey = parts[0]
+        nacl_pubkey = fields[0]
         session.pubkey = nacl_pubkey
+        session.pubkey_extended = len(fields) > 1
         session.responded_fill = True
 
         # Parse optional features (e.g., "features=neutrino_compat")
-        for part in parts[1:]:
+        for part in fields[1:]:
             if part.startswith("features="):
                 features_str = part[len("features=") :]
                 features = set(features_str.split(",")) if features_str else set()
@@ -747,19 +773,7 @@ class CoinJoinSession:
         # would resend !auth to compatible makers whose responses were not read.
         incompatible_makers: list[str] = []
         if taker_requires_extended:
-            for nick in list(pending_nicks):
-                session = self.maker_sessions[nick]
-                if session.supports_neutrino_compat:
-                    continue
-
-                logger.error(
-                    f"Incompatible maker {nick}: taker uses Neutrino backend but maker "
-                    f"doesn't support neutrino_compat. Taker cannot verify maker's UTXOs "
-                    f"without extended metadata (scriptpubkey + blockheight)."
-                )
-                incompatible_makers.append(nick)
-                del self.maker_sessions[nick]
-
+            incompatible_makers = self._drop_makers_without_neutrino_compat(pending_nicks)
             pending_nicks = [nick for nick in pending_nicks if nick in self.maker_sessions]
 
             # Report incompatible makers as failed so the replacement loop can
@@ -772,8 +786,25 @@ class CoinJoinSession:
                 )
                 return PhaseResult(success=False, failed_makers=incompatible_makers)
 
+        # A key-only !pubkey may be another message the maker signed, re-labelled
+        # by whoever relays it, so the key is unproven until !ioauth. Keep the
+        # revelation off any path a third party relays (see BarePubkeyPolicy).
+        unroutable_makers = await self._route_bare_pubkey_sessions(pending_nicks)
+        if unroutable_makers:
+            pending_nicks = [nick for nick in pending_nicks if nick in self.maker_sessions]
+            if len(self.maker_sessions) < self.config.minimum_makers:
+                logger.error(
+                    f"Not enough makers left to authenticate: {len(self.maker_sessions)} "
+                    f"< {self.config.minimum_makers}"
+                )
+                return PhaseResult(
+                    success=False,
+                    failed_makers=incompatible_makers,
+                    unroutable_makers=unroutable_makers,
+                )
+
         podle_revealed = False
-        for nick in pending_nicks:
+        for nick in list(pending_nicks):
             session = self.maker_sessions[nick]
             if session.crypto is None:
                 logger.error(f"No encryption session for {nick}")
@@ -812,14 +843,11 @@ class CoinJoinSession:
             )
 
             # Encrypt and send on the (possibly upgraded) session channel.
-            encrypted_revelation = session.crypto.encrypt(revelation_str)
-            await self.directory_client.send_privmsg(
-                nick,
-                "auth",
-                encrypted_revelation,
-                log_routing=True,
-                force_channel=session.comm_channel,
-            )
+            if not await self._send_auth(nick, session, session.crypto.encrypt(revelation_str)):
+                unroutable_makers.append(nick)
+                pending_nicks.remove(nick)
+                del self.maker_sessions[nick]
+                continue
             podle_revealed = True
 
         timeout = self.config.maker_timeout_sec
@@ -1075,6 +1103,7 @@ class CoinJoinSession:
                 failed_makers=failed_makers,
                 unavailable_makers=unavailable_makers,
                 over_budget_makers=over_budget_makers,
+                unroutable_makers=unroutable_makers,
                 podle_revealed=podle_revealed,
             )
 
@@ -1083,8 +1112,84 @@ class CoinJoinSession:
             failed_makers=failed_makers,
             unavailable_makers=unavailable_makers,
             over_budget_makers=over_budget_makers,
+            unroutable_makers=unroutable_makers,
             podle_revealed=podle_revealed,
         )
+
+    def _drop_makers_without_neutrino_compat(self, nicks: list[str]) -> list[str]:
+        """Remove sessions whose ``!pubkey`` lacked ``neutrino_compat``; return their nicks."""
+        dropped: list[str] = []
+        for nick in nicks:
+            if self.maker_sessions[nick].supports_neutrino_compat:
+                continue
+            logger.error(
+                f"Incompatible maker {nick}: taker uses Neutrino backend but maker "
+                f"doesn't support neutrino_compat. Taker cannot verify maker's UTXOs "
+                f"without extended metadata (scriptpubkey + blockheight)."
+            )
+            dropped.append(nick)
+            del self.maker_sessions[nick]
+        return dropped
+
+    async def _send_auth(self, nick: str, session: MakerSession, encrypted: str) -> bool:
+        """Send ``!auth`` on the session's pinned channel.
+
+        Returns False, without sending, when a key-only session pinned to its
+        direct connection has lost it: a forced direct channel raises rather
+        than falling back to a directory, and that only costs this maker.
+        Other send errors propagate.
+        """
+        try:
+            await self.directory_client.send_privmsg(
+                nick,
+                "auth",
+                encrypted,
+                log_routing=True,
+                force_channel=session.comm_channel,
+            )
+        except RuntimeError as e:
+            if session.pubkey_extended or session.comm_channel != "direct":
+                raise
+            logger.warning(f"Skipping maker {nick} for this round: direct send failed ({e})")
+            return False
+        return True
+
+    async def _route_bare_pubkey_sessions(self, nicks: list[str]) -> list[str]:
+        """Apply ``bare_pubkey_policy`` to sessions with a key-only ``!pubkey``.
+
+        Under DIRECT, sessions that obtain a verified direct connection are
+        pinned to it, so ``!auth`` and later messages never fall back to a
+        directory. Every other key-only session (all of them under REJECT) is
+        removed from ``maker_sessions``. Returns the removed nicks.
+        """
+        policy = self.config.bare_pubkey_policy
+        bare = [nick for nick in nicks if not self.maker_sessions[nick].pubkey_extended]
+        if not bare or policy == BarePubkeyPolicy.ALLOW:
+            return []
+
+        routable: set[str] = set()
+        if policy == BarePubkeyPolicy.DIRECT:
+            timeout = float(self.config.maker_timeout_sec)
+            verified = await asyncio.gather(
+                *(self.directory_client.connect_verified_direct(n, timeout) for n in bare)
+            )
+            routable = {nick for nick, ok in zip(bare, verified, strict=True) if ok}
+
+        removed: list[str] = []
+        for nick in bare:
+            if nick in routable:
+                self.maker_sessions[nick].comm_channel = "direct"
+                logger.info(f"Maker {nick} sent a key-only !pubkey; authenticating directly")
+                continue
+            reason = (
+                "bare_pubkey_policy=reject"
+                if policy == BarePubkeyPolicy.REJECT
+                else "no verified direct connection"
+            )
+            logger.warning(f"Skipping maker {nick} for this round: key-only !pubkey and {reason}")
+            removed.append(nick)
+            del self.maker_sessions[nick]
+        return removed
 
     def _sweep_over_budget_makers(self) -> list[str]:
         """Return makers to drop, heaviest input set first, so the sweep budget fits.

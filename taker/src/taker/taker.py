@@ -1868,6 +1868,12 @@ class Taker(TakerMonitoringMixin):
                     f"Hard-excluded {unavailable_nick} for this round "
                     "(UTXO verification unavailable)"
                 )
+            for unroutable_nick in auth_result.unroutable_makers:
+                failed_nicks.add(unroutable_nick)
+                logger.debug(
+                    f"Hard-excluded {unroutable_nick} for this round "
+                    "(key-only !pubkey without an accepted route)"
+                )
             for over_budget_nick in auth_result.over_budget_makers:
                 failed_nicks.add(over_budget_nick)
                 logger.debug(

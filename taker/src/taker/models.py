@@ -49,6 +49,10 @@ class MakerSession:
     responded_auth: bool = False
     responded_sig: bool = False
     supports_neutrino_compat: bool = False  # Supports extended UTXO metadata for Neutrino
+    # True when the signed !pubkey body carried a field after the NaCl key. A
+    # key-only body can be another signed message re-labelled, so it is not
+    # trusted for !auth over a relayed channel (see BarePubkeyPolicy).
+    pubkey_extended: bool = False
     # Communication channel used for this session (must be consistent throughout)
     # "direct" = peer-to-peer onion connection
     # "directory:<host>:<port>" = relayed through specific directory
@@ -70,6 +74,10 @@ class PhaseResult:
     # Sweep makers whose inputs the fixed fee budget cannot fund in this round.
     # They are excluded for this round but must not be blacklisted.
     over_budget_makers: list[str] = Field(default_factory=list)
+    # Makers with a key-only !pubkey that the bare-pubkey policy would not
+    # authenticate to in this round. Excluded for the round, never blacklisted:
+    # a relay can provoke this, so persisting it would let it ban honest makers.
+    unroutable_makers: list[str] = Field(default_factory=list)
     blacklist_error: bool = False  # True if any maker rejected due to blacklisted commitment
     # Subset of failed_makers that specifically rejected with a "blacklist" error.
     # Used so the taker can tell "minority blacklist rejection" (probably a lying
@@ -84,5 +92,8 @@ class PhaseResult:
     def needs_replacement(self) -> bool:
         """True if phase failed due to makers that can be replaced."""
         return not self.success and bool(
-            self.failed_makers or self.unavailable_makers or self.over_budget_makers
+            self.failed_makers
+            or self.unavailable_makers
+            or self.over_budget_makers
+            or self.unroutable_makers
         )

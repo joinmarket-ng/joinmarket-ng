@@ -43,7 +43,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 from loguru import logger
 from pydantic import (
@@ -1123,6 +1123,16 @@ class TakerSettings(BaseModel):
             "unbounded count lets a counterparty consolidate its UTXOs at the "
             "taker's expense. Makers exceeding the cap are dropped (and replaced "
             "when possible). 0 disables the cap (not recommended)."
+        ),
+    )
+    bare_pubkey_policy: Literal["direct", "reject", "allow"] = Field(
+        default="direct",
+        description=(
+            "Handling of makers whose !pubkey carries only the encryption key "
+            "(legacy makers). 'direct' sends !auth to them only over a direct "
+            "onion connection at the location every directory agrees on and "
+            "skips them for the round otherwise; 'reject' always skips them; "
+            "'allow' sends !auth over any channel."
         ),
     )
     taker_utxo_age: int = Field(

@@ -37,7 +37,7 @@ from jmwallet.wallet.service import WalletService
 from loguru import logger
 from pydantic import SecretStr
 from taker.coinjoin_session import CoinJoinSession
-from taker.config import MaxCjFee, TakerConfig
+from taker.config import BarePubkeyPolicy, MaxCjFee, TakerConfig
 from taker.models import PhaseResult
 from taker.orderbook import calculate_cj_fee
 from taker.taker import Taker
@@ -347,6 +347,27 @@ def clear_taker_ignored_makers() -> bool:
     else:
         logger.warning(f"Could not clear taker ignored makers list: {result.stderr}")
         return False
+
+
+def read_taker_ignored_makers() -> set[str]:
+    """Return the nicks in the containerized taker's persisted ignore list."""
+    from tests.e2e.docker_utils import get_compose_cmd_prefix
+
+    cmd = get_compose_cmd_prefix() + [
+        "run",
+        "--rm",
+        "-T",
+        "--entrypoint",
+        "sh",
+        "taker-reference",
+        "-c",
+        "cat /home/jm/.joinmarket-ng/ignored_makers.txt 2>/dev/null || true",
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=60, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
 def clear_podle_blacklist(maker_id: int) -> bool:
@@ -697,13 +718,20 @@ def _build_taker_docker_cmd(
     counterparties: int = 2,
     mixdepth: int = 0,
     round_up_cj_fees: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> list[str]:
     """Build the ``docker compose run ... taker-reference jm-taker coinjoin`` command."""
     from tests.e2e.docker_utils import get_compose_cmd_prefix
 
+    env_args = [
+        arg
+        for key, value in (extra_env or {}).items()
+        for arg in ("-e", f"{key}={value}")
+    ]
     cmd = get_compose_cmd_prefix() + [
         "run",
         "--rm",
+        *env_args,
         "-e",
         f"COINJOIN_AMOUNT={amount}",
         "-e",
@@ -946,9 +974,9 @@ async def test_our_taker_with_reference_makers(
     This is the main compatibility test - if this passes, our taker implementation
     is fully compatible with the reference JoinMarket makers.
 
-    The taker connects to our directory server which routes messages to the
-    reference makers. All communication goes through the directory - no direct
-    Tor connections are needed between taker and makers.
+    The taker reaches the reference makers through our directory server, and
+    authenticates them over direct Tor connections because their !pubkey
+    replies are key-only (default bare_pubkey_policy).
     """
     compose_file = reference_maker_services["compose_file"]
     dest_address = await _prepare_taker_environment(compose_file)
@@ -1074,6 +1102,9 @@ async def test_our_taker_replaces_failed_reference_maker_without_duplicate_auth(
         max_cj_fee=MaxCjFee(abs_fee=100_000, rel_fee="0.01"),
         bondless_makers_allowance_require_zero_fee=False,
         round_up_cj_fees=False,
+        # This host-side taker has no Tor proxy, so it cannot dial the JAM
+        # makers' onions; routing policy is covered by the containerized tests.
+        bare_pubkey_policy=BarePubkeyPolicy.ALLOW,
         data_dir=data_dir,
     )
     taker = Taker(wallet, backend, config)
@@ -1342,6 +1373,57 @@ async def test_our_taker_uses_direct_connections_with_reference_makers(
         f"Check that taker-reference has TOR__SOCKS_HOST configured.\n"
         f"Output: {output_combined[-3000:]}\n"
         f"Yieldgenerator logs:\n{maker_logs[-3000:]}"
+    )
+
+    # Reference makers reply with a key-only !pubkey, so under the default
+    # bare_pubkey_policy the taker must authenticate each of them directly.
+    assert "sent a key-only !pubkey; authenticating directly" in output_lower, (
+        f"Taker did not route key-only makers directly.\nOutput: {output_combined[-3000:]}"
+    )
+    assert "key-only !pubkey and" not in output_lower, (
+        f"Taker skipped a reference maker.\nOutput: {output_combined[-3000:]}"
+    )
+    assert "sent !auth to" in output_lower and not re.search(
+        r"sent !auth to \S+ via directory", output_lower
+    ), f"!auth to a reference maker was relayed.\nOutput: {output_combined[-3000:]}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(600)
+async def test_reject_policy_skips_reference_makers_for_the_round_only(
+    reference_maker_services, running_yieldgenerators
+):
+    """With ``bare_pubkey_policy = "reject"`` our taker must not authenticate to
+    reference makers, and must not persist them in the ignored-makers list."""
+    compose_file = reference_maker_services["compose_file"]
+    dest_address = await _prepare_taker_environment(compose_file)
+
+    cmd = _build_taker_docker_cmd(
+        compose_file,
+        dest_address,
+        extra_env={"TAKER__BARE_PUBKEY_POLICY": "reject"},
+    )
+    result = _run_taker_cmd(cmd)
+    output_combined, output_lower, has_success = _analyze_taker_output(result)
+
+    skipped = set(
+        re.findall(
+            r"Skipping maker (\S+) for this round: key-only !pubkey and "
+            r"bare_pubkey_policy=reject",
+            output_combined,
+        )
+    )
+    assert not has_success, (
+        f"CoinJoin unexpectedly succeeded.\n{output_combined[-3000:]}"
+    )
+    assert len(skipped) >= 2, (
+        f"Expected both reference makers to be skipped.\n{output_combined[-3000:]}"
+    )
+    assert "sent !auth to" not in output_lower, (
+        f"Taker sent !auth despite the reject policy.\n{output_combined[-3000:]}"
+    )
+    assert not skipped & read_taker_ignored_makers(), (
+        "Policy exclusions must not be persisted to the ignored-makers list"
     )
 
 

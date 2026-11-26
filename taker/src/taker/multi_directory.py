@@ -408,6 +408,33 @@ class MultiDirectoryClient(DirectoryClientPool):
             return "direct"
         return current_channel
 
+    async def connect_verified_direct(self, nick: str, timeout: float) -> bool:
+        """Ensure a handshaked direct connection to ``nick`` at an agreed location.
+
+        Starts a connection attempt when none is up and waits up to ``timeout``
+        for it. Returns True only when direct connections are enabled, the peer
+        is handshaked, and every connected directory that lists a serving
+        location for ``nick`` lists exactly the location we dialed. A single
+        directory could otherwise point us at an onion it controls.
+        """
+        if not self.prefer_direct_connections:
+            return False
+        if self._get_connected_peer(nick) is None:
+            self._try_direct_connect(nick)
+            task = self._pending_connect_tasks.get(nick)
+            if task is not None and not task.done():
+                await asyncio.wait({task}, timeout=timeout)
+        peer = self._get_connected_peer(nick)
+        if peer is None:
+            return False
+        listed = {
+            location
+            for client in self.clients.values()
+            if (location := client._active_peers.get(nick))
+            and location != NOT_SERVING_ONION_HOSTNAME
+        }
+        return listed == {peer.location}
+
     def try_direct_connect(self, nick: str) -> None:
         """
         Public alias for ``_try_direct_connect``.
@@ -889,6 +916,11 @@ class MultiDirectoryClient(DirectoryClientPool):
             if from_nick not in expected_nicks:
                 return
             if parsed[1] != self.nick:
+                return
+            # A direct connection speaks only for the nick we dialed. Without
+            # this, a reachable peer could inject lines another maker signed.
+            if msg.get("from_direct") and msg.get("from_nick") != from_nick:
+                logger.warning(f"Dropping direct line claiming {from_nick} via {source}")
                 return
 
             ok, command, _data = verify_signed_privmsg(from_nick, parsed[2], ONION_HOSTID)

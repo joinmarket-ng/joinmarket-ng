@@ -370,6 +370,7 @@ class TestBuildTakerConfig:
         settings.taker.taker_utxo_retries = 3
         settings.taker.taker_utxo_amtpercent = 20
         settings.taker.max_maker_utxos = 15
+        settings.taker.bare_pubkey_policy = "direct"
 
         # Wallet config
         settings.wallet.mixdepth_count = 5
@@ -565,6 +566,37 @@ class TestBuildTakerConfig:
         )
 
         assert config.max_maker_utxos == 4
+
+    @pytest.mark.parametrize("policy", ["direct", "reject", "allow"])
+    def test_bare_pubkey_policy_forwarded(
+        self, sample_mnemonic: str, mock_settings: MagicMock, policy: str
+    ) -> None:
+        """``taker.bare_pubkey_policy`` must reach the TakerConfig unchanged."""
+        from taker.config import BarePubkeyPolicy
+
+        mock_settings.taker.bare_pubkey_policy = policy
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+        )
+
+        assert config.bare_pubkey_policy is BarePubkeyPolicy(policy)
+
+    def test_bare_pubkey_policy_settings_default_and_validation(self) -> None:
+        from jmcore.settings import TakerSettings
+        from pydantic import ValidationError
+
+        from taker.config import BarePubkeyPolicy
+
+        assert TakerSettings().bare_pubkey_policy == BarePubkeyPolicy.DIRECT.value
+        assert TakerSettings(bare_pubkey_policy="reject").bare_pubkey_policy == "reject"
+        with pytest.raises(ValidationError):
+            TakerSettings(bare_pubkey_policy="sometimes")  # type: ignore[arg-type]
 
     def test_taker_fee_rate_setting_honored_without_cli_flag(
         self, sample_mnemonic: str, mock_settings: MagicMock

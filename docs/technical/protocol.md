@@ -73,8 +73,10 @@ Before connecting to any directory server, the taker syncs the wallet and verifi
 **Phase 2: Fill Request**
 
 1. Taker sends `!fill` with: order ID, amount, NaCl pubkey, PoDLE commitment
-2. Selected makers respond with `!pubkey` (their NaCl pubkey)
+2. Selected makers respond with `!pubkey <nacl_pubkey_hex> [fields...]`
 3. From here, all messages are NaCl encrypted
+
+Fields after the key are separated by single ASCII spaces; a reply with any other whitespace or an empty field is invalid. joinmarket-ng makers always append `features=...`, while reference makers send the key alone. A key-only reply carries no field that only a `!pubkey` would contain, and its key is not confirmed until `!ioauth`. The taker's `bare_pubkey_policy` controls how such makers are authenticated: `direct` (default) sends `!auth` only over a direct connection to the maker's advertised onion, `reject` skips them, and `allow` treats them like any other maker. Makers skipped this way are excluded for the current round only and replaced when possible.
 
 **Phase 3: Authentication**
 
@@ -154,7 +156,7 @@ JoinMarket supports two routing modes:
 - Reliable fallback for restrictive networks
 
 **Channel Selection:**
-A taker pins a single channel per maker before sending `!fill` and reuses it for the whole session. The reference taker, however, routes each message opportunistically: it sends `!fill` via a directory while a direct connection is still being established, then sends `!auth`/`!tx` over the direct connection once it handshakes. Makers therefore track the channel for diagnostics but accept such switches rather than aborting the session. Replay across channels is prevented by signing every message with a fixed `hostid` (`onion-network`) shared by all onion transports, not by pinning the transport.
+A taker pins a single channel per maker before sending `!fill` and reuses it for the whole session, except that a maker with a key-only `!pubkey` is moved to its direct connection before `!auth` (see Phase 2). A direct connection only carries messages from the nick it was dialed for. The reference taker, however, routes each message opportunistically: it sends `!fill` via a directory while a direct connection is still being established, then sends `!auth`/`!tx` over the direct connection once it handshakes. Makers therefore track the channel for diagnostics but accept such switches rather than aborting the session. Replay across channels is prevented by signing every message with a fixed `hostid` (`onion-network`) shared by all onion transports, not by pinning the transport.
 
 ### Handshake Protocol
 

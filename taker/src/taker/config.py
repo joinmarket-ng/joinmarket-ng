@@ -57,6 +57,25 @@ class BroadcastPolicy(StrEnum):
     NOT_SELF = "not-self"
 
 
+class BarePubkeyPolicy(StrEnum):
+    """How to authenticate to a maker whose ``!pubkey`` carries only the NaCl key.
+
+    Private message signatures do not cover the command, so a key-only body a
+    maker signed for another purpose can be presented as its ``!pubkey``. The
+    key is only proven by ``!ioauth``, after ``!auth`` already revealed our
+    PoDLE commitment to whoever holds it.
+
+    - DIRECT: send ``!auth`` only over a direct connection to the onion location
+      every directory agrees on; otherwise skip the maker for this round.
+    - REJECT: skip such makers.
+    - ALLOW: send ``!auth`` on any channel (legacy behavior).
+    """
+
+    DIRECT = "direct"
+    REJECT = "reject"
+    ALLOW = "allow"
+
+
 class MaxCjFee(BaseModel):
     """Maximum CoinJoin fee limits."""
 
@@ -186,6 +205,13 @@ class TakerConfig(WalletConfig):
             "unbounded input count lets a counterparty consolidate its UTXOs at "
             "the taker's expense. Makers exceeding the cap are dropped (and "
             "replaced when possible). 0 disables the cap (not recommended)."
+        ),
+    )
+    bare_pubkey_policy: BarePubkeyPolicy = Field(
+        default=BarePubkeyPolicy.DIRECT,
+        description=(
+            "Handling of makers whose !pubkey carries only the encryption key "
+            "(legacy makers): direct, reject or allow"
         ),
     )
 

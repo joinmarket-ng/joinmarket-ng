@@ -8,13 +8,16 @@ tests from the monorepo root.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import Any
 
 from jmcore.crypto import NickIdentity
 from jmcore.encryption import CryptoSession
 from jmcore.models import NetworkType
 from jmcore.network import OnionPeer
 from jmcore.paths import get_used_commitments_path
+from jmcore.protocol import MessageType
 from jmwallet.wallet.models import UTXOInfo
 
 from taker.config import TakerConfig
@@ -42,6 +45,26 @@ def initialize_test_commitment_history(data_dir: Path) -> None:
     """Prepare successful fixtures without resetting any already recorded proofs."""
     if not get_used_commitments_path(data_dir).exists():
         initialize_commitment_history(data_dir)
+
+
+class OneShotDirectory:
+    """Directory client stand-in that relays the given privmsg lines once.
+
+    A directory relays lines claiming any sender, so tests of signature-based
+    attribution should deliver lines this way rather than over a direct peer.
+    """
+
+    def __init__(self, lines: list[str]) -> None:
+        self.messages: list[dict[str, Any]] = [
+            {"type": MessageType.PRIVMSG.value, "line": line} for line in lines
+        ]
+        self._active_peers: dict[str, str] = {}
+
+    async def listen_for_messages(self, duration: float) -> list[dict[str, Any]]:
+        messages, self.messages = self.messages, []
+        if not messages:
+            await asyncio.sleep(duration)
+        return messages
 
 
 def register_direct_peer(client: MultiDirectoryClient, nick: str) -> None:

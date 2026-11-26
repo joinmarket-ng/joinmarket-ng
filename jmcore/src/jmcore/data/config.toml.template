@@ -596,6 +596,13 @@
 # Set to 0 to disable the cap (not recommended).
 # max_maker_utxos = 15
 
+# Makers whose !pubkey carries only the encryption key (legacy makers) cannot
+# prove that key until after !auth reveals your PoDLE commitment.
+# "direct": send !auth to them only over a direct onion connection to the
+#   location every directory agrees on; skip them for the round otherwise.
+# "reject": always skip them. "allow": send !auth over any channel.
+# bare_pubkey_policy = "direct"
+
 # PoDLE commitment requirements (control which UTXOs can be used as PoDLE inputs).
 # These match the reference JoinMarket defaults; loosening them weakens the
 # anti-DoS commitment scheme.

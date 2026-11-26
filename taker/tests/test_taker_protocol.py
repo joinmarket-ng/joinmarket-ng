@@ -2763,6 +2763,7 @@ class TestPhaseAuthMakerAuthentication:
             offer=offer,
             pubkey=maker_nacl_pk_hex,
             supports_neutrino_compat=is_neutrino_unavailable,
+            pubkey_extended=True,
         )
         object.__setattr__(session, "crypto", taker_crypto)
 
@@ -3575,7 +3576,7 @@ class TestNeutrinoIncompatibleMakerReplacement:
         taker._session.podle_commitment.has_neutrino_metadata.return_value = False
 
         taker_crypto, _ = make_crypto_pair()
-        maker = MakerSession(nick="J5err", offer=_simple_offer("J5err"))
+        maker = MakerSession(nick="J5err", offer=_simple_offer("J5err"), pubkey_extended=True)
         maker.crypto = taker_crypto
         taker._session.maker_sessions = {"J5err": maker}
 
@@ -3857,7 +3858,9 @@ class TestReplacementTargetRestoration:
         assert below_floor_taker._session.last_failure_reason is not None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("excluded_field", ["unavailable_makers", "over_budget_makers"])
+    @pytest.mark.parametrize(
+        "excluded_field", ["unavailable_makers", "over_budget_makers", "unroutable_makers"]
+    )
     async def test_auth_hard_excludes_unavailable_maker_without_ignoring(self, excluded_field):
         taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
         survivor = next(iter(taker._session.maker_sessions.values()))
@@ -4324,7 +4327,7 @@ class TestIncrementalPhaseTopUp:
 
     @staticmethod
     def _filled_maker(nick: str) -> MakerSession:
-        maker = MakerSession(nick=nick, offer=_simple_offer(nick))
+        maker = MakerSession(nick=nick, offer=_simple_offer(nick), pubkey_extended=True)
         peer = CryptoSession()
         maker.pubkey = peer.get_pubkey_hex()
         maker.crypto = CryptoSession()

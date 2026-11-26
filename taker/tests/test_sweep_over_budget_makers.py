@@ -111,7 +111,12 @@ def _add_ioauth_makers(taker: Taker, input_counts: tuple[int, ...]) -> None:
             f"{utxo_list} {auth_pub.hex()} {_address(10 + index)} {_address(50 + index)} {btc_sig}"
         )
         responses[nick] = {"data": maker_crypto.encrypt(ioauth)}
-        maker = MakerSession(nick=nick, offer=_offer(nick), pubkey=maker_crypto.get_pubkey_hex())
+        maker = MakerSession(
+            nick=nick,
+            offer=_offer(nick),
+            pubkey=maker_crypto.get_pubkey_hex(),
+            pubkey_extended=True,
+        )
         maker.responded_fill = True
         maker.crypto = taker_crypto
         session.maker_sessions[nick] = maker

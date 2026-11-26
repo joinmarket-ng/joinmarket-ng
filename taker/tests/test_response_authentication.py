@@ -11,7 +11,11 @@ import asyncio
 import json
 
 import pytest
-from _taker_test_helpers import make_directory_client, register_direct_peer
+from _taker_test_helpers import (
+    OneShotDirectory,
+    make_directory_client,
+    register_direct_peer,
+)
 from jmcore.crypto import NickIdentity
 from jmcore.network import ONION_HOSTID
 from jmcore.protocol import MessageType
@@ -23,15 +27,8 @@ def signed_line(identity: NickIdentity, recipient: str, command: str, data: str)
 
 
 async def run(client, expected_nicks, command, lines, counts=None):
-    register_direct_peer(client, "assigned-test-connection")
-    for line in lines:
-        await client._on_peer_message(
-            "assigned-test-connection",
-            json.dumps(
-                {"type": MessageType.PRIVMSG.value, "line": line, "source": "dir1"}
-            ).encode(),
-        )
-    client.clients = {}
+    # A directory relays lines from any nick; attribution must rest on signatures.
+    client.clients = {"dir1": OneShotDirectory(lines)}
     return await client.wait_for_responses(
         expected_nicks=expected_nicks,
         expected_command=command,
