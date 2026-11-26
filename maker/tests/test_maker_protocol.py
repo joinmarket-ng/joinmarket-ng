@@ -2563,3 +2563,51 @@ async def test_on_tx_masks_non_fee_verification_error_from_taker():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("neutrino_backend", [False, True])
+async def test_pubkey_reply_always_carries_a_space_separated_extension(neutrino_backend):
+    """Takers trust a ``!pubkey`` only when a field follows the key after one ASCII
+    space, because a key-only body could be another signed message re-labelled.
+    Our reply must keep that shape regardless of backend.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from jmcore.models import Offer, OfferType
+
+    from maker.coinjoin import CoinJoinSession
+    from maker.protocol_handlers import ProtocolHandlersMixin
+
+    backend = MagicMock()
+    backend.requires_neutrino_metadata.return_value = neutrino_backend
+    offer = Offer(
+        counterparty="J5Maker",
+        ordertype=OfferType.SW0_RELATIVE,
+        oid=0,
+        minsize=10_000,
+        maxsize=100_000_000,
+        txfee=0,
+        cjfee="0.0003",
+    )
+    session = CoinJoinSession(
+        taker_nick="J5Taker", offer=offer, wallet=MagicMock(), backend=backend
+    )
+    success, data = await session.handle_fill(
+        amount=1_000_000, commitment="aa" * 32, taker_pk=CryptoSession().get_pubkey_hex()
+    )
+    assert success
+
+    client = MagicMock()
+    client.send_private_message = AsyncMock()
+    bot = MagicMock()
+    bot._generation_clients.return_value = {"directory.test:5222": client}
+    await ProtocolHandlersMixin._send_response(bot, "J5Taker", "pubkey", data, generation_id=0)
+
+    client.send_private_message.assert_awaited_once()
+    _, command, body = client.send_private_message.await_args.args
+    assert command == "pubkey"
+    fields = body.split(" ")
+    assert fields == [data["nacl_pubkey"], "features=neutrino_compat"]
+    assert len(fields[0]) == 64
+    assert not any(ch.isspace() for field in fields for ch in field)
