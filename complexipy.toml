@@ -1,5 +1,5 @@
-# Rebaselined for Complexipy 8's scoring, without changing application code.
-max-complexity-allowed = 114
+# Rebaselined for Complexipy 9's scoring, without changing application code.
+max-complexity-allowed = 117
 exclude = [
     "joinmarket-clientserver",
     "jmvenv",

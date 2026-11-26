@@ -235,8 +235,12 @@ enabled rules in those configurations when upgrading Ruff.
 
 `prek autoupdate` refreshes remote hook revisions, not every tool pin. Review
 local hook dependencies, CI tool versions, and action references separately.
-Cleaning hook environments resolves unpinned tools again. CI uses fresh hook
-environments on every run; third-party Actions remain SHA-pinned for security.
+Complexipy runs from its versioned hook repository, so `prek autoupdate` bumps it
+and local runs score complexity exactly like CI; a new release may need the
+`complexipy.toml` threshold rebaselined. Cleaning hook environments resolves
+unpinned tools (such as mypy's additional dependencies) again, so do not skip
+`prek clean`. CI uses fresh hook environments on every run; third-party Actions
+remain SHA-pinned for security.
 
 Frontend test tooling resolves current Node and Playwright versions rather than
 using a dependency lockfile. The shared Playwright setup also refreshes existing

@@ -10,11 +10,14 @@ repos:
         language: system
         stages: [commit-msg]
         pass_filenames: true
+
+  # Versioned by rev (which pins the complexipy release) so `prek autoupdate`
+  # bumps it and local and CI scoring stay identical.
+  - repo: https://github.com/rohaquinlop/complexipy-pre-commit
+    rev: v9.0.0
+    hooks:
       - id: complexipy
-        name: complexipy
-        entry: complexipy . --failed --suggest-refactors
-        language: python
-        additional_dependencies: [complexipy]
+        args: [., --failed, --suggest-refactors]
         pass_filenames: false
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
