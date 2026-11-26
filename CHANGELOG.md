@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.1] - 2026-11-26
+
+Lint fix.
+
+### Configuration Changes
+
+This release did not change the bundled `config.toml.template`.
+
 ## [0.44.0] - 2026-11-26
 
 More security hardening and other improvements and bug fixes.
@@ -4726,7 +4734,8 @@ This release did not change the bundled `config.toml.template`.
 - Pre-built image support for directory server compose.
 - Tor configuration instructions.
 
-[Unreleased]: ../../compare/0.44.0...HEAD
+[Unreleased]: ../../compare/0.44.1...HEAD
+[0.44.1]: ../../compare/0.44.0...0.44.1
 [0.44.0]: ../../compare/0.43.0...0.44.0
 [0.43.0]: ../../compare/0.42.1...0.43.0
 [0.42.1]: ../../compare/0.42.0...0.42.1
