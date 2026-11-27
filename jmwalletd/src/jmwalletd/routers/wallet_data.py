@@ -201,6 +201,8 @@ async def list_utxos(
     token: str | None = Depends(get_optional_token),
 ) -> ListUtxosResponse:
     """List all UTXOs in the wallet."""
+    from jmwallet.history import get_coinjoin_counts
+
     ws, _generation = require_wallet_session(state, token, walletname)
     rescanning, _progress = await state.live_rescan_status()
     require_wallet_session(state, token, walletname)
@@ -208,10 +210,17 @@ async def list_utxos(
         await ws.sync_with_registered_bonds()
         require_wallet_session(state, token, walletname)
     utxo_entries: list[UTXOEntry] = []
+    coinjoin_counts = get_coinjoin_counts(
+        [u for mixdepth in range(ws.mixdepth_count) for u in ws.utxo_cache.get(mixdepth, [])],
+        network=ws.network,
+        data_dir=state.data_dir,
+        wallet_fingerprint=ws.wallet_fingerprint,
+    )
 
     for mixdepth in range(ws.mixdepth_count):
         utxos = ws.utxo_cache.get(mixdepth, [])
         for u in utxos:
+            coinjoins = coinjoin_counts[u.outpoint]
             utxo_entries.append(
                 UTXOEntry(
                     utxo=u.outpoint,
@@ -226,6 +235,9 @@ async def list_utxos(
                     confirmations=u.confirmations,
                     frozen=u.frozen,
                     locktime=_format_bond_locktime(u.locktime),
+                    coinjoin_count=coinjoins.coinjoins,
+                    last_coinjoin_role=coinjoins.last_role,
+                    last_coinjoin_participants=coinjoins.last_participants,
                 )
             )
 

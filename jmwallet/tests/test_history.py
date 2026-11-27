@@ -34,6 +34,7 @@ from jmwallet.history import (
     ORIGIN_DEPOSIT,
     ORIGIN_NON_CJ_CHANGE,
     YIELD_GENERATOR_REPORT_HEADER,
+    CoinjoinCount,
     HistoryRole,
     HistorySource,
     HistoryWriteError,
@@ -51,6 +52,7 @@ from jmwallet.history import (
     expire_pending_transaction_monitoring,
     format_yield_generator_report,
     get_address_history_types,
+    get_coinjoin_counts,
     get_coinjoin_lineage_outpoints,
     get_history_stats,
     get_history_stats_for_period,
@@ -3308,6 +3310,156 @@ class TestCoinjoinLineageOutpoints:
             )
             == set()
         )
+
+
+class TestCoinjoinCounts:
+    """Tests for per-UTXO CoinJoin counts built on the lineage."""
+
+    _outpoint = staticmethod(TestCoinjoinLineageOutpoints._outpoint)
+    _utxo = staticmethod(TestCoinjoinLineageOutpoints._utxo)
+    _append = staticmethod(TestCoinjoinLineageOutpoints._append)
+
+    @staticmethod
+    def _entry(*, peer_count: int | None = None, **kwargs: Any) -> TransactionHistoryEntry:
+        entry = TestCoinjoinLineageOutpoints._entry(**kwargs)
+        entry.peer_count = peer_count
+        return entry
+
+    def test_counts_follow_inputs_and_report_the_last_coinjoin(self, temp_data_dir: Path) -> None:
+        entries = [
+            # Takers record only the makers: 4 makers + us = 5 participants.
+            self._entry(
+                tx_number=1,
+                destination="cj1-equal",
+                change="cj1-change",
+                inputs=[(self._outpoint(0, 0), "deposit")],
+                role="taker",
+                peer_count=4,
+            ),
+            # Makers record every equal output.
+            self._entry(
+                tx_number=2,
+                destination="cj2-equal",
+                change="cj2-change",
+                inputs=[(self._outpoint(1, 0), "cj1-equal")],
+                peer_count=6,
+            ),
+            self._entry(
+                tx_number=4,
+                destination="cj4-equal",
+                change="",
+                inputs=[(self._outpoint(5, 0), "deposit")],
+                peer_count=3,
+            ),
+            # Peer count not detected yet; one input came straight from a deposit.
+            self._entry(
+                tx_number=3,
+                destination="cj3-equal",
+                change="cj3-change",
+                inputs=[
+                    (self._outpoint(4, 0), "cj4-equal"),
+                    (self._outpoint(9, 0), "deposit"),
+                ],
+            ),
+        ]
+        self._append(entries, temp_data_dir)
+        current = [
+            self._utxo(1, 1, "cj1-change"),
+            self._utxo(2, 0, "cj2-equal"),
+            self._utxo(2, 1, "cj2-change"),
+            self._utxo(3, 0, "cj3-equal"),
+            self._utxo(3, 1, "cj3-change"),
+            self._utxo(9, 1, "untracked"),
+        ]
+
+        counts = get_coinjoin_counts(
+            current,
+            network="regtest",
+            data_dir=temp_data_dir,
+            wallet_fingerprint="a1b2c3d4",
+        )
+
+        assert counts == {
+            # Change of a deposit stays linked to it.
+            self._outpoint(1, 1): CoinjoinCount(0, None, None),
+            self._outpoint(2, 0): CoinjoinCount(2, "maker", 6),
+            # Change keeps its input's count and that input's last CoinJoin.
+            self._outpoint(2, 1): CoinjoinCount(1, "taker", 5),
+            # The deposit input is the weakest link.
+            self._outpoint(3, 0): CoinjoinCount(1, "maker", None),
+            self._outpoint(3, 1): CoinjoinCount(0, None, None),
+            self._outpoint(9, 1): CoinjoinCount(0, None, None),
+        }
+
+    def test_nonzero_counts_are_exactly_the_lineage(self, temp_data_dir: Path) -> None:
+        entries = [
+            self._entry(
+                tx_number=10,
+                destination="a-equal",
+                change="a-change",
+                inputs=[(self._outpoint(0, 0), "deposit")],
+            ),
+            # Send change keeps the clean count of its input.
+            self._entry(
+                tx_number=11,
+                destination="external-payment",
+                change="send-change",
+                inputs=[(self._outpoint(10, 0), "a-equal")],
+                role="send",
+            ),
+            # Reconstructed change fails closed; its equal output still counts.
+            self._entry(
+                tx_number=12,
+                destination="b-equal",
+                change="b-change",
+                inputs=[(self._outpoint(11, 1), "send-change")],
+                source="onchain",
+            ),
+            self._entry(
+                tx_number=13,
+                destination="failed-equal",
+                change="failed-change",
+                inputs=[(self._outpoint(10, 1), "a-change")],
+                success=False,
+            ),
+            # Legacy row without input metadata: only its own CoinJoin is known.
+            self._entry(
+                tx_number=14,
+                destination="legacy-equal",
+                change="legacy-change",
+                inputs=None,
+            ),
+        ]
+        self._append(entries, temp_data_dir)
+        current = [
+            self._utxo(10, 1, "a-change"),
+            self._utxo(12, 0, "b-equal"),
+            self._utxo(12, 1, "b-change"),
+            self._utxo(13, 0, "failed-equal"),
+            self._utxo(13, 1, "failed-change"),
+            self._utxo(14, 0, "legacy-equal"),
+            self._utxo(14, 1, "legacy-change"),
+        ]
+        kwargs: dict[str, Any] = {
+            "network": "regtest",
+            "data_dir": temp_data_dir,
+            "wallet_fingerprint": "a1b2c3d4",
+        }
+
+        counts = get_coinjoin_counts(current, **kwargs)
+
+        assert {outpoint: count.coinjoins for outpoint, count in counts.items()} == {
+            self._outpoint(10, 1): 0,
+            self._outpoint(12, 0): 2,
+            self._outpoint(12, 1): 0,
+            self._outpoint(13, 0): 0,
+            self._outpoint(13, 1): 0,
+            self._outpoint(14, 0): 1,
+            self._outpoint(14, 1): 0,
+        }
+        assert {
+            outpoint for outpoint, count in counts.items() if count.coinjoins > 0
+        } == get_coinjoin_lineage_outpoints(current, **kwargs)
 
 
 class TestMakerRotationLineageOutpoints:
