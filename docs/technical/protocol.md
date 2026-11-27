@@ -264,6 +264,9 @@ When makers fail to respond, the taker can automatically select replacements ins
 - The requested counterparty count remains the replacement target through fill
   and auth. Partial replacement selections are used and the remaining deficit
   is retried while attempts remain.
+- A sweep fixes its CoinJoin amount at confirmation, so replacement candidates
+  whose fees the remaining funding cannot pay are skipped before they are
+  contacted or a PoDLE commitment is rotated, and another selection is tried.
 - If attempts are exhausted or no candidates remain, the CoinJoin proceeds only
   when the latest phase has at least `minimum_makers` completed makers;
   otherwise it aborts. A majority commitment blacklist rotates the PoDLE before

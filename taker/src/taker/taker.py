@@ -19,6 +19,7 @@ import inspect
 import math
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 from jmcore.bitcoin import calculate_tx_vsize, get_address_type
@@ -94,6 +95,18 @@ def _append_confirmation_hint(message: str, taker_utxo_age: int) -> str:
         f"{taker_utxo_age} confirmation(s) (taker_utxo_age setting). "
         f"Wait for more confirmations or lower taker_utxo_age in your config."
     )
+
+
+@dataclass(frozen=True)
+class _FeeHeadroomFailure:
+    """Why a maker set fails the fee preflight.
+
+    ``sweep_underfunded`` means the set's maker fees exceed the approved sweep
+    funding; a different (cheaper) maker set can still fit.
+    """
+
+    reason: str
+    sweep_underfunded: bool = False
 
 
 def _estimate_initial_tx_shape(
@@ -982,6 +995,50 @@ class Taker(TakerMonitoringMixin):
         logger.info(f"Updated {updated_count} offers with verified fidelity bond values")
 
     def _preflight_fee_headroom(self, offers: dict[str, Offer]) -> bool:
+        """Fail the round unless ``offers`` fit the fee limits (see ``_fee_headroom_failure``)."""
+        failure = self._fee_headroom_failure(offers)
+        if failure is None:
+            return True
+        self._fail_fee_headroom(failure)
+        return False
+
+    def _fail_fee_headroom(self, failure: _FeeHeadroomFailure) -> None:
+        self._session.last_failure_reason = failure.reason
+        if failure.sweep_underfunded:
+            logger.error(failure.reason)
+        else:
+            logger.error("CoinJoin fee headroom is insufficient")
+            logger.bind(sensitive=True).error("Fee headroom detail: {}", failure.reason)
+        self.state = TakerState.FAILED
+
+    def _affordable_replacements(
+        self, candidates: dict[str, Offer], skipped_nicks: set[str]
+    ) -> dict[str, Offer] | None:
+        """Keep the replacement candidates the approved sweep funding can pay.
+
+        A sweep fixes its CoinJoin amount when the user confirms, so a candidate
+        whose fee would make the maker set underfunded is skipped (and added to
+        ``skipped_nicks``) instead of failing the round; other candidates can
+        still fit. Any other fee headroom failure fails the round and returns None.
+        """
+        current = {nick: session.offer for nick, session in self._session.maker_sessions.items()}
+        accepted: dict[str, Offer] = {}
+        for nick, offer in candidates.items():
+            failure = self._fee_headroom_failure(current | accepted | {nick: offer})
+            if failure is None:
+                accepted[nick] = offer
+            elif failure.sweep_underfunded:
+                skipped_nicks.add(nick)
+                logger.info(
+                    f"Skipping replacement maker {nick}: its fee does not fit the "
+                    "approved sweep funding"
+                )
+            else:
+                self._fail_fee_headroom(failure)
+                return None
+        return accepted
+
+    def _fee_headroom_failure(self, offers: dict[str, Offer]) -> _FeeHeadroomFailure | None:
         """Bound complete mining fees before exposing a commitment to a maker set.
 
         Unknown makers can each use just one input. More actual inputs can make
@@ -1011,11 +1068,10 @@ class Taker(TakerMonitoringMixin):
                     - session._sweep_tx_fee_budget
                 )
                 if residual < 0:
-                    reason = "Sweep maker fees exceed selected funding before commitment exposure"
-                    session.last_failure_reason = reason
-                    logger.error(reason)
-                    self.state = TakerState.FAILED
-                    return False
+                    return _FeeHeadroomFailure(
+                        "Sweep maker fees exceed selected funding before commitment exposure",
+                        sweep_underfunded=True,
+                    )
                 complete_fee = session._sweep_tx_fee_budget + maker_contributions
                 if residual > BITCOIN_DUST_THRESHOLD:
                     minimum_vsize = estimate_p2wpkh_vsize(minimum_inputs, minimum_outputs + 1)
@@ -1033,18 +1089,14 @@ class Taker(TakerMonitoringMixin):
                 )
             cap = self.config.max_fee_rate_sat_vb
             if complete_fee <= cap * minimum_vsize:
-                return True
+                return None
             reason = (
                 f"Conservative CoinJoin miner fee rate {complete_fee / minimum_vsize:.2f} sat/vB "
                 f"exceeds safety cap {cap:.2f} sat/vB before commitment exposure. "
                 "Lower the requested fee rate or maker contributions, or explicitly raise "
                 "wallet.max_fee_rate_sat_vb only if you intend to pay this much."
             )
-        session.last_failure_reason = reason
-        logger.error("CoinJoin fee headroom is insufficient")
-        logger.bind(sensitive=True).error("Fee headroom detail: {}", reason)
-        self.state = TakerState.FAILED
-        return False
+        return _FeeHeadroomFailure(reason)
 
     def _log_initial_maker_fee_plan(self, fee_plan: dict[str, int]) -> None:
         """Explain the opt-in fee equalization policy before makers are contacted."""
@@ -1916,12 +1968,13 @@ class Taker(TakerMonitoringMixin):
                 if not replacement_offers:
                     break
 
-                prospective_offers = {
-                    nick: maker_session.offer
-                    for nick, maker_session in self._session.maker_sessions.items()
-                } | replacement_offers
-                if not self._preflight_fee_headroom(prospective_offers):
+                affordable_offers = self._affordable_replacements(replacement_offers, failed_nicks)
+                if affordable_offers is None:
                     return False
+                if not affordable_offers:
+                    # Skipped candidates are hard-excluded; select again.
+                    continue
+                replacement_offers = affordable_offers
 
                 if len(replacement_offers) < needed:
                     logger.info(
@@ -2257,65 +2310,67 @@ class Taker(TakerMonitoringMixin):
                 return False
 
             needed = target_makers - current_makers
-            if replacement_attempt >= max_replacement_attempts:
-                if fill_result.success and current_makers >= self.config.minimum_makers:
-                    logger.warning(
-                        f"Fill replacement attempts exhausted; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self.config.minimum_makers})"
+            replacement_offers: dict[str, Offer] = {}
+            while not replacement_offers:
+                if replacement_attempt >= max_replacement_attempts:
+                    if fill_result.success and current_makers >= self.config.minimum_makers:
+                        logger.warning(
+                            f"Fill replacement attempts exhausted; proceeding with "
+                            f"{current_makers}/{target_makers} makers "
+                            f"(minimum {self.config.minimum_makers})"
+                        )
+                        return True
+                    reason = (
+                        f"Fill phase failed: only {current_makers} responding makers remain, "
+                        f"below minimum {self.config.minimum_makers}"
                     )
-                    return True
-                reason = (
-                    f"Fill phase failed: only {current_makers} responding makers remain, "
-                    f"below minimum {self.config.minimum_makers}"
+                    logger.error(reason)
+                    self._session.last_failure_reason = reason
+                    self.state = TakerState.FAILED
+                    return False
+
+                replacement_attempt += 1
+                logger.info(
+                    f"Attempting maker replacement (attempt {replacement_attempt}/"
+                    f"{max_replacement_attempts}): need {needed} more makers"
                 )
-                logger.error(reason)
-                self._session.last_failure_reason = reason
-                self.state = TakerState.FAILED
-                return False
 
-            replacement_attempt += 1
-            logger.info(
-                f"Attempting maker replacement (attempt {replacement_attempt}/"
-                f"{max_replacement_attempts}): need {needed} more makers"
-            )
+                current_session_nicks = set(self._session.maker_sessions.keys())
+                candidate_offers, _ = self.orderbook_manager.select_makers(
+                    cj_amount=self._session.cj_amount,
+                    n=needed,
+                    hard_exclude_nicks=current_session_nicks | failed_nicks,
+                    required_features=required_features,
+                    penalized_maker_keys=penalized_maker_keys,
+                )
 
-            current_session_nicks = set(self._session.maker_sessions.keys())
-            replacement_offers, _ = self.orderbook_manager.select_makers(
-                cj_amount=self._session.cj_amount,
-                n=needed,
-                hard_exclude_nicks=current_session_nicks | failed_nicks,
-                required_features=required_features,
-                penalized_maker_keys=penalized_maker_keys,
-            )
-
-            if not replacement_offers:
-                if fill_result.success and current_makers >= self.config.minimum_makers:
-                    logger.warning(
-                        f"No fill replacements available; proceeding with {current_makers}/"
-                        f"{target_makers} makers (minimum {self.config.minimum_makers})"
+                if not candidate_offers:
+                    if fill_result.success and current_makers >= self.config.minimum_makers:
+                        logger.warning(
+                            f"No fill replacements available; proceeding with {current_makers}/"
+                            f"{target_makers} makers (minimum {self.config.minimum_makers})"
+                        )
+                        return True
+                    reason = (
+                        f"Fill phase failed: no replacements available and only "
+                        f"{current_makers} makers remain (minimum {self.config.minimum_makers})"
                     )
-                    return True
-                reason = (
-                    f"Fill phase failed: no replacements available and only {current_makers} "
-                    f"makers remain (minimum {self.config.minimum_makers})"
-                )
-                logger.error(reason)
-                self._session.last_failure_reason = reason
-                self.state = TakerState.FAILED
-                return False
+                    logger.error(reason)
+                    self._session.last_failure_reason = reason
+                    self.state = TakerState.FAILED
+                    return False
+
+                # Skipped candidates are hard-excluded, so the next attempt selects others.
+                affordable_offers = self._affordable_replacements(candidate_offers, failed_nicks)
+                if affordable_offers is None:
+                    return False
+                replacement_offers = affordable_offers
 
             if len(replacement_offers) < needed:
                 logger.info(
                     f"Fill replacement selection is partial: found {len(replacement_offers)}, "
                     f"need {needed}; retrying the remaining deficit"
                 )
-
-            prospective_offers = {
-                nick: maker_session.offer
-                for nick, maker_session in self._session.maker_sessions.items()
-            } | replacement_offers
-            if not self._preflight_fee_headroom(prospective_offers):
-                return False
 
             for nick, offer in replacement_offers.items():
                 self._session.maker_sessions[nick] = MakerSession(

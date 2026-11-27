@@ -3949,6 +3949,134 @@ class TestReplacementTargetRestoration:
         assert "J5expensive" not in selected
         taker._session._phase_fill.assert_awaited_once()
 
+    @staticmethod
+    def _fund_tight_sweep(taker: Taker) -> tuple[Offer, Offer]:
+        """Fund a sweep that covers a zero-fee replacement but not a paid one.
+
+        Returns (unaffordable, affordable) replacement offers.
+        """
+        session = taker._session
+        taker.config.round_up_cj_fees = False
+        taker.config.equalize_cj_fees = False
+        session.is_sweep = True
+        session._sweep_tx_fee_budget = 5_000
+        current_fees = 1_000 * len(session.maker_sessions)  # _simple_offer: 0.1% of 1M
+        session.preselected_utxos = [
+            make_utxo(value=session.cj_amount + current_fees + session._sweep_tx_fee_budget + 500)
+        ]
+        return (
+            _simple_offer("J5paid"),
+            _simple_offer("J5free").model_copy(update={"cjfee": "0"}),
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_skips_unaffordable_sweep_replacement_and_selects_again(self):
+        taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
+        next(iter(taker._session.maker_sessions.values())).responded_auth = True
+        paid, free = self._fund_tight_sweep(taker)
+        taker._session.podle_commitment = MagicMock()
+        taker._session.verify_own_inputs = AsyncMock(return_value=True)
+        taker._session._phase_auth = AsyncMock(
+            side_effect=[
+                PhaseResult(success=True, podle_revealed=True, failed_makers=["J5gone"]),
+                PhaseResult(success=True),
+            ]
+        )
+        taker.orderbook_manager.select_makers.side_effect = [
+            ({"J5paid": paid}, 0),
+            ({"J5free": free}, 0),
+        ]
+        taker.podle_manager = MagicMock()
+
+        async def mini_fill(replacement_offers, failed_nicks):
+            for nick, offer in replacement_offers.items():
+                taker._session.maker_sessions[nick] = MakerSession(nick=nick, offer=offer)
+            return True
+
+        taker._fill_replacement_makers = AsyncMock(side_effect=mini_fill)
+
+        assert await taker._run_auth_with_replacements(
+            required_features=None,
+            get_private_key=MagicMock(),
+            max_replacement_attempts=3,
+        )
+
+        assert "J5free" in taker._session.maker_sessions
+        assert "J5paid" not in taker._session.maker_sessions
+        second_selection = taker.orderbook_manager.select_makers.call_args_list[1]
+        assert "J5paid" in second_selection.kwargs["hard_exclude_nicks"]
+        # The skipped candidate was never contacted and spent no PoDLE index.
+        taker._fill_replacement_makers.assert_awaited_once()
+        taker.podle_manager.generate_fresh_commitment.assert_called_once()
+        assert all(
+            call.args != ("J5paid",)
+            for call in taker.orderbook_manager.add_ignored_maker.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_proceeds_at_floor_when_no_sweep_replacement_fits(self):
+        taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
+        next(iter(taker._session.maker_sessions.values())).responded_auth = True
+        paid, _ = self._fund_tight_sweep(taker)
+        taker._session.podle_commitment = MagicMock()
+        taker._session._phase_auth = AsyncMock(
+            return_value=PhaseResult(success=True, podle_revealed=True)
+        )
+        taker.orderbook_manager.select_makers.side_effect = [
+            ({f"J5paid{i}": paid.model_copy(update={"counterparty": f"J5paid{i}"})}, 0)
+            for i in range(2)
+        ]
+        taker.podle_manager = MagicMock()
+        taker._fill_replacement_makers = AsyncMock()
+
+        assert await taker._run_auth_with_replacements(
+            required_features=None,
+            get_private_key=MagicMock(),
+            max_replacement_attempts=2,
+        )
+
+        assert taker.state != TakerState.FAILED
+        assert list(taker._session.maker_sessions) == ["J5maker0"]
+        assert taker.orderbook_manager.select_makers.call_count == 2
+        taker.podle_manager.generate_fresh_commitment.assert_not_called()
+        taker._fill_replacement_makers.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fill_skips_unaffordable_sweep_replacement_and_selects_again(self):
+        taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
+        paid, free = self._fund_tight_sweep(taker)
+        selected = {nick: session.offer for nick, session in taker._session.maker_sessions.items()}
+        taker._session._phase_fill = AsyncMock(
+            side_effect=[
+                PhaseResult(success=True, failed_makers=["J5gone"]),
+                PhaseResult(success=True),
+            ]
+        )
+        taker.orderbook_manager.select_makers.side_effect = [
+            ({"J5paid": paid}, 0),
+            ({"J5free": free}, 0),
+        ]
+
+        notifier = MagicMock()
+        notifier.notify_coinjoin_start = AsyncMock()
+        with patch("taker.taker.get_notifier", return_value=notifier):
+            assert await taker._run_fill_with_replacements(
+                destination="bcrt1qdest",
+                selected_offers=selected,
+                required_features=None,
+                mixdepth=0,
+                get_private_key=MagicMock(),
+                max_replacement_attempts=3,
+            )
+
+        assert "J5free" in taker._session.maker_sessions
+        assert "J5paid" not in taker._session.maker_sessions
+        assert "J5paid" not in selected
+        second_selection = taker.orderbook_manager.select_makers.call_args_list[1]
+        assert "J5paid" in second_selection.kwargs["hard_exclude_nicks"]
+        # One fill pass for the original set and one for the affordable replacement.
+        assert taker._session._phase_fill.await_count == 2
+
     @pytest.mark.asyncio
     async def test_auth_replacement_history_failure_never_sends_mini_fill(self):
         taker = self._make_taker(minimum_makers=1, target_makers=2, current_makers=1)
