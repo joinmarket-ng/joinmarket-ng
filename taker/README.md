@@ -239,6 +239,11 @@ For full documentation, see [taker Documentation](https://joinmarket-ng.github.i
 │ --log-level        -l                     <str>             Log level        │
 │ --max-abs-fee                             <int>             Max absolute fee │
 │                                                             in sats          │
+│ --max-maker-repl…                         <int range>       Attempts to      │
+│                                           [0<=x<=10]        replace failed   │
+│                                                             makers per phase │
+│                                                             (0 disables      │
+│                                                             replacement)     │
 │ --max-rel-fee                             <str>             Max relative fee │
 │                                                             (0.001=0.1%)     │
 │ --mixdepth         -m                     <int>             Source mixdepth  │

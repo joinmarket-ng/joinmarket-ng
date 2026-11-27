@@ -256,7 +256,8 @@ This design reserves a configurable share of slots for uniform zero-fee selectio
 
 When makers fail to respond, the taker can automatically select replacements instead of aborting:
 
-- Configuration: `max_maker_replacement_attempts`
+- Configuration: `max_maker_replacement_attempts` (CLI:
+  `--max-maker-replacement-attempts`)
 - Failed makers added to ignored list for the session
 - New makers go through the full fill/auth flow
 - Auth-stage replacements use one fresh PoDLE commitment after a revelation

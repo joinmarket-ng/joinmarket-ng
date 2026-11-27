@@ -646,6 +646,7 @@
 # minimum_makers = 4
 # Maximum attempts to replace failed makers and restore counterparty_count.
 # Set to 0 to disable replacement. Default: 3 (range: 0-10).
+# Override per run with jm-taker coinjoin --max-maker-replacement-attempts.
 # max_maker_replacement_attempts = 3
 
 # ============================================================================

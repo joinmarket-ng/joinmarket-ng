@@ -115,6 +115,15 @@ def coinjoin(
     counterparties: Annotated[
         int | None, typer.Option("--counterparties", "-n", help="Number of makers")
     ] = None,
+    max_maker_replacement_attempts: Annotated[
+        int | None,
+        typer.Option(
+            "--max-maker-replacement-attempts",
+            min=0,
+            max=10,
+            help="Attempts to replace failed makers per phase (0 disables replacement)",
+        ),
+    ] = None,
     mnemonic_file: Annotated[
         Path | None, typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file")
     ] = None,
@@ -342,6 +351,7 @@ def coinjoin(
             require_quantized_cj_fees=quantized_offers_only,
             round_up_cj_fees=round_up_cj_fees,
             equalize_cj_fees=equalize_cj_fees,
+            max_maker_replacement_attempts=max_maker_replacement_attempts,
         )
     except ValueError as e:
         logger.error(str(e))

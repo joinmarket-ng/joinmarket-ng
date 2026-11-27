@@ -66,6 +66,7 @@ def build_taker_config_kwargs(
     require_quantized_cj_fees: bool | None = None,
     round_up_cj_fees: bool | None = None,
     equalize_cj_fees: bool | None = None,
+    max_maker_replacement_attempts: int | None = None,
 ) -> dict[str, Any]:
     """
     Resolve unified settings plus overrides into ``TakerConfig`` kwargs.
@@ -291,7 +292,11 @@ def build_taker_config_kwargs(
         "tx_broadcast": broadcast_policy,
         "broadcast_peer_count": settings.taker.broadcast_peer_count,
         "minimum_makers": effective_minimum_makers,
-        "max_maker_replacement_attempts": settings.taker.max_maker_replacement_attempts,
+        "max_maker_replacement_attempts": (
+            max_maker_replacement_attempts
+            if max_maker_replacement_attempts is not None
+            else settings.taker.max_maker_replacement_attempts
+        ),
         "rescan_interval_sec": settings.taker.rescan_interval_sec,
         "pending_tx_abandon_hours": settings.taker.pending_tx_abandon_hours,
         "select_utxos": select_utxos,
@@ -339,6 +344,7 @@ def build_taker_config(
     require_quantized_cj_fees: bool | None = None,
     round_up_cj_fees: bool | None = None,
     equalize_cj_fees: bool | None = None,
+    max_maker_replacement_attempts: int | None = None,
 ) -> TakerConfig:
     """
     Build TakerConfig from unified settings with CLI overrides.
@@ -380,5 +386,6 @@ def build_taker_config(
             require_quantized_cj_fees=require_quantized_cj_fees,
             round_up_cj_fees=round_up_cj_fees,
             equalize_cj_fees=equalize_cj_fees,
+            max_maker_replacement_attempts=max_maker_replacement_attempts,
         )
     )

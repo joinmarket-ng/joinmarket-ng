@@ -138,6 +138,32 @@ def test_coinjoin_select_utxos_does_not_require_amount_or_mixdepth() -> None:
     assert mock_run.await_args.kwargs["mixdepth"] is None
 
 
+def test_coinjoin_forwards_max_maker_replacement_attempts() -> None:
+    config = MagicMock()
+    config.network.value = "regtest"
+    config.backend_type = "descriptor_wallet"
+    resolved = MagicMock(mnemonic="test mnemonic", bip39_passphrase="", creation_height=None)
+
+    with (
+        patch("taker.cli.setup_cli", return_value=MagicMock()),
+        patch("taker.cli.ensure_config_file"),
+        patch("taker.cli.resolve_mnemonic", return_value=resolved),
+        patch("taker.cli.build_taker_config", return_value=config) as mock_build_config,
+        patch("taker.cli._run_coinjoin", new_callable=AsyncMock),
+    ):
+        result = runner.invoke(
+            app, ["coinjoin", "--amount", "0", "--max-maker-replacement-attempts", "6"]
+        )
+        out_of_range = runner.invoke(
+            app, ["coinjoin", "--amount", "0", "--max-maker-replacement-attempts", "11"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_build_config.call_args.kwargs["max_maker_replacement_attempts"] == 6
+    assert out_of_range.exit_code == 2
+    assert mock_build_config.call_count == 1
+
+
 def test_coinjoin_requires_amount_without_interactive_selection() -> None:
     from loguru import logger
 
@@ -1180,3 +1206,21 @@ class TestBuildTakerConfig:
         )
 
         assert config.max_maker_replacement_attempts == 7
+
+    def test_cli_zero_replacement_attempts_overrides_setting(
+        self, sample_mnemonic: str, mock_settings: MagicMock
+    ) -> None:
+        """An explicit 0 disables replacement instead of falling back to settings."""
+        mock_settings.taker.max_maker_replacement_attempts = 7
+
+        config = build_taker_config(
+            settings=mock_settings,
+            mnemonic=sample_mnemonic,
+            passphrase="",
+            destination="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            amount=100000,
+            mixdepth=0,
+            max_maker_replacement_attempts=0,
+        )
+
+        assert config.max_maker_replacement_attempts == 0
