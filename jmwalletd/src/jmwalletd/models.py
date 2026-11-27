@@ -243,6 +243,12 @@ class UTXOEntry(BaseModel):
     # so JAM (which keys fidelity-bond detection off a truthy ``locktime``)
     # treats the UTXO as a bond. Regular UTXOs omit the field entirely.
     locktime: str | None = None
+    # CoinJoins behind this coin since it entered the wallet, from the wallet's
+    # own history (see ``jmwallet.history.get_coinjoin_counts``). Not part of
+    # the reference API; clients that don't know these fields ignore them.
+    coinjoin_count: int = 0
+    last_coinjoin_role: str | None = None
+    last_coinjoin_participants: int | None = None
 
 
 class ListUtxosResponse(BaseModel):

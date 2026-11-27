@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import fields
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 from jmcore.paths import get_default_data_dir
 from loguru import logger
@@ -2314,6 +2314,37 @@ def get_coinjoin_lineage_outpoints(
     Outpoints, rather than addresses, are tracked so a later payment to a reused
     CoinJoin address remains warning-eligible.
     """
+    graph = _build_coinjoin_lineage(
+        current_utxos,
+        network=network,
+        data_dir=data_dir,
+        wallet_fingerprint=wallet_fingerprint,
+    )
+    return graph.lineage & graph.target_outpoints
+
+
+class _CoinjoinLineage(NamedTuple):
+    """CoinJoin lineage of known outpoints, with the rows that produced them."""
+
+    entries: list[TransactionHistoryEntry]
+    entry_inputs: dict[int, list[tuple[str, str]] | None]
+    # Outpoint -> index in ``entries`` of the CoinJoin whose equal output it is.
+    equal_outputs: dict[str, int]
+    # Outpoint -> index in ``entries`` of the transaction whose change it is.
+    change_outputs: dict[str, int]
+    # Every known outpoint with CoinJoin-only provenance, spent or not.
+    lineage: set[str]
+    target_outpoints: set[str]
+
+
+def _build_coinjoin_lineage(
+    current_utxos: Iterable[UTXOInfo],
+    *,
+    network: str,
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> _CoinjoinLineage:
+    """Resolve the lineage used by :func:`get_coinjoin_lineage_outpoints`."""
     targets = list(current_utxos)
     target_outpoints = {utxo.outpoint for utxo in targets}
     targets_by_outpoint = {utxo.outpoint: utxo for utxo in targets}
@@ -2323,8 +2354,8 @@ def get_coinjoin_lineage_outpoints(
         if entry.network == network
     ]
     successful_coinjoins = [
-        entry
-        for entry in entries
+        (index, entry)
+        for index, entry in enumerate(entries)
         if entry.success and entry.cj_amount > 0 and entry.role in ("maker", "taker")
     ]
 
@@ -2351,7 +2382,8 @@ def get_coinjoin_lineage_outpoints(
             outputs_by_tx_address[(txid, address)].add(outpoint)
 
     lineage: set[str] = set()
-    for entry in successful_coinjoins:
+    equal_outputs: dict[str, int] = {}
+    for index, entry in successful_coinjoins:
         if entry.txid and entry.destination_address:
             candidates = outputs_by_tx_address[(entry.txid, entry.destination_address)]
             if len(candidates) != 1:
@@ -2361,8 +2393,10 @@ def get_coinjoin_lineage_outpoints(
             if current is not None and current.value != entry.cj_amount:
                 continue
             lineage.add(candidate)
+            equal_outputs.setdefault(candidate, index)
 
     requirements: dict[str, set[str]] = defaultdict(set)
+    change_outputs: dict[str, int] = {}
     invalid_change_outpoints: set[str] = set()
     for index, entry in enumerate(entries):
         if not entry.success or not entry.txid or not entry.change_address:
@@ -2387,6 +2421,7 @@ def get_coinjoin_lineage_outpoints(
         input_outpoints = {outpoint for outpoint, _address in inputs}
         for change_outpoint in change_outpoints:
             requirements[change_outpoint].update(input_outpoints)
+            change_outputs.setdefault(change_outpoint, index)
 
     lineage.difference_update(invalid_change_outpoints)
 
@@ -2420,7 +2455,113 @@ def get_coinjoin_lineage_outpoints(
             lineage.add(change_outpoint)
             queue.append(change_outpoint)
 
-    return lineage & target_outpoints
+    return _CoinjoinLineage(
+        entries=entries,
+        entry_inputs=entry_inputs,
+        equal_outputs=equal_outputs,
+        change_outputs=change_outputs,
+        lineage=lineage,
+        target_outpoints=target_outpoints,
+    )
+
+
+class CoinjoinCount(NamedTuple):
+    """CoinJoins behind a coin since it entered the wallet."""
+
+    coinjoins: int
+    # Role and total participant count of the CoinJoin behind ``coinjoins``.
+    # ``last_participants`` is None when the history doesn't know it.
+    last_role: HistoryRole | None
+    last_participants: int | None
+
+
+_NO_COINJOIN = CoinjoinCount(coinjoins=0, last_role=None, last_participants=None)
+
+
+def _coinjoin_participants(entry: TransactionHistoryEntry) -> int | None:
+    """Total number of participants in a CoinJoin history row, if known."""
+    if entry.peer_count is None:
+        return None
+    # Takers record only the makers; makers record every equal output.
+    return entry.peer_count + 1 if entry.role == "taker" else entry.peer_count
+
+
+def get_coinjoin_counts(
+    current_utxos: Iterable[UTXOInfo],
+    *,
+    network: str,
+    data_dir: Path | None = None,
+    wallet_fingerprint: str | None = None,
+) -> dict[str, CoinjoinCount]:
+    """Count the CoinJoins behind each current outpoint.
+
+    Built on :func:`get_coinjoin_lineage_outpoints`: an outpoint has a non-zero
+    count exactly when it is in that lineage, so the same fail-closed rules
+    apply. An equal output adds one to the lowest count among its recorded
+    inputs, where an input outside the lineage counts as zero. Change keeps the
+    lowest count of its inputs, because it stays linked to them.
+    """
+    graph = _build_coinjoin_lineage(
+        current_utxos,
+        network=network,
+        data_dir=data_dir,
+        wallet_fingerprint=wallet_fingerprint,
+    )
+
+    def dependencies(outpoint: str) -> list[str]:
+        if outpoint not in graph.lineage:
+            return []
+        index = graph.equal_outputs.get(outpoint)
+        if index is None:
+            index = graph.change_outputs[outpoint]
+        inputs = graph.entry_inputs[index]
+        return sorted({input_outpoint for input_outpoint, _address in inputs or []})
+
+    def evaluate(outpoint: str, inputs: list[CoinjoinCount]) -> CoinjoinCount:
+        if outpoint not in graph.lineage:
+            return _NO_COINJOIN
+        lowest = min(inputs, key=lambda input_count: input_count.coinjoins, default=_NO_COINJOIN)
+        index = graph.equal_outputs.get(outpoint)
+        if index is not None:
+            entry = graph.entries[index]
+            return CoinjoinCount(
+                coinjoins=lowest.coinjoins + 1,
+                last_role=entry.role,
+                last_participants=_coinjoin_participants(entry),
+            )
+        # Every input of lineage change is in the lineage, so ``lowest`` is
+        # non-zero unless the history is cyclic, which no real chain can be.
+        if lowest.coinjoins < 1:
+            return CoinjoinCount(coinjoins=1, last_role=None, last_participants=None)
+        return lowest
+
+    # Depth-first over each outpoint's inputs, without recursion so long
+    # histories can't hit the recursion limit. An input still being visited
+    # (only possible in a cyclic history) counts as zero.
+    resolved: dict[str, CoinjoinCount] = {}
+    for target in sorted(graph.target_outpoints):
+        stack: list[tuple[str, bool]] = [(target, False)]
+        visiting: set[str] = set()
+        while stack:
+            outpoint, expanded = stack.pop()
+            if outpoint in resolved:
+                continue
+            if expanded:
+                visiting.discard(outpoint)
+                resolved[outpoint] = evaluate(
+                    outpoint,
+                    [resolved.get(dep, _NO_COINJOIN) for dep in dependencies(outpoint)],
+                )
+                continue
+            if outpoint in visiting:
+                continue
+            visiting.add(outpoint)
+            stack.append((outpoint, True))
+            for dep in dependencies(outpoint):
+                if dep not in resolved and dep not in visiting:
+                    stack.append((dep, False))
+
+    return {outpoint: resolved[outpoint] for outpoint in graph.target_outpoints}
 
 
 def _parse_complete_input_metadata(entry: TransactionHistoryEntry) -> list[tuple[str, str]] | None:

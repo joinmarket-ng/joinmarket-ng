@@ -277,6 +277,76 @@ class TestListUtxosFidelityBonds:
         assert regular_entry["locktime"] is None
 
 
+class TestListUtxosCoinjoinCounts:
+    def test_utxos_report_coinjoin_count_from_history(
+        self, authed_client: tuple[TestClient, str]
+    ) -> None:
+        from jmwallet.history import TransactionHistoryEntry, append_history_entry
+        from jmwallet.wallet.models import UTXOInfo
+
+        client, token = authed_client
+        state = get_daemon_state()
+        ws = state.wallet_service
+        ws.network = "regtest"
+        ws.wallet_fingerprint = "a1b2c3d4"
+
+        append_history_entry(
+            TransactionHistoryEntry(
+                timestamp="2026-01-01T00:00:00",
+                role="taker",
+                success=True,
+                txid="cc" * 32,
+                cj_amount=100_000,
+                peer_count=4,
+                destination_address="bcrt1qcjout",
+                change_address="bcrt1qchange",
+                utxos_used=f"{'dd' * 32}:0",
+                source_addresses="bcrt1qdeposit",
+                wallet_fingerprint="a1b2c3d4",
+                network="regtest",
+            ),
+            state.data_dir,
+        )
+
+        def utxo(txid: str, vout: int, address: str) -> UTXOInfo:
+            return UTXOInfo(
+                txid=txid,
+                vout=vout,
+                value=100_000,
+                address=address,
+                confirmations=5,
+                scriptpubkey="0014" + "22" * 20,
+                path="m/84'/1'/1'/0/3",
+                mixdepth=1,
+            )
+
+        ws.utxo_cache = {
+            0: [],
+            1: [utxo("cc" * 32, 0, "bcrt1qcjout"), utxo("cc" * 32, 1, "bcrt1qchange")],
+            2: [],
+            3: [],
+            4: [],
+        }
+
+        resp = client.get(
+            "/api/v1/wallet/test_wallet.jmdat/utxos",
+            headers=_auth_headers(token),
+        )
+        assert resp.status_code == 200
+        utxos = {u["utxo"]: u for u in resp.json()["utxos"]}
+
+        cj_out = utxos[f"{'cc' * 32}:0"]
+        assert cj_out["coinjoin_count"] == 1
+        assert cj_out["last_coinjoin_role"] == "taker"
+        assert cj_out["last_coinjoin_participants"] == 5
+
+        # Change of a deposit gets no credit.
+        change = utxos[f"{'cc' * 32}:1"]
+        assert change["coinjoin_count"] == 0
+        assert change["last_coinjoin_role"] is None
+        assert change["last_coinjoin_participants"] is None
+
+
 class TestNewAddress:
     def test_requires_auth(self, authed_client: tuple[TestClient, str]) -> None:
         client, _ = authed_client
